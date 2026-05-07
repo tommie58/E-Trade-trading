@@ -1,57 +1,53 @@
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 import pyetrade
 import json
 import os
 
-app = FastAPI()
+app = FastAPI(title="E*TRADE Trading Bot")
+
+# Enable CORS so your mobile app can connect
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
 CONSUMER_SECRET = os.getenv("ETRADE_CONSUMER_SECRET")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "default-secret")
-
-TOKENS_FILE = ".etrade_tokens.json"
-
-def load_tokens():
-    if os.path.exists(TOKENS_FILE):
-        with open(TOKENS_FILE) as f:
-            return json.load(f)
-    return None
-
-def save_tokens(tokens):
-    with open(TOKENS_FILE, "w") as f:
-        json.dump(tokens, f)
-
-tokens = load_tokens()
 
 oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
 
+@app.get("/")
+async def root():
+    return {"status": "✅ Bot is running!"}
+
 @app.post("/etrade/auth/start")
 async def start_auth():
+    if not CONSUMER_KEY or not CONSUMER_SECRET:
+        raise HTTPException(400, "ETRADE keys not set in Variables")
     try:
         url = oauth.get_request_token()
         return {"authorize_url": url}
     except Exception as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, f"Failed to start auth: {str(e)}")
 
 @app.post("/etrade/auth/complete")
 async def complete_auth(verifier: str):
     try:
-        new_tokens = oauth.get_access_token(verifier)
-        save_tokens(new_tokens)
-        return {"status": "linked"}
+        tokens = oauth.get_access_token(verifier)
+        with open(".etrade_tokens.json", "w") as f:
+            json.dump(tokens, f)
+        return {"status": "linked", "message": "Success!"}
     except Exception as e:
         raise HTTPException(500, str(e))
 
 @app.get("/etrade/account")
 async def get_account():
-    if not tokens:
-        return {"status": "not_linked"}
-    return {"status": "linked"}
+    return {"status": "linked" if os.path.exists(".etrade_tokens.json") else "not_linked"}
 
 @app.post("/webhook")
 async def webhook(request: Request):
     return {"status": "received"}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
