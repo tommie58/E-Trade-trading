@@ -4,9 +4,8 @@ import pyetrade
 import os
 import json
 
-app = FastAPI(title="E*TRADE Trading Bot")
+app = FastAPI(title="E*TRADE Bot")
 
-# CORS for mobile app
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,25 +16,27 @@ app.add_middleware(
 
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
 CONSUMER_SECRET = os.getenv("ETRADE_CONSUMER_SECRET")
-TOKENS_FILE = ".etrade_tokens.json"
 
 oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
 
-def load_tokens():
-    if os.path.exists(TOKENS_FILE):
+# Store tokens in environment variable (more persistent on Railway)
+TOKEN_ENV_VAR = "ETRADE_ACCESS_TOKENS"
+
+def get_tokens():
+    tokens_str = os.getenv(TOKEN_ENV_VAR)
+    if tokens_str:
         try:
-            with open(TOKENS_FILE) as f:
-                return json.load(f)
+            return json.loads(tokens_str)
         except:
             pass
     return None
 
 def save_tokens(tokens):
     try:
-        with open(TOKENS_FILE, "w") as f:
-            json.dump(tokens, f)
-    except:
-        pass  # Fail silently if file write fails
+        os.environ[TOKEN_ENV_VAR] = json.dumps(tokens)
+        print("✅ Tokens saved to environment variable")
+    except Exception as e:
+        print(f"⚠️ Failed to save tokens: {e}")
 
 @app.get("/")
 async def root():
@@ -55,7 +56,7 @@ async def start_auth():
 async def complete_auth(request: Request):
     try:
         data = await request.json()
-        verifier = data.get("verifier") or data.get("code") or str(data).strip()
+        verifier = data.get("verifier") or data.get("code") or str(data)
         verifier = str(verifier).strip()
         
         if len(verifier) < 4:
@@ -64,16 +65,13 @@ async def complete_auth(request: Request):
         tokens = oauth.get_access_token(verifier)
         save_tokens(tokens)
         
-        return {
-            "status": "linked", 
-            "message": "✅ E*TRADE account successfully linked!"
-        }
+        return {"status": "linked", "message": "✅ E*TRADE account successfully linked!"}
     except Exception as e:
         raise HTTPException(500, f"Complete auth failed: {str(e)}")
 
 @app.get("/etrade/account")
 async def get_account():
-    tokens = load_tokens()
+    tokens = get_tokens()
     return {
         "status": "linked" if tokens else "not_linked",
         "has_tokens": bool(tokens)
