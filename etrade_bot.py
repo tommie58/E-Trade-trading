@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import pyetrade
 import os
@@ -32,17 +32,22 @@ async def start_auth():
         raise HTTPException(500, f"Start failed: {str(e)}")
 
 @app.post("/etrade/auth/complete")
-async def complete_auth(verifier: str):
-    verifier = verifier.strip()
-    if not verifier or len(verifier) < 4:
-        raise HTTPException(400, "Invalid verification code")
+async def complete_auth(request: Request):
     try:
+        data = await request.json()
+        verifier = data.get("verifier") or data.get("code") or str(data)
+        verifier = str(verifier).strip()
+        
+        if len(verifier) < 4:
+            raise HTTPException(400, "Invalid code")
+            
         tokens = oauth.get_access_token(verifier)
         with open(".etrade_tokens.json", "w") as f:
             json.dump(tokens, f)
-        return {"status": "linked", "message": "✅ Successfully linked to E*TRADE!"}
+            
+        return {"status": "linked", "message": "✅ Successfully linked!"}
     except Exception as e:
-        raise HTTPException(500, f"Complete failed: {str(e)}")
+        raise HTTPException(422, f"Complete failed: {str(e)}")
 
 @app.get("/etrade/account")
 async def get_account():
