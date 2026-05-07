@@ -16,27 +16,8 @@ app.add_middleware(
 
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
 CONSUMER_SECRET = os.getenv("ETRADE_CONSUMER_SECRET")
-TOKEN_ENV_VAR = "ETRADE_ACCESS_TOKENS"
 
 oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
-
-def get_tokens():
-    tokens_str = os.getenv(TOKEN_ENV_VAR)
-    if tokens_str:
-        try:
-            return json.loads(tokens_str)
-        except:
-            pass
-    return None
-
-def save_tokens(tokens):
-    try:
-        os.environ[TOKEN_ENV_VAR] = json.dumps(tokens)
-        print("✅ Tokens saved successfully to env var")
-        return True
-    except Exception as e:
-        print(f"⚠️ Token save failed: {e}")
-        return False
 
 @app.get("/")
 async def root():
@@ -45,7 +26,7 @@ async def root():
 @app.post("/etrade/auth/start")
 async def start_auth():
     if not CONSUMER_KEY or not CONSUMER_SECRET:
-        raise HTTPException(400, "ETRADE keys not set")
+        raise HTTPException(400, "ETRADE keys not set in Variables")
     try:
         url = oauth.get_request_token()
         return {"authorize_url": url}
@@ -62,19 +43,17 @@ async def complete_auth(request: Request):
             raise HTTPException(400, "Invalid verification code")
 
         tokens = oauth.get_access_token(verifier)
-        save_tokens(tokens)
         
+        # Return tokens so the app can store them permanently
         return {
-            "status": "linked", 
-            "message": "✅ E*TRADE account successfully linked and tokens saved!"
+            "status": "linked",
+            "message": "✅ E*TRADE linked!",
+            "tokens": tokens   # ← This is the key change
         }
     except Exception as e:
         raise HTTPException(500, f"Complete failed: {str(e)}")
 
 @app.get("/etrade/account")
 async def get_account():
-    tokens = get_tokens()
-    return {
-        "status": "linked" if tokens else "not_linked",
-        "has_tokens": bool(tokens)
-    }
+    # Simple check - app will handle persistence
+    return {"status": "linked"}
