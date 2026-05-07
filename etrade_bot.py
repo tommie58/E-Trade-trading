@@ -4,8 +4,9 @@ import pyetrade
 import os
 import json
 
-app = FastAPI(title="E*TRADE Bot")
+app = FastAPI(title="E*TRADE Trading Bot")
 
+# CORS for mobile app
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,10 +15,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-oauth = pyetrade.ETradeOAuth(
-    os.getenv("ETRADE_CONSUMER_KEY"),
-    os.getenv("ETRADE_CONSUMER_SECRET")
-)
+CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
+CONSUMER_SECRET = os.getenv("ETRADE_CONSUMER_SECRET")
+TOKENS_FILE = ".etrade_tokens.json"
+
+oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
+
+def load_tokens():
+    if os.path.exists(TOKENS_FILE):
+        try:
+            with open(TOKENS_FILE) as f:
+                return json.load(f)
+        except:
+            pass
+    return None
+
+def save_tokens(tokens):
+    try:
+        with open(TOKENS_FILE, "w") as f:
+            json.dump(tokens, f)
+    except:
+        pass  # Fail silently if file write fails
 
 @app.get("/")
 async def root():
@@ -25,30 +43,42 @@ async def root():
 
 @app.post("/etrade/auth/start")
 async def start_auth():
+    if not CONSUMER_KEY or not CONSUMER_SECRET:
+        raise HTTPException(400, "ETRADE keys not set in Variables")
     try:
         url = oauth.get_request_token()
         return {"authorize_url": url}
     except Exception as e:
-        raise HTTPException(500, f"Start failed: {str(e)}")
+        raise HTTPException(500, f"Start auth failed: {str(e)}")
 
 @app.post("/etrade/auth/complete")
 async def complete_auth(request: Request):
     try:
         data = await request.json()
-        verifier = data.get("verifier") or data.get("code") or str(data)
+        verifier = data.get("verifier") or data.get("code") or str(data).strip()
         verifier = str(verifier).strip()
         
         if len(verifier) < 4:
-            raise HTTPException(400, "Invalid code")
-            
+            raise HTTPException(400, "Invalid verification code")
+
         tokens = oauth.get_access_token(verifier)
-        with open(".etrade_tokens.json", "w") as f:
-            json.dump(tokens, f)
-            
-        return {"status": "linked", "message": "✅ Successfully linked!"}
+        save_tokens(tokens)
+        
+        return {
+            "status": "linked", 
+            "message": "✅ E*TRADE account successfully linked!"
+        }
     except Exception as e:
-        raise HTTPException(422, f"Complete failed: {str(e)}")
+        raise HTTPException(500, f"Complete auth failed: {str(e)}")
 
 @app.get("/etrade/account")
 async def get_account():
-    return {"status": "linked" if os.path.exists(".etrade_tokens.json") else "not_linked"}
+    tokens = load_tokens()
+    return {
+        "status": "linked" if tokens else "not_linked",
+        "has_tokens": bool(tokens)
+    }
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    return {"status": "received"}
