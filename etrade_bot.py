@@ -1,12 +1,10 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import pyetrade
-import json
 import os
 
-app = FastAPI(title="E*TRADE Trading Bot")
+app = FastAPI(title="E*TRADE Bot")
 
-# Enable CORS so your mobile app can connect
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,10 +22,12 @@ oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
 async def root():
     return {"status": "✅ Bot is running!"}
 
+# Support both GET (for browser testing) and POST (for the app)
+@app.get("/etrade/auth/start")
 @app.post("/etrade/auth/start")
 async def start_auth():
     if not CONSUMER_KEY or not CONSUMER_SECRET:
-        raise HTTPException(400, "ETRADE keys not set in Variables")
+        raise HTTPException(400, "ETRADE keys not set in Variables tab")
     try:
         url = oauth.get_request_token()
         return {"authorize_url": url}
@@ -43,11 +43,3 @@ async def complete_auth(verifier: str):
         return {"status": "linked", "message": "Success!"}
     except Exception as e:
         raise HTTPException(500, str(e))
-
-@app.get("/etrade/account")
-async def get_account():
-    return {"status": "linked" if os.path.exists(".etrade_tokens.json") else "not_linked"}
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    return {"status": "received"}
