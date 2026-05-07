@@ -14,10 +14,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
-CONSUMER_SECRET = os.getenv("ETRADE_CONSUMER_SECRET")
-
-oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
+oauth = pyetrade.ETradeOAuth(
+    os.getenv("ETRADE_CONSUMER_KEY"),
+    os.getenv("ETRADE_CONSUMER_SECRET")
+)
 
 @app.get("/")
 async def root():
@@ -25,25 +25,24 @@ async def root():
 
 @app.post("/etrade/auth/start")
 async def start_auth():
-    if not CONSUMER_KEY or not CONSUMER_SECRET:
-        raise HTTPException(400, "ETRADE keys not configured")
     try:
         url = oauth.get_request_token()
         return {"authorize_url": url}
     except Exception as e:
-        raise HTTPException(500, f"Start auth failed: {str(e)}")
+        raise HTTPException(500, f"Start failed: {str(e)}")
 
 @app.post("/etrade/auth/complete")
 async def complete_auth(verifier: str):
-    if not verifier or len(verifier.strip()) < 5:
+    verifier = verifier.strip()
+    if not verifier or len(verifier) < 4:
         raise HTTPException(400, "Invalid verification code")
     try:
-        tokens = oauth.get_access_token(verifier.strip())
+        tokens = oauth.get_access_token(verifier)
         with open(".etrade_tokens.json", "w") as f:
             json.dump(tokens, f)
-        return {"status": "linked", "message": "E*TRADE account successfully linked!"}
+        return {"status": "linked", "message": "✅ Successfully linked to E*TRADE!"}
     except Exception as e:
-        raise HTTPException(500, f"Complete auth failed: {str(e)}")
+        raise HTTPException(500, f"Complete failed: {str(e)}")
 
 @app.get("/etrade/account")
 async def get_account():
