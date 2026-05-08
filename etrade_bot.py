@@ -41,3 +41,8 @@ async def complete_auth(request: Request):
 @app.get("/etrade/account")
 async def get_account():
     return {"status": "linked"}   # App will handle real persistence
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    # You can add logging here later
+    return {"status": "received"}
