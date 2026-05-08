@@ -3,96 +3,69 @@ from fastapi.middleware.cors import CORSMiddleware
 import pyetrade
 import os
 import json
-from datetime import datetime
 
 app = FastAPI(title="E*TRADE Bot")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# E*TRADE Setup
-CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
-CONSUMER_SECRET = os.getenv("ETRADE_CONSUMER_SECRET")
-oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
+oauth = pyetrade.ETradeOAuth(
+    os.getenv("ETRADE_CONSUMER_KEY"),
+    os.getenv("ETRADE_CONSUMER_SECRET")
+)
 
 def load_session():
     try:
-        with open(".etrade_tokens.json", "r") as f:
+        with open(".etrade_tokens.json") as f:
             tokens = json.load(f)
-        return pyetrade.ETradeAccounts(tokens)
-    except Exception as e:
-        print("❌ Failed to load E*TRADE session:", e)
+        return pyetrade.ETradeOrder(tokens)  # Use ETradeOrder for trading
+    except:
         return None
-
-@app.get("/")
-async def root():
-    return {"status": "✅ Bot is running!"}
-
-@app.post("/etrade/auth/start")
-async def start_auth():
-    try:
-        url = oauth.get_request_token()
-        return {"authorize_url": url}
-    except Exception as e:
-        raise HTTPException(500, f"Start failed: {str(e)}")
-
-@app.post("/etrade/auth/complete")
-async def complete_auth(request: Request):
-    try:
-        data = await request.json()
-        verifier = str(data.get("verifier") or data.get("code") or data).strip()
-        tokens = oauth.get_access_token(verifier)
-        with open(".etrade_tokens.json", "w") as f:
-            json.dump(tokens, f)
-        return {"status": "linked", "message": "✅ Linked!", "tokens": tokens}
-    except Exception as e:
-        raise HTTPException(500, f"Complete failed: {str(e)}")
 
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         payload = await request.json()
-        
         ticker = payload["ticker"]
-        action = payload["action"].upper()  # BUY / SELL
-        entry = payload.get("entry")
-        stop = payload.get("stop")
-        target = payload.get("target")
+        action = payload["action"].upper()
         shares = int(payload.get("position_size_shares", 0))
-        risk_dollars = payload.get("risk_dollars", 0)
+        stop_price = payload.get("stop")
+        limit_price = payload.get("target")
 
-        print(f"🚀 RECEIVED SIGNAL → {action} {shares} {ticker} | Risk ${risk_dollars}")
+        print(f"🚀 SIGNAL: {action} {shares} {ticker}")
 
         session = load_session()
         if not session:
-            print("❌ No valid E*TRADE session")
+            print("❌ No E*TRADE session loaded")
             return {"status": "error", "reason": "not_linked"}
 
-        # Bracket Order (Entry + Stop + Target)
-        order = {
-            "symbol": ticker,
-            "action": action,
-            "quantity": shares,
-            "orderType": "MARKET",
-            "priceType": "MARKET",
-            "stopPrice": stop,
-            "limitPrice": target if action == "BUY" else None,
-        }
+        # 1. Preview the order first (required by E*TRADE)
+        preview = session.preview_equity_order(
+            accountIdKey=session.accountIdKey,  # You may need to set this
+            symbol=ticker,
+            quantity=shares,
+            orderAction=action,
+            priceType="MARKET"
+        )
+        print("✅ Preview successful")
 
-        response = session.place_equity_order(**order)
-        print(f"✅ ORDER PLACED SUCCESSFULLY: {ticker} {action} {shares} shares")
+        # 2. Place the actual order
+        order_response = session.place_equity_order(
+            accountIdKey=session.accountIdKey,
+            symbol=ticker,
+            quantity=shares,
+            orderAction=action,
+            priceType="MARKET",
+            stopPrice=stop_price,
+            limitPrice=limit_price
+        )
 
-        return {
-            "status": "success",
-            "ticker": ticker,
-            "action": action,
-            "shares": shares,
-            "response": response
-        }
+        print(f"✅ ORDER PLACED: {action} {shares} {ticker}")
+        return {"status": "success", "response": order_response}
 
     except Exception as e:
-        print("❌ Webhook error:", str(e))
-        raise HTTPException(500, str(e))
+        print(f"❌ ORDER ERROR: {str(e)}")
+        raise HTTPException(500, f"Order failed: {str(e)}")
 
-@app.get("/etrade/account")
-async def get_account():
-    return {"status": "linked"}
+@app.get("/")
+async def root():
+    return {"status": "✅ Bot running"}
