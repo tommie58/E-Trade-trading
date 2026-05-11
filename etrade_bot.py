@@ -8,6 +8,8 @@ app = FastAPI(title="E*TRADE Bot")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+ENV = os.getenv("ETRADE_ENV", "sandbox")  # sandbox or live
+
 oauth = pyetrade.ETradeOAuth(
     os.getenv("ETRADE_CONSUMER_KEY"),
     os.getenv("ETRADE_CONSUMER_SECRET")
@@ -15,53 +17,23 @@ oauth = pyetrade.ETradeOAuth(
 
 TOKENS_FILE = ".etrade_tokens.json"
 
-def save_tokens(tokens):
-    try:
-        with open(TOKENS_FILE, "w") as f:
-            json.dump(tokens, f)
-        print("✅ Tokens saved")
-    except Exception as e:
-        print("❌ Token save failed:", e)
-
 def load_session():
     try:
         with open(TOKENS_FILE) as f:
             tokens = json.load(f)
-        accounts = pyetrade.ETradeAccounts(tokens)
-        # Get first account
+        
+        accounts = pyetrade.ETradeAccounts(tokens, sandbox=ENV == "sandbox")
         acct_list = accounts.list_accounts()
+        
+        # Get first account
         account = acct_list['AccountListResponse']['Accounts']['Account'][0]
-        return accounts, account['accountIdKey']
+        account_id_key = account['accountIdKey']
+        
+        print(f"✅ Loaded {ENV} account: {account_id_key}")
+        return accounts, account_id_key
     except Exception as e:
-        print("❌ Load session failed:", e)
+        print(f"❌ Load session failed: {e}")
         return None, None
-
-@app.get("/")
-async def root():
-    return {"status": "✅ Bot is running!"}
-
-@app.post("/etrade/auth/start")
-async def start_auth():
-    try:
-        url = oauth.get_request_token()
-        return {"authorize_url": url}
-    except Exception as e:
-        raise HTTPException(500, f"Start failed: {str(e)}")
-
-@app.post("/etrade/auth/complete")
-async def complete_auth(request: Request):
-    try:
-        data = await request.json()
-        verifier = str(data.get("verifier") or data.get("code") or data).strip()
-        tokens = oauth.get_access_token(verifier)
-        save_tokens(tokens)
-        return {"status": "linked", "message": "✅ Linked successfully!"}
-    except Exception as e:
-        raise HTTPException(500, f"Complete failed: {str(e)}")
-
-@app.get("/etrade/account")
-async def get_account():
-    return {"status": "linked"}
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -70,33 +42,44 @@ async def webhook(request: Request):
         ticker = payload.get("ticker")
         action = payload.get("action", "BUY").upper()
         shares = int(payload.get("position_size_shares", 0))
+        stop_price = payload.get("stop")
+        target_price = payload.get("target")
 
-        print(f"🚀 SIGNAL: {action} {shares} {ticker}")
+        print(f"🚀 SIGNAL: {action} {shares} {ticker} | ENV={ENV}")
 
         session, account_id_key = load_session()
         if not session or not account_id_key:
+            print("❌ No valid session or account")
             return {"status": "error", "reason": "not_linked"}
 
-        # Preview then Place
-        session.preview_equity_order(
+        # Preview (required)
+        preview = session.preview_equity_order(
             accountIdKey=account_id_key,
             symbol=ticker,
             quantity=shares,
             orderAction=action,
             priceType="MARKET"
         )
+        print("✅ Preview OK")
 
-        response = session.place_equity_order(
+        # Place order
+        order = session.place_equity_order(
             accountIdKey=account_id_key,
             symbol=ticker,
             quantity=shares,
             orderAction=action,
-            priceType="MARKET"
+            priceType="MARKET",
+            stopPrice=stop_price,
+            limitPrice=target_price if action == "SELL" else None
         )
 
-        print(f"✅ ORDER PLACED: {action} {shares} {ticker}")
-        return {"status": "success"}
+        print(f"✅ ORDER PLACED SUCCESSFULLY: {action} {shares} {ticker}")
+        return {"status": "success", "order": order}
 
     except Exception as e:
-        print(f"❌ ERROR: {str(e)}")
-        raise HTTPException(500, str(e))
+        print(f"❌ ORDER FAILED: {str(e)}")
+        raise HTTPException(500, f"Order failed: {str(e)}")
+
+@app.get("/")
+async def root():
+    return {"status": "✅ Bot is running!"}
