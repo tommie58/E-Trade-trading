@@ -35,7 +35,7 @@ async def complete_auth(request: Request):
         tokens = oauth.get_access_token(verifier)
         with open(TOKENS_FILE, "w") as f:
             json.dump(tokens, f)
-        return {"status": "linked", "message": "✅ Successfully linked!"}
+        return {"status": "linked", "message": "✅ Linked!"}
     except Exception as e:
         raise HTTPException(500, f"Complete failed: {str(e)}")
 
@@ -47,7 +47,7 @@ async def get_account():
 async def webhook(request: Request):
     try:
         payload = await request.json()
-        print("Received webhook:", payload.get("ticker"), payload.get("action"))
+        print("✅ Webhook received:", payload.get("ticker"), payload.get("action"))
         return {"status": "received"}
     except Exception as e:
         raise HTTPException(500, str(e))
