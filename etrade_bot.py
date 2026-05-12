@@ -51,3 +51,12 @@ async def webhook(request: Request):
         return {"status": "received"}
     except Exception as e:
         raise HTTPException(500, str(e))
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "uvicorn etrade_bot:app --host 0.0.0.0 --port $PORT"
+  }
+}
