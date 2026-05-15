@@ -20,14 +20,23 @@ def load_session():
     try:
         with open(TOKENS_FILE) as f:
             tokens = json.load(f)
-        accounts = pyetrade.ETradeAccounts(tokens)   # ← Fixed: removed sandbox argument
-        acct_list = accounts.list_accounts()
+        
+        # Correct way to restore session
+        session = pyetrade.ETradeAccounts(
+            tokens.get('oauth_token'),
+            tokens.get('oauth_token_secret'),
+            os.getenv("ETRADE_CONSUMER_KEY"),
+            os.getenv("ETRADE_CONSUMER_SECRET")
+        )
+        
+        acct_list = session.list_accounts()
         account = acct_list['AccountListResponse']['Accounts']['Account'][0]
         account_id_key = account['accountIdKey']
-        print(f"✅ LOADED ACCOUNT: {account_id_key} ({ENV})")
-        return accounts, account_id_key
+        
+        print(f"✅ SUCCESSFULLY LOADED ACCOUNT: {account_id_key}")
+        return session, account_id_key
     except Exception as e:
-        print(f"❌ Load session failed: {e}")
+        print(f"❌ SESSION LOAD FAILED: {e}")
         return None, None
 
 @app.get("/")
@@ -50,6 +59,7 @@ async def complete_auth(request: Request):
         tokens = oauth.get_access_token(verifier)
         with open(TOKENS_FILE, "w") as f:
             json.dump(tokens, f)
+        print("✅ Tokens saved successfully")
         return {"status": "linked", "message": "✅ Linked!"}
     except Exception as e:
         raise HTTPException(500, f"Complete failed: {str(e)}")
@@ -66,11 +76,11 @@ async def webhook(request: Request):
         action = payload.get("action", "BUY").upper()
         shares = int(payload.get("position_size_shares", 0))
 
-        print(f"🚀 SIGNAL: {action} {shares} {ticker}")
+        print(f"🚀 SIGNAL RECEIVED: {action} {shares} {ticker}")
 
         session, account_id_key = load_session()
         if not session or not account_id_key:
-            print("❌ No valid session")
+            print("❌ No valid E*TRADE session")
             return {"status": "error", "reason": "not_linked"}
 
         # Preview + Place
@@ -94,5 +104,5 @@ async def webhook(request: Request):
         return {"status": "success"}
 
     except Exception as e:
-        print(f"❌ ERROR: {str(e)}")
+        print(f"❌ ORDER ERROR: {str(e)}")
         raise HTTPException(500, f"Order failed: {str(e)}")
