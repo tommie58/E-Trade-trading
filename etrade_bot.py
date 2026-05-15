@@ -16,15 +16,26 @@ oauth = pyetrade.ETradeOAuth(
 TOKENS_FILE = ".etrade_tokens.json"
 ENV = os.getenv("ETRADE_ENV", "sandbox")
 
-# === YOUR NEW load_session ===
 def load_session():
     try:
         with open(TOKENS_FILE) as f:
             tokens = json.load(f)
 
+        consumer_key = os.getenv("ETRADE_CONSUMER_KEY")
+        consumer_secret = os.getenv("ETRADE_CONSUMER_SECRET")
+
+        # Create order session
+        order_session = pyetrade.ETradeOrder(
+            consumer_key,
+            consumer_secret,
+            tokens["oauth_token"],
+            tokens["oauth_token_secret"]
+        )
+
+        # Get account ID
         accounts = pyetrade.ETradeAccounts(
-            os.getenv("ETRADE_CONSUMER_KEY"),
-            os.getenv("ETRADE_CONSUMER_SECRET"),
+            consumer_key,
+            consumer_secret,
             tokens["oauth_token"],
             tokens["oauth_token_secret"]
         )
@@ -33,8 +44,8 @@ def load_session():
         account = acct_list["AccountListResponse"]["Accounts"]["Account"][0]
         account_id_key = account["accountIdKey"]
 
-        print(f"✅ SUCCESS - Loaded account: {account_id_key} ({ENV})")
-        return accounts, account_id_key
+        print(f"✅ Order session loaded for account {account_id_key}")
+        return order_session, account_id_key
 
     except Exception as e:
         print(f"❌ Load session failed: {e}")
@@ -60,7 +71,7 @@ async def complete_auth(request: Request):
         tokens = oauth.get_access_token(verifier)
         with open(TOKENS_FILE, "w") as f:
             json.dump(tokens, f)
-        print("✅ Tokens saved successfully")
+        print("✅ Tokens saved")
         return {"status": "linked", "message": "✅ Linked!"}
     except Exception as e:
         raise HTTPException(500, f"Complete failed: {str(e)}")
@@ -84,7 +95,7 @@ async def webhook(request: Request):
             print("❌ No valid session")
             return {"status": "error", "reason": "not_linked"}
 
-        # Preview order
+        # === YOUR UPDATED PREVIEW BLOCK ===
         preview = session.preview_equity_order(
             accountIdKey=account_id_key,
             symbol=ticker,
@@ -104,15 +115,16 @@ async def webhook(request: Request):
                 "details": preview
             }
 
-        # Place order
+        # Place order (using previewId - recommended)
+        preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
+        if isinstance(preview_ids, list):
+            preview_id = preview_ids[0]["previewId"]
+        else:
+            preview_id = preview_ids["previewId"]
+
         order = session.place_equity_order(
             accountIdKey=account_id_key,
-            symbol=ticker,
-            quantity=shares,
-            orderAction=action,
-            priceType="MARKET",
-            marketSession="REGULAR",
-            orderTerm="GOOD_FOR_DAY"
+            previewId=preview_id
         )
 
         print("ORDER RESPONSE:", order)
