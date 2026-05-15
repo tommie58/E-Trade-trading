@@ -111,7 +111,10 @@ async def webhook(request: Request):
 
         # Extract previewId
         preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
-        preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
+        if isinstance(preview_ids, list):
+            preview_id = preview_ids[0]["previewId"]
+        else:
+            preview_id = preview_ids["previewId"]
 
         print(f"✅ PREVIEW ID: {preview_id}")
 
