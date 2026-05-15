@@ -16,16 +16,26 @@ oauth = pyetrade.ETradeOAuth(
 TOKENS_FILE = ".etrade_tokens.json"
 ENV = os.getenv("ETRADE_ENV", "sandbox")
 
+# === YOUR NEW load_session ===
 def load_session():
     try:
         with open(TOKENS_FILE) as f:
             tokens = json.load(f)
-        accounts = pyetrade.ETradeAccounts(tokens, sandbox=ENV == "sandbox")
+
+        accounts = pyetrade.ETradeAccounts(
+            os.getenv("ETRADE_CONSUMER_KEY"),
+            os.getenv("ETRADE_CONSUMER_SECRET"),
+            tokens["oauth_token"],
+            tokens["oauth_token_secret"]
+        )
+
         acct_list = accounts.list_accounts()
-        account = acct_list['AccountListResponse']['Accounts']['Account'][0]
-        account_id_key = account['accountIdKey']
-        print(f"✅ LOADED ACCOUNT: {account_id_key} ({ENV})")
+        account = acct_list["AccountListResponse"]["Accounts"]["Account"][0]
+        account_id_key = account["accountIdKey"]
+
+        print(f"✅ SUCCESS - Loaded account: {account_id_key} ({ENV})")
         return accounts, account_id_key
+
     except Exception as e:
         print(f"❌ Load session failed: {e}")
         return None, None
@@ -50,7 +60,7 @@ async def complete_auth(request: Request):
         tokens = oauth.get_access_token(verifier)
         with open(TOKENS_FILE, "w") as f:
             json.dump(tokens, f)
-        print("✅ Tokens saved")
+        print("✅ Tokens saved successfully")
         return {"status": "linked", "message": "✅ Linked!"}
     except Exception as e:
         raise HTTPException(500, f"Complete failed: {str(e)}")
@@ -74,7 +84,6 @@ async def webhook(request: Request):
             print("❌ No valid session")
             return {"status": "error", "reason": "not_linked"}
 
-        # === YOUR IMPROVED PREVIEW + PLACE BLOCK ===
         # Preview order
         preview = session.preview_equity_order(
             accountIdKey=account_id_key,
@@ -88,47 +97,28 @@ async def webhook(request: Request):
 
         print("PREVIEW RESPONSE:", preview)
 
-        # Verify preview succeeded
-        preview_response = preview.get("PreviewOrderResponse")
-        if not preview_response:
+        if "PreviewOrderResponse" not in preview:
             return {
                 "status": "error",
                 "reason": "preview_failed",
                 "details": preview
             }
 
-        # Extract previewId
-        preview_ids = preview_response["PreviewIds"]["previewId"]
-        if isinstance(preview_ids, list):
-            preview_id = preview_ids[0]["previewId"]
-        else:
-            preview_id = preview_ids["previewId"]
-
-        print(f"✅ PREVIEW ID: {preview_id}")
-
-        # Place live order using previewId
+        # Place order
         order = session.place_equity_order(
             accountIdKey=account_id_key,
-            previewId=preview_id
+            symbol=ticker,
+            quantity=shares,
+            orderAction=action,
+            priceType="MARKET",
+            marketSession="REGULAR",
+            orderTerm="GOOD_FOR_DAY"
         )
 
         print("ORDER RESPONSE:", order)
+        print(f"✅ ORDER PLACED: {action} {shares} {ticker}")
 
-        # Confirm order placed
-        if "PlaceOrderResponse" not in order:
-            return {
-                "status": "error",
-                "reason": "order_failed",
-                "details": order
-            }
-
-        print(f"✅ LIVE ORDER PLACED: {action} {shares} {ticker}")
-
-        return {
-            "status": "success",
-            "preview_id": preview_id,
-            "details": order
-        }
+        return {"status": "success", "details": order}
 
     except Exception as e:
         print(f"❌ ORDER ERROR: {str(e)}")
