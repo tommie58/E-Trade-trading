@@ -74,7 +74,7 @@ async def webhook(request: Request):
             print("❌ No valid session")
             return {"status": "error", "reason": "not_linked"}
 
-        # === YOUR PREVIEW + PLACE BLOCK ===
+        # === YOUR IMPROVED PREVIEW + PLACE BLOCK ===
         # Preview order
         preview = session.preview_equity_order(
             accountIdKey=account_id_key,
@@ -88,30 +88,45 @@ async def webhook(request: Request):
 
         print("PREVIEW RESPONSE:", preview)
 
-        # Ensure preview succeeded
-        if "PreviewOrderResponse" not in preview:
+        # Verify preview succeeded
+        preview_response = preview.get("PreviewOrderResponse")
+        if not preview_response:
             return {
                 "status": "error",
                 "reason": "preview_failed",
                 "details": preview
             }
 
-        # Place order
+        # Extract previewId
+        preview_ids = preview_response["PreviewIds"]["previewId"]
+        if isinstance(preview_ids, list):
+            preview_id = preview_ids[0]["previewId"]
+        else:
+            preview_id = preview_ids["previewId"]
+
+        print(f"✅ PREVIEW ID: {preview_id}")
+
+        # Place live order using previewId
         order = session.place_equity_order(
             accountIdKey=account_id_key,
-            symbol=ticker,
-            quantity=shares,
-            orderAction=action,
-            priceType="MARKET",
-            marketSession="REGULAR",
-            orderTerm="GOOD_FOR_DAY"
+            previewId=preview_id
         )
 
         print("ORDER RESPONSE:", order)
-        print(f"✅ ORDER PLACED: {action} {shares} {ticker}")
+
+        # Confirm order placed
+        if "PlaceOrderResponse" not in order:
+            return {
+                "status": "error",
+                "reason": "order_failed",
+                "details": order
+            }
+
+        print(f"✅ LIVE ORDER PLACED: {action} {shares} {ticker}")
 
         return {
             "status": "success",
+            "preview_id": preview_id,
             "details": order
         }
 
