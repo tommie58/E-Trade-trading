@@ -20,11 +20,11 @@ def load_session():
     try:
         with open(TOKENS_FILE) as f:
             tokens = json.load(f)
-        accounts = pyetrade.ETradeAccounts(tokens, sandbox=ENV == "sandbox")
+        accounts = pyetrade.ETradeAccounts(tokens)   # ← Fixed: removed sandbox argument
         acct_list = accounts.list_accounts()
         account = acct_list['AccountListResponse']['Accounts']['Account'][0]
         account_id_key = account['accountIdKey']
-        print(f"✅ Loaded account: {account_id_key}")
+        print(f"✅ LOADED ACCOUNT: {account_id_key} ({ENV})")
         return accounts, account_id_key
     except Exception as e:
         print(f"❌ Load session failed: {e}")
@@ -50,7 +50,7 @@ async def complete_auth(request: Request):
         tokens = oauth.get_access_token(verifier)
         with open(TOKENS_FILE, "w") as f:
             json.dump(tokens, f)
-        return {"status": "linked", "message": "✅ Linked successfully!"}
+        return {"status": "linked", "message": "✅ Linked!"}
     except Exception as e:
         raise HTTPException(500, f"Complete failed: {str(e)}")
 
@@ -73,7 +73,7 @@ async def webhook(request: Request):
             print("❌ No valid session")
             return {"status": "error", "reason": "not_linked"}
 
-        # Preview (required)
+        # Preview + Place
         session.preview_equity_order(
             accountIdKey=account_id_key,
             symbol=ticker,
@@ -82,7 +82,6 @@ async def webhook(request: Request):
             priceType="MARKET"
         )
 
-        # Place order
         order = session.place_equity_order(
             accountIdKey=account_id_key,
             symbol=ticker,
@@ -95,5 +94,5 @@ async def webhook(request: Request):
         return {"status": "success"}
 
     except Exception as e:
-        print(f"❌ ERROR: {e}")
+        print(f"❌ ERROR: {str(e)}")
         raise HTTPException(500, f"Order failed: {str(e)}")
