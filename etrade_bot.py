@@ -22,7 +22,7 @@ TOKENS_FILE = ".etrade_tokens.json"
 
 @app.get("/")
 async def root():
-    return {"status": "✅ Bot is running - linking should work now"}
+    return {"status": "✅ Bot is running!"}
 
 @app.post("/etrade/auth/start")
 async def start_auth():
@@ -40,7 +40,7 @@ async def complete_auth(request: Request):
         tokens = oauth.get_access_token(verifier)
         with open(TOKENS_FILE, "w") as f:
             json.dump(tokens, f)
-        return {"status": "linked", "message": "✅ Linked successfully!"}
+        return {"status": "linked", "message": "✅ Linked!"}
     except Exception as e:
         raise HTTPException(500, f"Complete failed: {str(e)}")
 
