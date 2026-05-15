@@ -6,7 +6,12 @@ import json
 
 app = FastAPI(title="E*TRADE Bot")
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 oauth = pyetrade.ETradeOAuth(
     os.getenv("ETRADE_CONSUMER_KEY"),
@@ -35,7 +40,7 @@ async def complete_auth(request: Request):
         tokens = oauth.get_access_token(verifier)
         with open(TOKENS_FILE, "w") as f:
             json.dump(tokens, f)
-        return {"status": "linked", "message": "✅ Linked!"}
+        return {"status": "linked", "message": "✅ Linked successfully!"}
     except Exception as e:
         raise HTTPException(500, f"Complete failed: {str(e)}")
 
@@ -45,5 +50,9 @@ async def get_account():
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    print("Webhook received")
-    return {"status": "received"}
+    try:
+        payload = await request.json()
+        print("Webhook received:", payload.get("ticker"))
+        return {"status": "received"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
