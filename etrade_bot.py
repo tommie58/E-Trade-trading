@@ -24,7 +24,6 @@ def load_session():
         consumer_key = os.getenv("ETRADE_CONSUMER_KEY")
         consumer_secret = os.getenv("ETRADE_CONSUMER_SECRET")
 
-        # Create order session
         order_session = pyetrade.ETradeOrder(
             consumer_key,
             consumer_secret,
@@ -32,7 +31,6 @@ def load_session():
             tokens["oauth_token_secret"]
         )
 
-        # Get account ID
         accounts = pyetrade.ETradeAccounts(
             consumer_key,
             consumer_secret,
@@ -44,7 +42,7 @@ def load_session():
         account = acct_list["AccountListResponse"]["Accounts"]["Account"][0]
         account_id_key = account["accountIdKey"]
 
-        print(f"✅ Order session loaded for account {account_id_key}")
+        print(f"✅ Loaded account: {account_id_key}")
         return order_session, account_id_key
 
     except Exception as e:
@@ -95,7 +93,7 @@ async def webhook(request: Request):
             print("❌ No valid session")
             return {"status": "error", "reason": "not_linked"}
 
-        # === YOUR UPDATED PREVIEW BLOCK ===
+        # Preview order
         preview = session.preview_equity_order(
             accountIdKey=account_id_key,
             symbol=ticker,
@@ -109,26 +107,22 @@ async def webhook(request: Request):
         print("PREVIEW RESPONSE:", preview)
 
         if "PreviewOrderResponse" not in preview:
-            return {
-                "status": "error",
-                "reason": "preview_failed",
-                "details": preview
-            }
+            return {"status": "error", "reason": "preview_failed", "details": preview}
 
-        # Place order (using previewId - recommended)
+        # Extract previewId
         preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
-        if isinstance(preview_ids, list):
-            preview_id = preview_ids[0]["previewId"]
-        else:
-            preview_id = preview_ids["previewId"]
+        preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
 
+        print(f"✅ PREVIEW ID: {preview_id}")
+
+        # Place order using previewId
         order = session.place_equity_order(
             accountIdKey=account_id_key,
             previewId=preview_id
         )
 
         print("ORDER RESPONSE:", order)
-        print(f"✅ ORDER PLACED: {action} {shares} {ticker}")
+        print(f"✅ ORDER PLACED SUCCESSFULLY: {action} {shares} {ticker}")
 
         return {"status": "success", "details": order}
 
