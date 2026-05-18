@@ -42,11 +42,11 @@ def load_session():
         account = acct_list["AccountListResponse"]["Accounts"]["Account"][0]
         account_id_key = account["accountIdKey"]
 
-        print(f"✅ Loaded account: {account_id_key}")
+        print(f"✅ LOADED ACCOUNT: {account_id_key}")
         return order_session, account_id_key
 
     except Exception as e:
-        print(f"❌ Load session failed: {e}")
+        print(f"❌ LOAD SESSION FAILED: {e}")
         return None, None
 
 @app.get("/")
@@ -93,7 +93,7 @@ async def webhook(request: Request):
             print("❌ No valid session")
             return {"status": "error", "reason": "not_linked"}
 
-        # Preview order
+        # Preview
         preview = session.preview_equity_order(
             accountIdKey=account_id_key,
             symbol=ticker,
@@ -103,7 +103,6 @@ async def webhook(request: Request):
             marketSession="REGULAR",
             orderTerm="GOOD_FOR_DAY"
         )
-
         print("PREVIEW RESPONSE:", preview)
 
         if "PreviewOrderResponse" not in preview:
@@ -111,24 +110,21 @@ async def webhook(request: Request):
 
         # Extract previewId
         preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
-        if isinstance(preview_ids, list):
-            preview_id = preview_ids[0]["previewId"]
-        else:
-            preview_id = preview_ids["previewId"]
+        preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
 
         print(f"✅ PREVIEW ID: {preview_id}")
 
-        # Place order using previewId
+        # Place order
         order = session.place_equity_order(
             accountIdKey=account_id_key,
             previewId=preview_id
         )
 
         print("ORDER RESPONSE:", order)
-        print(f"✅ ORDER PLACED SUCCESSFULLY: {action} {shares} {ticker}")
+        print(f"✅ ORDER PLACED: {action} {shares} {ticker}")
 
         return {"status": "success", "details": order}
 
     except Exception as e:
-        print(f"❌ ORDER ERROR: {str(e)}")
+        print(f"❌ CRITICAL ORDER ERROR: {str(e)}")
         raise HTTPException(500, f"Order failed: {str(e)}")
