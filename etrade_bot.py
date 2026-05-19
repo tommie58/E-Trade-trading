@@ -86,6 +86,7 @@ async def webhook(request: Request):
         action = payload.get("action", "BUY").upper()
         shares = int(payload.get("position_size_shares", 0))
 
+        # === YOUR VALIDATION BLOCK ===
         if not ticker:
             raise HTTPException(400, "Missing ticker")
         if shares <= 0:
@@ -100,7 +101,7 @@ async def webhook(request: Request):
             print("❌ No valid session")
             return {"status": "error", "reason": "not_linked"}
 
-        # Preview order
+        # === YOUR PREVIEW BLOCK ===
         preview = session.preview_equity_order(
             account_id_key=account_id_key,
             symbol=ticker,
