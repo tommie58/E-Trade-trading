@@ -9,6 +9,9 @@ import logging
 from datetime import datetime
 import pytz
 
+# =========================================================
+# CONFIG
+# =========================================================
 TOKENS_FILE = ".etrade_tokens.json"
 ENV = os.getenv("ETRADE_ENV", "sandbox")
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
@@ -90,6 +93,9 @@ async def complete_auth(request: Request):
 async def get_account():
     return {"status": "linked"}
 
+# =========================================================
+# HYBRID WEBHOOK – FINAL VERSION (no preview crash)
+# =========================================================
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
@@ -114,6 +120,7 @@ async def webhook(request: Request):
         client_order_id = str(int(datetime.utcnow().timestamp()))
 
         if instrument == "option":
+            # OPTION TRADE
             contracts = int(payload.get("option_contracts") or payload.get("contracts") or 0)
             call_put = payload.get("option_right", "").upper()
             strike = float(payload.get("strike_hint") or payload.get("strike") or 0)
@@ -128,53 +135,39 @@ async def webhook(request: Request):
 
             logger.info(f"🚀 OPTION SIGNAL: {action} {contracts} {occ_symbol} @ {limit_price}")
 
-            # Preview
-            preview = session.preview_option_order(
-                account_id_key=account_id_key,
-                client_order_id=client_order_id,
+            # DIRECT PLACE – skip preview (library doesn't support it)
+            logger.info("⚠️ preview_option_order not available → placing directly")
+
+            order = session.place_option_order(
+                accountIdKey=account_id_key,
                 symbol=occ_symbol,
-                order_action=action,
+                orderAction=action,
                 quantity=str(contracts),
-                price_type="LIMIT",
-                limit_price=round(limit_price, 2),
-                call_put=call_put,
-                strike_price=float(strike),
-                expiry_year=dt.year,
-                expiry_month=dt.month,
-                expiry_day=dt.day,
-                routing_destination="AUTO",
-                market_session="REGULAR",
-                order_term="GOOD_FOR_DAY",
-                all_or_none=False,
-                reserve_order=False
+                priceType="LIMIT",
+                limitPrice=round(limit_price, 2),
+                callPut=call_put,
+                strikePrice=float(strike),
+                expiryYear=dt.year,
+                expiryMonth=dt.month,
+                expiryDay=dt.day,
+                routingDestination="AUTO",
+                marketSession="REGULAR",
+                orderTerm="GOOD_FOR_DAY",
+                allOrNone=False,
+                reserveOrder=False,
+                clientOrderId=client_order_id
             )
 
-            logger.info(f"🔍 FULL PREVIEW RESPONSE:\n{json.dumps(preview, indent=2)}")
-
-            preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
-            preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
-
-            logger.info(f"✅ PREVIEW ID: {preview_id}")
-
-            # PLACE ORDER
-            logger.info(f"Placing order with: accountIdKey={account_id_key}, previewId={preview_id}, clientOrderId={client_order_id}")
-
-            if mode == "live":
-                order = session.place_option_order(
-                    accountIdKey=account_id_key,
-                    previewId=preview_id,
-                    clientOrderId=client_order_id
-                )
-                logger.info(f"✅ LIVE ORDER PLACED: {action} {ticker}")
-            else:
-                return {"status": "paper_only"}
+            logger.info(f"✅ OPTION ORDER PLACED: {action} {ticker}")
 
         else:
-            # Stock fallback (unchanged)
+            # STOCK TRADE (fallback)
             action = raw_action
             shares = int(payload.get("position_size_shares") or 0)
             if shares <= 0:
                 raise HTTPException(400, "Invalid shares quantity")
+
+            logger.info(f"🚀 STOCK SIGNAL: {action} {shares} {ticker}")
 
             preview = session.preview_equity_order(
                 accountIdKey=account_id_key,
