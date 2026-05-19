@@ -86,7 +86,6 @@ async def webhook(request: Request):
         action = payload.get("action", "BUY").upper()
         shares = int(payload.get("position_size_shares", 0))
 
-        # === YOUR VALIDATION BLOCK ===
         if not ticker:
             raise HTTPException(400, "Missing ticker")
         if shares <= 0:
@@ -103,13 +102,13 @@ async def webhook(request: Request):
 
         # Preview order
         preview = session.preview_equity_order(
-            accountIdKey=account_id_key,
+            account_id_key=account_id_key,
             symbol=ticker,
+            order_action=action,
+            price_type="MARKET",
             quantity=shares,
-            orderAction=action,
-            priceType="MARKET",
-            marketSession="REGULAR",
-            orderTerm="GOOD_FOR_DAY"
+            market_session="REGULAR",
+            order_term="GOOD_FOR_DAY"
         )
 
         print("PREVIEW RESPONSE:", preview)
@@ -123,10 +122,10 @@ async def webhook(request: Request):
 
         print(f"✅ PREVIEW ID: {preview_id}")
 
-        # Place order using previewId
+        # === YOUR CORRECTED PLACE ORDER ===
         order = session.place_equity_order(
-            accountIdKey=account_id_key,
-            previewId=preview_id
+            account_id_key=account_id_key,
+            preview_id=preview_id
         )
 
         print("ORDER RESPONSE:", order)
