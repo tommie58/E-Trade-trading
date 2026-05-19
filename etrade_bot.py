@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import pyetrade
 import os
 import json
+from datetime import datetime
 
 app = FastAPI(title="E*TRADE Bot")
 
@@ -78,36 +79,75 @@ async def complete_auth(request: Request):
 async def get_account():
     return {"status": "linked"}
 
+# =========================
+# NEW OPTION WEBHOOK
+# =========================
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         payload = await request.json()
-        ticker = payload.get("ticker")
-        action = payload.get("action", "BUY").upper()
-        shares = int(payload.get("position_size_shares", 0))
 
-        # === YOUR VALIDATION BLOCK ===
+        # =========================
+        # PARSE PAYLOAD
+        # =========================
+        ticker = payload.get("ticker")
+        action = payload.get("action", "").upper()
+        contracts = int(payload.get("contracts", 0))
+        call_put = payload.get("call_put", "").upper()
+        strike = float(payload.get("strike"))
+        limit_price = float(payload.get("limit_price"))
+        expiry = payload.get("expiry")
+
+        # =========================
+        # VALIDATION
+        # =========================
         if not ticker:
             raise HTTPException(400, "Missing ticker")
-        if shares <= 0:
-            raise HTTPException(400, "position_size_shares must be greater than 0")
-        if action not in ["BUY", "SELL"]:
+        if action not in ["BUY_OPEN", "SELL_CLOSE", "SELL_OPEN", "BUY_CLOSE"]:
             raise HTTPException(400, f"Invalid action: {action}")
+        if contracts <= 0:
+            raise HTTPException(400, "contracts must be > 0")
+        if call_put not in ["CALL", "PUT"]:
+            raise HTTPException(400, "call_put must be CALL or PUT")
+        if strike <= 0:
+            raise HTTPException(400, "Invalid strike")
+        if limit_price <= 0:
+            raise HTTPException(400, "Invalid limit price")
 
-        print(f"🚀 SIGNAL RECEIVED: {action} {shares} {ticker}")
+        # =========================
+        # PARSE EXPIRATION
+        # =========================
+        dt = datetime.strptime(expiry, "%Y-%m-%d")
+        expiry_year = dt.year
+        expiry_month = dt.month
+        expiry_day = dt.day
 
+        print(f"🚀 OPTION SIGNAL: {action} {contracts} {ticker} {call_put} {strike}")
+        print(f"EXP: {expiry} | LIMIT: {limit_price}")
+
+        # =========================
+        # LOAD SESSION
+        # =========================
         session, account_id_key = load_session()
         if not session or not account_id_key:
             print("❌ No valid session")
             return {"status": "error", "reason": "not_linked"}
 
-        # === YOUR PREVIEW BLOCK ===
-        preview = session.preview_equity_order(
+        # =========================
+        # PREVIEW OPTION ORDER
+        # =========================
+        preview = session.preview_option_order(
             account_id_key=account_id_key,
             symbol=ticker,
             order_action=action,
-            price_type="MARKET",
-            quantity=shares,
+            quantity=contracts,
+            price_type="LIMIT",
+            limit_price=limit_price,
+            call_put=call_put,
+            strike_price=strike,
+            expiry_year=expiry_year,
+            expiry_month=expiry_month,
+            expiry_day=expiry_day,
             market_session="REGULAR",
             order_term="GOOD_FOR_DAY"
         )
@@ -115,24 +155,35 @@ async def webhook(request: Request):
         print("PREVIEW RESPONSE:", preview)
 
         if "PreviewOrderResponse" not in preview:
-            return {"status": "error", "reason": "preview_failed", "details": preview}
+            return {
+                "status": "error",
+                "reason": "preview_failed",
+                "details": preview
+            }
 
-        # Extract previewId
+        # =========================
+        # EXTRACT PREVIEW ID
+        # =========================
         preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
         preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
 
         print(f"✅ PREVIEW ID: {preview_id}")
 
-        # === YOUR CORRECTED PLACE ORDER ===
-        order = session.place_equity_order(
+        # =========================
+        # PLACE OPTION ORDER
+        # =========================
+        order = session.place_option_order(
             account_id_key=account_id_key,
             preview_id=preview_id
         )
 
         print("ORDER RESPONSE:", order)
-        print(f"✅ ORDER PLACED SUCCESSFULLY: {action} {shares} {ticker}")
+        print(f"✅ OPTION ORDER PLACED SUCCESSFULLY")
 
-        return {"status": "success", "details": order}
+        return {
+            "status": "success",
+            "details": order
+        }
 
     except Exception as e:
         print(f"❌ ORDER ERROR: {str(e)}")
