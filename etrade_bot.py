@@ -82,18 +82,15 @@ async def get_account():
 async def webhook(request: Request):
     try:
         payload = await request.json()
-        
-        # === YOUR VALIDATION BLOCK ===
         ticker = payload.get("ticker")
         action = payload.get("action", "BUY").upper()
         shares = int(payload.get("position_size_shares", 0))
 
+        # === YOUR VALIDATION BLOCK ===
         if not ticker:
             raise HTTPException(400, "Missing ticker")
-
         if shares <= 0:
             raise HTTPException(400, "position_size_shares must be greater than 0")
-
         if action not in ["BUY", "SELL"]:
             raise HTTPException(400, f"Invalid action: {action}")
 
@@ -126,14 +123,14 @@ async def webhook(request: Request):
 
         print(f"✅ PREVIEW ID: {preview_id}")
 
-        # Place order
+        # Place order using previewId
         order = session.place_equity_order(
             accountIdKey=account_id_key,
             previewId=preview_id
         )
 
         print("ORDER RESPONSE:", order)
-        print(f"✅ ORDER PLACED: {action} {shares} {ticker}")
+        print(f"✅ ORDER PLACED SUCCESSFULLY: {action} {shares} {ticker}")
 
         return {"status": "success", "details": order}
 
