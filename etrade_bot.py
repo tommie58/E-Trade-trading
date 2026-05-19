@@ -9,9 +9,6 @@ import logging
 from datetime import datetime
 import pytz
 
-# =========================================================
-# CONFIG
-# =========================================================
 TOKENS_FILE = ".etrade_tokens.json"
 ENV = os.getenv("ETRADE_ENV", "sandbox")
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
@@ -31,9 +28,6 @@ oauth = pyetrade.ETradeOAuth(
     os.getenv("ETRADE_CONSUMER_SECRET")
 )
 
-# =========================================================
-# HELPERS
-# =========================================================
 def build_occ_symbol(ticker, expiry, call_put, strike):
     dt = datetime.strptime(expiry, "%Y-%m-%d")
     yy = dt.strftime("%y")
@@ -59,16 +53,8 @@ def load_session():
             tokens = json.load(f)
         consumer_key = os.getenv("ETRADE_CONSUMER_KEY")
         consumer_secret = os.getenv("ETRADE_CONSUMER_SECRET")
-        order_session = pyetrade.ETradeOrder(
-            consumer_key, consumer_secret,
-            tokens["oauth_token"], tokens["oauth_token_secret"],
-            dev=dev_mode
-        )
-        accounts = pyetrade.ETradeAccounts(
-            consumer_key, consumer_secret,
-            tokens["oauth_token"], tokens["oauth_token_secret"],
-            dev=dev_mode
-        )
+        order_session = pyetrade.ETradeOrder(consumer_key, consumer_secret, tokens["oauth_token"], tokens["oauth_token_secret"], dev=dev_mode)
+        accounts = pyetrade.ETradeAccounts(consumer_key, consumer_secret, tokens["oauth_token"], tokens["oauth_token_secret"], dev=dev_mode)
         acct_list = accounts.list_accounts()
         account_list = acct_list["AccountListResponse"]["Accounts"]["Account"]
         selected_account = next((acct for acct in account_list if TARGET_ACCOUNT_ID is None or acct["accountIdKey"] == TARGET_ACCOUNT_ID), None)
@@ -81,9 +67,6 @@ def load_session():
         logger.exception("Load session failed")
         return None, None
 
-# =========================================================
-# ENDPOINTS
-# =========================================================
 @app.get("/")
 async def root():
     return {"status": "running", "env": ENV}
@@ -107,9 +90,6 @@ async def complete_auth(request: Request):
 async def get_account():
     return {"status": "linked"}
 
-# =========================================================
-# HYBRID WEBHOOK (Stock + Option)
-# =========================================================
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
@@ -134,7 +114,6 @@ async def webhook(request: Request):
         client_order_id = str(int(datetime.utcnow().timestamp()))
 
         if instrument == "option":
-            # OPTION TRADE
             contracts = int(payload.get("option_contracts") or payload.get("contracts") or 0)
             call_put = payload.get("option_right", "").upper()
             strike = float(payload.get("strike_hint") or payload.get("strike") or 0)
@@ -149,52 +128,53 @@ async def webhook(request: Request):
 
             logger.info(f"🚀 OPTION SIGNAL: {action} {contracts} {occ_symbol} @ {limit_price}")
 
-            # Defensive preview
-            if hasattr(session, "preview_option_order"):
-                preview = session.preview_option_order(
-                    account_id_key=account_id_key,
-                    client_order_id=client_order_id,
-                    symbol=occ_symbol,
-                    order_action=action,
-                    quantity=str(contracts),
-                    price_type="LIMIT",
-                    limit_price=round(limit_price, 2),
-                    call_put=call_put,
-                    strike_price=float(strike),
-                    expiry_year=dt.year,
-                    expiry_month=dt.month,
-                    expiry_day=dt.day,
-                    routing_destination="AUTO",
-                    market_session="REGULAR",
-                    order_term="GOOD_FOR_DAY",
-                    all_or_none=False,
-                    reserve_order=False
-                )
-                preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
-                preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
-            else:
-                preview_id = None
+            # Preview
+            preview = session.preview_option_order(
+                account_id_key=account_id_key,
+                client_order_id=client_order_id,
+                symbol=occ_symbol,
+                order_action=action,
+                quantity=str(contracts),
+                price_type="LIMIT",
+                limit_price=round(limit_price, 2),
+                call_put=call_put,
+                strike_price=float(strike),
+                expiry_year=dt.year,
+                expiry_month=dt.month,
+                expiry_day=dt.day,
+                routing_destination="AUTO",
+                market_session="REGULAR",
+                order_term="GOOD_FOR_DAY",
+                all_or_none=False,
+                reserve_order=False
+            )
+
+            logger.info(f"🔍 FULL PREVIEW RESPONSE:\n{json.dumps(preview, indent=2)}")
+
+            preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
+            preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
+
+            logger.info(f"✅ PREVIEW ID: {preview_id}")
+
+            # PLACE ORDER
+            logger.info(f"Placing order with: accountIdKey={account_id_key}, previewId={preview_id}, clientOrderId={client_order_id}")
 
             if mode == "live":
                 order = session.place_option_order(
-                    account_id_key=account_id_key,
-                    preview_id=preview_id,
-                    client_order_id=client_order_id
+                    accountIdKey=account_id_key,
+                    previewId=preview_id,
+                    clientOrderId=client_order_id
                 )
+                logger.info(f"✅ LIVE ORDER PLACED: {action} {ticker}")
             else:
                 return {"status": "paper_only"}
 
         else:
-            # STOCK TRADE (this is what failed last time)
+            # Stock fallback (unchanged)
             action = raw_action
-            if action not in ["BUY", "SELL"]:
-                raise HTTPException(400, f"Invalid stock action: {action}")
-
             shares = int(payload.get("position_size_shares") or 0)
             if shares <= 0:
                 raise HTTPException(400, "Invalid shares quantity")
-
-            logger.info(f"🚀 STOCK SIGNAL: {action} {shares} {ticker}")
 
             preview = session.preview_equity_order(
                 accountIdKey=account_id_key,
@@ -203,11 +183,10 @@ async def webhook(request: Request):
                 quantity=str(shares),
                 priceType="MARKET",
                 marketSession="REGULAR",
-                orderTerm="GOOD_FOR_DAY"
+                orderTerm="GOOD_FOR_DAY",
+                allOrNone=False,
+                reserveOrder=False
             )
-
-            if "PreviewOrderResponse" not in preview:
-                return {"status": "error", "reason": "preview_failed", "details": preview}
 
             preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
             preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
@@ -220,11 +199,8 @@ async def webhook(request: Request):
             else:
                 return {"status": "paper_only"}
 
-        logger.info(f"✅ ORDER PLACED: {action} {ticker}")
         return {"status": "success", "order": order}
 
-    except HTTPException:
-        raise
-    except Exception:
+    except Exception as e:
         logger.exception("ORDER FAILURE")
-        raise HTTPException(500, "Order execution failed")
+        raise HTTPException(500, f"Order failed: {str(e)}")
