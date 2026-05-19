@@ -122,7 +122,7 @@ async def webhook(request: Request):
 
         print(f"✅ PREVIEW ID: {preview_id}")
 
-        # === YOUR CORRECTED PLACE ORDER ===
+        # === YOUR CORRECTED PLACE ORDER BLOCK ===
         order = session.place_equity_order(
             account_id_key=account_id_key,
             preview_id=preview_id
