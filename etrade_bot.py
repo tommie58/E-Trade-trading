@@ -13,7 +13,6 @@ import pytz
 # =========================================================
 # CONFIG
 # =========================================================
-
 TOKENS_FILE = ".etrade_tokens.json"
 ENV = os.getenv("ETRADE_ENV", "sandbox")
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
@@ -22,28 +21,19 @@ TARGET_ACCOUNT_ID = os.getenv("ETRADE_ACCOUNT_ID")
 MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "5"))
 dev_mode = ENV == "sandbox"
 
-# =========================================================
-# LOGGING
-# =========================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("etrade-bot")
 
-# =========================================================
-# FASTAPI
-# =========================================================
-app = FastAPI(title="E*TRADE Options Bot")
+app = FastAPI(title="E*TRADE Bot")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# =========================================================
-# OAUTH
-# =========================================================
 oauth = pyetrade.ETradeOAuth(
     os.getenv("ETRADE_CONSUMER_KEY"),
     os.getenv("ETRADE_CONSUMER_SECRET")
 )
 
 # =========================================================
-# HELPERS (unchanged)
+# HELPERS
 # =========================================================
 def build_occ_symbol(ticker, expiry, call_put, strike):
     dt = datetime.strptime(expiry, "%Y-%m-%d")
@@ -74,11 +64,7 @@ def load_session():
         accounts = pyetrade.ETradeAccounts(consumer_key, consumer_secret, tokens["oauth_token"], tokens["oauth_token_secret"], dev=dev_mode)
         acct_list = accounts.list_accounts()
         account_list = acct_list["AccountListResponse"]["Accounts"]["Account"]
-        selected_account = None
-        for acct in account_list:
-            if TARGET_ACCOUNT_ID is None or acct["accountIdKey"] == TARGET_ACCOUNT_ID:
-                selected_account = acct
-                break
+        selected_account = next((acct for acct in account_list if TARGET_ACCOUNT_ID is None or acct["accountIdKey"] == TARGET_ACCOUNT_ID), None)
         if not selected_account:
             raise Exception("Target account not found")
         account_id_key = selected_account["accountIdKey"]
@@ -123,66 +109,24 @@ async def get_account():
     return {"status": "linked"}
 
 # =========================================================
-# ROBUST OPTION WEBHOOK
+# HYBRID WEBHOOK – Supports your exact app payload
 # =========================================================
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         payload = await request.json()
-        logger.info(f"📥 FULL PAYLOAD RECEIVED: {json.dumps(payload, indent=2)}")  # ← This will help us debug
+        logger.info(f"📥 FULL PAYLOAD RECEIVED:\n{json.dumps(payload, indent=2)}")
 
-        # WEBHOOK AUTH
         secret = payload.get("secret")
         if secret != WEBHOOK_SECRET:
             raise HTTPException(403, "Unauthorized")
 
-        # SAFE PARSING
         ticker = payload.get("ticker")
-        action = payload.get("action", "").upper()
-        contracts = int(payload.get("contracts") or 0)
-        call_put = payload.get("call_put", "").upper()
-        strike_raw = payload.get("strike")
-        limit_price_raw = payload.get("limit_price")
-        expiry = payload.get("expiry")
+        raw_action = payload.get("action", "").upper()
+        instrument = payload.get("instrument", "stock").lower()
 
         if not ticker:
             raise HTTPException(400, "Missing ticker")
-        if action not in ["BUY_OPEN", "SELL_CLOSE", "SELL_OPEN", "BUY_CLOSE"]:
-            raise HTTPException(400, f"Invalid action: {action}")
-        if contracts <= 0:
-            raise HTTPException(400, "contracts must be > 0")
-        if contracts > MAX_CONTRACTS:
-            raise HTTPException(400, "Contract limit exceeded")
-        if call_put not in ["CALL", "PUT"]:
-            raise HTTPException(400, "Invalid call_put")
-        if strike_raw is None:
-            raise HTTPException(400, "Missing strike price")
-        if limit_price_raw is None:
-            raise HTTPException(400, "Missing limit_price")
-        if not expiry:
-            raise HTTPException(400, "Missing expiry")
-
-        strike = float(strike_raw)
-        limit_price = float(limit_price_raw)
-
-        if strike <= 0:
-            raise HTTPException(400, "Invalid strike")
-        if limit_price <= 0:
-            raise HTTPException(400, "Invalid limit price")
-
-        # Market hours + expiration checks (unchanged)
-        validate_market_hours()
-        dt = datetime.strptime(expiry, "%Y-%m-%d")
-        if dt.date() <= datetime.utcnow().date():
-            raise HTTPException(400, "Option expiration invalid")
-
-        expiry_year = dt.year
-        expiry_month = dt.month
-        expiry_day = dt.day
-
-        occ_symbol = build_occ_symbol(ticker, expiry, call_put, strike)
-
-        logger.info(f"🚀 SIGNAL: {action} {contracts} {occ_symbol} LIMIT={limit_price}")
 
         session, account_id_key = load_session()
         if not session:
@@ -190,49 +134,112 @@ async def webhook(request: Request):
 
         client_order_id = str(int(datetime.utcnow().timestamp()))
 
-        # PREVIEW
-        preview = session.preview_option_order(
-            account_id_key=account_id_key,
-            client_order_id=client_order_id,
-            symbol=occ_symbol,
-            order_action=action,
-            quantity=str(contracts),
-            price_type="LIMIT",
-            limit_price=round(limit_price, 2),
-            call_put=call_put,
-            strike_price=float(strike),
-            expiry_year=int(expiry_year),
-            expiry_month=int(expiry_month),
-            expiry_day=int(expiry_day),
-            routing_destination="AUTO",
-            market_session="REGULAR",
-            order_term="GOOD_FOR_DAY",
-            all_or_none=False,
-            reserve_order=False
-        )
+        if instrument == "option":
+            # ==================== OPTION TRADE ====================
+            contracts = int(payload.get("option_contracts") or payload.get("contracts") or 0)
+            call_put = payload.get("option_right", "").upper()
+            strike = float(payload.get("strike_hint") or payload.get("strike") or 0)
+            limit_price = float(payload.get("limit_price") or 3.0)  # fallback if missing
+            expiry = payload.get("expiration_hint") or payload.get("expiry")
 
-        logger.info(f"PREVIEW RESPONSE:\n{json.dumps(preview, indent=2)}")
+            # Map BUY → BUY_OPEN, SELL → SELL_OPEN for opening positions
+            action = raw_action
+            if action == "BUY":
+                action = "BUY_OPEN"
+            elif action == "SELL":
+                action = "SELL_OPEN"
 
-        if "PreviewOrderResponse" not in preview:
-            return {"status": "error", "reason": "preview_failed", "details": preview}
+            if action not in ["BUY_OPEN", "SELL_CLOSE", "SELL_OPEN", "BUY_CLOSE"]:
+                raise HTTPException(400, f"Invalid option action: {action}")
 
-        # Extract preview ID
-        preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
-        preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
+            if contracts <= 0 or contracts > MAX_CONTRACTS:
+                raise HTTPException(400, "Invalid contracts")
+            if call_put not in ["CALL", "PUT"]:
+                raise HTTPException(400, "Invalid call_put")
+            if strike <= 0 or not expiry:
+                raise HTTPException(400, "Missing strike or expiry for option")
 
-        logger.info(f"✅ PREVIEW ID: {preview_id}")
+            validate_market_hours()
+            dt = datetime.strptime(expiry, "%Y-%m-%d")
+            if dt.date() <= datetime.utcnow().date():
+                raise HTTPException(400, "Option expiration invalid")
 
-        if not LIVE_TRADING:
-            return {"status": "paper_only", "preview": preview}
+            occ_symbol = build_occ_symbol(ticker, expiry, call_put, strike)
 
-        # PLACE ORDER
-        order = session.place_option_order(
-            account_id_key=account_id_key,
-            preview_id=preview_id,
-            client_order_id=client_order_id
-        )
+            logger.info(f"🚀 OPTION SIGNAL: {action} {contracts} {occ_symbol} @ {limit_price}")
 
-        logger.info(f"ORDER RESPONSE:\n{json.dumps(order, indent=2)}")
+            preview = session.preview_option_order(
+                account_id_key=account_id_key,
+                client_order_id=client_order_id,
+                symbol=occ_symbol,
+                order_action=action,
+                quantity=str(contracts),
+                price_type="LIMIT",
+                limit_price=round(limit_price, 2),
+                call_put=call_put,
+                strike_price=float(strike),
+                expiry_year=dt.year,
+                expiry_month=dt.month,
+                expiry_day=dt.day,
+                routing_destination="AUTO",
+                market_session="REGULAR",
+                order_term="GOOD_FOR_DAY",
+                all_or_none=False,
+                reserve_order=False
+            )
+
+            if "PreviewOrderResponse" not in preview:
+                return {"status": "error", "reason": "preview_failed", "details": preview}
+
+            preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
+            preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
+
+            if not LIVE_TRADING:
+                return {"status": "paper_only", "preview": preview}
+
+            order = session.place_option_order(
+                account_id_key=account_id_key,
+                preview_id=preview_id,
+                client_order_id=client_order_id
+            )
+
+        else:
+            # ==================== STOCK TRADE ====================
+            action = raw_action
+            if action not in ["BUY", "SELL"]:
+                raise HTTPException(400, f"Invalid stock action: {action}")
+
+            shares = int(payload.get("position_size_shares") or payload.get("shares") or 0)
+            if shares <= 0:
+                raise HTTPException(400, "Invalid shares quantity")
+
+            logger.info(f"🚀 STOCK SIGNAL: {action} {shares} {ticker}")
+
+            preview = session.preview_equity_order(
+                account_id_key=account_id_key,
+                symbol=ticker,
+                order_action=action,
+                quantity=str(shares),
+                price_type="MARKET",
+                market_session="REGULAR",
+                order_term="GOOD_FOR_DAY"
+            )
+
+            if "PreviewOrderResponse" not in preview:
+                return {"status": "error", "reason": "preview_failed", "details": preview}
+
+            preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
+            preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
+
+            if not LIVE_TRADING:
+                return {"status": "paper_only", "preview": preview}
+
+            order = session.place_equity_order(
+                account_id_key=account_id_key,
+                preview_id=preview_id
+            )
+
+        logger.info(f"✅ ORDER PLACED SUCCESSFULLY: {action} {ticker}")
         return {"status": "success", "order": order}
 
     except HTTPException:
