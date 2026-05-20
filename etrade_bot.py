@@ -37,16 +37,6 @@ def build_occ_symbol(ticker, expiry, call_put, strike):
     strike_formatted = f"{int(float(strike) * 1000):08d}"
     return f"{ticker.upper():<6}{yy}{mm}{dd}{cp}{strike_formatted}"
 
-def validate_market_hours():
-    eastern = pytz.timezone("US/Eastern")
-    now = datetime.now(eastern)
-    if now.weekday() >= 5:
-        raise HTTPException(400, "Market closed (weekend)")
-    if now.hour < 9 or (now.hour == 9 and now.minute < 30):
-        raise HTTPException(400, "Market not open")
-    if now.hour >= 16:
-        raise HTTPException(400, "Market closed")
-
 def load_session():
     try:
         with open(TOKENS_FILE) as f:
@@ -90,9 +80,6 @@ async def complete_auth(request: Request):
 async def get_account():
     return {"status": "linked"}
 
-# =========================================================
-# FINAL FIXED WEBHOOK
-# =========================================================
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
@@ -124,17 +111,16 @@ async def webhook(request: Request):
             expiry = payload.get("expiration_hint") or payload.get("expiry")
 
             if not expiry:
-                raise HTTPException(400, "Missing expiration_hint/expiry for option trade")
+                raise HTTPException(400, "Missing expiration_hint")
 
             action = "BUY_OPEN" if raw_action == "BUY" else "SELL_OPEN"
 
-            validate_market_hours()
             dt = datetime.strptime(expiry, "%Y-%m-%d")
             occ_symbol = build_occ_symbol(ticker, expiry, call_put, strike)
 
             logger.info(f"🚀 OPTION SIGNAL: {action} {contracts} {occ_symbol} @ {limit_price}")
 
-            # DIRECT PLACE with expiryDate (required by the library)
+            # Place order
             order = session.place_option_order(
                 accountIdKey=account_id_key,
                 symbol=occ_symbol,
@@ -144,7 +130,7 @@ async def webhook(request: Request):
                 limitPrice=round(limit_price, 2),
                 callPut=call_put,
                 strikePrice=float(strike),
-                expiryDate=expiry,          # ← This was missing
+                expiryDate=expiry,           # ← required by the library
                 expiryYear=dt.year,
                 expiryMonth=dt.month,
                 expiryDay=dt.day,
@@ -156,10 +142,14 @@ async def webhook(request: Request):
                 clientOrderId=client_order_id
             )
 
+            # Log the FULL response from E*TRADE
+            logger.info(f"🔍 FULL ORDER RESPONSE FROM E*TRADE:\n{json.dumps(order, indent=2)}")
+
             logger.info(f"✅ OPTION ORDER PLACED: {action} {ticker}")
+            return {"status": "success", "order": order}
 
         else:
-            # Stock fallback
+            # Stock fallback (kept for completeness)
             action = raw_action
             shares = int(payload.get("position_size_shares") or 0)
             if shares <= 0:
