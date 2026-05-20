@@ -9,9 +9,6 @@ import logging
 from datetime import datetime
 import pytz
 
-# =========================================================
-# CONFIG
-# =========================================================
 TOKENS_FILE = ".etrade_tokens.json"
 ENV = os.getenv("ETRADE_ENV", "sandbox")
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
@@ -94,7 +91,7 @@ async def get_account():
     return {"status": "linked"}
 
 # =========================================================
-# HYBRID WEBHOOK – FINAL VERSION (no preview crash)
+# FINAL FIXED WEBHOOK
 # =========================================================
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -120,12 +117,14 @@ async def webhook(request: Request):
         client_order_id = str(int(datetime.utcnow().timestamp()))
 
         if instrument == "option":
-            # OPTION TRADE
             contracts = int(payload.get("option_contracts") or payload.get("contracts") or 0)
             call_put = payload.get("option_right", "").upper()
             strike = float(payload.get("strike_hint") or payload.get("strike") or 0)
             limit_price = float(payload.get("limit_price") or 3.0)
             expiry = payload.get("expiration_hint") or payload.get("expiry")
+
+            if not expiry:
+                raise HTTPException(400, "Missing expiration_hint/expiry for option trade")
 
             action = "BUY_OPEN" if raw_action == "BUY" else "SELL_OPEN"
 
@@ -135,9 +134,7 @@ async def webhook(request: Request):
 
             logger.info(f"🚀 OPTION SIGNAL: {action} {contracts} {occ_symbol} @ {limit_price}")
 
-            # DIRECT PLACE – skip preview (library doesn't support it)
-            logger.info("⚠️ preview_option_order not available → placing directly")
-
+            # DIRECT PLACE with expiryDate (required by the library)
             order = session.place_option_order(
                 accountIdKey=account_id_key,
                 symbol=occ_symbol,
@@ -147,6 +144,7 @@ async def webhook(request: Request):
                 limitPrice=round(limit_price, 2),
                 callPut=call_put,
                 strikePrice=float(strike),
+                expiryDate=expiry,          # ← This was missing
                 expiryYear=dt.year,
                 expiryMonth=dt.month,
                 expiryDay=dt.day,
@@ -161,13 +159,11 @@ async def webhook(request: Request):
             logger.info(f"✅ OPTION ORDER PLACED: {action} {ticker}")
 
         else:
-            # STOCK TRADE (fallback)
+            # Stock fallback
             action = raw_action
             shares = int(payload.get("position_size_shares") or 0)
             if shares <= 0:
                 raise HTTPException(400, "Invalid shares quantity")
-
-            logger.info(f"🚀 STOCK SIGNAL: {action} {shares} {ticker}")
 
             preview = session.preview_equity_order(
                 accountIdKey=account_id_key,
