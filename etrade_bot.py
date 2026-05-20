@@ -5,7 +5,7 @@ import pyetrade
 import os
 import json
 import logging
-import uuid   # ← Added for client_order_id
+import uuid
 
 from datetime import datetime
 import pytz
@@ -124,14 +124,8 @@ async def webhook(request: Request):
         if not session:
             raise HTTPException(500, "Session unavailable")
 
-        # ============================================
-        # NEW CLIENT ORDER ID (UUID)
-        # ============================================
         client_order_id = str(uuid.uuid4())
 
-        # ============================================
-        # YOUR OPTION BLOCK
-        # ============================================
         if instrument == "option":
 
             # LIVE TRADING SAFETY
@@ -143,7 +137,7 @@ async def webhook(request: Request):
             contracts = int(payload.get("option_contracts") or payload.get("contracts") or 0)
             call_put = payload.get("option_right", "").upper()
             strike = float(payload.get("strike_hint") or payload.get("strike") or 0)
-            limit_price = float(payload.get("limit_price") or 0)
+            limit_price = float(payload.get("limit_price") or payload.get("entry") or 0)   # ← FIXED: fallback to entry
             expiry = payload.get("expiration_hint") or payload.get("expiry")
 
             # VALIDATION
@@ -155,7 +149,7 @@ async def webhook(request: Request):
             if strike <= 0:
                 raise HTTPException(400, "Invalid strike")
             if limit_price <= 0:
-                raise HTTPException(400, "Invalid limit price")
+                raise HTTPException(400, "Invalid limit price (no limit_price or entry provided)")
             if not expiry:
                 raise HTTPException(400, "Missing expiration_hint")
 
@@ -171,7 +165,6 @@ async def webhook(request: Request):
             else:
                 raise HTTPException(400, f"Unsupported action: {raw_action}")
 
-            # BUILD OCC SYMBOL
             occ_symbol = build_occ_symbol(ticker, expiry, call_put, strike)
 
             logger.info(f"🚀 OPTION SIGNAL: {action} {contracts} {occ_symbol} @ {limit_price}")
@@ -203,10 +196,7 @@ async def webhook(request: Request):
             # EXTRACT PREVIEW ID
             try:
                 preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
-                if isinstance(preview_ids, list):
-                    preview_id = preview_ids[0]["previewId"]
-                else:
-                    preview_id = preview_ids["previewId"]
+                preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
             except Exception:
                 logger.error(f"❌ Failed extracting preview ID:\n{json.dumps(preview, indent=2)}")
                 raise HTTPException(500, "Preview failed — invalid E*TRADE response")
@@ -226,7 +216,7 @@ async def webhook(request: Request):
             return {"status": "success", "order": order}
 
         else:
-            # STOCK FALLBACK (kept for completeness)
+            # STOCK FALLBACK
             action = raw_action
             shares = int(payload.get("position_size_shares") or 0)
             if shares <= 0:
