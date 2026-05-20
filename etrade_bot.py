@@ -137,7 +137,8 @@ async def webhook(request: Request):
             contracts = int(payload.get("option_contracts") or payload.get("contracts") or 0)
             call_put = payload.get("option_right", "").upper()
             strike = float(payload.get("strike_hint") or payload.get("strike") or 0)
-            limit_price = float(payload.get("limit_price") or payload.get("entry") or 0)   # ← FIXED: fallback to entry
+            # FIXED: fallback to "entry" if limit_price is missing
+            limit_price = float(payload.get("limit_price") or payload.get("entry") or 0)
             expiry = payload.get("expiration_hint") or payload.get("expiry")
 
             # VALIDATION
@@ -157,7 +158,7 @@ async def webhook(request: Request):
             if dt.date() < datetime.utcnow().date():
                 raise HTTPException(400, "Contract already expired")
 
-            # ORDER ACTION LOGIC
+            # ORDER ACTION
             if raw_action == "BUY":
                 action = "BUY_OPEN"
             elif raw_action in ["SELL", "EXIT", "CLOSE"]:
@@ -169,8 +170,8 @@ async def webhook(request: Request):
 
             logger.info(f"🚀 OPTION SIGNAL: {action} {contracts} {occ_symbol} @ {limit_price}")
 
-            # PREVIEW ORDER
-            preview = session.preview_option_order(
+            # DIRECT PLACE (no preview — pyetrade doesn't support it)
+            order = session.place_option_order(
                 accountIdKey=account_id_key,
                 symbol=occ_symbol,
                 orderAction=action,
@@ -189,27 +190,6 @@ async def webhook(request: Request):
                 allOrNone=False,
                 reserveOrder=False,
                 clientOrderId=client_order_id
-            )
-
-            logger.info(f"🔍 PREVIEW RESPONSE:\n{json.dumps(preview, indent=2)}")
-
-            # EXTRACT PREVIEW ID
-            try:
-                preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
-                preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
-            except Exception:
-                logger.error(f"❌ Failed extracting preview ID:\n{json.dumps(preview, indent=2)}")
-                raise HTTPException(500, "Preview failed — invalid E*TRADE response")
-
-            # PAPER MODE
-            if mode != "live":
-                logger.info("📝 Paper mode only — no live order sent")
-                return {"status": "paper_only", "preview": preview, "preview_id": preview_id}
-
-            # PLACE LIVE ORDER
-            order = session.place_option_order(
-                accountIdKey=account_id_key,
-                previewId=preview_id
             )
 
             logger.info(f"✅ OPTION ORDER PLACED:\n{json.dumps(order, indent=2)}")
