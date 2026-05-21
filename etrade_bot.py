@@ -56,7 +56,6 @@ def build_occ_symbol(ticker, expiry, call_put, strike):
     return f"{ticker.upper():<6}{yy}{mm}{dd}{cp}{strike_formatted}"
 
 def is_duplicate(key: str, seconds: int = 30) -> bool:
-    """Prevent duplicate signals within X seconds"""
     now = time.time()
     if key in recent_orders and (now - recent_orders[key]) < seconds:
         return True
@@ -112,7 +111,6 @@ def load_session():
         return None, None
 
 def classify_error(error_msg: str) -> str:
-    """Classify E*TRADE errors"""
     error_msg = error_msg.lower()
     if "code: 100" in error_msg or "temporarily unavailable" in error_msg:
         return "broker_unavailable"
@@ -125,12 +123,62 @@ def classify_error(error_msg: str) -> str:
 async def root():
     return {"status": "running", "env": ENV}
 
+# =========================================================
+# E*TRADE LINKING ROUTES (NEW)
+# =========================================================
+@app.post("/etrade/auth/start")
+async def start_auth():
+    try:
+        url = oauth.get_request_token()
+        logger.info("✅ Auth start successful")
+        return {"authorize_url": url}
+    except Exception as e:
+        logger.exception("❌ Auth start failed")
+        raise HTTPException(500, f"Failed to start linking: {str(e)}")
+
+@app.post("/etrade/auth/complete")
+async def complete_auth(request: Request):
+    try:
+        data = await request.json()
+        verifier = str(data.get("verifier") or data.get("code") or data).strip()
+
+        tokens = oauth.get_access_token(verifier)
+
+        with open(TOKENS_FILE, "w") as f:
+            json.dump(tokens, f)
+
+        logger.info("✅ E*TRADE account linked successfully")
+        return {"status": "linked", "message": "Account linked successfully"}
+
+    except Exception as e:
+        logger.exception("❌ Auth complete failed")
+        raise HTTPException(500, f"Failed to complete linking: {str(e)}")
+
+@app.get("/etrade/account")
+async def get_account_status():
+    try:
+        if not os.path.exists(TOKENS_FILE):
+            return {"status": "not_linked"}
+
+        with open(TOKENS_FILE) as f:
+            tokens = json.load(f)
+
+        if tokens.get("oauth_token") and tokens.get("oauth_token_secret"):
+            return {"status": "linked"}
+        else:
+            return {"status": "not_linked"}
+
+    except Exception:
+        return {"status": "not_linked"}
+
+# =========================================================
+# WEBHOOK
+# =========================================================
 @app.post("/webhook")
 async def webhook(request: Request):
     global broker_down_until
 
     try:
-        # === Broker Cooldown Check ===
         if time.time() < broker_down_until:
             return {
                 "status": "cooldown",
@@ -140,7 +188,6 @@ async def webhook(request: Request):
         payload = await request.json()
         logger.info(f"📥 PAYLOAD:\n{json.dumps(payload, indent=2)}")
 
-        # === Secret Validation ===
         if payload.get("secret") != WEBHOOK_SECRET:
             raise HTTPException(403, "Unauthorized")
 
@@ -155,7 +202,7 @@ async def webhook(request: Request):
         if raw_action not in ["BUY", "SELL", "EXIT", "CLOSE"]:
             raise HTTPException(400, f"Invalid action: {raw_action}")
 
-        # === Duplicate Protection ===
+        # Duplicate protection
         if instrument == "option":
             strike = payload.get("strike_hint") or payload.get("strike")
             expiry = payload.get("expiration_hint") or payload.get("expiry")
@@ -167,7 +214,6 @@ async def webhook(request: Request):
             logger.warning(f"⚠️ Duplicate signal blocked: {duplicate_key}")
             return {"status": "ignored", "message": "Duplicate signal blocked"}
 
-        # === Load Session ===
         session, account_id_key = load_session()
         if not session:
             return {"status": "failed", "message": "Session unavailable"}
@@ -188,7 +234,6 @@ async def webhook(request: Request):
             limit_price = float(payload.get("limit_price") or payload.get("entry") or 0)
             expiry = payload.get("expiration_hint") or payload.get("expiry")
 
-            # Validation
             if contracts <= 0:
                 raise HTTPException(400, "Invalid contracts quantity")
             contracts = min(contracts, MAX_CONTRACTS)
@@ -209,7 +254,6 @@ async def webhook(request: Request):
 
             logger.info(f"🚀 OPTION SIGNAL: {action} {contracts} {occ_symbol} @ {limit_price}")
 
-            # === RETRY WITH EXPONENTIAL BACKOFF ===
             MAX_RETRIES = 5
             last_error = None
 
@@ -247,23 +291,22 @@ async def webhook(request: Request):
 
                     if error_type == "broker_unavailable" and attempt < MAX_RETRIES - 1:
                         wait_time = 2 ** attempt
-                        logger.warning(f"⏳ E*TRADE unavailable. Retrying in {wait_time}s...")
+                        logger.warning(f"⏳ Retrying in {wait_time}s...")
                         time.sleep(wait_time)
                         continue
 
-                    # Trigger cooldown on persistent broker issues
                     if error_type == "broker_unavailable":
-                        broker_down_until = time.time() + 300  # 5 minutes cooldown
+                        broker_down_until = time.time() + 300
                         return {
                             "status": "broker_unavailable",
-                            "message": "E*TRADE temporarily unavailable. Please try again later.",
+                            "message": "E*TRADE temporarily unavailable",
                             "retry_after_seconds": 300
                         }
 
                     return {"status": "failed", "error": last_error}
 
         # =========================================================
-        # STOCK ORDERS (with same retry protection)
+        # STOCK ORDERS
         # =========================================================
         else:
             shares = int(payload.get("position_size_shares") or 0)
