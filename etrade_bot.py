@@ -6,7 +6,7 @@ import os
 import json
 import logging
 import uuid
-import time   # ← Added for retry delay
+import time
 
 from datetime import datetime
 import pytz
@@ -33,9 +33,6 @@ oauth = pyetrade.ETradeOAuth(
     os.getenv("ETRADE_CONSUMER_SECRET")
 )
 
-# =========================================================
-# HELPERS
-# =========================================================
 def build_occ_symbol(ticker, expiry, call_put, strike):
     dt = datetime.strptime(expiry, "%Y-%m-%d")
     yy = dt.strftime("%y")
@@ -44,16 +41,6 @@ def build_occ_symbol(ticker, expiry, call_put, strike):
     cp = "C" if call_put == "CALL" else "P"
     strike_formatted = f"{int(float(strike) * 1000):08d}"
     return f"{ticker.upper():<6}{yy}{mm}{dd}{cp}{strike_formatted}"
-
-def validate_market_hours():
-    eastern = pytz.timezone("US/Eastern")
-    now = datetime.now(eastern)
-    if now.weekday() >= 5:
-        raise HTTPException(400, "Market closed (weekend)")
-    if now.hour < 9 or (now.hour == 9 and now.minute < 30):
-        raise HTTPException(400, "Market not open")
-    if now.hour >= 16:
-        raise HTTPException(400, "Market closed")
 
 def load_session():
     try:
@@ -75,9 +62,6 @@ def load_session():
         logger.exception("Load session failed")
         return None, None
 
-# =========================================================
-# ENDPOINTS
-# =========================================================
 @app.get("/")
 async def root():
     return {"status": "running", "env": ENV}
@@ -101,9 +85,6 @@ async def complete_auth(request: Request):
 async def get_account():
     return {"status": "linked"}
 
-# =========================================================
-# WEBHOOK
-# =========================================================
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
@@ -129,28 +110,22 @@ async def webhook(request: Request):
 
         if instrument == "option":
 
-            # LIVE TRADING SAFETY
             if mode == "live" and not LIVE_TRADING:
-                logger.warning("⚠️ Live trading blocked by LIVE_TRADING flag")
                 return {"status": "paper_only"}
 
-            # EXTRACT PAYLOAD
             contracts = int(payload.get("option_contracts") or payload.get("contracts") or 0)
             call_put = payload.get("option_right", "").upper()
             strike = float(payload.get("strike_hint") or payload.get("strike") or 0)
             limit_price = float(payload.get("limit_price") or payload.get("entry") or 0)
             expiry = payload.get("expiration_hint") or payload.get("expiry")
 
-            # VALIDATION
             if contracts <= 0:
                 raise HTTPException(400, "Invalid contracts quantity")
             contracts = min(contracts, MAX_CONTRACTS)
             if call_put not in ["CALL", "PUT"]:
                 raise HTTPException(400, "Invalid option_right")
-            if strike <= 0:
-                raise HTTPException(400, "Invalid strike")
-            if limit_price <= 0:
-                raise HTTPException(400, "Invalid limit price")
+            if strike <= 0 or limit_price <= 0:
+                raise HTTPException(400, "Invalid strike or limit price")
             if not expiry:
                 raise HTTPException(400, "Missing expiration_hint")
 
@@ -158,7 +133,6 @@ async def webhook(request: Request):
             if dt.date() < datetime.utcnow().date():
                 raise HTTPException(400, "Contract already expired")
 
-            # ORDER ACTION
             if raw_action == "BUY":
                 action = "BUY_OPEN"
             elif raw_action in ["SELL", "EXIT", "CLOSE"]:
@@ -167,14 +141,11 @@ async def webhook(request: Request):
                 raise HTTPException(400, f"Unsupported action: {raw_action}")
 
             occ_symbol = build_occ_symbol(ticker, expiry, call_put, strike)
-
             logger.info(f"🚀 OPTION SIGNAL: {action} {contracts} {occ_symbol} @ {limit_price}")
 
-            # ============================================
-            # RETRY LOGIC FOR E*TRADE CODE 100
-            # ============================================
+            # === RETRY LOGIC FOR CODE 100 ===
             max_retries = 3
-            last_error = None
+            last_exception = None
 
             for attempt in range(1, max_retries + 1):
                 try:
@@ -199,26 +170,28 @@ async def webhook(request: Request):
                         clientOrderId=client_order_id
                     )
 
-                    logger.info(f"✅ OPTION ORDER PLACED on attempt {attempt}")
-                    logger.info(f"🔍 FULL ORDER RESPONSE:\n{json.dumps(order, indent=2)}")
+                    logger.info(f"✅ ORDER PLACED on attempt {attempt}")
                     return {"status": "success", "order": order, "attempts": attempt}
 
                 except Exception as e:
-                    last_error = str(e)
-                    if "Code: 100" in last_error and attempt < max_retries:
-                        logger.warning(f"⚠️ E*TRADE Code 100 on attempt {attempt}. Retrying in 3 seconds...")
+                    last_exception = str(e)
+                    if "Code: 100" in last_exception and attempt < max_retries:
+                        logger.warning(f"⚠️ E*TRADE Code 100 on attempt {attempt}. Retrying...")
                         time.sleep(3)
                         continue
                     else:
                         logger.error(f"❌ Failed after {attempt} attempts")
                         break
 
-            # If we reach here, all retries failed
-            logger.exception("ORDER FAILURE after retries")
-            raise HTTPException(500, f"Order failed after {max_retries} attempts. Last error: {last_error}")
+            # All retries exhausted
+            logger.error(f"Final E*TRADE error: {last_exception}")
+            raise HTTPException(
+                500, 
+                f"E*TRADE temporarily unavailable (Code 100). Please try again in a few minutes."
+            )
 
         else:
-            # STOCK FALLBACK
+            # Stock fallback (simplified)
             action = raw_action
             shares = int(payload.get("position_size_shares") or 0)
             if shares <= 0:
@@ -231,26 +204,21 @@ async def webhook(request: Request):
                 quantity=str(shares),
                 priceType="MARKET",
                 marketSession="REGULAR",
-                orderTerm="GOOD_FOR_DAY",
-                allOrNone=False,
-                reserveOrder=False
+                orderTerm="GOOD_FOR_DAY"
             )
 
             preview_ids = preview["PreviewOrderResponse"]["PreviewIds"]["previewId"]
             preview_id = preview_ids[0]["previewId"] if isinstance(preview_ids, list) else preview_ids["previewId"]
 
             if mode == "live":
-                order = session.place_equity_order(
-                    accountIdKey=account_id_key,
-                    previewId=preview_id
-                )
+                order = session.place_equity_order(accountIdKey=account_id_key, previewId=preview_id)
             else:
                 return {"status": "paper_only"}
 
         return {"status": "success", "order": order}
 
-    except HTTPException:
-        raise
+    except HTTPException as he:
+        raise he
     except Exception as e:
         logger.exception("ORDER FAILURE")
         raise HTTPException(500, f"Order failed: {str(e)}")
