@@ -6,6 +6,7 @@ import os
 import json
 import logging
 import uuid
+import time   # ← Added for retry delay
 
 from datetime import datetime
 import pytz
@@ -137,7 +138,6 @@ async def webhook(request: Request):
             contracts = int(payload.get("option_contracts") or payload.get("contracts") or 0)
             call_put = payload.get("option_right", "").upper()
             strike = float(payload.get("strike_hint") or payload.get("strike") or 0)
-            # FIXED: fallback to "entry" if limit_price is missing
             limit_price = float(payload.get("limit_price") or payload.get("entry") or 0)
             expiry = payload.get("expiration_hint") or payload.get("expiry")
 
@@ -150,7 +150,7 @@ async def webhook(request: Request):
             if strike <= 0:
                 raise HTTPException(400, "Invalid strike")
             if limit_price <= 0:
-                raise HTTPException(400, "Invalid limit price (no limit_price or entry provided)")
+                raise HTTPException(400, "Invalid limit price")
             if not expiry:
                 raise HTTPException(400, "Missing expiration_hint")
 
@@ -170,30 +170,52 @@ async def webhook(request: Request):
 
             logger.info(f"🚀 OPTION SIGNAL: {action} {contracts} {occ_symbol} @ {limit_price}")
 
-            # DIRECT PLACE (no preview — pyetrade doesn't support it)
-            order = session.place_option_order(
-                accountIdKey=account_id_key,
-                symbol=occ_symbol,
-                orderAction=action,
-                quantity=str(contracts),
-                priceType="LIMIT",
-                limitPrice=round(limit_price, 2),
-                callPut=call_put,
-                strikePrice=float(strike),
-                expiryDate=expiry,
-                expiryYear=dt.year,
-                expiryMonth=dt.month,
-                expiryDay=dt.day,
-                routingDestination="AUTO",
-                marketSession="REGULAR",
-                orderTerm="GOOD_FOR_DAY",
-                allOrNone=False,
-                reserveOrder=False,
-                clientOrderId=client_order_id
-            )
+            # ============================================
+            # RETRY LOGIC FOR E*TRADE CODE 100
+            # ============================================
+            max_retries = 3
+            last_error = None
 
-            logger.info(f"✅ OPTION ORDER PLACED:\n{json.dumps(order, indent=2)}")
-            return {"status": "success", "order": order}
+            for attempt in range(1, max_retries + 1):
+                try:
+                    order = session.place_option_order(
+                        accountIdKey=account_id_key,
+                        symbol=occ_symbol,
+                        orderAction=action,
+                        quantity=str(contracts),
+                        priceType="LIMIT",
+                        limitPrice=round(limit_price, 2),
+                        callPut=call_put,
+                        strikePrice=float(strike),
+                        expiryDate=expiry,
+                        expiryYear=dt.year,
+                        expiryMonth=dt.month,
+                        expiryDay=dt.day,
+                        routingDestination="AUTO",
+                        marketSession="REGULAR",
+                        orderTerm="GOOD_FOR_DAY",
+                        allOrNone=False,
+                        reserveOrder=False,
+                        clientOrderId=client_order_id
+                    )
+
+                    logger.info(f"✅ OPTION ORDER PLACED on attempt {attempt}")
+                    logger.info(f"🔍 FULL ORDER RESPONSE:\n{json.dumps(order, indent=2)}")
+                    return {"status": "success", "order": order, "attempts": attempt}
+
+                except Exception as e:
+                    last_error = str(e)
+                    if "Code: 100" in last_error and attempt < max_retries:
+                        logger.warning(f"⚠️ E*TRADE Code 100 on attempt {attempt}. Retrying in 3 seconds...")
+                        time.sleep(3)
+                        continue
+                    else:
+                        logger.error(f"❌ Failed after {attempt} attempts")
+                        break
+
+            # If we reach here, all retries failed
+            logger.exception("ORDER FAILURE after retries")
+            raise HTTPException(500, f"Order failed after {max_retries} attempts. Last error: {last_error}")
 
         else:
             # STOCK FALLBACK
@@ -227,6 +249,8 @@ async def webhook(request: Request):
 
         return {"status": "success", "order": order}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("ORDER FAILURE")
         raise HTTPException(500, f"Order failed: {str(e)}")
