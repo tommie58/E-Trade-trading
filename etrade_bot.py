@@ -64,13 +64,16 @@ def validate_market_hours():
         raise HTTPException(400, "Market is closed")
 
 def build_occ_symbol(ticker, expiry, call_put, strike):
+    # FIXED: no extra spaces
     dt = datetime.strptime(expiry, "%Y-%m-%d")
     yy = dt.strftime("%y")
     mm = dt.strftime("%m")
     dd = dt.strftime("%d")
     cp = "C" if call_put == "CALL" else "P"
-    strike_formatted = f"{int(float(strike) * 1000):08d}"
-    return f"{ticker.upper():<6}{yy}{mm}{dd}{cp}{strike_formatted}"
+    # Round strike to nearest 0.5 (most common)
+    strike_rounded = round(float(strike) * 2) / 2
+    strike_formatted = f"{int(strike_rounded * 1000):08d}"
+    return f"{ticker.upper()}{yy}{mm}{dd}{cp}{strike_formatted}"
 
 def is_duplicate(key: str, seconds: int = 30) -> bool:
     now = time.time()
@@ -233,7 +236,6 @@ async def webhook(request: Request):
         if raw_action not in ["BUY", "SELL", "EXIT", "CLOSE"]:
             raise HTTPException(400, f"Invalid action: {raw_action}")
 
-        # Duplicate protection
         if instrument == "option":
             strike = payload.get("strike_hint") or payload.get("strike")
             expiry = payload.get("expiration_hint") or payload.get("expiry")
@@ -271,6 +273,11 @@ async def webhook(request: Request):
                 raise HTTPException(400, "Invalid strike or limit price")
             if not expiry:
                 raise HTTPException(400, "Missing expiration_hint")
+
+            # 0 DTE warning
+            days_to_expiry = payload.get("days_to_expiry_hint", 0)
+            if days_to_expiry == 0:
+                logger.warning("⚠️ 0 DTE option detected - these contracts may not exist yet")
 
             dt = datetime.strptime(expiry, "%Y-%m-%d")
             if dt.date() < datetime.utcnow().date():
