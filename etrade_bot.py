@@ -25,7 +25,8 @@ MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "5"))
 ENABLE_MARKET_HOURS_CHECK = os.getenv("ENABLE_MARKET_HOURS_CHECK", "false").lower() == "true"
 BROKER_TIMEOUT_SECONDS = int(os.getenv("BROKER_TIMEOUT_SECONDS", "25"))
 VERIFY_POSITIONS_ON_CLOSE = os.getenv("VERIFY_POSITIONS_ON_CLOSE", "false").lower() == "true"
-REJECT_0_DTE = os.getenv("REJECT_0_DTE", "false").lower() == "true"   # Default = false (allowed)
+REJECT_0_DTE = os.getenv("REJECT_0_DTE", "false").lower() == "true"      # Default = false (allowed)
+ZERO_DTE_DELAY_SECONDS = int(os.getenv("ZERO_DTE_DELAY_SECONDS", "15"))  # Wait before first attempt
 
 dev_mode = ENV == "sandbox"
 
@@ -64,19 +65,21 @@ def validate_market_hours():
     if now.hour >= 16:
         raise HTTPException(400, "Market is closed")
 
-def build_occ_symbol(ticker, expiry, call_put, strike):
+def build_occ_symbol(ticker, expiry, call_put, strike, days_to_expiry=0):
     dt = datetime.strptime(expiry, "%Y-%m-%d")
     yy = dt.strftime("%y")
     mm = dt.strftime("%m")
     dd = dt.strftime("%d")
     cp = "C" if call_put == "CALL" else "P"
     
-    # Round strike to nearest 0.5 (most reliable for short-dated options)
-    strike_rounded = round(float(strike) * 2) / 2
-    strike_formatted = f"{int(strike_rounded * 1000):08d}"
+    # For 0 DTE, round to nearest 5 (much more likely to exist)
+    if days_to_expiry == 0:
+        strike_rounded = round(float(strike) / 5) * 5
+    else:
+        strike_rounded = round(float(strike) * 2) / 2
     
-    symbol = f"{ticker.upper()}{yy}{mm}{dd}{cp}{strike_formatted}"
-    return symbol
+    strike_formatted = f"{int(strike_rounded * 1000):08d}"
+    return f"{ticker.upper()}{yy}{mm}{dd}{cp}{strike_formatted}"
 
 def is_duplicate(key: str, seconds: int = 30) -> bool:
     now = time.time()
@@ -281,13 +284,17 @@ async def webhook(request: Request):
             # 0 DTE handling
             if days_to_expiry == 0:
                 logger.warning(f"⚠️ 0 DTE option detected for {ticker} {call_put} {strike} - these contracts may not exist yet in the morning")
+                if REJECT_0_DTE:
+                    raise HTTPException(400, "0 DTE options are not supported yet")
+                # Short delay to give E*TRADE time to load the chain
+                await asyncio.sleep(ZERO_DTE_DELAY_SECONDS)
 
             dt = datetime.strptime(expiry, "%Y-%m-%d")
             if dt.date() < datetime.utcnow().date():
                 raise HTTPException(400, "Option already expired")
 
             action = "BUY_OPEN" if raw_action == "BUY" else "SELL_CLOSE"
-            occ_symbol = build_occ_symbol(ticker, expiry, call_put, strike)
+            occ_symbol = build_occ_symbol(ticker, expiry, call_put, strike, days_to_expiry)
 
             if action == "SELL_CLOSE":
                 has_position = await verify_option_position(accounts, account_id_key, occ_symbol, contracts)
