@@ -7,8 +7,4 @@
     "startCommand": "uvicorn etrade_bot:app --host 0.0.0.0 --port $PORT"
   }
 }
-ENABLE_MARKET_HOURS_CHECK=true
-BROKER_TIMEOUT_SECONDS=25
-VERIFY_POSITIONS_ON_CLOSE=true    
-MAX_CONTRACTS=5
-LIVE_TRADING=true                
+               
