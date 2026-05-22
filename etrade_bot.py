@@ -54,10 +54,8 @@ oauth = pyetrade.ETradeOAuth(
 def validate_market_hours():
     if not ENABLE_MARKET_HOURS_CHECK:
         return
-
     eastern = pytz.timezone("US/Eastern")
     now = datetime.now(eastern)
-
     if now.weekday() >= 5:
         raise HTTPException(400, "Market is closed (weekend)")
     if now.hour < 9 or (now.hour == 9 and now.minute < 30):
@@ -76,11 +74,9 @@ def build_occ_symbol(ticker, expiry, call_put, strike):
 
 def is_duplicate(key: str, seconds: int = 30) -> bool:
     now = time.time()
-    # Cleanup old entries
     for k in list(recent_orders.keys()):
         if now - recent_orders[k] > seconds:
             recent_orders.pop(k, None)
-
     if key in recent_orders:
         return True
     recent_orders[key] = now
@@ -108,41 +104,31 @@ def load_session():
     try:
         if not os.path.exists(TOKENS_FILE):
             raise Exception("Token file missing")
-
         with open(TOKENS_FILE) as f:
             tokens = json.load(f)
-
         oauth_token = tokens.get("oauth_token")
         oauth_secret = tokens.get("oauth_token_secret")
-
         if not oauth_token or not oauth_secret:
             raise Exception("Invalid OAuth tokens")
-
         consumer_key = os.getenv("ETRADE_CONSUMER_KEY")
         consumer_secret = os.getenv("ETRADE_CONSUMER_SECRET")
-
         order_session = pyetrade.ETradeOrder(
             consumer_key, consumer_secret, oauth_token, oauth_secret, dev=dev_mode
         )
         accounts = pyetrade.ETradeAccounts(
             consumer_key, consumer_secret, oauth_token, oauth_secret, dev=dev_mode
         )
-
         acct_list = accounts.list_accounts()
         account_list = acct_list["AccountListResponse"]["Accounts"]["Account"]
-
         selected_account = next(
             (acct for acct in account_list if TARGET_ACCOUNT_ID is None or acct["accountIdKey"] == TARGET_ACCOUNT_ID),
             None
         )
-
         if not selected_account:
             raise Exception("Target account not found")
-
         account_id_key = selected_account["accountIdKey"]
         logger.info(f"✅ Loaded account: {account_id_key}")
         return order_session, accounts, account_id_key
-
     except Exception:
         logger.exception("❌ Failed to load session")
         return None, None, None
@@ -155,14 +141,12 @@ async def run_with_timeout(func, *args, **kwargs):
 
 async def verify_option_position(accounts, account_id_key, occ_symbol, quantity):
     if not VERIFY_POSITIONS_ON_CLOSE:
-        return True  # Skip verification if disabled
-
+        return True
     try:
         portfolio = await run_with_timeout(accounts.get_account_portfolio, account_id_key)
         positions = portfolio.get("PortfolioResponse", {}).get("AccountPortfolio", [])
         if isinstance(positions, dict):
             positions = [positions]
-
         total_qty = 0
         for acct in positions:
             for pos in acct.get("Position", []):
@@ -170,11 +154,10 @@ async def verify_option_position(accounts, account_id_key, occ_symbol, quantity)
                     product = pos.get("Product", {})
                     if product.get("symbol", "").strip() == occ_symbol.strip():
                         total_qty += float(pos.get("quantity", 0))
-
         return total_qty >= quantity
     except Exception as e:
         logger.warning(f"Position verification failed (continuing anyway): {e}")
-        return True  # Fail open for safety
+        return True
 
 # =========================================================
 # ROUTES
@@ -296,7 +279,6 @@ async def webhook(request: Request):
             action = "BUY_OPEN" if raw_action == "BUY" else "SELL_CLOSE"
             occ_symbol = build_occ_symbol(ticker, expiry, call_put, strike)
 
-            # Optional position verification for SELL_CLOSE
             if action == "SELL_CLOSE":
                 has_position = await verify_option_position(accounts, account_id_key, occ_symbol, contracts)
                 if not has_position:
@@ -308,7 +290,7 @@ async def webhook(request: Request):
             for attempt in range(MAX_RETRIES):
                 try:
                     preview = await run_with_timeout(
-                        session.preview_option_order,
+                        session.preview_equity_order,
                         accountIdKey=account_id_key,
                         orderType="OPTN",
                         symbol=occ_symbol,
@@ -334,11 +316,11 @@ async def webhook(request: Request):
 
                     if mode == "live":
                         order = await run_with_timeout(
-                            session.place_option_order,
+                            session.place_equity_order,
                             accountIdKey=account_id_key,
                             previewId=preview_id
                         )
-                        logger.info(f"OPTION PLACED:\n{json.dumps(order, indent=2)}")
+                        logger.info(f"✅ OPTION ORDER PLACED:\n{json.dumps(order, indent=2)}")
                         return {"status": "success", "order": order}
 
                     return {"status": "paper_only", "preview": preview}
@@ -350,15 +332,13 @@ async def webhook(request: Request):
 
                     if error_type == "broker_unavailable" and attempt < MAX_RETRIES - 1:
                         wait = 2 ** attempt
-                        logger.warning(f"Retrying in {wait}s...")
+                        logger.warning(f"⏳ Retrying in {wait}s...")
                         await asyncio.sleep(wait)
                         continue
 
                     if error_type == "broker_unavailable":
                         broker_down_until = time.time() + 300
                         return {"status": "broker_unavailable", "retry_after_seconds": 300}
-                    if error_type == "auth_error":
-                        return {"status": "auth_error", "message": "Reconnect E*TRADE"}
 
                     return {"status": "failed", "error": last_error}
 
@@ -396,7 +376,7 @@ async def webhook(request: Request):
                             accountIdKey=account_id_key,
                             previewId=preview_id
                         )
-                        logger.info(f"STOCK PLACED:\n{json.dumps(order, indent=2)}")
+                        logger.info(f"✅ STOCK ORDER PLACED:\n{json.dumps(order, indent=2)}")
                         return {"status": "success", "order": order}
 
                     return {"status": "paper_only"}
@@ -413,9 +393,6 @@ async def webhook(request: Request):
                     if error_type == "broker_unavailable":
                         broker_down_until = time.time() + 300
                         return {"status": "broker_unavailable"}
-
-                    if error_type == "auth_error":
-                        return {"status": "auth_error", "message": "Reconnect E*TRADE"}
 
                     return {"status": "failed", "error": last_error}
 
