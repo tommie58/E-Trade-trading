@@ -25,8 +25,8 @@ MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "5"))
 ENABLE_MARKET_HOURS_CHECK = os.getenv("ENABLE_MARKET_HOURS_CHECK", "false").lower() == "true"
 BROKER_TIMEOUT_SECONDS = int(os.getenv("BROKER_TIMEOUT_SECONDS", "25"))
 VERIFY_POSITIONS_ON_CLOSE = os.getenv("VERIFY_POSITIONS_ON_CLOSE", "false").lower() == "true"
-REJECT_0_DTE = os.getenv("REJECT_0_DTE", "false").lower() == "true"      # Default = false (allowed)
-ZERO_DTE_DELAY_SECONDS = int(os.getenv("ZERO_DTE_DELAY_SECONDS", "15"))  # Wait before first attempt
+REJECT_0_DTE = os.getenv("REJECT_0_DTE", "false").lower() == "true"
+ZERO_DTE_DELAY_SECONDS = int(os.getenv("ZERO_DTE_DELAY_SECONDS", "180"))
 
 dev_mode = ENV == "sandbox"
 
@@ -65,21 +65,61 @@ def validate_market_hours():
     if now.hour >= 16:
         raise HTTPException(400, "Market is closed")
 
-def build_occ_symbol(ticker, expiry, call_put, strike, days_to_expiry=0):
+def build_occ_symbol(ticker, expiry, call_put, strike):
     dt = datetime.strptime(expiry, "%Y-%m-%d")
     yy = dt.strftime("%y")
     mm = dt.strftime("%m")
     dd = dt.strftime("%d")
     cp = "C" if call_put == "CALL" else "P"
-    
-    # For 0 DTE, round to nearest 5 (much more likely to exist)
-    if days_to_expiry == 0:
-        strike_rounded = round(float(strike) / 5) * 5
-    else:
-        strike_rounded = round(float(strike) * 2) / 2
-    
+    strike_rounded = round(float(strike) * 2) / 2
     strike_formatted = f"{int(strike_rounded * 1000):08d}"
     return f"{ticker.upper()}{yy}{mm}{dd}{cp}{strike_formatted}"
+
+async def get_market_client():
+    if not os.path.exists(TOKENS_FILE):
+        raise Exception("Token file missing")
+    with open(TOKENS_FILE) as f:
+        tokens = json.load(f)
+    oauth_token = tokens.get("oauth_token")
+    oauth_secret = tokens.get("oauth_token_secret")
+    consumer_key = os.getenv("ETRADE_CONSUMER_KEY")
+    consumer_secret = os.getenv("ETRADE_CONSUMER_SECRET")
+    return pyetrade.ETradeMarket(
+        consumer_key,
+        consumer_secret,
+        oauth_token,
+        oauth_secret,
+        dev=dev_mode
+    )
+
+async def get_valid_option_contract(market, ticker, expiry_dt, call_put, target_strike):
+    chain = await run_with_timeout(
+        market.get_option_chains,
+        ticker,
+        expiry_year=expiry_dt.year,
+        expiry_month=expiry_dt.month,
+        expiry_day=expiry_dt.day
+    )
+    option_pairs = chain.get("OptionChainResponse", {}).get("OptionPair", [])
+    if not option_pairs:
+        raise Exception("No option chain returned")
+    closest_option = None
+    smallest_diff = 999999
+    for pair in option_pairs:
+        option = pair.get("Call") if call_put == "CALL" else pair.get("Put")
+        if not option:
+            continue
+        strike_price = float(option.get("strikePrice", 0))
+        diff = abs(strike_price - float(target_strike))
+        if diff < smallest_diff:
+            smallest_diff = diff
+            closest_option = option
+    if not closest_option:
+        raise Exception("No valid option contract found")
+    return {
+        "symbol": closest_option["osiKey"],
+        "strike": float(closest_option["strikePrice"])
+    }
 
 def is_duplicate(key: str, seconds: int = 30) -> bool:
     now = time.time()
@@ -269,7 +309,6 @@ async def webhook(request: Request):
             strike = float(payload.get("strike_hint") or payload.get("strike") or 0)
             limit_price = float(payload.get("limit_price") or payload.get("entry") or 0)
             expiry = payload.get("expiration_hint") or payload.get("expiry")
-            days_to_expiry = int(payload.get("days_to_expiry_hint", 0))
 
             if contracts <= 0:
                 raise HTTPException(400, "Invalid contracts quantity")
@@ -281,20 +320,43 @@ async def webhook(request: Request):
             if not expiry:
                 raise HTTPException(400, "Missing expiration_hint")
 
-            # 0 DTE handling
+            dt = datetime.strptime(expiry, "%Y-%m-%d")
+            days_to_expiry = (dt.date() - datetime.utcnow().date()).days
+
             if days_to_expiry == 0:
                 logger.warning(f"⚠️ 0 DTE option detected for {ticker} {call_put} {strike} - these contracts may not exist yet in the morning")
                 if REJECT_0_DTE:
                     raise HTTPException(400, "0 DTE options are not supported yet")
-                # Short delay to give E*TRADE time to load the chain
+                
+                eastern = pytz.timezone("US/Eastern")
+                now = datetime.now(eastern)
+                if now.hour == 9 and now.minute < 35:
+                    raise HTTPException(400, "0DTE chain not stable yet")
+                
                 await asyncio.sleep(ZERO_DTE_DELAY_SECONDS)
 
-            dt = datetime.strptime(expiry, "%Y-%m-%d")
             if dt.date() < datetime.utcnow().date():
                 raise HTTPException(400, "Option already expired")
 
-            action = "BUY_OPEN" if raw_action == "BUY" else "SELL_CLOSE"
-            occ_symbol = build_occ_symbol(ticker, expiry, call_put, strike, days_to_expiry)
+            action = (
+                "BUY_OPEN"
+                if raw_action == "BUY"
+                else "SELL_CLOSE"
+            )
+
+            # === DYNAMIC CONTRACT LOOKUP ===
+            market = await get_market_client()
+            valid_contract = await get_valid_option_contract(
+                market, ticker, dt, call_put, strike
+            )
+            occ_symbol = valid_contract["symbol"]
+            actual_strike = valid_contract["strike"]
+
+            logger.info(
+                f"✅ VALID CONTRACT: "
+                f"{occ_symbol} "
+                f"STRIKE={actual_strike}"
+            )
 
             if action == "SELL_CLOSE":
                 has_position = await verify_option_position(accounts, account_id_key, occ_symbol, contracts)
@@ -316,7 +378,7 @@ async def webhook(request: Request):
                         priceType="LIMIT",
                         limitPrice=str(round(limit_price, 2)),
                         callPut=call_put,
-                        strikePrice=float(strike),
+                        strikePrice=float(actual_strike),
                         expiryYear=dt.year,
                         expiryMonth=dt.month,
                         expiryDay=dt.day,
@@ -346,6 +408,16 @@ async def webhook(request: Request):
                     last_error = str(e)
                     error_type = classify_error(last_error)
                     logger.error(f"OPTION ATTEMPT {attempt + 1} FAILED: {last_error}")
+
+                    if "does not recognize this symbol" in last_error.lower():
+                        logger.warning("🔄 Refreshing option chain...")
+                        await asyncio.sleep(30)
+                        valid_contract = await get_valid_option_contract(
+                            market, ticker, dt, call_put, strike
+                        )
+                        occ_symbol = valid_contract["symbol"]
+                        actual_strike = valid_contract["strike"]
+                        continue
 
                     if error_type == "broker_unavailable" and attempt < MAX_RETRIES - 1:
                         wait = 2 ** attempt
