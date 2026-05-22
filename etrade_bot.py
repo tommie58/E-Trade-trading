@@ -25,7 +25,7 @@ MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "5"))
 ENABLE_MARKET_HOURS_CHECK = os.getenv("ENABLE_MARKET_HOURS_CHECK", "false").lower() == "true"
 BROKER_TIMEOUT_SECONDS = int(os.getenv("BROKER_TIMEOUT_SECONDS", "25"))
 VERIFY_POSITIONS_ON_CLOSE = os.getenv("VERIFY_POSITIONS_ON_CLOSE", "false").lower() == "true"
-REJECT_0_DTE = os.getenv("REJECT_0_DTE", "true").lower() == "true"   # New: reject same-day options
+REJECT_0_DTE = os.getenv("REJECT_0_DTE", "false").lower() == "true"   # Default = false (allowed)
 
 dev_mode = ENV == "sandbox"
 
@@ -70,13 +70,9 @@ def build_occ_symbol(ticker, expiry, call_put, strike):
     mm = dt.strftime("%m")
     dd = dt.strftime("%d")
     cp = "C" if call_put == "CALL" else "P"
-    
-    # Round strike to nearest 0.5 (most common for short-dated options)
     strike_rounded = round(float(strike) * 2) / 2
     strike_formatted = f"{int(strike_rounded * 1000):08d}"
-    
-    symbol = f"{ticker.upper()}{yy}{mm}{dd}{cp}{strike_formatted}"
-    return symbol
+    return f"{ticker.upper()}{yy}{mm}{dd}{cp}{strike_formatted}"
 
 def is_duplicate(key: str, seconds: int = 30) -> bool:
     now = time.time()
@@ -278,11 +274,9 @@ async def webhook(request: Request):
             if not expiry:
                 raise HTTPException(400, "Missing expiration_hint")
 
-            # 0 DTE handling
+            # 0 DTE handling - allowed by default, just warns
             if days_to_expiry == 0:
-                logger.warning("⚠️ 0 DTE option detected - these contracts often do not exist yet in the morning")
-                if REJECT_0_DTE:
-                    raise HTTPException(400, "0 DTE options are not supported yet (contract may not exist)")
+                logger.warning(f"⚠️ 0 DTE option detected for {ticker} {call_put} {strike} - these contracts may not exist yet in the morning")
 
             dt = datetime.strptime(expiry, "%Y-%m-%d")
             if dt.date() < datetime.utcnow().date():
