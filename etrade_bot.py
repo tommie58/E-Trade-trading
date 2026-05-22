@@ -25,6 +25,7 @@ MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "5"))
 ENABLE_MARKET_HOURS_CHECK = os.getenv("ENABLE_MARKET_HOURS_CHECK", "false").lower() == "true"
 BROKER_TIMEOUT_SECONDS = int(os.getenv("BROKER_TIMEOUT_SECONDS", "25"))
 VERIFY_POSITIONS_ON_CLOSE = os.getenv("VERIFY_POSITIONS_ON_CLOSE", "false").lower() == "true"
+REJECT_0_DTE = os.getenv("REJECT_0_DTE", "true").lower() == "true"   # New: reject same-day options
 
 dev_mode = ENV == "sandbox"
 
@@ -64,16 +65,18 @@ def validate_market_hours():
         raise HTTPException(400, "Market is closed")
 
 def build_occ_symbol(ticker, expiry, call_put, strike):
-    # FIXED: no extra spaces
     dt = datetime.strptime(expiry, "%Y-%m-%d")
     yy = dt.strftime("%y")
     mm = dt.strftime("%m")
     dd = dt.strftime("%d")
     cp = "C" if call_put == "CALL" else "P"
-    # Round strike to nearest 0.5 (most common)
+    
+    # Round strike to nearest 0.5 (most common for short-dated options)
     strike_rounded = round(float(strike) * 2) / 2
     strike_formatted = f"{int(strike_rounded * 1000):08d}"
-    return f"{ticker.upper()}{yy}{mm}{dd}{cp}{strike_formatted}"
+    
+    symbol = f"{ticker.upper()}{yy}{mm}{dd}{cp}{strike_formatted}"
+    return symbol
 
 def is_duplicate(key: str, seconds: int = 30) -> bool:
     now = time.time()
@@ -263,6 +266,7 @@ async def webhook(request: Request):
             strike = float(payload.get("strike_hint") or payload.get("strike") or 0)
             limit_price = float(payload.get("limit_price") or payload.get("entry") or 0)
             expiry = payload.get("expiration_hint") or payload.get("expiry")
+            days_to_expiry = int(payload.get("days_to_expiry_hint", 0))
 
             if contracts <= 0:
                 raise HTTPException(400, "Invalid contracts quantity")
@@ -274,10 +278,11 @@ async def webhook(request: Request):
             if not expiry:
                 raise HTTPException(400, "Missing expiration_hint")
 
-            # 0 DTE warning
-            days_to_expiry = payload.get("days_to_expiry_hint", 0)
+            # 0 DTE handling
             if days_to_expiry == 0:
-                logger.warning("⚠️ 0 DTE option detected - these contracts may not exist yet")
+                logger.warning("⚠️ 0 DTE option detected - these contracts often do not exist yet in the morning")
+                if REJECT_0_DTE:
+                    raise HTTPException(400, "0 DTE options are not supported yet (contract may not exist)")
 
             dt = datetime.strptime(expiry, "%Y-%m-%d")
             if dt.date() < datetime.utcnow().date():
