@@ -93,18 +93,22 @@ async def get_market_client():
     )
 
 async def get_valid_option_contract(market, ticker, expiry_dt, call_put, target_strike):
+    # FIXED: Use expiry_date=MM/DD/YYYY instead of separate year/month/day
+    expiry_date_str = expiry_dt.strftime("%m/%d/%Y")
+    
     chain = await run_with_timeout(
         market.get_option_chains,
         ticker,
-        expiry_year=expiry_dt.year,
-        expiry_month=expiry_dt.month,
-        expiry_day=expiry_dt.day
+        expiry_date=expiry_date_str
     )
+    
     option_pairs = chain.get("OptionChainResponse", {}).get("OptionPair", [])
     if not option_pairs:
         raise Exception("No option chain returned")
+
     closest_option = None
     smallest_diff = 999999
+
     for pair in option_pairs:
         option = pair.get("Call") if call_put == "CALL" else pair.get("Put")
         if not option:
@@ -114,8 +118,10 @@ async def get_valid_option_contract(market, ticker, expiry_dt, call_put, target_
         if diff < smallest_diff:
             smallest_diff = diff
             closest_option = option
+
     if not closest_option:
         raise Exception("No valid option contract found")
+
     return {
         "symbol": closest_option["osiKey"],
         "strike": float(closest_option["strikePrice"])
