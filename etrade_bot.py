@@ -70,9 +70,13 @@ def build_occ_symbol(ticker, expiry, call_put, strike):
     mm = dt.strftime("%m")
     dd = dt.strftime("%d")
     cp = "C" if call_put == "CALL" else "P"
+    
+    # Round strike to nearest 0.5 (most reliable for short-dated options)
     strike_rounded = round(float(strike) * 2) / 2
     strike_formatted = f"{int(strike_rounded * 1000):08d}"
-    return f"{ticker.upper()}{yy}{mm}{dd}{cp}{strike_formatted}"
+    
+    symbol = f"{ticker.upper()}{yy}{mm}{dd}{cp}{strike_formatted}"
+    return symbol
 
 def is_duplicate(key: str, seconds: int = 30) -> bool:
     now = time.time()
@@ -274,7 +278,7 @@ async def webhook(request: Request):
             if not expiry:
                 raise HTTPException(400, "Missing expiration_hint")
 
-            # 0 DTE handling - allowed by default, just warns
+            # 0 DTE handling
             if days_to_expiry == 0:
                 logger.warning(f"⚠️ 0 DTE option detected for {ticker} {call_put} {strike} - these contracts may not exist yet in the morning")
 
