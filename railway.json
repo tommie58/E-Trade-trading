@@ -9,6 +9,6 @@
 }
 ENABLE_MARKET_HOURS_CHECK=true
 BROKER_TIMEOUT_SECONDS=25
-VERIFY_POSITIONS_ON_CLOSE=true     # Set to false if you get errors on SELL_CLOSE
+VERIFY_POSITIONS_ON_CLOSE=true    
 MAX_CONTRACTS=5
-LIVE_TRADING=false                 # Change to true only when ready for live trading
+LIVE_TRADING=true                
