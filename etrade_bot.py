@@ -327,12 +327,6 @@ async def webhook(request: Request):
                 logger.warning(f"⚠️ 0 DTE option detected for {ticker} {call_put} {strike} - these contracts may not exist yet in the morning")
                 if REJECT_0_DTE:
                     raise HTTPException(400, "0 DTE options are not supported yet")
-                
-                eastern = pytz.timezone("US/Eastern")
-                now = datetime.now(eastern)
-                if now.hour == 9 and now.minute < 35:
-                    raise HTTPException(400, "0DTE chain not stable yet")
-                
                 await asyncio.sleep(ZERO_DTE_DELAY_SECONDS)
 
             if dt.date() < datetime.utcnow().date():
