@@ -1,0 +1,8 @@
+python -c '
+from cryptography.fernet import Fernet
+key = Fernet.generate_key()
+print("Raw key (save this securely):", key.decode())
+import base64
+ciphertext = boto3.client("kms").encrypt(KeyId="your-kms-key-id", Plaintext=key)["CiphertextBlob"]
+print("KMS_ENCRYPTED_KEY (add this to Railway):", base64.b64encode(ciphertext).decode())
+'
