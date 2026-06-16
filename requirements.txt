@@ -4,6 +4,6 @@ pyetrade
 redis
 aioredis
 sqlalchemy[asyncio]
-tenacity
 python-dotenv
 aiohttp
+pydantic
