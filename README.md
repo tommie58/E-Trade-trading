@@ -4,26 +4,16 @@ FastAPI webhook that receives signals from your mobile app and executes trades o
 
 ## Environment Variables (Railway)
 
-| Variable                        | Example Value          | Description |
-|--------------------------------|------------------------|-----------|
-| `ETRADE_ENV`                   | `sandbox`              | `sandbox` or `live` |
-| `LIVE_TRADING`                 | `true`                | Set to `true` only when ready for real money |
-| `WEBHOOK_SECRET`               | `TO@#ot122808`     | Must match your app |
-| `ETRADE_CONSUMER_KEY`          | `...`                  | From E*TRADE developer portal |
-| `ETRADE_CONSUMER_SECRET`       | `...`                  | From E*TRADE developer portal |
-| `ENABLE_MARKET_HOURS_CHECK`    | `true`                 | Prevents trading outside market hours |
-| `BROKER_TIMEOUT_SECONDS`       | `25`                   | Timeout for E*TRADE API calls |
-| `VERIFY_POSITIONS_ON_CLOSE`    | `true`                 | Safer option closing |
-| `MAX_CONTRACTS`                | `5`                    | Max contracts per signal |
+| Variable                        | Example Value          
+|--------------------------------|------------------------
+| `ETRADE_ENV`                   | `production`              
+| `LIVE_TRADING`                 | `true`                
+| `WEBHOOK_SECRET`               | `TO@#ot122808`     
+| `ETRADE_CONSUMER_KEY`          | `926ff2672fdcf9642547613c7f5a5c38`            
+|`ETRADE_CONSUMER_SECRET`        | `592af2baf1665fa939c40ef54467178b7e3fa2ed6199b9a03a30e1366a8a4d08`                 
+| `ENABLE_MARKET_HOURS_CHECK`    | `true`                 
+| `BROKER_TIMEOUT_SECONDS`       | `25`                  
+| `VERIFY_POSITIONS_ON_CLOSE`    | `true`                 
+| `MAX_CONTRACTS`                | `5`                    
+| `DAILY_LOSS_LIMIT_DOLLARS      |  `500`
 
-## How to Deploy
-
-1. Push code to GitHub
-2. Connect repo to Railway
-3. Add the environment variables above
-4. Deploy
-
-## Testing
-
-- Link account via `/etrade/auth/start`
-- Send test signals to `/webhook`
