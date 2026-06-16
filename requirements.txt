@@ -1,12 +1,22 @@
+# Core
 fastapi
 uvicorn[standard]
+
+# E*TRADE
 pyetrade
-cryptography
+
+# Async & Database
+redis
 aioredis
 sqlalchemy[asyncio]
-asyncpg
+
+# Utilities
 tenacity
+cryptography
 boto3
-pydantic
+pytz
 python-dotenv
 aiohttp
+
+# Pydantic (usually comes with FastAPI, but explicit is safer)
+pydantic
