@@ -2,7 +2,6 @@ fastapi
 uvicorn[standard]
 pyetrade
 redis
-aioredis
 sqlalchemy[asyncio]
 python-dotenv
 aiohttp
