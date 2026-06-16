@@ -10,7 +10,7 @@ import uuid
 import time
 import asyncio
 from datetime import datetime
-import aioredis
+from redis.asyncio import from_url as redis_from_url
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
@@ -101,23 +101,22 @@ async def alert_admin(subject: str, body: str):
 
 # ==================== LIVE ORDER EXECUTION ====================
 async def execute_live_order(payload: dict):
-    # Only allow real trades when BOTH conditions are true
     if not LIVE_TRADING or is_sandbox:
-        logger.warning("Skipping real trade (LIVE_TRADING or sandbox mode)")
+        logger.warning("Skipping real trade (not in live production mode)")
         return {"status": "skipped"}
 
     await check_risk_limits()
 
     tokens = load_tokens()
     if not tokens:
-        raise AuthInvalidError("Tokens not found in environment variables")
+        raise Exception("Tokens not found in environment variables")
 
     orders = pyetrade.ETradeOrder(
         os.getenv("ETRADE_CONSUMER_KEY"),
         os.getenv("ETRADE_CONSUMER_SECRET"),
         tokens["oauth_token"],
         tokens["oauth_token_secret"],
-        dev=is_sandbox          # False = production when ENV=production
+        dev=is_sandbox
     )
 
     instrument = payload.get("instrument", "stock").lower()
@@ -128,7 +127,7 @@ async def execute_live_order(payload: dict):
 
     try:
         if instrument == "option":
-            # ... (keep your option logic here)
+            # Add your option order logic here if needed
             pass
         else:
             # STOCK
@@ -152,7 +151,7 @@ async def execute_live_order(payload: dict):
                 marketSession="REGULAR",
             )
 
-        logger.info(f"✅ LIVE TRADE EXECUTED: {ticker}")
+        logger.info(f"✅ LIVE TRADE EXECUTED → {ticker}")
         return {"status": "success"}
 
     except Exception as e:
@@ -179,21 +178,28 @@ async def start_worker():
     global _worker_task
     _worker_task = asyncio.create_task(placement_worker())
 
-# ==================== STARTUP ====================
+# ==================== STARTUP / SHUTDOWN ====================
 @app.on_event("startup")
-async def startup():
+async def on_startup():
     global redis
-    logger.info(f"Mode: {ENV} | Live Trading: {LIVE_TRADING}")
+    logger.info(f"Starting in {'SANDBOX' if is_sandbox else 'PRODUCTION'} mode | LIVE_TRADING={LIVE_TRADING}")
 
     if REDIS_URL:
-        redis = await aioredis.from_url(REDIS_URL, decode_responses=True)
+        redis = await redis_from_url(REDIS_URL, decode_responses=True)
+        logger.info("✅ Redis connected")
+    else:
+        logger.warning("⚠️ No REDIS_URL set — worker may not function")
+
     await init_db()
     await start_worker()
+    logger.info("✅ Worker started")
 
 @app.on_event("shutdown")
-async def shutdown():
+async def on_shutdown():
     global _worker_stop
     _worker_stop = True
+    if redis:
+        await redis.close()
 
 # ==================== ENDPOINTS ====================
 @app.post("/webhook")
@@ -209,9 +215,14 @@ async def webhook(payload: WebhookPayload = Body(...)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "live_trading": LIVE_TRADING, "env": ENV}
+    return {
+        "status": "ok",
+        "env": ENV,
+        "live_trading": LIVE_TRADING,
+        "circuit_breaker": circuit_breaker_open
+    }
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)   # ← Wrong
+    uvicorn.run("main_bot:app", host="0.0.0.0", port=port)
