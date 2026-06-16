@@ -10,25 +10,19 @@ import uuid
 import time
 import traceback
 import asyncio
-import base64
-import boto3
 from datetime import datetime
-import pytz
 from pathlib import Path
-from cryptography.fernet import Fernet, InvalidToken
 import aioredis
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter, retry_if_exception_type
-
-# Optional: Load .env file locally
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # =========================================================
-# CONFIG + SAFETY LIMITS
+# CONFIG
 # =========================================================
-TOKENS_FILE = ".etrade_tokens.json.enc"
 ENV = os.getenv("ETRADE_ENV", "sandbox").lower()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
@@ -37,28 +31,22 @@ MAX_CONTRACTS = int(os.getenv("MAX_CONTRACTS", "2"))
 MAX_POSITION_VALUE = float(os.getenv("MAX_POSITION_VALUE", "10000"))
 DAILY_LOSS_LIMIT_DOLLARS = float(os.getenv("DAILY_LOSS_LIMIT_DOLLARS", "-500"))
 ENABLE_MARKET_HOURS_CHECK = os.getenv("ENABLE_MARKET_HOURS_CHECK", "false").lower() == "true"
-BROKER_TIMEOUT_SECONDS = int(os.getenv("BROKER_TIMEOUT_SECONDS", "25"))
-REJECT_0_DTE = os.getenv("REJECT_0_DTE", "false").lower() == "true"
-KMS_ENCRYPTED_KEY = os.getenv("KMS_ENCRYPTED_KEY")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 
 is_sandbox = ENV == "sandbox"
-dev_mode_for_pyetrade = is_sandbox
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("etrade-bot")
 
-app = FastAPI(title="E*TRADE Auto-Bot - Production Ready")
+app = FastAPI(title="E*TRADE Auto-Bot")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # =========================================================
 # GLOBALS
 # =========================================================
 broker_down_until = 0
-TOKENS_PATH = Path(TOKENS_FILE)
-fernet = None
 redis = None
 engine = None
 async_session = None
@@ -128,26 +116,20 @@ class AuthInvalidError(Exception):
     pass
 
 # =========================================================
-# KMS + TOKEN HELPERS
+# TOKEN LOADER (Simplified - No KMS)
 # =========================================================
-def get_encryption_key_from_kms() -> bytes:
-    if KMS_ENCRYPTED_KEY:
-        kms = boto3.client('kms', region_name=os.getenv("AWS_REGION", "us-east-1"))
-        response = kms.decrypt(CiphertextBlob=base64.b64decode(KMS_ENCRYPTED_KEY))
-        return response['Plaintext']
-    return os.getenv("FERNET_KEY", "your-fernet-key-here-32-bytes!!").encode()
-
 def load_tokens() -> Optional[Dict[str, str]]:
-    global fernet
-    if not TOKENS_PATH.exists() or not fernet:
-        return None
-    try:
-        encrypted = TOKENS_PATH.read_bytes()
-        decrypted = fernet.decrypt(encrypted)
-        return json.loads(decrypted)
-    except Exception as e:
-        logger.error(f"Token load failed: {e}")
-        return None
+    """Load tokens from environment variables (recommended for Railway/Docker)"""
+    access_token = os.getenv("ETRADE_ACCESS_TOKEN")
+    access_token_secret = os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
+
+    if access_token and access_token_secret:
+        return {
+            "oauth_token": access_token,
+            "oauth_token_secret": access_token_secret
+        }
+    logger.error("ETRADE_ACCESS_TOKEN or ETRADE_ACCESS_TOKEN_SECRET not set")
+    return None
 
 # =========================================================
 # DB INIT
@@ -162,7 +144,7 @@ async def init_db():
     logger.info("✅ Database initialized")
 
 # =========================================================
-# SAFETY FUNCTIONS (Circuit Breaker + Risk)
+# SAFETY
 # =========================================================
 async def check_risk_limits():
     global circuit_breaker_open
@@ -212,7 +194,7 @@ async def execute_live_order(payload: dict) -> dict:
 
     tokens = load_tokens()
     if not tokens:
-        raise AuthInvalidError("Failed to load tokens")
+        raise AuthInvalidError("Failed to load tokens from environment variables")
 
     orders_client = pyetrade.ETradeOrder(
         os.getenv("ETRADE_CONSUMER_KEY"),
@@ -233,28 +215,40 @@ async def execute_live_order(payload: dict) -> dict:
             price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
             limit_price = payload.get("limit_price") or payload.get("entry")
 
-            # Preview first
             await asyncio.to_thread(
                 orders_client.preview_option_order,
                 resp_format="json",
                 accountId=account_id,
-                symbol=ticker, callPut=right, expiryDate=expiry,
-                strikePrice=float(strike), orderAction=order_action,
-                clientOrderId=client_order_id, priceType=price_type,
+                symbol=ticker,
+                callPut=right,
+                expiryDate=expiry,
+                strikePrice=float(strike),
+                orderAction=order_action,
+                clientOrderId=client_order_id,
+                priceType=price_type,
                 limitPrice=float(limit_price) if limit_price else None,
-                quantity=int(quantity), orderTerm="GOOD_FOR_DAY", marketSession="REGULAR"
+                quantity=int(quantity),
+                orderTerm="GOOD_FOR_DAY",
+                marketSession="REGULAR",
             )
 
             resp = await asyncio.to_thread(
                 orders_client.place_option_order,
                 resp_format="json",
                 accountId=account_id,
-                symbol=ticker, callPut=right, expiryDate=expiry,
-                strikePrice=float(strike), orderAction=order_action,
-                clientOrderId=client_order_id, priceType=price_type,
+                symbol=ticker,
+                callPut=right,
+                expiryDate=expiry,
+                strikePrice=float(strike),
+                orderAction=order_action,
+                clientOrderId=client_order_id,
+                priceType=price_type,
                 limitPrice=float(limit_price) if limit_price else None,
-                quantity=int(quantity), orderTerm="GOOD_FOR_DAY", marketSession="REGULAR"
+                quantity=int(quantity),
+                orderTerm="GOOD_FOR_DAY",
+                marketSession="REGULAR",
             )
+
         else:
             # STOCK
             quantity = payload.get("position_size_shares") or 1
@@ -266,20 +260,28 @@ async def execute_live_order(payload: dict) -> dict:
                 orders_client.preview_equity_order,
                 resp_format="json",
                 accountId=account_id,
-                symbol=ticker, orderAction=order_action,
-                clientOrderId=client_order_id, priceType=price_type,
+                symbol=ticker,
+                orderAction=order_action,
+                clientOrderId=client_order_id,
+                priceType=price_type,
                 limitPrice=float(limit_price) if limit_price else None,
-                quantity=int(quantity), orderTerm="GOOD_FOR_DAY", marketSession="REGULAR"
+                quantity=int(quantity),
+                orderTerm="GOOD_FOR_DAY",
+                marketSession="REGULAR",
             )
 
             resp = await asyncio.to_thread(
                 orders_client.place_equity_order,
                 resp_format="json",
                 accountId=account_id,
-                symbol=ticker, orderAction=order_action,
-                clientOrderId=client_order_id, priceType=price_type,
+                symbol=ticker,
+                orderAction=order_action,
+                clientOrderId=client_order_id,
+                priceType=price_type,
                 limitPrice=float(limit_price) if limit_price else None,
-                quantity=int(quantity), orderTerm="GOOD_FOR_DAY", marketSession="REGULAR"
+                quantity=int(quantity),
+                orderTerm="GOOD_FOR_DAY",
+                marketSession="REGULAR",
             )
 
         logger.info(f"✅ LIVE ORDER PLACED: {resp}")
@@ -326,19 +328,11 @@ async def stop_worker():
 # =========================================================
 @app.on_event("startup")
 async def on_startup():
-    global redis, fernet
+    global redis
     logger.info(f"Starting in {'SANDBOX' if is_sandbox else 'PRODUCTION'} mode | LIVE_TRADING={LIVE_TRADING}")
 
     redis = await aioredis.from_url(REDIS_URL, decode_responses=True)
     await init_db()
-
-    try:
-        key = get_encryption_key_from_kms()
-        fernet = Fernet(key if len(key) == 44 else base64.b64encode(key))
-        logger.info("✅ Fernet ready")
-    except Exception as e:
-        logger.error(f"Fernet init failed: {e}")
-
     await start_worker()
     logger.info("✅ Worker started")
 
@@ -376,7 +370,6 @@ async def metrics():
 @app.post("/webhook")
 async def webhook(payload: WebhookPayload = Body(...)):
     global consecutive_failures
-
     try:
         await check_risk_limits()
         if time.time() < broker_down_until:
@@ -404,7 +397,7 @@ async def webhook(payload: WebhookPayload = Body(...)):
         return {"status": "failed", "message": str(e)}
 
 # =========================================================
-# RAILWAY-COMPATIBLE RUN
+# RAILWAY RUN
 # =========================================================
 if __name__ == "__main__":
     import uvicorn
