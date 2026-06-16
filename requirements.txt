@@ -3,6 +3,7 @@ uvicorn[standard]
 pyetrade
 redis
 sqlalchemy[asyncio]
+asyncpg
 python-dotenv
 aiohttp
 pydantic
