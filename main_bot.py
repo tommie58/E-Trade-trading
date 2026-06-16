@@ -1,13 +1,12 @@
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
-from typing import Optional, Dict
+from typing import Optional
 import pyetrade
 import os
 import json
 import logging
 import uuid
-import time
 import asyncio
 from datetime import datetime
 from redis.asyncio import from_url as redis_from_url
@@ -36,6 +35,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ==================== GLOBALS ====================
 redis = None
+engine = None
+async_session = None
 circuit_breaker_open = False
 consecutive_failures = 0
 MAX_CONSECUTIVE_FAILURES = 5
@@ -63,9 +64,9 @@ class WebhookPayload(BaseModel):
 
     @validator("action")
     def validate_action(cls, v):
-        if v.upper() not in {"BUY", "SELL", "EXIT", "CLOSE"}:
+        if str(v).upper() not in {"BUY", "SELL", "EXIT", "CLOSE"}:
             raise ValueError("Invalid action")
-        return v.upper()
+        return str(v).upper()
 
 # ==================== TOKEN LOADER ====================
 def load_tokens():
@@ -73,16 +74,21 @@ def load_tokens():
     token_secret = os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
     if token and token_secret:
         return {"oauth_token": token, "oauth_token_secret": token_secret}
-    logger.error("Missing ETRADE_ACCESS_TOKEN or ETRADE_ACCESS_TOKEN_SECRET")
     return None
 
-# ==================== DB ====================
+# ==================== DATABASE (Safe Version) ====================
 async def init_db():
     global engine, async_session
     if not DATABASE_URL:
+        logger.warning("No DATABASE_URL set — running without database")
         return
-    engine = create_async_engine(DATABASE_URL)
-    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        engine = create_async_engine(DATABASE_URL, echo=False)
+        async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        logger.info("✅ Database connected")
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+        # App continues even if DB fails
 
 # ==================== SAFETY ====================
 async def check_risk_limits():
@@ -99,17 +105,17 @@ async def alert_admin(subject: str, body: str):
         except:
             pass
 
-# ==================== LIVE ORDER EXECUTION ====================
+# ==================== LIVE TRADING ====================
 async def execute_live_order(payload: dict):
     if not LIVE_TRADING or is_sandbox:
-        logger.warning("Skipping real trade (not in live production mode)")
+        logger.warning("Skipping real trade (LIVE_TRADING=false or sandbox mode)")
         return {"status": "skipped"}
 
     await check_risk_limits()
 
     tokens = load_tokens()
     if not tokens:
-        raise Exception("Tokens not found in environment variables")
+        raise Exception("ETRADE_ACCESS_TOKEN / ETRADE_ACCESS_TOKEN_SECRET not set")
 
     orders = pyetrade.ETradeOrder(
         os.getenv("ETRADE_CONSUMER_KEY"),
@@ -127,14 +133,13 @@ async def execute_live_order(payload: dict):
 
     try:
         if instrument == "option":
-            # Add your option order logic here if needed
+            # Add your full option logic here if needed
             pass
         else:
-            # STOCK
+            # STOCK ORDER
             quantity = payload.get("position_size_shares", 1)
             price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
             limit_price = payload.get("limit_price")
-
             order_action = "BUY" if action == "BUY" else "SELL"
 
             await asyncio.to_thread(
@@ -151,21 +156,21 @@ async def execute_live_order(payload: dict):
                 marketSession="REGULAR",
             )
 
-        logger.info(f"✅ LIVE TRADE EXECUTED → {ticker}")
+        logger.info(f"✅ LIVE TRADE PLACED: {ticker}")
         return {"status": "success"}
 
     except Exception as e:
         consecutive_failures += 1
         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
             circuit_breaker_open = True
-        logger.error(f"Trade failed: {e}")
+        logger.error(f"Trade execution failed: {e}")
         raise
 
-# ==================== WORKER ====================
+# ==================== BACKGROUND WORKER ====================
 async def placement_worker():
     while not _worker_stop:
         try:
-            job = await redis.lpop(QUEUE_KEY)
+            job = await redis.lpop(QUEUE_KEY) if redis else None
             if job:
                 await execute_live_order(json.loads(job)["payload"])
             else:
@@ -184,15 +189,19 @@ async def on_startup():
     global redis
     logger.info(f"Starting in {'SANDBOX' if is_sandbox else 'PRODUCTION'} mode | LIVE_TRADING={LIVE_TRADING}")
 
+    # Redis
     if REDIS_URL:
-        redis = await redis_from_url(REDIS_URL, decode_responses=True)
-        logger.info("✅ Redis connected")
+        try:
+            redis = await redis_from_url(REDIS_URL, decode_responses=True)
+            logger.info("✅ Redis connected")
+        except Exception as e:
+            logger.error(f"Redis connection failed: {e}")
     else:
-        logger.warning("⚠️ No REDIS_URL set — worker may not function")
+        logger.warning("⚠️ No REDIS_URL set — background worker disabled")
 
     await init_db()
     await start_worker()
-    logger.info("✅ Worker started")
+    logger.info("✅ Application startup complete")
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -209,6 +218,9 @@ async def webhook(payload: WebhookPayload = Body(...)):
 
     await check_risk_limits()
 
+    if not redis:
+        return {"status": "error", "message": "Redis not available"}
+
     job = {"payload": payload.dict()}
     await redis.rpush(QUEUE_KEY, json.dumps(job))
     return {"status": "queued"}
@@ -219,7 +231,7 @@ async def health():
         "status": "ok",
         "env": ENV,
         "live_trading": LIVE_TRADING,
-        "circuit_breaker": circuit_breaker_open
+        "circuit_breaker_open": circuit_breaker_open
     }
 
 if __name__ == "__main__":
