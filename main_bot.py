@@ -86,9 +86,9 @@ def save_tokens(token: str, token_secret: str):
     logger.info("=== NEW TOKENS RECEIVED ===")
     logger.info(f"ETRADE_ACCESS_TOKEN={token}")
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
-    logger.info("=== Paste these into Railway Variables and Redeploy ===")
+    logger.info("Add these to Railway Variables and redeploy!")
 
-# ==================== OAUTH LINKING ====================
+# ==================== OAUTH LINKING (Mobile App Friendly) ====================
 @app.get("/link")
 @app.get("/etrade/link")
 @app.get("/connect")
@@ -97,30 +97,33 @@ async def start_linking():
     try:
         request_token = oauth.get_request_token()
         auth_url = oauth.get_authorize_url(request_token)
-        logger.info(f"✅ Auth URL generated")
+        
+        logger.info(f"✅ Auth URL generated for mobile app")
+
         return {
             "status": "success",
             "auth_url": auth_url,
-            "message": "Open this URL in browser to authorize"
+            "request_token": request_token,
+            "message": "Please authorize on E*TRADE and return with the code"
         }
     except Exception as e:
         logger.error(f"Start linking failed: {e}")
-        raise HTTPException(500, "Could not start linking")
+        raise HTTPException(500, detail="Could not start linking")
 
 @app.post("/complete-link")
 @app.post("/oauth/complete")
+@app.post("/link/complete")
 async def complete_link(data: dict = Body(...)):
-    """Called by mobile app when user pastes the 5-character code"""
+    """Mobile app sends the verification code here"""
     try:
-        oauth_token = data.get("oauth_token")
-        oauth_verifier = data.get("oauth_verifier") or data.get("verifier") or data.get("code")
+        oauth_token = data.get("oauth_token") or data.get("request_token")
+        verifier = data.get("oauth_verifier") or data.get("verifier") or data.get("code")
 
-        if not oauth_token or not oauth_verifier:
-            raise HTTPException(400, "Missing oauth_token or verification code")
+        if not oauth_token or not verifier:
+            raise HTTPException(400, "Missing verification code")
 
         access_token, access_token_secret = oauth.get_access_token(
-            request_token=oauth_token, 
-            verifier=oauth_verifier
+            request_token=oauth_token, verifier=verifier
         )
 
         save_tokens(access_token, access_token_secret)
@@ -133,7 +136,7 @@ async def complete_link(data: dict = Body(...)):
         logger.error(f"Complete link failed: {e}")
         raise HTTPException(500, "Failed to complete linking")
 
-# ==================== DATABASE ====================
+# ==================== DATABASE (Safe) ====================
 async def init_db():
     global engine, async_session
     if not DATABASE_URL:
@@ -224,7 +227,7 @@ async def start_worker():
     global _worker_task
     _worker_task = asyncio.create_task(placement_worker())
 
-# ==================== STARTUP ====================
+# ==================== STARTUP / SHUTDOWN ====================
 @app.on_event("startup")
 async def on_startup():
     global redis
