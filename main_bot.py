@@ -86,9 +86,9 @@ def save_tokens(token: str, token_secret: str):
     logger.info("=== NEW E*TRADE TOKENS RECEIVED ===")
     logger.info(f"ETRADE_ACCESS_TOKEN={token}")
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
-    logger.info("=== Add these to Railway Variables and Redeploy ===")
+    logger.info("Add these to Railway Variables and redeploy!")
 
-# ==================== OAUTH LINKING (Multiple Routes) ====================
+# ==================== OAUTH LINKING (Improved) ====================
 @app.get("/link")
 @app.get("/etrade/link")
 @app.get("/connect")
@@ -98,15 +98,15 @@ async def start_linking():
         request_token = oauth.get_request_token()
         auth_url = oauth.get_authorize_url(request_token)
         
-        logger.info(f"Auth URL generated: {auth_url}")
+        logger.info(f"✅ Auth URL generated successfully")
         
         return {
             "status": "success",
             "auth_url": auth_url,
-            "message": "Open this URL in browser to link E*TRADE account"
+            "message": "Open this URL in your browser to authorize E*TRADE"
         }
     except Exception as e:
-        logger.error(f"Start linking failed: {e}")
+        logger.error(f"❌ Start linking failed: {str(e)}")
         raise HTTPException(500, detail="Could not start linking")
 
 @app.get("/oauth/callback")
@@ -177,29 +177,26 @@ async def execute_live_order(payload: dict):
     client_order_id = str(uuid.uuid4())[:20]
 
     try:
-        if instrument == "option":
-            pass  # Add option logic later if needed
-        else:
-            quantity = payload.get("position_size_shares", 1)
-            price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
-            limit_price = payload.get("limit_price")
-            order_action = "BUY" if action == "BUY" else "SELL"
+        quantity = payload.get("position_size_shares", 1)
+        price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
+        limit_price = payload.get("limit_price")
+        order_action = "BUY" if action == "BUY" else "SELL"
 
-            await asyncio.to_thread(
-                orders.place_equity_order,
-                resp_format="json",
-                accountId=account_id,
-                symbol=ticker,
-                orderAction=order_action,
-                clientOrderId=client_order_id,
-                priceType=price_type,
-                limitPrice=limit_price,
-                quantity=quantity,
-                orderTerm="GOOD_FOR_DAY",
-                marketSession="REGULAR",
-            )
+        await asyncio.to_thread(
+            orders.place_equity_order,
+            resp_format="json",
+            accountId=account_id,
+            symbol=ticker,
+            orderAction=order_action,
+            clientOrderId=client_order_id,
+            priceType=price_type,
+            limitPrice=limit_price,
+            quantity=quantity,
+            orderTerm="GOOD_FOR_DAY",
+            marketSession="REGULAR",
+        )
 
-        logger.info(f"✅ LIVE TRADE: {ticker}")
+        logger.info(f"✅ LIVE TRADE EXECUTED: {ticker}")
         return {"status": "success"}
 
     except Exception as e:
