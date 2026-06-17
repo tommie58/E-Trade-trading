@@ -88,20 +88,20 @@ def save_tokens(token: str, token_secret: str):
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
     logger.info("Add these to Railway Variables and redeploy!")
 
-# ==================== OAUTH LINKING (Fixed - Supports GET + POST) ====================
+# ==================== OAUTH LINKING (FIXED) ====================
 @app.api_route("/etrade/auth/start", methods=["GET", "POST"])
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        request_token = oauth.get_request_token()
-        auth_url = oauth.get_authorize_url(request_token)
+        # pyetrade: get_request_token() returns the full authorization URL
+        auth_url = oauth.get_request_token()
 
         logger.info("✅ E*TRADE auth URL generated")
 
         return {
             "status": "success",
             "auth_url": auth_url,
-            "request_token": request_token,
+            "request_token": auth_url,   # for apps that expect this field
             "message": "Open this URL in browser to authorize E*TRADE"
         }
     except Exception as e:
