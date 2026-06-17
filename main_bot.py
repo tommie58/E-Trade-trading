@@ -88,39 +88,36 @@ def save_tokens(token: str, token_secret: str):
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
     logger.info("Add these to Railway Variables and redeploy!")
 
-# ==================== OAUTH LINKING (Mobile App Friendly) ====================
-@app.get("/link")
-@app.get("/etrade/link")
-@app.get("/connect")
-@app.get("/oauth/link")
-async def start_linking():
+# ==================== OAUTH LINKING (Fixed - Supports GET + POST) ====================
+@app.api_route("/etrade/auth/start", methods=["GET", "POST"])
+@app.api_route("/link", methods=["GET", "POST"])
+async def etrade_auth_start():
     try:
         request_token = oauth.get_request_token()
         auth_url = oauth.get_authorize_url(request_token)
-        
-        logger.info(f"✅ Auth URL generated for mobile app")
+
+        logger.info("✅ E*TRADE auth URL generated")
 
         return {
             "status": "success",
             "auth_url": auth_url,
             "request_token": request_token,
-            "message": "Please authorize on E*TRADE and return with the code"
+            "message": "Open this URL in browser to authorize E*TRADE"
         }
     except Exception as e:
         logger.error(f"Start linking failed: {e}")
         raise HTTPException(500, detail="Could not start linking")
 
+@app.post("/etrade/auth/complete")
 @app.post("/complete-link")
 @app.post("/oauth/complete")
-@app.post("/link/complete")
-async def complete_link(data: dict = Body(...)):
-    """Mobile app sends the verification code here"""
+async def etrade_auth_complete(data: dict = Body(...)):
     try:
         oauth_token = data.get("oauth_token") or data.get("request_token")
         verifier = data.get("oauth_verifier") or data.get("verifier") or data.get("code")
 
         if not oauth_token or not verifier:
-            raise HTTPException(400, "Missing verification code")
+            raise HTTPException(400, "Missing oauth_token or verification code")
 
         access_token, access_token_secret = oauth.get_access_token(
             request_token=oauth_token, verifier=verifier
@@ -136,7 +133,7 @@ async def complete_link(data: dict = Body(...)):
         logger.error(f"Complete link failed: {e}")
         raise HTTPException(500, "Failed to complete linking")
 
-# ==================== DATABASE (Safe) ====================
+# ==================== DATABASE ====================
 async def init_db():
     global engine, async_session
     if not DATABASE_URL:
