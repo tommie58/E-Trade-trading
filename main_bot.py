@@ -96,7 +96,6 @@ async def etrade_auth_start():
         auth_url = oauth.get_request_token()
 
         if not auth_url:
-            logger.error("get_request_token() returned empty")
             raise HTTPException(500, detail="Failed to generate authorization URL")
 
         logger.info("✅ E*TRADE auth URL generated successfully")
@@ -129,7 +128,6 @@ async def etrade_auth_complete(data: dict = Body(...)):
         if not verifier:
             raise HTTPException(400, "Missing verification code")
 
-        # Correct pyetrade usage - only pass the verifier
         access_token, access_token_secret = oauth.get_access_token(verifier)
 
         save_tokens(access_token, access_token_secret)
@@ -144,6 +142,25 @@ async def etrade_auth_complete(data: dict = Body(...)):
     except Exception as e:
         logger.error(f"Complete link failed: {str(e)}")
         raise HTTPException(500, detail=f"Failed to complete linking: {str(e)}")
+
+# ==================== E*TRADE ACCOUNT STATUS ====================
+@app.get("/etrade/account")
+async def get_etrade_account():
+    tokens = load_tokens()
+    
+    if not tokens:
+        return {
+            "status": "not_linked",
+            "message": "E*TRADE account is not linked",
+            "linked": False
+        }
+    
+    return {
+        "status": "linked",
+        "message": "E*TRADE account is successfully linked",
+        "linked": True,
+        "has_tokens": True
+    }
 
 # ==================== DATABASE ====================
 async def init_db():
