@@ -83,12 +83,12 @@ def load_tokens():
     return None
 
 def save_tokens(token: str, token_secret: str):
-    logger.info("=== NEW E*TRADE TOKENS RECEIVED ===")
+    logger.info("=== NEW TOKENS RECEIVED ===")
     logger.info(f"ETRADE_ACCESS_TOKEN={token}")
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
-    logger.info("Add these to Railway Variables and redeploy!")
+    logger.info("=== Paste these into Railway Variables and Redeploy ===")
 
-# ==================== OAUTH LINKING (Improved) ====================
+# ==================== OAUTH LINKING ====================
 @app.get("/link")
 @app.get("/etrade/link")
 @app.get("/connect")
@@ -97,40 +97,41 @@ async def start_linking():
     try:
         request_token = oauth.get_request_token()
         auth_url = oauth.get_authorize_url(request_token)
-        
-        logger.info(f"✅ Auth URL generated successfully")
-        
+        logger.info(f"✅ Auth URL generated")
         return {
             "status": "success",
             "auth_url": auth_url,
-            "message": "Open this URL in your browser to authorize E*TRADE"
+            "message": "Open this URL in browser to authorize"
         }
     except Exception as e:
-        logger.error(f"❌ Start linking failed: {str(e)}")
-        raise HTTPException(500, detail="Could not start linking")
+        logger.error(f"Start linking failed: {e}")
+        raise HTTPException(500, "Could not start linking")
 
-@app.get("/oauth/callback")
-async def oauth_callback(
-    oauth_token: str = Query(None),
-    oauth_verifier: str = Query(None)
-):
+@app.post("/complete-link")
+@app.post("/oauth/complete")
+async def complete_link(data: dict = Body(...)):
+    """Called by mobile app when user pastes the 5-character code"""
     try:
+        oauth_token = data.get("oauth_token")
+        oauth_verifier = data.get("oauth_verifier") or data.get("verifier") or data.get("code")
+
         if not oauth_token or not oauth_verifier:
-            raise HTTPException(400, "Missing oauth_token or oauth_verifier")
-            
+            raise HTTPException(400, "Missing oauth_token or verification code")
+
         access_token, access_token_secret = oauth.get_access_token(
-            request_token=oauth_token, verifier=oauth_verifier
+            request_token=oauth_token, 
+            verifier=oauth_verifier
         )
-        
+
         save_tokens(access_token, access_token_secret)
-        
+
         return {
             "status": "success",
-            "message": "E*TRADE Account Linked Successfully!"
+            "message": "E*TRADE Account Successfully Linked!"
         }
     except Exception as e:
-        logger.error(f"Callback failed: {e}")
-        raise HTTPException(500, "Linking failed")
+        logger.error(f"Complete link failed: {e}")
+        raise HTTPException(500, "Failed to complete linking")
 
 # ==================== DATABASE ====================
 async def init_db():
@@ -196,7 +197,7 @@ async def execute_live_order(payload: dict):
             marketSession="REGULAR",
         )
 
-        logger.info(f"✅ LIVE TRADE EXECUTED: {ticker}")
+        logger.info(f"✅ LIVE TRADE: {ticker}")
         return {"status": "success"}
 
     except Exception as e:
@@ -223,7 +224,7 @@ async def start_worker():
     global _worker_task
     _worker_task = asyncio.create_task(placement_worker())
 
-# ==================== STARTUP / SHUTDOWN ====================
+# ==================== STARTUP ====================
 @app.on_event("startup")
 async def on_startup():
     global redis
