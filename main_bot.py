@@ -88,7 +88,7 @@ def save_tokens(token: str, token_secret: str):
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
     logger.info("Add these to Railway Variables and redeploy!")
 
-# ==================== OAUTH LINKING (Final Version) ====================
+# ==================== OAUTH LINKING ====================
 @app.api_route("/etrade/auth/start", methods=["GET", "POST"])
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
@@ -120,25 +120,30 @@ async def etrade_auth_start():
 @app.post("/oauth/complete")
 async def etrade_auth_complete(data: dict = Body(...)):
     try:
-        oauth_token = data.get("oauth_token") or data.get("request_token")
-        verifier = data.get("oauth_verifier") or data.get("verifier") or data.get("code")
-
-        if not oauth_token or not verifier:
-            raise HTTPException(400, "Missing oauth_token or verification code")
-
-        access_token, access_token_secret = oauth.get_access_token(
-            request_token=oauth_token, verifier=verifier
+        verifier = (
+            data.get("oauth_verifier")
+            or data.get("verifier")
+            or data.get("code")
         )
 
+        if not verifier:
+            raise HTTPException(400, "Missing verification code")
+
+        # Correct pyetrade usage - only pass the verifier
+        access_token, access_token_secret = oauth.get_access_token(verifier)
+
         save_tokens(access_token, access_token_secret)
+
+        logger.info("✅ E*TRADE linking completed successfully")
 
         return {
             "status": "success",
             "message": "E*TRADE Account Successfully Linked!"
         }
+
     except Exception as e:
-        logger.error(f"Complete link failed: {e}")
-        raise HTTPException(500, "Failed to complete linking")
+        logger.error(f"Complete link failed: {str(e)}")
+        raise HTTPException(500, detail=f"Failed to complete linking: {str(e)}")
 
 # ==================== DATABASE ====================
 async def init_db():
