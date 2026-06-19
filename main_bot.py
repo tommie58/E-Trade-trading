@@ -47,10 +47,13 @@ _worker_stop = False
 Base = declarative_base()
 
 # ==================== OAUTH SETUP ====================
+# ==================== OAUTH SETUP ====================
 oauth = pyetrade.ETradeOAuth(
     consumer_key=os.getenv("ETRADE_CONSUMER_KEY"),
-    consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET")
+    consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET"),
+    dev=False
 )
+
 
 # ==================== MODELS ====================
 class WebhookPayload(BaseModel):
