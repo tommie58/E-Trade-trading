@@ -46,7 +46,7 @@ _worker_stop = False
 
 Base = declarative_base()
 
-# ==================== OAUTH SETUP (FIXED) ====================
+# ==================== OAUTH SETUP ====================
 oauth = pyetrade.ETradeOAuth(
     consumer_key=os.getenv("ETRADE_CONSUMER_KEY"),
     consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET")
@@ -88,24 +88,18 @@ def save_tokens(token: str, token_secret: str):
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
     logger.info("Add these to Railway Variables and redeploy!")
 
-# ==================== OAUTH LINKING (UPDATED) ====================
+# ==================== OAUTH LINKING (FIXED) ====================
 @app.api_route("/etrade/auth/start", methods=["GET", "POST"])
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        # Force OOB callback for manual flow
-        request_token = oauth.get_request_token(oauth_callback="oob")
+        # Simple call without oauth_callback
+        request_token = oauth.get_request_token()
 
         # Generate authorization URL
         auth_url = oauth.get_authorize_url(request_token)
 
         logger.info("✅ E*TRADE auth URL generated successfully")
-
-        # Safety check
-        if "apisb" in str(auth_url).lower():
-            logger.error("⚠️ WARNING: URL contains 'apisb' (sandbox)")
-        else:
-            logger.info("✅ URL confirmed as production")
 
         return {
             "status": "success",
