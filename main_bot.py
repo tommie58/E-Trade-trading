@@ -128,11 +128,19 @@ async def etrade_auth_complete(data: dict = Body(...)):
         if not verifier:
             raise HTTPException(400, "Missing verification code")
 
+        logger.info(f"Attempting to exchange verifier code: {verifier}")
+
+        # Get real access tokens from E*TRADE
         access_token, access_token_secret = oauth.get_access_token(verifier)
+
+        # Check if we got real tokens (not dummy values)
+        if access_token == "oauth_token" or len(access_token) < 20:
+            logger.error("E*TRADE returned dummy/placeholder tokens instead of real ones")
+            raise HTTPException(500, "Failed to get real tokens from E*TRADE")
 
         save_tokens(access_token, access_token_secret)
 
-        logger.info("✅ E*TRADE linking completed successfully")
+        logger.info("✅ E*TRADE linking completed successfully with REAL tokens")
 
         return {
             "status": "success",
@@ -140,8 +148,14 @@ async def etrade_auth_complete(data: dict = Body(...)):
         }
 
     except Exception as e:
-        logger.error(f"Complete link failed: {str(e)}")
-        raise HTTPException(500, detail=f"Failed to complete linking: {str(e)}")
+        error_msg = str(e)
+        logger.error(f"Complete link failed: {error_msg}")
+        
+        # Log more details if available
+        if hasattr(e, 'response'):
+            logger.error(f"E*TRADE response: {e.response.text if e.response else 'No response'}")
+        
+        raise HTTPException(500, detail=f"Failed to complete linking: {error_msg}")
 
 # ==================== E*TRADE ACCOUNT STATUS ====================
 @app.get("/etrade/account")
