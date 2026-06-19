@@ -1,8 +1,8 @@
 # CRASH IMMEDIATELY ON BOOT IF RAILWAY DROPS ENVIRONMENT SECRETS
 if not DATABASE_URL or not os.getenv("ETRADE_CONSUMER_KEY"):
     raise RuntimeError("CRITICAL: Production variables missing on deployment node!")
-from fastapi import 
-FastAPI, HTTPException, Body, Query
+# ==================== FIX LINE 1 TO 6 (SYNTAX FIX) ====================
+from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
 from typing import Optional
@@ -13,12 +13,31 @@ import logging
 import uuid
 import asyncio
 from datetime import datetime
-from redis.asyncio import from_url as redis_from_url
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import declarative_base, sessionmaker
-from dotenv import load_dotenv
 
-load_dotenv()
+# ==================== HARD ENFORCE PRODUCTION ENVIRONMENT ====================
+# This completely stops Railway from spinning up broken fallback replicas
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL or not os.getenv("ETRADE_CONSUMER_KEY"):
+    raise RuntimeError("CRITICAL PRODUCTION CONFIGURATION ERROR: Environment secrets missing!")
+
+ENV = "production"
+LIVE_TRADING = True
+is_sandbox = False
+
+# ==================== OAUTH FIXED SETUP ====================
+# Instantiate pyetrade cleanly
+oauth = pyetrade.ETradeOAuth(
+    consumer_key=os.getenv("ETRADE_CONSUMER_KEY"),
+    consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET")
+)
+
+# Fix the underlying library defaults securely at the source class level
+# This guarantees pyetrade never uses '://etrade.com' for any step of auth
+pyetrade.ETradeOAuth.BASE_URL = "https://etrade.com"
+oauth.request_token_url = "https://etrade.com/oauth/request_token"
+oauth.access_token_url = "https://etrade.com/oauth/access_token"
+oauth.authorize_url = "https://etrade.com{}&token={}"
+
 
 # ==================== CONFIG ====================
 ENV = os.getenv("ETRADE_ENV", "sandbox").lower()
