@@ -93,11 +93,11 @@ def save_tokens(token: str, token_secret: str):
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        # Simple call without oauth_callback
-        request_token = oauth.get_request_token()
+        # In this version of pyetrade, get_request_token() returns the full URL
+        auth_url = oauth.get_request_token()
 
-        # Generate authorization URL
-        auth_url = oauth.get_authorize_url(request_token)
+        if not auth_url:
+            raise HTTPException(500, detail="Failed to generate authorization URL")
 
         logger.info("✅ E*TRADE auth URL generated successfully")
 
@@ -107,7 +107,7 @@ async def etrade_auth_start():
             "authorize_url": auth_url,
             "url": auth_url,
             "authorization_url": auth_url,
-            "request_token": request_token,
+            "request_token": auth_url,
             "message": "Open this URL in browser to authorize E*TRADE"
         }
 
