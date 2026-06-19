@@ -25,7 +25,9 @@ REDIS_URL = os.getenv("REDIS_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 
+# Force a safe production fallback if ETRADE_ENV is missing
 is_sandbox = os.getenv("ETRADE_ENV", "production").lower() == "sandbox"
+
 
 
 logging.basicConfig(level=logging.INFO)
@@ -53,9 +55,12 @@ oauth = pyetrade.ETradeOAuth(
     consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET")
 )
 
+# Hard override pyetrade's internal defaults to force production base endpoints
+# This fixes the dummy token issue cleanly without using the invalid 'dev' parameter
 oauth.request_token_url = "https://etrade.com"
 oauth.access_token_url = "https://etrade.com"
 oauth.authorize_url = "https://etrade.com{}&token={}"
+
 
 
 
