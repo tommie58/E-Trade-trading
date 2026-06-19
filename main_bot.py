@@ -128,15 +128,18 @@ async def etrade_auth_complete(data: dict = Body(...)):
         if not verifier:
             raise HTTPException(400, "Missing verification code")
 
-        logger.info(f"Attempting to exchange verifier code: {verifier}")
+        logger.info(f"Attempting to exchange verifier code...")
 
-        # Get real access tokens from E*TRADE
         access_token, access_token_secret = oauth.get_access_token(verifier)
 
-        # Check if we got real tokens (not dummy values)
+        # Check if we got real tokens
         if access_token == "oauth_token" or len(access_token) < 20:
-            logger.error("E*TRADE returned dummy/placeholder tokens instead of real ones")
-            raise HTTPException(500, "Failed to get real tokens from E*TRADE")
+            logger.error("E*TRADE returned dummy/placeholder tokens")
+            # Friendly message for the app
+            raise HTTPException(
+                500, 
+                detail="Linking failed. E*TRADE did not return valid tokens yet. Please wait a while (up to 1-2 hours) and try linking again."
+            )
 
         save_tokens(access_token, access_token_secret)
 
@@ -147,15 +150,17 @@ async def etrade_auth_complete(data: dict = Body(...)):
             "message": "E*TRADE Account Successfully Linked!"
         }
 
+    except HTTPException as he:
+        # Re-raise HTTP exceptions (so the friendly message reaches the app)
+        raise he
+
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Complete link failed: {error_msg}")
-        
-        # Log more details if available
-        if hasattr(e, 'response'):
-            logger.error(f"E*TRADE response: {e.response.text if e.response else 'No response'}")
-        
-        raise HTTPException(500, detail=f"Failed to complete linking: {error_msg}")
+        logger.error(f"Complete link failed: {str(e)}")
+        # Friendly message for the app
+        raise HTTPException(
+            500, 
+            detail="Linking failed. Please wait and try again later. If the problem continues, check your production keys or contact support."
+        )
 
 # ==================== E*TRADE ACCOUNT STATUS ====================
 @app.get("/etrade/account")
