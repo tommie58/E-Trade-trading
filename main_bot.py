@@ -25,7 +25,8 @@ REDIS_URL = os.getenv("REDIS_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 
-is_sandbox = ENV == "sandbox"
+is_sandbox = os.getenv("ETRADE_ENV", "production").lower() == "sandbox"
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("etrade-bot")
@@ -47,12 +48,15 @@ _worker_stop = False
 Base = declarative_base()
 
 # ==================== OAUTH SETUP ====================
-# ==================== OAUTH SETUP ====================
 oauth = pyetrade.ETradeOAuth(
     consumer_key=os.getenv("ETRADE_CONSUMER_KEY"),
-    consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET"),
-    dev=False
+    consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET")
 )
+
+oauth.request_token_url = "https://etrade.com"
+oauth.access_token_url = "https://etrade.com"
+oauth.authorize_url = "https://etrade.com{}&token={}"
+
 
 
 # ==================== MODELS ====================
