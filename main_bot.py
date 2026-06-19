@@ -46,11 +46,10 @@ _worker_stop = False
 
 Base = declarative_base()
 
-# ==================== OAUTH SETUP (UPDATED) ====================
+# ==================== OAUTH SETUP (FIXED) ====================
 oauth = pyetrade.ETradeOAuth(
     consumer_key=os.getenv("ETRADE_CONSUMER_KEY"),
-    consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET"),
-    dev=False                    # ← Explicitly force production
+    consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET")
 )
 
 # ==================== MODELS ====================
@@ -94,17 +93,17 @@ def save_tokens(token: str, token_secret: str):
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        # Force OOB callback for manual code flow + production
+        # Force OOB callback for manual flow
         request_token = oauth.get_request_token(oauth_callback="oob")
 
-        # Generate the authorization URL
+        # Generate authorization URL
         auth_url = oauth.get_authorize_url(request_token)
 
-        logger.info("✅ E*TRADE production auth URL generated")
+        logger.info("✅ E*TRADE auth URL generated successfully")
 
         # Safety check
         if "apisb" in str(auth_url).lower():
-            logger.error("⚠️ WARNING: Generated URL still contains 'apisb' (sandbox)!")
+            logger.error("⚠️ WARNING: URL contains 'apisb' (sandbox)")
         else:
             logger.info("✅ URL confirmed as production")
 
@@ -145,7 +144,7 @@ async def etrade_auth_complete(data: dict = Body(...)):
             logger.error("E*TRADE returned dummy/placeholder tokens")
             raise HTTPException(
                 500, 
-                detail="Linking failed. E*TRADE did not return valid tokens yet. Please wait a while (up to 1-2 hours) and try linking again."
+                detail="Linking failed. E*TRADE did not return valid tokens yet. Please wait a while and try linking again."
             )
 
         save_tokens(access_token, access_token_secret)
