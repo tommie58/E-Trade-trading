@@ -88,12 +88,11 @@ def save_tokens(token: str, token_secret: str):
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
     logger.info("Add these to Railway Variables and redeploy!")
 
-# ==================== OAUTH LINKING (FIXED) ====================
+# ==================== OAUTH LINKING ====================
 @app.api_route("/etrade/auth/start", methods=["GET", "POST"])
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        # In this version of pyetrade, get_request_token() returns the full URL
         auth_url = oauth.get_request_token()
 
         if not auth_url:
@@ -133,7 +132,6 @@ async def etrade_auth_complete(data: dict = Body(...)):
 
         access_token, access_token_secret = oauth.get_access_token(verifier)
 
-        # Check if we got real tokens
         if access_token == "oauth_token" or len(access_token) < 20:
             logger.error("E*TRADE returned dummy/placeholder tokens")
             raise HTTPException(
@@ -198,16 +196,16 @@ async def check_risk_limits():
     if circuit_breaker_open:
         raise HTTPException(503, "Circuit breaker open")
 
-# ==================== LIVE TRADING ====================
+# ==================== LIVE TRADING (UPDATED - Preview + Place) ====================
 async def execute_live_order(payload: dict):
     if not LIVE_TRADING or is_sandbox:
-        return {"status": "skipped"}
+        return {"status": "skipped", "reason": "Not in live mode or sandbox"}
 
     await check_risk_limits()
 
     tokens = load_tokens()
     if not tokens:
-        raise Exception("Tokens not set")
+        raise Exception("E*TRADE tokens not set")
 
     orders = pyetrade.ETradeOrder(
         os.getenv("ETRADE_CONSUMER_KEY"),
@@ -217,34 +215,62 @@ async def execute_live_order(payload: dict):
         dev=is_sandbox
     )
 
-    instrument = payload.get("instrument", "stock").lower()
-    action = payload["action"]
     ticker = payload["ticker"]
+    action = payload["action"]
     account_id = TARGET_ACCOUNT_ID
     client_order_id = str(uuid.uuid4())[:20]
 
-    try:
-        quantity = payload.get("position_size_shares", 1)
-        price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
-        limit_price = payload.get("limit_price")
-        order_action = "BUY" if action == "BUY" else "SELL"
+    quantity = payload.get("position_size_shares", 1)
+    price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
+    limit_price = payload.get("limit_price")
+    order_action = "BUY" if action == "BUY" else "SELL"
 
-        await asyncio.to_thread(
-            orders.place_equity_order,
+    try:
+        # Build order payload
+        order_payload = {
+            "Order": [{
+                "allOrNone": False,
+                "priceType": price_type,
+                "orderTerm": "GOOD_FOR_DAY",
+                "marketSession": "REGULAR",
+                "Instrument": [{
+                    "Product": {"securityType": "EQ", "symbol": ticker},
+                    "orderAction": order_action,
+                    "quantityType": "QUANTITY",
+                    "quantity": quantity
+                }]
+            }]
+        }
+
+        if limit_price:
+            order_payload["Order"][0]["limitPrice"] = limit_price
+
+        # Step 1: Preview the order (recommended by E*TRADE)
+        logger.info(f"Previewing order for {ticker}...")
+        preview_response = await asyncio.to_thread(
+            orders.preview_equity_order,
             resp_format="json",
-            accountId=account_id,
-            symbol=ticker,
-            orderAction=order_action,
-            clientOrderId=client_order_id,
-            priceType=price_type,
-            limitPrice=limit_price,
-            quantity=quantity,
-            orderTerm="GOOD_FOR_DAY",
-            marketSession="REGULAR",
+            accountIdKey=account_id,
+            order=order_payload,
+            clientOrderId=client_order_id
         )
 
-        logger.info(f"✅ LIVE TRADE: {ticker}")
-        return {"status": "success"}
+        preview_id = preview_response['PreviewOrderResponse']['PreviewIds']['PreviewId'][0]['previewId']
+        logger.info(f"Preview successful. Preview ID: {preview_id}")
+
+        # Step 2: Place the actual order using the preview ID
+        logger.info(f"Placing live order for {ticker}...")
+        final_response = await asyncio.to_thread(
+            orders.place_equity_order,
+            resp_format="json",
+            accountIdKey=account_id,
+            order=order_payload,
+            clientOrderId=client_order_id,
+            previewId=preview_id
+        )
+
+        logger.info(f"✅ LIVE TRADE EXECUTED: {ticker} | {action}")
+        return {"status": "success", "response": final_response}
 
     except Exception as e:
         consecutive_failures += 1
@@ -309,7 +335,6 @@ async def webhook(payload: WebhookPayload = Body(...)):
 async def health():
     tokens = load_tokens()
 
-    # Check critical environment variables
     critical_vars = {
         "ETRADE_CONSUMER_KEY": bool(os.getenv("ETRADE_CONSUMER_KEY")),
         "ETRADE_CONSUMER_SECRET": bool(os.getenv("ETRADE_CONSUMER_SECRET")),
@@ -339,3 +364,8 @@ async def health():
         "database_connected": engine is not None,
         "message": "All critical variables present" if not missing else "Some variables are missing"
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main_bot:app", host="0.0.0.0", port=port)
