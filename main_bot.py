@@ -46,10 +46,11 @@ _worker_stop = False
 
 Base = declarative_base()
 
-# ==================== OAUTH SETUP ====================
+# ==================== OAUTH SETUP (UPDATED) ====================
 oauth = pyetrade.ETradeOAuth(
-    os.getenv("ETRADE_CONSUMER_KEY"),
-    os.getenv("ETRADE_CONSUMER_SECRET")
+    consumer_key=os.getenv("ETRADE_CONSUMER_KEY"),
+    consumer_secret=os.getenv("ETRADE_CONSUMER_SECRET"),
+    dev=False                    # ← Explicitly force production
 )
 
 # ==================== MODELS ====================
@@ -88,17 +89,24 @@ def save_tokens(token: str, token_secret: str):
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
     logger.info("Add these to Railway Variables and redeploy!")
 
-# ==================== OAUTH LINKING ====================
+# ==================== OAUTH LINKING (UPDATED) ====================
 @app.api_route("/etrade/auth/start", methods=["GET", "POST"])
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        auth_url = oauth.get_request_token()
+        # Force OOB callback for manual code flow + production
+        request_token = oauth.get_request_token(oauth_callback="oob")
 
-        if not auth_url:
-            raise HTTPException(500, detail="Failed to generate authorization URL")
+        # Generate the authorization URL
+        auth_url = oauth.get_authorize_url(request_token)
 
-        logger.info("✅ E*TRADE auth URL generated successfully")
+        logger.info("✅ E*TRADE production auth URL generated")
+
+        # Safety check
+        if "apisb" in str(auth_url).lower():
+            logger.error("⚠️ WARNING: Generated URL still contains 'apisb' (sandbox)!")
+        else:
+            logger.info("✅ URL confirmed as production")
 
         return {
             "status": "success",
@@ -106,7 +114,7 @@ async def etrade_auth_start():
             "authorize_url": auth_url,
             "url": auth_url,
             "authorization_url": auth_url,
-            "request_token": auth_url,
+            "request_token": request_token,
             "message": "Open this URL in browser to authorize E*TRADE"
         }
 
@@ -135,7 +143,6 @@ async def etrade_auth_complete(data: dict = Body(...)):
         # Check if we got real tokens
         if access_token == "oauth_token" or len(access_token) < 20:
             logger.error("E*TRADE returned dummy/placeholder tokens")
-            # Friendly message for the app
             raise HTTPException(
                 500, 
                 detail="Linking failed. E*TRADE did not return valid tokens yet. Please wait a while (up to 1-2 hours) and try linking again."
@@ -151,12 +158,10 @@ async def etrade_auth_complete(data: dict = Body(...)):
         }
 
     except HTTPException as he:
-        # Re-raise HTTP exceptions (so the friendly message reaches the app)
         raise he
 
     except Exception as e:
         logger.error(f"Complete link failed: {str(e)}")
-        # Friendly message for the app
         raise HTTPException(
             500, 
             detail="Linking failed. Please wait and try again later. If the problem continues, check your production keys or contact support."
