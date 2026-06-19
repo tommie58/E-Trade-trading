@@ -308,14 +308,34 @@ async def webhook(payload: WebhookPayload = Body(...)):
 @app.get("/health")
 async def health():
     tokens = load_tokens()
+
+    # Check critical environment variables
+    critical_vars = {
+        "ETRADE_CONSUMER_KEY": bool(os.getenv("ETRADE_CONSUMER_KEY")),
+        "ETRADE_CONSUMER_SECRET": bool(os.getenv("ETRADE_CONSUMER_SECRET")),
+        "ETRADE_ACCESS_TOKEN": bool(os.getenv("ETRADE_ACCESS_TOKEN")),
+        "ETRADE_ACCESS_TOKEN_SECRET": bool(os.getenv("ETRADE_ACCESS_TOKEN_SECRET")),
+        "TARGET_ACCOUNT_ID": bool(TARGET_ACCOUNT_ID),
+        "WEBHOOK_SECRET": bool(WEBHOOK_SECRET),
+        "REDIS_URL": bool(REDIS_URL),
+    }
+
+    missing = [key for key, present in critical_vars.items() if not present]
+
     return {
         "status": "ok",
         "env": ENV,
         "live_trading": LIVE_TRADING,
-        "linked": bool(tokens)
+        "is_sandbox": is_sandbox,
+        "linked": bool(tokens),
+        "ready_for_linking": bool(
+            os.getenv("ETRADE_CONSUMER_KEY") and os.getenv("ETRADE_CONSUMER_SECRET")
+        ),
+        "ready_for_live_trading": bool(
+            tokens and TARGET_ACCOUNT_ID and LIVE_TRADING and not is_sandbox
+        ),
+        "missing_critical_vars": missing,
+        "redis_connected": redis is not None,
+        "database_connected": engine is not None,
+        "message": "All critical variables present" if not missing else "Some variables are missing"
     }
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main_bot:app", host="0.0.0.0", port=port)
