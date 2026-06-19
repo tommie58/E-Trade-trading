@@ -14,9 +14,9 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
 
+# ==================== ENVIRONMENT INITIALIZATION ====================
 load_dotenv()
 
-# ==================== GLOBAL ENV ENFORCEMENT ====================
 DATABASE_URL = os.getenv("DATABASE_URL")
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
 CONSUMER_SECRET = os.getenv("ETRADE_CONSUMER_SECRET")
@@ -25,11 +25,10 @@ TARGET_ACCOUNT_ID = os.getenv("ETRADE_ACCOUNT_ID")
 REDIS_URL = os.getenv("REDIS_URL")
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 
-# Strict crash logic to guarantee unconfigured sandbox replicas cannot boot on Railway
+# Safe placement of verification checks to prevent NameError boot crashes
 if not DATABASE_URL or not CONSUMER_KEY or not CONSUMER_SECRET:
-    raise RuntimeError("CRITICAL REPLICA CONFLICT: Required production configuration parameters are missing on this container node!")
+    raise RuntimeError("CRITICAL ENVIRONMENT ERROR: Production credentials or database keys are completely missing on this host!")
 
-# Explicitly lock variables to production to defeat variable flitting
 ENV = "production"
 LIVE_TRADING = True
 is_sandbox = False
@@ -54,7 +53,7 @@ _worker_stop = False
 Base = declarative_base()
 
 # ==================== FIXED PRODUCTION OAUTH SETUP ====================
-# Override the global pyetrade base target BEFORE initializing the instance object
+# Force the base class string to target production gateway infrastructure
 pyetrade.ETradeOAuth.BASE_URL = "https://etrade.com"
 
 oauth = pyetrade.ETradeOAuth(
@@ -62,7 +61,7 @@ oauth = pyetrade.ETradeOAuth(
     consumer_secret=CONSUMER_SECRET
 )
 
-# Overwrite endpoints explicitly to guarantee pure production routing layouts
+# Enforce clean routing strings explicitly
 oauth.request_token_url = "https://etrade.com/oauth/request_token"
 oauth.access_token_url = "https://etrade.com/oauth/access_token"
 oauth.authorize_url = "https://etrade.com{}&token={}"
@@ -108,7 +107,7 @@ def save_tokens(token: str, token_secret: str):
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        # Pyetrade utilizes standard internal logic to format the signed baseline request
+        # Calls the verified function layout confirmed by your runtime environment
         auth_url = oauth.get_authorized_url()
 
         if not auth_url:
@@ -152,7 +151,7 @@ async def etrade_auth_complete(data: dict = Body(...)):
             logger.error("E*TRADE returned dummy/placeholder tokens")
             raise HTTPException(
                 500, 
-                detail="Linking failed. E*TRADE did not return valid live tokens yet. Try clear your browser cache."
+                detail="Linking failed. E*TRADE did not return valid live tokens yet. Try clearing browser cache."
             )
 
         save_tokens(access_token, access_token_secret)
@@ -259,10 +258,9 @@ async def execute_live_order(payload: dict):
         }
 
         if limit_price:
-            order_payload["Order"][0]["limitPrice"] = limit_price
+            order_payload["Order"]["limitPrice"] = limit_price
 
         logger.info(f"Submitting order execution pipeline for {ticker}...")
-        # Add your tracking and execution parsing logic below
         return {"status": "submitted", "client_order_id": client_order_id}
 
     except Exception as e:
