@@ -1,4 +1,8 @@
-from fastapi import FastAPI, HTTPException, Body, Query
+# CRASH IMMEDIATELY ON BOOT IF RAILWAY DROPS ENVIRONMENT SECRETS
+if not DATABASE_URL or not os.getenv("ETRADE_CONSUMER_KEY"):
+    raise RuntimeError("CRITICAL: Production variables missing on deployment node!")
+from fastapi import 
+FastAPI, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
 from typing import Optional
@@ -105,70 +109,64 @@ def save_tokens(token: str, token_secret: str):
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        auth_url = oauth.get_request_token()
-
-        if not auth_url:
-            raise HTTPException(500, detail="Failed to generate authorization URL")
+        # 1. Fetch the request token dict from E*TRADE
+        req_token_dict = oauth.get_request_token_wrapper() 
+        
+        # 2. Extract the actual authorize redirect URL string
+        auth_url = oauth.get_authorized_url()
 
         logger.info("✅ E*TRADE auth URL generated successfully")
 
+        # Pass the temporary tokens back to your frontend client 
+        # so they can be sent back to the /complete endpoint safely
         return {
             "status": "success",
             "auth_url": auth_url,
-            "authorize_url": auth_url,
-            "url": auth_url,
-            "authorization_url": auth_url,
-            "request_token": auth_url,
-            "message": "Open this URL in browser to authorize E*TRADE"
+            "oauth_token": req_token_dict.get("oauth_token"),
+            "oauth_token_secret": req_token_dict.get("oauth_token_secret"),
+            "message": "Open auth_url in browser"
         }
-
     except Exception as e:
         logger.error(f"Start linking failed: {str(e)}")
         raise HTTPException(500, detail=f"Could not start linking: {str(e)}")
 
+
 @app.post("/etrade/auth/complete")
-@app.post("/complete-link")
-@app.post("/oauth/complete")
 async def etrade_auth_complete(data: dict = Body(...)):
     try:
-        verifier = (
-            data.get("oauth_verifier")
-            or data.get("verifier")
-            or data.get("code")
-        )
+        verifier = data.get("oauth_verifier") or data.get("verifier") or data.get("code")
+        
+        # Extract the request tokens passed back from the client request payload
+        req_token = data.get("oauth_token")
+        req_token_secret = data.get("oauth_token_secret")
 
         if not verifier:
             raise HTTPException(400, "Missing verification code")
 
-        logger.info(f"Attempting to exchange verifier code...")
+        logger.info("Attempting to exchange verifier code statelessly...")
+
+        # Re-assign the tokens to the active handler object before running the exchange
+        # This completely stops the cross-container memory drop bug
+        if req_token and req_token_secret:
+            oauth.oauth_token = req_token
+            oauth.oauth_token_secret = req_token_secret
 
         access_token, access_token_secret = oauth.get_access_token(verifier)
 
         if access_token == "oauth_token" or len(access_token) < 20:
             logger.error("E*TRADE returned dummy/placeholder tokens")
-            raise HTTPException(
-                500, 
-                detail="Linking failed. E*TRADE did not return valid tokens yet. Please wait a while and try linking again."
-            )
+            raise HTTPException(500, detail="Linking failed. E*TRADE returned dummy tokens.")
 
         save_tokens(access_token, access_token_secret)
-
         logger.info("✅ E*TRADE linking completed successfully with REAL tokens")
 
-        return {
-            "status": "success",
-            "message": "E*TRADE Account Successfully Linked!"
-        }
-
-    except HTTPException as he:
-        raise he
+        return {"status": "success", "message": "E*TRADE Account Successfully Linked!"}
 
     except Exception as e:
         logger.error(f"Complete link failed: {str(e)}")
-        raise HTTPException(
-            500, 
-            detail="Linking failed. Please wait and try again later. If the problem continues, check your production keys or contact support."
-        )
+        raise HTTPException(500, detail="Handshake dropped by gateway signature mismatch.")
+
+
 
 # ==================== E*TRADE ACCOUNT STATUS ====================
 @app.get("/etrade/account")
