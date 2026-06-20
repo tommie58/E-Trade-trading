@@ -103,7 +103,7 @@ def save_tokens(token: str, token_secret: str):
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        # Fixed: get_request_token returns the true string URL from pyetrade's client core
+        # Fetches the true string URL from pyetrade's client core
         auth_url = oauth.get_request_token()
 
         if not auth_url:
@@ -111,13 +111,16 @@ async def etrade_auth_start():
 
         logger.info("✅ E*TRADE auth URL generated successfully")
 
+        # Pass the temporary request token credentials back to the client interface payload
+        # so they can be securely passed directly into your /complete route
         return {
             "status": "success",
             "auth_url": auth_url,
             "authorize_url": auth_url,
             "url": auth_url,
             "authorization_url": auth_url,
-            "request_token": auth_url,
+            "oauth_token": oauth.oauth_token,
+            "oauth_token_secret": oauth.oauth_token_secret,
             "message": "Open this URL in browser to authorize E*TRADE production mapping"
         }
 
@@ -135,11 +138,21 @@ async def etrade_auth_complete(data: dict = Body(...)):
             or data.get("verifier")
             or data.get("code")
         )
+        
+        # Pull the temporary token parameters passed back from your client architecture payload
+        req_token = data.get("oauth_token")
+        req_token_secret = data.get("oauth_token_secret")
 
         if not verifier:
             raise HTTPException(400, "Missing verification code")
 
-        logger.info(f"Attempting to exchange verifier code...")
+        logger.info(f"Attempting stateless handshake token signature verification...")
+
+        # Reassign session values directly onto the class structure handler 
+        # to ensure verification signatures evaluate correctly across container processes
+        if req_token and req_token_secret:
+            oauth.oauth_token = req_token
+            oauth.oauth_token_secret = req_token_secret
 
         access_token, access_token_secret = oauth.get_access_token(verifier)
 
