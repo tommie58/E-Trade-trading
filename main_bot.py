@@ -8,6 +8,7 @@ import json
 import logging
 import uuid
 import asyncio
+import urllib.parse
 from datetime import datetime
 from redis.asyncio import from_url as redis_from_url
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -111,9 +112,10 @@ async def etrade_auth_start():
 
         logger.info("✅ E*TRADE auth URL generated successfully")
 
-        # Fixed: Extracts tracking values from pyetrade's explicit inner token dictionary block
-        token_val = oauth.req_token.get('oauth_token') if oauth.req_token else ""
-        secret_val = oauth.req_token.get('oauth_token_secret') if oauth.req_token else ""
+        # Safely parse the URL string instead of hitting hidden internal objects
+        parsed_url = urllib.parse.urlparse(auth_url)
+        url_params = urllib.parse.parse_qs(parsed_url.query)
+        token_val = url_params.get('oauth_token', [''])[0]
 
         return {
             "status": "success",
@@ -122,7 +124,7 @@ async def etrade_auth_start():
             "url": auth_url,
             "authorization_url": auth_url,
             "oauth_token": token_val,
-            "oauth_token_secret": secret_val,
+            "oauth_token_secret": "",
             "message": "Open this URL in browser to authorize E*TRADE production mapping"
         }
 
@@ -140,21 +142,11 @@ async def etrade_auth_complete(data: dict = Body(...)):
             or data.get("verifier")
             or data.get("code")
         )
-        
-        req_token = data.get("oauth_token")
-        req_token_secret = data.get("oauth_token_secret")
 
         if not verifier:
             raise HTTPException(400, "Missing verification code")
 
-        logger.info(f"Attempting stateless handshake token signature verification...")
-
-        # Fixed: Restores dictionary objects straight back onto inner parameter mapping fields
-        if req_token and req_token_secret:
-            oauth.req_token = {
-                'oauth_token': req_token,
-                'oauth_token_secret': req_token_secret
-            }
+        logger.info(f"Attempting token verification handshake...")
 
         access_token, access_token_secret = oauth.get_access_token(verifier)
 
