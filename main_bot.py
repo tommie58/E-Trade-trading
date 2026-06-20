@@ -111,15 +111,18 @@ async def etrade_auth_start():
 
         logger.info("✅ E*TRADE auth URL generated successfully")
 
-        # Fixed: Extracts the tokens using pyetrade's correct native properties
+        # Fixed: Extracts tracking values from pyetrade's explicit inner token dictionary block
+        token_val = oauth.req_token.get('oauth_token') if oauth.req_token else ""
+        secret_val = oauth.req_token.get('oauth_token_secret') if oauth.req_token else ""
+
         return {
             "status": "success",
             "auth_url": auth_url,
             "authorize_url": auth_url,
             "url": auth_url,
             "authorization_url": auth_url,
-            "oauth_token": oauth.token,
-            "oauth_token_secret": oauth.secret,
+            "oauth_token": token_val,
+            "oauth_token_secret": secret_val,
             "message": "Open this URL in browser to authorize E*TRADE production mapping"
         }
 
@@ -146,10 +149,12 @@ async def etrade_auth_complete(data: dict = Body(...)):
 
         logger.info(f"Attempting stateless handshake token signature verification...")
 
-        # Fixed: Restores the session variables onto pyetrade's proper internal parameters
+        # Fixed: Restores dictionary objects straight back onto inner parameter mapping fields
         if req_token and req_token_secret:
-            oauth.token = req_token
-            oauth.secret = req_token_secret
+            oauth.req_token = {
+                'oauth_token': req_token,
+                'oauth_token_secret': req_token_secret
+            }
 
         access_token, access_token_secret = oauth.get_access_token(verifier)
 
