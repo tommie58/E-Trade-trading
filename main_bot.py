@@ -103,8 +103,8 @@ def save_tokens(token: str, token_secret: str):
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        # Fixed: Uses native pyetrade function to extract auth URL
-        auth_url = oauth.get_home_url()
+        # Fixed: get_request_token returns the true string URL from pyetrade's client core
+        auth_url = oauth.get_request_token()
 
         if not auth_url:
             raise HTTPException(500, detail="Failed to generate authorization URL")
