@@ -104,7 +104,7 @@ def save_tokens(token: str, token_secret: str):
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        # Natively returns the full URL string in pyetrade
+        # Natively returns the full authorization redirect URL string in pyetrade
         auth_url = oauth.get_request_token()
 
         if not auth_url:
@@ -115,7 +115,9 @@ async def etrade_auth_start():
         # Safely parse the URL string instead of hitting hidden internal objects
         parsed_url = urllib.parse.urlparse(auth_url)
         url_params = urllib.parse.parse_qs(parsed_url.query)
+        
         token_val = url_params.get('oauth_token', [''])[0]
+        secret_val = oauth.client.client.resource_owner_secret if hasattr(oauth, 'client') else ""
 
         return {
             "status": "success",
@@ -124,7 +126,7 @@ async def etrade_auth_start():
             "url": auth_url,
             "authorization_url": auth_url,
             "oauth_token": token_val,
-            "oauth_token_secret": "",
+            "oauth_token_secret": secret_val,
             "message": "Open this URL in browser to authorize E*TRADE production mapping"
         }
 
@@ -142,11 +144,19 @@ async def etrade_auth_complete(data: dict = Body(...)):
             or data.get("verifier")
             or data.get("code")
         )
+        
+        req_token = data.get("oauth_token")
+        req_token_secret = data.get("oauth_token_secret")
 
         if not verifier:
             raise HTTPException(400, "Missing verification code")
 
         logger.info(f"Attempting token verification handshake...")
+
+        # Reassign the session variables onto pyetrade's proper internal parameters
+        if req_token and req_token_secret and hasattr(oauth, 'client'):
+            oauth.client.client.resource_owner_key = req_token
+            oauth.client.client.resource_owner_secret = req_token_secret
 
         access_token, access_token_secret = oauth.get_access_token(verifier)
 
