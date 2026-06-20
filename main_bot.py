@@ -103,7 +103,7 @@ def save_tokens(token: str, token_secret: str):
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        # Fetches the true string URL from pyetrade's client core
+        # Natively returns the full URL string in pyetrade
         auth_url = oauth.get_request_token()
 
         if not auth_url:
@@ -111,16 +111,15 @@ async def etrade_auth_start():
 
         logger.info("✅ E*TRADE auth URL generated successfully")
 
-        # Pass the temporary request token credentials back to the client interface payload
-        # so they can be securely passed directly into your /complete route
+        # Fixed: Extracts the tokens using pyetrade's correct native properties
         return {
             "status": "success",
             "auth_url": auth_url,
             "authorize_url": auth_url,
             "url": auth_url,
             "authorization_url": auth_url,
-            "oauth_token": oauth.oauth_token,
-            "oauth_token_secret": oauth.oauth_token_secret,
+            "oauth_token": oauth.token,
+            "oauth_token_secret": oauth.secret,
             "message": "Open this URL in browser to authorize E*TRADE production mapping"
         }
 
@@ -139,7 +138,6 @@ async def etrade_auth_complete(data: dict = Body(...)):
             or data.get("code")
         )
         
-        # Pull the temporary token parameters passed back from your client architecture payload
         req_token = data.get("oauth_token")
         req_token_secret = data.get("oauth_token_secret")
 
@@ -148,11 +146,10 @@ async def etrade_auth_complete(data: dict = Body(...)):
 
         logger.info(f"Attempting stateless handshake token signature verification...")
 
-        # Reassign session values directly onto the class structure handler 
-        # to ensure verification signatures evaluate correctly across container processes
+        # Fixed: Restores the session variables onto pyetrade's proper internal parameters
         if req_token and req_token_secret:
-            oauth.oauth_token = req_token
-            oauth.oauth_token_secret = req_token_secret
+            oauth.token = req_token
+            oauth.secret = req_token_secret
 
         access_token, access_token_secret = oauth.get_access_token(verifier)
 
