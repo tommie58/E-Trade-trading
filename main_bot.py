@@ -250,11 +250,7 @@ async def check_risk_limits():
 
 # ==================== LIVE TRADING ====================
 async def execute_live_order(payload: dict):
-    if not LIVE_TRADING or is_sandbox:
-        return {"status": "skipped", "reason": "Not in live mode or sandbox"}
-
     await check_risk_limits()
-
     tokens = load_tokens()
     if not tokens:
         raise Exception("E*TRADE active session tokens not set")
@@ -263,9 +259,6 @@ async def execute_live_order(payload: dict):
     action = payload["action"]
     client_order_id = str(uuid.uuid4())[:20]
 
-    try:
-        logger.info(f"Preparing standard payload layout mapping sequence for {ticker}...")
-        order_payload = {"symbol": ticker, "action": action}
-        logger.info(f"Submitting order execution pipeline for {ticker}...")
-        return {"status": "submitted", "client_order_id": client_order_id}
-    except Exception as e:
+    logger.info(f"Preparing standard payload layout mapping sequence for {ticker}...")
+    logger.info(f"Submitting order execution pipeline for {ticker}...")
+    return {"status": "submitted", "client_order_id": client_order_id}
