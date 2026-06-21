@@ -14,6 +14,7 @@ from redis.asyncio import from_url as redis_from_url
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import Column, String, Text, DateTime
+from requests_oauthlib import OAuth1Session
 from dotenv import load_dotenv
 
 # ==================== ENVIRONMENT INITIALIZATION ====================
@@ -57,17 +58,10 @@ class ETradeSessionState(Base):
     oauth_token_secret = Column(Text, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-# ==================== FIXED PRODUCTION OAUTH SETUP ====================
-pyetrade.ETradeOAuth.BASE_URL = "https://etrade.com"
-
-oauth = pyetrade.ETradeOAuth(
-    consumer_key=CONSUMER_KEY,
-    consumer_secret=CONSUMER_SECRET
-)
-
-oauth.request_token_url = "https://etrade.com/oauth/request_token"
-oauth.access_token_url = "https://etrade.com/oauth/access_token"
-oauth.authorize_url = "https://etrade.com{}&token={}"
+# Enforce explicit production targets for absolute signature safety
+REQUEST_TOKEN_URL = "https://etrade.com"
+AUTHORIZE_URL = "https://etrade.com"
+ACCESS_TOKEN_URL = "https://etrade.com"
 
 # ==================== MODELS ====================
 class WebhookPayload(BaseModel):
@@ -105,30 +99,33 @@ def save_tokens(token: str, token_secret: str):
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
     logger.info("Add these to Railway Variables and redeploy!")
 
-# ==================== OAUTH LINKING ====================
+# ==================== OAUTH LINKING (ROBUST STATELESS NATIVE) ====================
 @app.api_route("/etrade/auth/start", methods=["GET", "POST"])
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        auth_url = oauth.get_request_token()
+        # Utilize pure requests_oauthlib layout to fully capture explicit token secrets on execution
+        etrade_session = OAuth1Session(client_key=CONSUMER_KEY, client_secret=CONSUMER_SECRET, callback_uri="oob")
+        
+        fetch_response = etrade_session.fetch_request_token(REQUEST_TOKEN_URL)
+        
+        token_val = fetch_response.get("oauth_token")
+        secret_val = fetch_response.get("oauth_token_secret")
+        
+        if not token_val or not secret_val:
+            raise Exception("Failed to retrieve query properties from E*TRADE gateway.")
 
-        if not auth_url:
-            raise HTTPException(500, detail="Failed to generate authorization URL")
+        # Construct the true authorized redirection string layout
+        auth_url = f"{AUTHORIZE_URL}?key={CONSUMER_KEY}&token={token_val}"
 
-        parsed_url = urllib.parse.urlparse(auth_url)
-        url_params = urllib.parse.parse_qs(parsed_url.query)
-        token_list = url_params.get('oauth_token', [''])
-        token_val = token_list[0] if token_list else ""
-        secret_val = oauth.client.client.resource_owner_secret if hasattr(oauth, 'client') else ""
-
-        if async_session and token_val and secret_val:
+        if async_session:
             async with async_session() as session:
                 async with session.begin():
                     state = ETradeSessionState(id="active_state", oauth_token=str(token_val), oauth_token_secret=str(secret_val))
                     await session.merge(state)
-                    logger.info("✅ Temporary verification tokens cached inside database record")
+                    logger.info("✅ Verification context properties saved into local database layer record")
 
-        logger.info("✅ E*TRADE auth URL generated successfully")
+        logger.info("✅ E*TRADE auth URL generated successfully via native OAuth client")
 
         return {
             "status": "success",
@@ -159,34 +156,45 @@ async def etrade_auth_complete(data: dict = Body(...)):
 
         logger.info(f"Retrieving cached connection context tracking data...")
 
+        token_val, secret_val = None, None
         if async_session:
             async with async_session() as session:
                 cached_state = await session.get(ETradeSessionState, "active_state")
-                if cached_state and hasattr(oauth, 'client'):
-                    oauth.client.client.resource_owner_key = cached_state.oauth_token
-                    oauth.client.client.resource_owner_secret = cached_state.oauth_token_secret
+                if cached_state:
+                    token_val = cached_state.oauth_token
+                    secret_val = cached_state.oauth_token_secret
                     logger.info("✅ Cryptographic session parameters restored successfully")
 
-        logger.info(f"Attempting token verification handshake...")
-        access_token, access_token_secret = oauth.get_access_token(verifier)
+        if not token_val or not secret_val:
+            raise HTTPException(400, "No active temporary handshake credentials found. Run /start again.")
 
-        if access_token == "oauth_token" or len(access_token) < 20:
-            logger.error("E*TRADE returned dummy/placeholder tokens")
-            raise HTTPException(
-                500, 
-                detail="Linking failed. E*TRADE did not return valid live tokens yet. Try clearing browser cache."
-            )
+        logger.info(f"Attempting token verification handshake via signed native layout session...")
+        
+        # Instantiate a clean state tracker utilizing the exact keys saved during step 1
+        etrade_session = OAuth1Session(
+            client_key=CONSUMER_KEY,
+            client_secret=CONSUMER_SECRET,
+            resource_owner_key=token_val,
+            resource_owner_secret=secret_val,
+            verifier=verifier
+        )
 
-        save_tokens(access_token, access_token_secret)
+        # Retrieve the final authentic production token strings cleanly
+        access_tokens = etrade_session.fetch_access_token(ACCESS_TOKEN_URL)
+        
+        final_token = access_tokens.get("oauth_token")
+        final_secret = access_tokens.get("oauth_token_secret")
+
+        if not final_token or not final_secret:
+            raise Exception("Handshake completed but no authentication values returned.")
+
+        save_tokens(final_token, final_secret)
         logger.info("✅ E*TRADE linking completed successfully with REAL tokens")
 
         return {
             "status": "success",
             "message": "E*TRADE Account Successfully Linked!"
         }
-
-    except HTTPException as he:
-        raise he
 
     except Exception as e:
         logger.error(f"Complete link failed: {str(e)}")
@@ -261,13 +269,3 @@ async def execute_live_order(payload: dict):
     client_order_id = str(uuid.uuid4())[:20]
 
     try:
-        # Simplified clean layout completely eliminating bracket parsing crashes
-        logger.info(f"Preparing standard payload layout mapping sequence for {ticker}...")
-        order_payload = {"symbol": ticker, "action": action}
-        
-        logger.info(f"Submitting order execution pipeline for {ticker}...")
-        return {"status": "submitted", "client_order_id": client_order_id}
-
-    except Exception as e:
-        logger.error(f"Live order tracking exception block reached: {str(e)}")
-        return {"status": "failed", "error": str(e)}
