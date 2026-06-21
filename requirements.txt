@@ -1,9 +1,8 @@
 fastapi
-uvicorn[standard]
+uvicorn
 pyetrade
-redis
-sqlalchemy[asyncio]
-asyncpg
-python-dotenv
-aiohttp
+requests_oauthlib
+sqlalchemy
+aiosqlite
 pydantic
+python-dotenv
