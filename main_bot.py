@@ -50,7 +50,6 @@ _worker_stop = False
 
 Base = declarative_base()
 
-# Transient schema table to hold temporary link credentials state securely across endpoints
 class ETradeSessionState(Base):
     __tablename__ = "etrade_session_state"
     id = Column(String(50), primary_key=True, default="active_state")
@@ -116,14 +115,12 @@ async def etrade_auth_start():
         if not auth_url:
             raise HTTPException(500, detail="Failed to generate authorization URL")
 
-        # Safely parse tokens using urllib
         parsed_url = urllib.parse.urlparse(auth_url)
         url_params = urllib.parse.parse_qs(parsed_url.query)
         token_list = url_params.get('oauth_token', [''])
         token_val = token_list[0] if token_list else ""
         secret_val = oauth.client.client.resource_owner_secret if hasattr(oauth, 'client') else ""
 
-        # Persist request tokens directly to the database cache table
         if async_session and token_val and secret_val:
             async with async_session() as session:
                 async with session.begin():
@@ -160,9 +157,8 @@ async def etrade_auth_complete(data: dict = Body(...)):
         if not verifier:
             raise HTTPException(400, "Missing verification code")
 
-        logger.info(f"Retrieving cached connection context tracking data from database...")
+        logger.info(f"Retrieving cached connection context tracking data...")
 
-        # Automatically look up request keys straight out of the database cache storage layer
         if async_session:
             async with async_session() as session:
                 cached_state = await session.get(ETradeSessionState, "active_state")
@@ -221,19 +217,21 @@ async def get_etrade_account():
 # ==================== DATABASE ====================
 async def init_db():
     global engine, async_session
-    if not DATABASE_URL:
-        logger.warning("Skipping DB initialization: DATABASE_URL not populated yet.")
-        return
     try:
-        # Fixed engine tracking configuration parameters to parse async protocols smoothly
-        engine = create_async_engine(DATABASE_URL, echo=False)
+        local_db_url = "sqlite+aiosqlite:///etrade_cache.db"
+        target_url = DATABASE_URL if (DATABASE_URL and "railway" in DATABASE_URL) else local_db_url
+        
+        if not target_url or "internal" in target_url:
+            target_url = local_db_url
+
+        logger.info(f"Connecting to token state storage via: {target_url.split('@')[-1]}")
+        engine = create_async_engine(target_url, echo=False)
         async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
         
-        # Create session state cache database layout structures automatically on startup
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             
-        logger.info("✅ Database connected and session tracking schema tables initialized")
+        logger.info("✅ Token tracking file structures initialized successfully")
     except Exception as e:
         logger.error(f"Database failed to initialize: {e}")
 
@@ -272,3 +270,12 @@ async def execute_live_order(payload: dict):
     client_order_id = str(uuid.uuid4())[:20]
 
     quantity = payload.get("position_size_shares", 1)
+    price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
+    limit_price = payload.get("limit_price")
+    order_action = "BUY" if action == "BUY" else "SELL"
+
+    try:
+        order_payload = {
+            "Order": [{
+                "allOrNone": False,
+                "priceType": price_type,
