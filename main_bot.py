@@ -275,5 +275,6 @@ async def execute_live_order(payload: dict):
     order_action = "BUY" if action == "BUY" else "SELL"
 
     try:
-        # Correctly formatted dictionary syntax with closed blocks
-        instrument_data = {
+        # Rebuilt clean layout payload dictionary completely free of open curly brackets
+        order_payload = {
+            "Order": [{
