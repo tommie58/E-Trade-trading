@@ -264,10 +264,8 @@ async def execute_live_order(payload: dict):
     client_order_id = str(uuid.uuid4())[:20]
 
     try:
-        # Correctly aligned and indented local dictionary assignments
         logger.info(f"Preparing standard payload layout mapping sequence for {ticker}...")
         order_payload = {"symbol": ticker, "action": action}
-        
         logger.info(f"Submitting order execution pipeline for {ticker}...")
         return {"status": "submitted", "client_order_id": client_order_id}
-
+    except Exception as e:
