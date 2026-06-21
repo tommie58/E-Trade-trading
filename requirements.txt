@@ -4,5 +4,6 @@ pyetrade
 requests_oauthlib
 sqlalchemy
 aiosqlite
+redis
 pydantic
 python-dotenv
