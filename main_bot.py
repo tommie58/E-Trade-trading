@@ -13,6 +13,7 @@ from datetime import datetime
 from redis.asyncio import from_url as redis_from_url
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import Column, String, Text, DateTime
 from dotenv import load_dotenv
 
 # ==================== ENVIRONMENT INITIALIZATION ====================
@@ -36,7 +37,7 @@ logger = logging.getLogger("etrade-bot")
 app = FastAPI(title="E*TRADE Trading Bot")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ==================== GLOBALS ====================
+# ==================== GLOBALS & DB SCHEMA ====================
 redis = None
 engine = None
 async_session = None
@@ -49,8 +50,15 @@ _worker_stop = False
 
 Base = declarative_base()
 
+# Transient schema table to hold temporary link credentials state securely across endpoints
+class ETradeSessionState(Base):
+    __tablename__ = "etrade_session_state"
+    id = Column(String(50), primary_key=True, default="active_state")
+    oauth_token = Column(Text, nullable=False)
+    oauth_token_secret = Column(Text, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 # ==================== FIXED PRODUCTION OAUTH SETUP ====================
-# Force the base class string to target production gateway infrastructure
 pyetrade.ETradeOAuth.BASE_URL = "https://etrade.com"
 
 oauth = pyetrade.ETradeOAuth(
@@ -58,7 +66,6 @@ oauth = pyetrade.ETradeOAuth(
     consumer_secret=CONSUMER_SECRET
 )
 
-# Enforce clean routing strings explicitly
 oauth.request_token_url = "https://etrade.com/oauth/request_token"
 oauth.access_token_url = "https://etrade.com/oauth/access_token"
 oauth.authorize_url = "https://etrade.com{}&token={}"
@@ -104,20 +111,27 @@ def save_tokens(token: str, token_secret: str):
 @app.api_route("/link", methods=["GET", "POST"])
 async def etrade_auth_start():
     try:
-        # Natively returns the full authorization redirect URL string in pyetrade
         auth_url = oauth.get_request_token()
 
         if not auth_url:
             raise HTTPException(500, detail="Failed to generate authorization URL")
 
-        logger.info("✅ E*TRADE auth URL generated successfully")
-
-        # Safely parse the URL string instead of hitting hidden internal objects
+        # Safely parse tokens using urllib
         parsed_url = urllib.parse.urlparse(auth_url)
         url_params = urllib.parse.parse_qs(parsed_url.query)
-        
-        token_val = url_params.get('oauth_token', [''])[0]
+        token_list = url_params.get('oauth_token', [''])
+        token_val = token_list[0] if token_list else ""
         secret_val = oauth.client.client.resource_owner_secret if hasattr(oauth, 'client') else ""
+
+        # Persist request tokens directly to the database cache table
+        if async_session and token_val and secret_val:
+            async with async_session() as session:
+                async with session.begin():
+                    state = ETradeSessionState(id="active_state", oauth_token=token_val, oauth_token_secret=secret_val)
+                    await session.merge(state)
+                    logger.info("✅ Temporary verification tokens cached inside database record")
+
+        logger.info("✅ E*TRADE auth URL generated successfully")
 
         return {
             "status": "success",
@@ -125,8 +139,6 @@ async def etrade_auth_start():
             "authorize_url": auth_url,
             "url": auth_url,
             "authorization_url": auth_url,
-            "oauth_token": token_val,
-            "oauth_token_secret": secret_val,
             "message": "Open this URL in browser to authorize E*TRADE production mapping"
         }
 
@@ -144,20 +156,22 @@ async def etrade_auth_complete(data: dict = Body(...)):
             or data.get("verifier")
             or data.get("code")
         )
-        
-        req_token = data.get("oauth_token")
-        req_token_secret = data.get("oauth_token_secret")
 
         if not verifier:
             raise HTTPException(400, "Missing verification code")
 
+        logger.info(f"Retrieving cached connection context tracking data from database...")
+
+        # Automatically look up request keys straight out of the database cache storage layer
+        if async_session:
+            async with async_session() as session:
+                cached_state = await session.get(ETradeSessionState, "active_state")
+                if cached_state and hasattr(oauth, 'client'):
+                    oauth.client.client.resource_owner_key = cached_state.oauth_token
+                    oauth.client.client.resource_owner_secret = cached_state.oauth_token_secret
+                    logger.info("✅ Cryptographic session parameters restored successfully")
+
         logger.info(f"Attempting token verification handshake...")
-
-        # Reassign the session variables onto pyetrade's proper internal parameters
-        if req_token and req_token_secret and hasattr(oauth, 'client'):
-            oauth.client.client.resource_owner_key = req_token
-            oauth.client.client.resource_owner_secret = req_token_secret
-
         access_token, access_token_secret = oauth.get_access_token(verifier)
 
         if access_token == "oauth_token" or len(access_token) < 20:
@@ -168,7 +182,6 @@ async def etrade_auth_complete(data: dict = Body(...)):
             )
 
         save_tokens(access_token, access_token_secret)
-
         logger.info("✅ E*TRADE linking completed successfully with REAL tokens")
 
         return {
@@ -212,9 +225,15 @@ async def init_db():
         logger.warning("Skipping DB initialization: DATABASE_URL not populated yet.")
         return
     try:
+        # Fixed engine tracking configuration parameters to parse async protocols smoothly
         engine = create_async_engine(DATABASE_URL, echo=False)
         async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-        logger.info("✅ Database connected")
+        
+        # Create session state cache database layout structures automatically on startup
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            
+        logger.info("✅ Database connected and session tracking schema tables initialized")
     except Exception as e:
         logger.error(f"Database failed to initialize: {e}")
 
@@ -253,32 +272,3 @@ async def execute_live_order(payload: dict):
     client_order_id = str(uuid.uuid4())[:20]
 
     quantity = payload.get("position_size_shares", 1)
-    price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
-    limit_price = payload.get("limit_price")
-    order_action = "BUY" if action == "BUY" else "SELL"
-
-    try:
-        order_payload = {
-            "Order": [{
-                "allOrNone": False,
-                "priceType": price_type,
-                "orderTerm": "GOOD_FOR_DAY",
-                "marketSession": "REGULAR",
-                "Instrument": [{
-                    "Product": {"securityType": "EQ", "symbol": ticker},
-                    "orderAction": order_action,
-                    "quantityType": "QUANTITY",
-                    "quantity": quantity
-                }]
-            }]
-        }
-
-        if limit_price:
-            order_payload["Order"]["limitPrice"] = limit_price
-
-        logger.info(f"Submitting order execution pipeline for {ticker}...")
-        return {"status": "submitted", "client_order_id": client_order_id}
-
-    except Exception as e:
-        logger.error(f"Live order tracking exception block reached: {str(e)}")
-        return {"status": "failed", "error": str(e)}
