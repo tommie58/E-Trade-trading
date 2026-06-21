@@ -275,7 +275,7 @@ async def execute_live_order(payload: dict):
     order_action = "BUY" if action == "BUY" else "SELL"
 
     try:
+        # Fixed syntax payload block format structure
         order_payload = {
             "Order": [{
                 "allOrNone": False,
-                "priceType": price_type,
