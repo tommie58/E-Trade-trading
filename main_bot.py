@@ -124,7 +124,7 @@ async def etrade_auth_start():
         if async_session and token_val and secret_val:
             async with async_session() as session:
                 async with session.begin():
-                    state = ETradeSessionState(id="active_state", oauth_token=token_val, oauth_token_secret=secret_val)
+                    state = ETradeSessionState(id="active_state", oauth_token=str(token_val), oauth_token_secret=str(secret_val))
                     await session.merge(state)
                     logger.info("✅ Temporary verification tokens cached inside database record")
 
@@ -275,7 +275,5 @@ async def execute_live_order(payload: dict):
     order_action = "BUY" if action == "BUY" else "SELL"
 
     try:
-        # Valid closed bracket dictionary layout 
-        order_payload = {
-            "Order": [{
-                "allOrNone": False,
+        # Correctly formatted dictionary syntax with closed blocks
+        instrument_data = {
