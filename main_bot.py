@@ -8,7 +8,6 @@ import json
 import logging
 import uuid
 import asyncio
-import time
 from datetime import datetime
 from redis.asyncio import from_url as redis_from_url
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -62,7 +61,7 @@ class WebhookPayload(BaseModel):
     secret: str
     ticker: str
     action: str
-    mode: Optional[str] = "paper"          # ← NEW: respects "live" or "paper"
+    mode: Optional[str] = "paper"
     instrument: Optional[str] = "stock"
     strike: Optional[float] = None
     strike_hint: Optional[float] = None
@@ -92,39 +91,116 @@ def save_tokens(token: str, token_secret: str):
     logger.info("=== NEW TOKENS RECEIVED ===")
     logger.info(f"ETRADE_ACCESS_TOKEN={token}")
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
-    logger.info("Add these to Railway Variables and redeploy!")
 
-# ==================== OAUTH + RENEW + QUOTE (same as before) ====================
-# ... (keeping the rest of the file the same for brevity - the important changes are below)
-
+# ==================== OAUTH ====================
 REQUEST_TOKEN_URL = "https://api.etrade.com/oauth/request_token"
 AUTHORIZE_URL = "https://us.etrade.com/e/t/etws/authorize"
 ACCESS_TOKEN_URL = "https://api.etrade.com/oauth/access_token"
 
-# (All previous endpoints for /link, /complete, /renew, /quote remain unchanged)
+@app.api_route("/etrade/auth/start", methods=["GET", "POST"])
+@app.api_route("/link", methods=["GET", "POST"])
+async def etrade_auth_start():
+    try:
+        etrade_session = OAuth1Session(client_key=CONSUMER_KEY, client_secret=CONSUMER_SECRET, callback_uri="oob")
+        fetch_response = etrade_session.fetch_request_token(REQUEST_TOKEN_URL)
+        token_val = fetch_response.get("oauth_token")
+        secret_val = fetch_response.get("oauth_token_secret")
 
-# ==================== UPDATED: LIVE TRADING WITH MODE SUPPORT ====================
+        if not token_val or not secret_val:
+            raise Exception("Failed to get request token")
+
+        auth_url = f"{AUTHORIZE_URL}?key={CONSUMER_KEY}&token={token_val}"
+
+        if async_session:
+            async with async_session() as session:
+                async with session.begin():
+                    state = ETradeSessionState(id="active_state", oauth_token=str(token_val), oauth_token_secret=str(secret_val))
+                    await session.merge(state)
+
+        return {"status": "success", "auth_url": auth_url, "authorize_url": auth_url}
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+@app.post("/etrade/auth/complete")
+@app.post("/complete-link")
+async def etrade_auth_complete(data: dict = Body(...)):
+    try:
+        verifier = data.get("oauth_verifier") or data.get("verifier") or data.get("code")
+        if not verifier:
+            raise HTTPException(400, "Missing verification code")
+
+        token_val, secret_val = None, None
+        if async_session:
+            async with async_session() as session:
+                cached = await session.get(ETradeSessionState, "active_state")
+                if cached:
+                    token_val = cached.oauth_token
+                    secret_val = cached.oauth_token_secret
+
+        if not token_val or not secret_val:
+            raise HTTPException(400, "No active request token found")
+
+        etrade_session = OAuth1Session(CONSUMER_KEY, CONSUMER_SECRET, resource_owner_key=token_val, resource_owner_secret=secret_val, verifier=verifier)
+        access_tokens = etrade_session.fetch_access_token(ACCESS_TOKEN_URL)
+
+        final_token = access_tokens.get("oauth_token")
+        final_secret = access_tokens.get("oauth_token_secret")
+
+        save_tokens(final_token, final_secret)
+        return {"status": "success", "message": "Linked successfully"}
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+# ==================== QUOTE ENDPOINT ====================
+@app.get("/etrade/quote")
+async def get_quotes(symbols: str = Query(...)):
+    tokens = load_tokens()
+    if not tokens:
+        raise HTTPException(401, "Not linked")
+
+    market = pyetrade.ETradeMarket(CONSUMER_KEY, CONSUMER_SECRET, tokens["oauth_token"], tokens["oauth_token_secret"], dev=is_sandbox)
+    symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
+
+    for attempt in range(1, 5):
+        try:
+            return await asyncio.to_thread(market.get_quote, symbol_list, resp_format="json")
+        except Exception as e:
+            if attempt < 4 and "401" in str(e):
+                await asyncio.sleep(3)
+                continue
+            raise HTTPException(500, detail=str(e))
+
+# ==================== DATABASE ====================
+async def init_db():
+    global engine, async_session
+    target_url = DATABASE_URL if DATABASE_URL else "sqlite+aiosqlite:///etrade_cache.db"
+    try:
+        engine = create_async_engine(target_url, echo=False)
+        async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("✅ Database connected")
+    except Exception as e:
+        logger.error(f"Database error: {e}")
+
+# ==================== SAFETY ====================
+async def check_risk_limits():
+    if circuit_breaker_open:
+        raise HTTPException(503, "Circuit breaker open")
+
+# ==================== LIVE TRADING (RESPECTS MODE) ====================
 async def execute_live_order(payload: dict):
     mode = payload.get("mode", "paper").lower()
 
-    # Only proceed with real trade if mode is "live" AND server allows it
     if mode != "live" or not LIVE_TRADING or is_sandbox:
-        logger.info(f"Signal mode={mode} → Skipping real trade (paper/filtered)")
         return {"status": "skipped", "reason": f"mode={mode}"}
 
     await check_risk_limits()
-
     tokens = load_tokens()
     if not tokens:
-        raise Exception("E*TRADE tokens not set")
+        raise Exception("No tokens")
 
-    orders = pyetrade.ETradeOrder(
-        CONSUMER_KEY,
-        CONSUMER_SECRET,
-        tokens["oauth_token"],
-        tokens["oauth_token_secret"],
-        dev=is_sandbox
-    )
+    orders = pyetrade.ETradeOrder(CONSUMER_KEY, CONSUMER_SECRET, tokens["oauth_token"], tokens["oauth_token_secret"], dev=is_sandbox)
 
     ticker = payload["ticker"]
     action = payload["action"]
@@ -134,56 +210,31 @@ async def execute_live_order(payload: dict):
     limit_price = payload.get("limit_price")
     order_action = "BUY" if action == "BUY" else "SELL"
 
-    try:
-        order_payload = {
-            "Order": [{
-                "allOrNone": False,
-                "priceType": price_type,
-                "orderTerm": "GOOD_FOR_DAY",
-                "marketSession": "REGULAR",
-                "Instrument": [{
-                    "Product": {"securityType": "EQ", "symbol": ticker},
-                    "orderAction": order_action,
-                    "quantityType": "QUANTITY",
-                    "quantity": quantity
-                }]
+    order_payload = {
+        "Order": [{
+            "allOrNone": False,
+            "priceType": price_type,
+            "orderTerm": "GOOD_FOR_DAY",
+            "marketSession": "REGULAR",
+            "Instrument": [{
+                "Product": {"securityType": "EQ", "symbol": ticker},
+                "orderAction": order_action,
+                "quantityType": "QUANTITY",
+                "quantity": quantity
             }]
-        }
-        if limit_price:
-            order_payload["Order"][0]["limitPrice"] = limit_price
+        }]
+    }
+    if limit_price:
+        order_payload["Order"][0]["limitPrice"] = limit_price
 
-        # Preview first
-        preview_resp = await asyncio.to_thread(
-            orders.preview_equity_order,
-            resp_format="json",
-            accountIdKey=TARGET_ACCOUNT_ID,
-            order=order_payload,
-            clientOrderId=client_order_id
-        )
-        preview_id = preview_resp['PreviewOrderResponse']['PreviewIds']['PreviewId'][0]['previewId']
+    preview = await asyncio.to_thread(orders.preview_equity_order, resp_format="json", accountIdKey=TARGET_ACCOUNT_ID, order=order_payload, clientOrderId=client_order_id)
+    preview_id = preview['PreviewOrderResponse']['PreviewIds']['PreviewId'][0]['previewId']
 
-        # Place order
-        final_resp = await asyncio.to_thread(
-            orders.place_equity_order,
-            resp_format="json",
-            accountIdKey=TARGET_ACCOUNT_ID,
-            order=order_payload,
-            clientOrderId=client_order_id,
-            previewId=preview_id
-        )
+    final = await asyncio.to_thread(orders.place_equity_order, resp_format="json", accountIdKey=TARGET_ACCOUNT_ID, order=order_payload, clientOrderId=client_order_id, previewId=preview_id)
+    logger.info(f"✅ LIVE TRADE: {ticker}")
+    return {"status": "success", "response": final}
 
-        logger.info(f"✅ LIVE TRADE EXECUTED: {ticker} | mode=live")
-        return {"status": "success", "response": final_resp}
-
-    except Exception as e:
-        consecutive_failures += 1
-        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-            global circuit_breaker_open
-            circuit_breaker_open = True
-        logger.error(f"Trade failed: {e}")
-        raise
-
-# ==================== WORKER (unchanged) ====================
+# ==================== WORKER ====================
 async def placement_worker():
     while not _worker_stop:
         try:
@@ -200,9 +251,7 @@ async def start_worker():
     global _worker_task
     _worker_task = asyncio.create_task(placement_worker())
 
-# ==================== STARTUP / SHUTDOWN + OTHER ENDPOINTS ====================
-# (All previous code for startup, shutdown, webhook, health, etc. remains the same)
-
+# ==================== STARTUP ====================
 @app.on_event("startup")
 async def on_startup():
     global redis
@@ -212,7 +261,7 @@ async def on_startup():
         try:
             redis = await redis_from_url(REDIS_URL, decode_responses=True)
         except Exception as e:
-            logger.error(f"Redis failed: {e}")
+            logger.error(f"Redis error: {e}")
 
     await init_db()
     await start_worker()
@@ -225,6 +274,7 @@ async def on_shutdown():
     if redis:
         await redis.close()
 
+# ==================== ENDPOINTS ====================
 @app.post("/webhook")
 async def webhook(payload: WebhookPayload = Body(...)):
     if payload.secret != WEBHOOK_SECRET:
@@ -241,8 +291,7 @@ async def health():
         "status": "ok",
         "env": ENV,
         "live_trading": LIVE_TRADING,
-        "linked": bool(tokens),
-        "ready_for_live_trading": bool(tokens and TARGET_ACCOUNT_ID and LIVE_TRADING and not is_sandbox)
+        "linked": bool(tokens)
     }
 
 if __name__ == "__main__":
