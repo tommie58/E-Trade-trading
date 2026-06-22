@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
-from typing import Optional
+from typing import Optional, List
 import pyetrade
 import os
 import json
@@ -93,7 +93,7 @@ def save_tokens(token: str, token_secret: str):
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
     logger.info("Add these to Railway Variables and redeploy!")
 
-# ==================== OAUTH LINKING (requests_oauthlib + DB State) ====================
+# ==================== OAUTH LINKING ====================
 REQUEST_TOKEN_URL = "https://api.etrade.com/oauth/request_token"
 AUTHORIZE_URL = "https://us.etrade.com/e/t/etws/authorize"
 ACCESS_TOKEN_URL = "https://api.etrade.com/oauth/access_token"
@@ -113,7 +113,6 @@ async def etrade_auth_start():
 
         auth_url = f"{AUTHORIZE_URL}?key={CONSUMER_KEY}&token={token_val}"
 
-        # Save temporary tokens to database
         if async_session:
             async with async_session() as session:
                 async with session.begin():
@@ -148,7 +147,6 @@ async def etrade_auth_complete(data: dict = Body(...)):
         if not verifier:
             raise HTTPException(400, "Missing verification code")
 
-        # Load temporary tokens from database
         token_val, secret_val = None, None
         if async_session:
             async with async_session() as session:
@@ -160,7 +158,6 @@ async def etrade_auth_complete(data: dict = Body(...)):
         if not token_val or not secret_val:
             raise HTTPException(400, "No active request token found. Please start linking again.")
 
-        # Exchange for access tokens
         etrade_session = OAuth1Session(
             client_key=CONSUMER_KEY,
             client_secret=CONSUMER_SECRET,
@@ -177,16 +174,78 @@ async def etrade_auth_complete(data: dict = Body(...)):
             raise Exception("Failed to get access tokens from E*TRADE")
 
         save_tokens(final_token, final_secret)
-
         logger.info("✅ E*TRADE linking completed successfully with REAL tokens")
-        return {
-            "status": "success",
-            "message": "E*TRADE Account Successfully Linked!"
-        }
+
+        return {"status": "success", "message": "E*TRADE Account Successfully Linked!"}
 
     except Exception as e:
         logger.error(f"Complete link failed: {str(e)}")
         raise HTTPException(500, detail=f"Linking failed: {str(e)}")
+
+
+# ==================== NEW: Token Renew Endpoint ====================
+@app.post("/etrade/auth/renew")
+async def etrade_auth_renew(data: dict = Body(...)):
+    try:
+        access_token = data.get("access_token") or os.getenv("ETRADE_ACCESS_TOKEN")
+        access_token_secret = data.get("access_token_secret") or os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
+
+        if not access_token or not access_token_secret:
+            raise HTTPException(400, "Missing access tokens")
+
+        # Use pyetrade to renew
+        auth_manager = pyetrade.ETradeAccessManager(
+            CONSUMER_KEY,
+            CONSUMER_SECRET,
+            access_token,
+            access_token_secret
+        )
+
+        renewed = auth_manager.renew_access_token()
+
+        if renewed:
+            new_token = auth_manager.oauth_token
+            new_secret = auth_manager.oauth_token_secret
+            save_tokens(new_token, new_secret)
+            logger.info("✅ Tokens renewed successfully")
+            return {"status": "success", "message": "Tokens renewed"}
+        else:
+            raise HTTPException(400, "Token renewal failed")
+
+    except Exception as e:
+        logger.error(f"Renew failed: {str(e)}")
+        raise HTTPException(500, detail=f"Renew failed: {str(e)}")
+
+
+# ==================== NEW: Quote Endpoint ====================
+@app.get("/etrade/quote")
+async def get_quotes(symbols: str = Query(...)):
+    try:
+        tokens = load_tokens()
+        if not tokens:
+            raise HTTPException(401, "E*TRADE account not linked")
+
+        market = pyetrade.ETradeMarket(
+            CONSUMER_KEY,
+            CONSUMER_SECRET,
+            tokens["oauth_token"],
+            tokens["oauth_token_secret"],
+            dev=is_sandbox
+        )
+
+        symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
+        response = await asyncio.to_thread(
+            market.get_quote,
+            symbol_list,
+            resp_format="json"
+        )
+
+        return response
+
+    except Exception as e:
+        logger.error(f"Quote failed: {str(e)}")
+        raise HTTPException(500, detail=f"Failed to get quotes: {str(e)}")
+
 
 # ==================== E*TRADE ACCOUNT STATUS ====================
 @app.get("/etrade/account")
@@ -196,11 +255,11 @@ async def get_etrade_account():
         return {"status": "not_linked", "linked": False}
     return {"status": "linked", "linked": True}
 
-# ==================== DATABASE (Improved Fallback) ====================
+
+# ==================== DATABASE ====================
 async def init_db():
     global engine, async_session
 
-    # Prefer SQLite unless Postgres + asyncpg is confirmed
     use_postgres = False
     if DATABASE_URL and "postgres" in DATABASE_URL:
         try:
@@ -212,10 +271,8 @@ async def init_db():
 
     if use_postgres:
         target_url = DATABASE_URL
-        logger.info("Using Postgres for session state")
     else:
         target_url = "sqlite+aiosqlite:///etrade_cache.db"
-        logger.info("Using SQLite for session state (recommended)")
 
     try:
         engine = create_async_engine(target_url, echo=False)
@@ -228,12 +285,14 @@ async def init_db():
     except Exception as e:
         logger.error(f"Database failed: {e}")
 
+
 # ==================== SAFETY ====================
 async def check_risk_limits():
     if circuit_breaker_open:
         raise HTTPException(503, "Circuit breaker open")
 
-# ==================== LIVE TRADING (Preview + Place) ====================
+
+# ==================== LIVE TRADING ====================
 async def execute_live_order(payload: dict):
     if not LIVE_TRADING or is_sandbox:
         return {"status": "skipped"}
@@ -278,7 +337,6 @@ async def execute_live_order(payload: dict):
         if limit_price:
             order_payload["Order"][0]["limitPrice"] = limit_price
 
-        # Preview first (safer)
         preview_resp = await asyncio.to_thread(
             orders.preview_equity_order,
             resp_format="json",
@@ -288,7 +346,6 @@ async def execute_live_order(payload: dict):
         )
         preview_id = preview_resp['PreviewOrderResponse']['PreviewIds']['PreviewId'][0]['previewId']
 
-        # Place order
         final_resp = await asyncio.to_thread(
             orders.place_equity_order,
             resp_format="json",
@@ -309,6 +366,7 @@ async def execute_live_order(payload: dict):
         logger.error(f"Trade failed: {e}")
         raise
 
+
 # ==================== WORKER ====================
 async def placement_worker():
     while not _worker_stop:
@@ -322,9 +380,11 @@ async def placement_worker():
             logger.error(f"Worker error: {e}")
             await asyncio.sleep(2)
 
+
 async def start_worker():
     global _worker_task
     _worker_task = asyncio.create_task(placement_worker())
+
 
 # ==================== STARTUP / SHUTDOWN ====================
 @app.on_event("startup")
@@ -342,12 +402,14 @@ async def on_startup():
     await start_worker()
     logger.info("✅ Bot ready")
 
+
 @app.on_event("shutdown")
 async def on_shutdown():
     global _worker_stop
     _worker_stop = True
     if redis:
         await redis.close()
+
 
 # ==================== ENDPOINTS ====================
 @app.post("/webhook")
@@ -359,6 +421,7 @@ async def webhook(payload: WebhookPayload = Body(...)):
     await redis.rpush(QUEUE_KEY, json.dumps({"payload": payload.dict()}))
     return {"status": "queued"}
 
+
 @app.get("/health")
 async def health():
     tokens = load_tokens()
@@ -369,6 +432,7 @@ async def health():
         "linked": bool(tokens),
         "ready_for_live_trading": bool(tokens and TARGET_ACCOUNT_ID and LIVE_TRADING and not is_sandbox)
     }
+
 
 if __name__ == "__main__":
     import uvicorn
