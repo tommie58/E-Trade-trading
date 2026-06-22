@@ -107,7 +107,7 @@ async def etrade_auth_start():
         secret_val = fetch_response.get("oauth_token_secret")
 
         if not token_val or not secret_val:
-            raise Exception("Failed to get request token")
+            raise Exception("Failed to get request token from E*TRADE")
 
         auth_url = f"{AUTHORIZE_URL}?key={CONSUMER_KEY}&token={token_val}"
 
@@ -138,7 +138,7 @@ async def etrade_auth_complete(data: dict = Body(...)):
                     secret_val = cached.oauth_token_secret
 
         if not token_val or not secret_val:
-            raise HTTPException(400, "No active request token found")
+            raise HTTPException(400, "No active request token found. Please start linking again.")
 
         etrade_session = OAuth1Session(CONSUMER_KEY, CONSUMER_SECRET, resource_owner_key=token_val, resource_owner_secret=secret_val, verifier=verifier)
         access_tokens = etrade_session.fetch_access_token(ACCESS_TOKEN_URL)
@@ -147,16 +147,16 @@ async def etrade_auth_complete(data: dict = Body(...)):
         final_secret = access_tokens.get("oauth_token_secret")
 
         save_tokens(final_token, final_secret)
-        return {"status": "success", "message": "Linked successfully"}
+        return {"status": "success", "message": "E*TRADE account linked successfully"}
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-# ==================== QUOTE ENDPOINT ====================
+# ==================== QUOTE ENDPOINT (with retry) ====================
 @app.get("/etrade/quote")
 async def get_quotes(symbols: str = Query(...)):
     tokens = load_tokens()
     if not tokens:
-        raise HTTPException(401, "Not linked")
+        raise HTTPException(401, "E*TRADE account not linked")
 
     market = pyetrade.ETradeMarket(CONSUMER_KEY, CONSUMER_SECRET, tokens["oauth_token"], tokens["oauth_token_secret"], dev=is_sandbox)
     symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
@@ -165,20 +165,38 @@ async def get_quotes(symbols: str = Query(...)):
         try:
             return await asyncio.to_thread(market.get_quote, symbol_list, resp_format="json")
         except Exception as e:
-            if attempt < 4 and "401" in str(e):
+            if attempt < 4 and ("401" in str(e) or "Unauthorized" in str(e)):
                 await asyncio.sleep(3)
                 continue
             raise HTTPException(500, detail=str(e))
 
-# ==================== DATABASE ====================
+# ==================== DATABASE (Safe SQLite Fallback) ====================
 async def init_db():
     global engine, async_session
-    target_url = DATABASE_URL if DATABASE_URL else "sqlite+aiosqlite:///etrade_cache.db"
+
+    use_postgres = False
+    if DATABASE_URL and "postgres" in DATABASE_URL:
+        try:
+            import asyncpg
+            use_postgres = True
+        except ImportError:
+            logger.warning("asyncpg not found — falling back to SQLite")
+            use_postgres = False
+
+    if use_postgres:
+        target_url = DATABASE_URL
+        logger.info("Using Postgres for database")
+    else:
+        target_url = "sqlite+aiosqlite:///etrade_cache.db"
+        logger.info("Using SQLite for database (recommended)")
+
     try:
         engine = create_async_engine(target_url, echo=False)
         async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+
         logger.info("✅ Database connected")
     except Exception as e:
         logger.error(f"Database error: {e}")
@@ -188,7 +206,7 @@ async def check_risk_limits():
     if circuit_breaker_open:
         raise HTTPException(503, "Circuit breaker open")
 
-# ==================== LIVE TRADING (RESPECTS MODE) ====================
+# ==================== LIVE TRADING (Respects mode from signal) ====================
 async def execute_live_order(payload: dict):
     mode = payload.get("mode", "paper").lower()
 
@@ -198,7 +216,7 @@ async def execute_live_order(payload: dict):
     await check_risk_limits()
     tokens = load_tokens()
     if not tokens:
-        raise Exception("No tokens")
+        raise Exception("E*TRADE tokens not set")
 
     orders = pyetrade.ETradeOrder(CONSUMER_KEY, CONSUMER_SECRET, tokens["oauth_token"], tokens["oauth_token_secret"], dev=is_sandbox)
 
@@ -231,7 +249,7 @@ async def execute_live_order(payload: dict):
     preview_id = preview['PreviewOrderResponse']['PreviewIds']['PreviewId'][0]['previewId']
 
     final = await asyncio.to_thread(orders.place_equity_order, resp_format="json", accountIdKey=TARGET_ACCOUNT_ID, order=order_payload, clientOrderId=client_order_id, previewId=preview_id)
-    logger.info(f"✅ LIVE TRADE: {ticker}")
+    logger.info(f"✅ LIVE TRADE EXECUTED: {ticker}")
     return {"status": "success", "response": final}
 
 # ==================== WORKER ====================
@@ -251,7 +269,7 @@ async def start_worker():
     global _worker_task
     _worker_task = asyncio.create_task(placement_worker())
 
-# ==================== STARTUP ====================
+# ==================== STARTUP / SHUTDOWN ====================
 @app.on_event("startup")
 async def on_startup():
     global redis
@@ -261,7 +279,7 @@ async def on_startup():
         try:
             redis = await redis_from_url(REDIS_URL, decode_responses=True)
         except Exception as e:
-            logger.error(f"Redis error: {e}")
+            logger.error(f"Redis failed: {e}")
 
     await init_db()
     await start_worker()
