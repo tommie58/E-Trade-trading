@@ -93,7 +93,7 @@ def save_tokens(token: str, token_secret: str):
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
     logger.info("Add these to Railway Variables and redeploy!")
 
-# ==================== OAUTH LINKING (IMPROVED - requests_oauthlib + DB State) ====================
+# ==================== OAUTH LINKING (requests_oauthlib + DB State) ====================
 REQUEST_TOKEN_URL = "https://api.etrade.com/oauth/request_token"
 AUTHORIZE_URL = "https://us.etrade.com/e/t/etws/authorize"
 ACCESS_TOKEN_URL = "https://api.etrade.com/oauth/access_token"
@@ -196,14 +196,26 @@ async def get_etrade_account():
         return {"status": "not_linked", "linked": False}
     return {"status": "linked", "linked": True}
 
-# ==================== DATABASE ====================
+# ==================== DATABASE (Improved Fallback) ====================
 async def init_db():
     global engine, async_session
-    if not DATABASE_URL:
-        logger.warning("No DATABASE_URL set - using SQLite fallback")
-        target_url = "sqlite+aiosqlite:///etrade_cache.db"
-    else:
+
+    # Prefer SQLite unless Postgres + asyncpg is confirmed
+    use_postgres = False
+    if DATABASE_URL and "postgres" in DATABASE_URL:
+        try:
+            import asyncpg
+            use_postgres = True
+        except ImportError:
+            logger.warning("asyncpg not found — falling back to SQLite")
+            use_postgres = False
+
+    if use_postgres:
         target_url = DATABASE_URL
+        logger.info("Using Postgres for session state")
+    else:
+        target_url = "sqlite+aiosqlite:///etrade_cache.db"
+        logger.info("Using SQLite for session state (recommended)")
 
     try:
         engine = create_async_engine(target_url, echo=False)
@@ -266,7 +278,7 @@ async def execute_live_order(payload: dict):
         if limit_price:
             order_payload["Order"][0]["limitPrice"] = limit_price
 
-        # Preview first
+        # Preview first (safer)
         preview_resp = await asyncio.to_thread(
             orders.preview_equity_order,
             resp_format="json",
