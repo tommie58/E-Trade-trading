@@ -1,13 +1,14 @@
 from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
-from typing import Optional, List
+from typing import Optional
 import pyetrade
 import os
 import json
 import logging
 import uuid
 import asyncio
+import time
 from datetime import datetime
 from redis.asyncio import from_url as redis_from_url
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -183,43 +184,33 @@ async def etrade_auth_complete(data: dict = Body(...)):
         raise HTTPException(500, detail=f"Linking failed: {str(e)}")
 
 
-# ==================== IMPROVED: Token Renew Endpoint ====================
+# ==================== IMPROVED RENEW ENDPOINT ====================
 @app.post("/etrade/auth/renew")
 async def etrade_auth_renew(data: dict = Body(...)):
     try:
-        # Get tokens from request body (mobile app) or environment
         access_token = data.get("access_token") or os.getenv("ETRADE_ACCESS_TOKEN")
         access_token_secret = data.get("access_token_secret") or os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
 
         if not access_token or not access_token_secret:
-            raise HTTPException(400, "Missing access tokens for renewal")
+            raise HTTPException(400, "Missing access tokens")
 
         logger.info("Attempting to validate current tokens before renewal...")
 
-        # Step 1: Try to use current tokens with a lightweight call
         try:
             accounts = pyetrade.ETradeAccounts(
-                CONSUMER_KEY,
-                CONSUMER_SECRET,
-                access_token,
-                access_token_secret,
+                CONSUMER_KEY, CONSUMER_SECRET,
+                access_token, access_token_secret,
                 dev=is_sandbox
             )
-            # Lightweight call to test if tokens are still valid
-            test_response = await asyncio.to_thread(accounts.list_accounts, resp_format="json")
-            logger.info("✅ Current tokens are still valid. No renewal needed.")
+            await asyncio.to_thread(accounts.list_accounts, resp_format="json")
+            logger.info("✅ Current tokens are still valid.")
             return {"status": "success", "message": "Tokens are still valid", "renewed": False}
+        except Exception:
+            logger.warning("Current tokens appear invalid. Attempting renewal...")
 
-        except Exception as auth_error:
-            logger.warning(f"Current tokens appear invalid or expired: {auth_error}")
-
-        # Step 2: Attempt renewal using ETradeAccessManager
-        logger.info("Attempting token renewal via ETradeAccessManager...")
         auth_manager = pyetrade.ETradeAccessManager(
-            CONSUMER_KEY,
-            CONSUMER_SECRET,
-            access_token,
-            access_token_secret
+            CONSUMER_KEY, CONSUMER_SECRET,
+            access_token, access_token_secret
         )
 
         renewed = await asyncio.to_thread(auth_manager.renew_access_token)
@@ -229,13 +220,8 @@ async def etrade_auth_renew(data: dict = Body(...)):
             new_secret = auth_manager.oauth_token_secret
             save_tokens(new_token, new_secret)
             logger.info("✅ Tokens renewed successfully")
-            return {
-                "status": "success",
-                "message": "Tokens renewed successfully",
-                "renewed": True
-            }
+            return {"status": "success", "message": "Tokens renewed", "renewed": True}
         else:
-            logger.error("Token renewal returned False")
             raise HTTPException(400, "Token renewal failed")
 
     except Exception as e:
@@ -243,34 +229,56 @@ async def etrade_auth_renew(data: dict = Body(...)):
         raise HTTPException(500, detail=f"Renew failed: {str(e)}")
 
 
-# ==================== Quote Endpoint ====================
+# ==================== IMPROVED QUOTE ENDPOINT WITH RETRY ====================
 @app.get("/etrade/quote")
 async def get_quotes(symbols: str = Query(...)):
-    try:
-        tokens = load_tokens()
-        if not tokens:
-            raise HTTPException(401, "E*TRADE account not linked")
+    tokens = load_tokens()
+    if not tokens:
+        raise HTTPException(401, "E*TRADE account not linked")
 
-        market = pyetrade.ETradeMarket(
-            CONSUMER_KEY,
-            CONSUMER_SECRET,
-            tokens["oauth_token"],
-            tokens["oauth_token_secret"],
-            dev=is_sandbox
-        )
+    market = pyetrade.ETradeMarket(
+        CONSUMER_KEY,
+        CONSUMER_SECRET,
+        tokens["oauth_token"],
+        tokens["oauth_token_secret"],
+        dev=is_sandbox
+    )
 
-        symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
-        response = await asyncio.to_thread(
-            market.get_quote,
-            symbol_list,
-            resp_format="json"
-        )
+    symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
 
-        return response
+    max_retries = 4
+    delay_seconds = 3
 
-    except Exception as e:
-        logger.error(f"Quote failed: {str(e)}")
-        raise HTTPException(500, detail=f"Failed to get quotes: {str(e)}")
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"Fetching quotes (attempt {attempt}/{max_retries})...")
+            response = await asyncio.to_thread(
+                market.get_quote,
+                symbol_list,
+                resp_format="json"
+            )
+            logger.info("✅ Quote request successful")
+            return response
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(f"Quote attempt {attempt} failed: {error_msg}")
+
+            if "401" in error_msg or "Unauthorized" in error_msg:
+                if attempt < max_retries:
+                    logger.info(f"Waiting {delay_seconds} seconds before retry...")
+                    await asyncio.sleep(delay_seconds)
+                    continue
+                else:
+                    raise HTTPException(
+                        401,
+                        detail="Failed to get quotes after multiple retries. Tokens may need more time to activate."
+                    )
+            else:
+                # For other errors, don't retry
+                raise HTTPException(500, detail=f"Failed to get quotes: {error_msg}")
+
+    raise HTTPException(500, detail="Unexpected error in quote endpoint")
 
 
 # ==================== E*TRADE ACCOUNT STATUS ====================
