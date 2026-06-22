@@ -183,17 +183,38 @@ async def etrade_auth_complete(data: dict = Body(...)):
         raise HTTPException(500, detail=f"Linking failed: {str(e)}")
 
 
-# ==================== NEW: Token Renew Endpoint ====================
+# ==================== IMPROVED: Token Renew Endpoint ====================
 @app.post("/etrade/auth/renew")
 async def etrade_auth_renew(data: dict = Body(...)):
     try:
+        # Get tokens from request body (mobile app) or environment
         access_token = data.get("access_token") or os.getenv("ETRADE_ACCESS_TOKEN")
         access_token_secret = data.get("access_token_secret") or os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
 
         if not access_token or not access_token_secret:
-            raise HTTPException(400, "Missing access tokens")
+            raise HTTPException(400, "Missing access tokens for renewal")
 
-        # Use pyetrade to renew
+        logger.info("Attempting to validate current tokens before renewal...")
+
+        # Step 1: Try to use current tokens with a lightweight call
+        try:
+            accounts = pyetrade.ETradeAccounts(
+                CONSUMER_KEY,
+                CONSUMER_SECRET,
+                access_token,
+                access_token_secret,
+                dev=is_sandbox
+            )
+            # Lightweight call to test if tokens are still valid
+            test_response = await asyncio.to_thread(accounts.list_accounts, resp_format="json")
+            logger.info("✅ Current tokens are still valid. No renewal needed.")
+            return {"status": "success", "message": "Tokens are still valid", "renewed": False}
+
+        except Exception as auth_error:
+            logger.warning(f"Current tokens appear invalid or expired: {auth_error}")
+
+        # Step 2: Attempt renewal using ETradeAccessManager
+        logger.info("Attempting token renewal via ETradeAccessManager...")
         auth_manager = pyetrade.ETradeAccessManager(
             CONSUMER_KEY,
             CONSUMER_SECRET,
@@ -201,15 +222,20 @@ async def etrade_auth_renew(data: dict = Body(...)):
             access_token_secret
         )
 
-        renewed = auth_manager.renew_access_token()
+        renewed = await asyncio.to_thread(auth_manager.renew_access_token)
 
         if renewed:
             new_token = auth_manager.oauth_token
             new_secret = auth_manager.oauth_token_secret
             save_tokens(new_token, new_secret)
             logger.info("✅ Tokens renewed successfully")
-            return {"status": "success", "message": "Tokens renewed"}
+            return {
+                "status": "success",
+                "message": "Tokens renewed successfully",
+                "renewed": True
+            }
         else:
+            logger.error("Token renewal returned False")
             raise HTTPException(400, "Token renewal failed")
 
     except Exception as e:
@@ -217,7 +243,7 @@ async def etrade_auth_renew(data: dict = Body(...)):
         raise HTTPException(500, detail=f"Renew failed: {str(e)}")
 
 
-# ==================== NEW: Quote Endpoint ====================
+# ==================== Quote Endpoint ====================
 @app.get("/etrade/quote")
 async def get_quotes(symbols: str = Query(...)):
     try:
