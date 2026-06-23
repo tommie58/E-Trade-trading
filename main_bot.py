@@ -151,7 +151,46 @@ async def etrade_auth_complete(data: dict = Body(...)):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-# ==================== QUOTE ENDPOINT (with retry) ====================
+# ==================== NEW: Disconnect Endpoint ====================
+@app.post("/etrade/disconnect")
+async def etrade_disconnect():
+    logger.info("User requested account disconnect")
+    # You can extend this later to clear tokens if needed
+    return {"status": "success", "message": "Disconnect request received"}
+
+# ==================== IMPROVED: Renew Endpoint ====================
+@app.post("/etrade/auth/renew")
+async def etrade_auth_renew(data: dict = Body(...)):
+    try:
+        access_token = data.get("access_token") or os.getenv("ETRADE_ACCESS_TOKEN")
+        access_token_secret = data.get("access_token_secret") or os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
+
+        if not access_token or not access_token_secret:
+            raise HTTPException(400, "Missing access tokens")
+
+        # Try to validate current tokens first
+        try:
+            accounts = pyetrade.ETradeAccounts(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret, dev=is_sandbox)
+            await asyncio.to_thread(accounts.list_accounts, resp_format="json")
+            return {"status": "success", "message": "Tokens are still valid", "renewed": False}
+        except Exception:
+            pass  # Tokens are invalid, try to renew
+
+        auth_manager = pyetrade.ETradeAccessManager(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret)
+        renewed = await asyncio.to_thread(auth_manager.renew_access_token)
+
+        if renewed:
+            new_token = auth_manager.oauth_token
+            new_secret = auth_manager.oauth_token_secret
+            save_tokens(new_token, new_secret)
+            return {"status": "success", "message": "Tokens renewed successfully", "renewed": True}
+        else:
+            raise HTTPException(400, "Token renewal failed")
+
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+# ==================== QUOTE ENDPOINT ====================
 @app.get("/etrade/quote")
 async def get_quotes(symbols: str = Query(...)):
     tokens = load_tokens()
@@ -170,7 +209,15 @@ async def get_quotes(symbols: str = Query(...)):
                 continue
             raise HTTPException(500, detail=str(e))
 
-# ==================== DATABASE (Safe SQLite Fallback) ====================
+# ==================== ACCOUNT STATUS ====================
+@app.get("/etrade/account")
+async def get_etrade_account():
+    tokens = load_tokens()
+    if not tokens:
+        return {"status": "not_linked", "linked": False}
+    return {"status": "linked", "linked": True}
+
+# ==================== DATABASE ====================
 async def init_db():
     global engine, async_session
 
@@ -185,10 +232,8 @@ async def init_db():
 
     if use_postgres:
         target_url = DATABASE_URL
-        logger.info("Using Postgres for database")
     else:
         target_url = "sqlite+aiosqlite:///etrade_cache.db"
-        logger.info("Using SQLite for database (recommended)")
 
     try:
         engine = create_async_engine(target_url, echo=False)
@@ -206,7 +251,7 @@ async def check_risk_limits():
     if circuit_breaker_open:
         raise HTTPException(503, "Circuit breaker open")
 
-# ==================== LIVE TRADING (Respects mode from signal) ====================
+# ==================== LIVE TRADING (Respects mode) ====================
 async def execute_live_order(payload: dict):
     mode = payload.get("mode", "paper").lower()
 
