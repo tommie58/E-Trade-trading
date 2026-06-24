@@ -300,7 +300,7 @@ async def check_risk_limits():
 
 # ==================== LIVE TRADING (Equity + Options) ====================
 async def execute_live_order(payload: dict):
-    global consecutive_failures   # ← Fixed scoping issue
+    global consecutive_failures
 
     mode = payload.get("mode", "paper").lower()
     instrument = payload.get("instrument", "stock").lower()
@@ -324,7 +324,7 @@ async def execute_live_order(payload: dict):
 
     try:
         if instrument == "option":
-            # OPTION ORDER
+            # OPTION ORDER (direct place - no preview for compatibility)
             symbol = payload["ticker"]
             strike = payload.get("strike_hint") or payload.get("strike")
             expiry = payload.get("expiration_hint") or payload.get("expiry")
@@ -356,22 +356,12 @@ async def execute_live_order(payload: dict):
                 }]
             }
 
-            preview = await asyncio.to_thread(
-                orders.preview_option_order,
-                resp_format="json",
-                accountIdKey=TARGET_ACCOUNT_ID,
-                order=order_payload,
-                clientOrderId=client_order_id
-            )
-            preview_id = preview['PreviewOrderResponse']['PreviewIds']['PreviewId'][0]['previewId']
-
             final = await asyncio.to_thread(
                 orders.place_option_order,
                 resp_format="json",
                 accountIdKey=TARGET_ACCOUNT_ID,
                 order=order_payload,
-                clientOrderId=client_order_id,
-                previewId=preview_id
+                clientOrderId=client_order_id
             )
             logger.info(f"✅ LIVE OPTION TRADE: {symbol} {call_put}")
             return {"status": "success", "response": final}
