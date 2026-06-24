@@ -151,14 +151,15 @@ async def etrade_auth_complete(data: dict = Body(...)):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-# ==================== NEW: Disconnect Endpoint ====================
-@app.post("/etrade/disconnect")
-async def etrade_disconnect():
-    logger.info("User requested account disconnect")
-    # You can extend this later to clear tokens if needed
-    return {"status": "success", "message": "Disconnect request received"}
+# ==================== ACCOUNT STATUS ====================
+@app.get("/etrade/account")
+async def get_etrade_account():
+    tokens = load_tokens()
+    if not tokens:
+        return {"status": "not_linked", "linked": False}
+    return {"status": "linked", "linked": True}
 
-# ==================== IMPROVED: Renew Endpoint ====================
+# ==================== RENEW ====================
 @app.post("/etrade/auth/renew")
 async def etrade_auth_renew(data: dict = Body(...)):
     try:
@@ -168,29 +169,33 @@ async def etrade_auth_renew(data: dict = Body(...)):
         if not access_token or not access_token_secret:
             raise HTTPException(400, "Missing access tokens")
 
-        # Try to validate current tokens first
         try:
             accounts = pyetrade.ETradeAccounts(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret, dev=is_sandbox)
             await asyncio.to_thread(accounts.list_accounts, resp_format="json")
             return {"status": "success", "message": "Tokens are still valid", "renewed": False}
         except Exception:
-            pass  # Tokens are invalid, try to renew
+            pass
 
         auth_manager = pyetrade.ETradeAccessManager(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret)
         renewed = await asyncio.to_thread(auth_manager.renew_access_token)
 
         if renewed:
             new_token = auth_manager.oauth_token
-            new_secret = auth_manager.oauth_token_secret
-            save_tokens(new_token, new_secret)
-            return {"status": "success", "message": "Tokens renewed successfully", "renewed": True}
+            noumber = auth_manager.oauth_token_secret
+            save_tokens(new_token, noumber)
+            return {"status": "success", "message": "Tokens renewed", "renewed": True}
         else:
             raise HTTPException(400, "Token renewal failed")
-
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-# ==================== QUOTE ENDPOINT ====================
+# ==================== DISCONNECT ====================
+@app.post("/etrade/disconnect")
+async def etrade_disconnect():
+    logger.info("User requested account disconnect")
+    return {"status": "success", "message": "Disconnect request received"}
+
+# ==================== QUOTE (with retry) ====================
 @app.get("/etrade/quote")
 async def get_quotes(symbols: str = Query(...)):
     tokens = load_tokens()
@@ -208,14 +213,6 @@ async def get_quotes(symbols: str = Query(...)):
                 await asyncio.sleep(3)
                 continue
             raise HTTPException(500, detail=str(e))
-
-# ==================== ACCOUNT STATUS ====================
-@app.get("/etrade/account")
-async def get_etrade_account():
-    tokens = load_tokens()
-    if not tokens:
-        return {"status": "not_linked", "linked": False}
-    return {"status": "linked", "linked": True}
 
 # ==================== DATABASE ====================
 async def init_db():
@@ -251,9 +248,10 @@ async def check_risk_limits():
     if circuit_breaker_open:
         raise HTTPException(503, "Circuit breaker open")
 
-# ==================== LIVE TRADING (Respects mode) ====================
+# ==================== LIVE TRADING (Equity + Options) ====================
 async def execute_live_order(payload: dict):
     mode = payload.get("mode", "paper").lower()
+    instrument = payload.get("instrument", "stock").lower()
 
     if mode != "live" or not LIVE_TRADING or is_sandbox:
         return {"status": "skipped", "reason": f"mode={mode}"}
@@ -263,39 +261,121 @@ async def execute_live_order(payload: dict):
     if not tokens:
         raise Exception("E*TRADE tokens not set")
 
-    orders = pyetrade.ETradeOrder(CONSUMER_KEY, CONSUMER_SECRET, tokens["oauth_token"], tokens["oauth_token_secret"], dev=is_sandbox)
+    orders = pyetrade.ETradeOrder(
+        CONSUMER_KEY, CONSUMER_SECRET,
+        tokens["oauth_token"], tokens["oauth_token_secret"],
+        dev=is_sandbox
+    )
 
-    ticker = payload["ticker"]
-    action = payload["action"]
     client_order_id = str(uuid.uuid4())[:20]
-    quantity = payload.get("position_size_shares", 1)
-    price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
-    limit_price = payload.get("limit_price")
-    order_action = "BUY" if action == "BUY" else "SELL"
+    action = payload["action"].upper()
 
-    order_payload = {
-        "Order": [{
-            "allOrNone": False,
-            "priceType": price_type,
-            "orderTerm": "GOOD_FOR_DAY",
-            "marketSession": "REGULAR",
-            "Instrument": [{
-                "Product": {"securityType": "EQ", "symbol": ticker},
-                "orderAction": order_action,
-                "quantityType": "QUANTITY",
-                "quantity": quantity
-            }]
-        }]
-    }
-    if limit_price:
-        order_payload["Order"][0]["limitPrice"] = limit_price
+    try:
+        if instrument == "option":
+            # OPTION ORDER
+            symbol = payload["ticker"]
+            strike = payload.get("strike_hint") or payload.get("strike")
+            expiry = payload.get("expiration_hint") or payload.get("expiry")
+            call_put = payload.get("option_right", "CALL").upper()
+            quantity = payload.get("option_contracts", 1)
+            order_action = "BUY_OPEN" if action == "BUY" else "SELL_OPEN"
 
-    preview = await asyncio.to_thread(orders.preview_equity_order, resp_format="json", accountIdKey=TARGET_ACCOUNT_ID, order=order_payload, clientOrderId=client_order_id)
-    preview_id = preview['PreviewOrderResponse']['PreviewIds']['PreviewId'][0]['previewId']
+            if not strike or not expiry:
+                raise Exception("Missing strike or expiration for option order")
 
-    final = await asyncio.to_thread(orders.place_equity_order, resp_format="json", accountIdKey=TARGET_ACCOUNT_ID, order=order_payload, clientOrderId=client_order_id, previewId=preview_id)
-    logger.info(f"✅ LIVE TRADE EXECUTED: {ticker}")
-    return {"status": "success", "response": final}
+            order_payload = {
+                "Order": [{
+                    "allOrNone": False,
+                    "priceType": "MARKET",
+                    "orderTerm": "GOOD_FOR_DAY",
+                    "marketSession": "REGULAR",
+                    "Instrument": [{
+                        "Product": {
+                            "securityType": "OPTN",
+                            "symbol": symbol,
+                            "callPut": call_put,
+                            "strikePrice": strike,
+                            "expiryDate": expiry
+                        },
+                        "orderAction": order_action,
+                        "quantityType": "QUANTITY",
+                        "quantity": quantity
+                    }]
+                }]
+            }
+
+            preview = await asyncio.to_thread(
+                orders.preview_option_order,
+                resp_format="json",
+                accountIdKey=TARGET_ACCOUNT_ID,
+                order=order_payload,
+                clientOrderId=client_order_id
+            )
+            preview_id = preview['PreviewOrderResponse']['PreviewIds']['PreviewId'][0]['previewId']
+
+            final = await asyncio.to_thread(
+                orders.place_option_order,
+                resp_format="json",
+                accountIdKey=TARGET_ACCOUNT_ID,
+                order=order_payload,
+                clientOrderId=client_order_id,
+                previewId=preview_id
+            )
+            logger.info(f"✅ LIVE OPTION TRADE: {symbol} {call_put}")
+            return {"status": "success", "response": final}
+
+        else:
+            # EQUITY ORDER
+            ticker = payload["ticker"]
+            quantity = payload.get("position_size_shares", 1)
+            price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
+            limit_price = payload.get("limit_price")
+            order_action = "BUY" if action == "BUY" else "SELL"
+
+            order_payload = {
+                "Order": [{
+                    "allOrNone": False,
+                    "priceType": price_type,
+                    "orderTerm": "GOOD_FOR_DAY",
+                    "marketSession": "REGULAR",
+                    "Instrument": [{
+                        "Product": {"securityType": "EQ", "symbol": ticker},
+                        "orderAction": order_action,
+                        "quantityType": "QUANTITY",
+                        "quantity": quantity
+                    }]
+                }]
+            }
+            if limit_price:
+                order_payload["Order"][0]["limitPrice"] = limit_price
+
+            preview = await asyncio.to_thread(
+                orders.preview_equity_order,
+                resp_format="json",
+                accountIdKey=TARGET_ACCOUNT_ID,
+                order=order_payload,
+                clientOrderId=client_order_id
+            )
+            preview_id = preview['PreviewOrderResponse']['PreviewIds']['PreviewId'][0]['previewId']
+
+            final = await asyncio.to_thread(
+                orders.place_equity_order,
+                resp_format="json",
+                accountIdKey=TARGET_ACCOUNT_ID,
+                order=order_payload,
+                clientOrderId=client_order_id,
+                previewId=preview_id
+            )
+            logger.info(f"✅ LIVE EQUITY TRADE: {ticker}")
+            return {"status": "success", "response": final}
+
+    except Exception as e:
+        consecutive_failures += 1
+        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            global circuit_breaker_open
+            circuit_breaker_open = True
+        logger.error(f"Trade failed: {e}")
+        raise
 
 # ==================== WORKER ====================
 async def placement_worker():
