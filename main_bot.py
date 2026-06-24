@@ -79,18 +79,17 @@ class WebhookPayload(BaseModel):
             raise ValueError("Invalid action")
         return str(v).upper()
 
-# ==================== TOKEN PERSISTENCE (FIXED) ====================
+# ==================== TOKEN PERSISTENCE ====================
 def save_tokens(token: str, token_secret: str):
     logger.info("=== NEW TOKENS RECEIVED ===")
     logger.info(f"ETRADE_ACCESS_TOKEN={token}")
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
 
-    # Persist to database so load_tokens() can read them later
     if async_session:
         try:
             asyncio.create_task(_save_tokens_to_db(token, token_secret))
         except Exception as e:
-            logger.warning(f"Failed to schedule token persistence: {e}")
+            logger.warning(f"Failed to persist tokens: {e}")
 
 
 async def _save_tokens_to_db(token: str, token_secret: str):
@@ -111,29 +110,20 @@ async def _save_tokens_to_db(token: str, token_secret: str):
 
 
 def load_tokens():
-    # 1. Try environment variables first (Railway Variables)
     token = os.getenv("ETRADE_ACCESS_TOKEN")
     secret = os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
     if token and secret:
         return {"oauth_token": token, "oauth_token_secret": secret}
 
-    # 2. Fall back to database (tokens saved after linking)
     if async_session:
         try:
             loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Create task if we're already in an async context
-                task = asyncio.create_task(_load_tokens_from_db())
-                # For simplicity in this version, we'll return None if we can't await
-                # In practice, tokens will be available after the first successful link
-                return None
-            else:
+            if not loop.is_running():
                 tokens = loop.run_until_complete(_load_tokens_from_db())
                 if tokens:
                     return tokens
         except Exception as e:
             logger.warning(f"Could not load tokens from DB: {e}")
-
     return None
 
 
@@ -211,7 +201,7 @@ async def etrade_auth_complete(data: dict = Body(...)):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-# ==================== ACCOUNT STATUS ====================
+# ==================== ACCOUNT ====================
 @app.get("/etrade/account")
 async def get_etrade_account():
     tokens = load_tokens()
@@ -255,7 +245,7 @@ async def etrade_disconnect():
     logger.info("User requested account disconnect")
     return {"status": "success", "message": "Disconnect request received"}
 
-# ==================== QUOTE (with retry) ====================
+# ==================== QUOTE ====================
 @app.get("/etrade/quote")
 async def get_quotes(symbols: str = Query(...)):
     tokens = load_tokens()
@@ -332,7 +322,6 @@ async def execute_live_order(payload: dict):
 
     try:
         if instrument == "option":
-            # OPTION ORDER
             symbol = payload["ticker"]
             strike = payload.get("strike_hint") or payload.get("strike")
             expiry = payload.get("expiration_hint") or payload.get("expiry")
@@ -385,7 +374,6 @@ async def execute_live_order(payload: dict):
             return {"status": "success", "response": final}
 
         else:
-            # EQUITY ORDER
             ticker = payload["ticker"]
             quantity = payload.get("position_size_shares", 1)
             price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
@@ -441,11 +429,14 @@ async def execute_live_order(payload: dict):
 async def placement_worker():
     while not _worker_stop:
         try:
-            job = await redis.lpop(QUEUE_KEY) if redis else None
-            if job:
-                await execute_live_order(json.loads(job)["payload"])
+            if redis:
+                job = await redis.lpop(QUEUE_KEY)
+                if job:
+                    await execute_live_order(json.loads(job)["payload"])
+                else:
+                    await asyncio.sleep(0.5)
             else:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"Worker error: {e}")
             await asyncio.sleep(2)
@@ -454,7 +445,7 @@ async def start_worker():
     global _worker_task
     _worker_task = asyncio.create_task(placement_worker())
 
-# ==================== STARTUP / SHUTDOWN ====================
+# ==================== STARTUP ====================
 @app.on_event("startup")
 async def on_startup():
     global redis
@@ -463,8 +454,13 @@ async def on_startup():
     if REDIS_URL:
         try:
             redis = await redis_from_url(REDIS_URL, decode_responses=True)
+            logger.info("✅ Redis connected")
         except Exception as e:
-            logger.error(f"Redis failed: {e}")
+            logger.warning(f"Redis not available (running without queue): {e}")
+            redis = None
+    else:
+        logger.warning("No REDIS_URL set — running without Redis queue")
+        redis = None
 
     await init_db()
     await start_worker()
@@ -482,10 +478,23 @@ async def on_shutdown():
 async def webhook(payload: WebhookPayload = Body(...)):
     if payload.secret != WEBHOOK_SECRET:
         raise HTTPException(403, "Unauthorized")
-    if not redis:
-        return {"status": "error", "message": "Redis unavailable"}
-    await redis.rpush(QUEUE_KEY, json.dumps({"payload": payload.dict()}))
-    return {"status": "queued"}
+
+    job = {"payload": payload.dict()}
+
+    if redis:
+        try:
+            await redis.rpush(QUEUE_KEY, json.dumps(job))
+            return {"status": "queued"}
+        except Exception as e:
+            logger.warning(f"Redis push failed, processing directly: {e}")
+
+    # Process directly if Redis is unavailable
+    try:
+        result = await execute_live_order(payload.dict())
+        return {"status": "processed_directly", "result": result}
+    except Exception as e:
+        logger.error(f"Direct processing failed: {e}")
+        return {"status": "error", "message": str(e)}
 
 @app.get("/health")
 async def health():
