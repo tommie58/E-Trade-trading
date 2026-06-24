@@ -300,6 +300,8 @@ async def check_risk_limits():
 
 # ==================== LIVE TRADING (Equity + Options) ====================
 async def execute_live_order(payload: dict):
+    global consecutive_failures   # ← Fixed scoping issue
+
     mode = payload.get("mode", "paper").lower()
     instrument = payload.get("instrument", "stock").lower()
 
@@ -322,6 +324,7 @@ async def execute_live_order(payload: dict):
 
     try:
         if instrument == "option":
+            # OPTION ORDER
             symbol = payload["ticker"]
             strike = payload.get("strike_hint") or payload.get("strike")
             expiry = payload.get("expiration_hint") or payload.get("expiry")
@@ -374,6 +377,7 @@ async def execute_live_order(payload: dict):
             return {"status": "success", "response": final}
 
         else:
+            # EQUITY ORDER
             ticker = payload["ticker"]
             quantity = payload.get("position_size_shares", 1)
             price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
