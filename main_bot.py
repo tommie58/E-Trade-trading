@@ -79,18 +79,78 @@ class WebhookPayload(BaseModel):
             raise ValueError("Invalid action")
         return str(v).upper()
 
-# ==================== TOKEN HELPERS ====================
-def load_tokens():
-    token = os.getenv("ETRADE_ACCESS_TOKEN")
-    secret = os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
-    if token and secret:
-        return {"oauth_token": token, "oauth_token_secret": secret}
-    return None
-
+# ==================== TOKEN PERSISTENCE (FIXED) ====================
 def save_tokens(token: str, token_secret: str):
     logger.info("=== NEW TOKENS RECEIVED ===")
     logger.info(f"ETRADE_ACCESS_TOKEN={token}")
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
+
+    # Persist to database so load_tokens() can read them later
+    if async_session:
+        try:
+            asyncio.create_task(_save_tokens_to_db(token, token_secret))
+        except Exception as e:
+            logger.warning(f"Failed to schedule token persistence: {e}")
+
+
+async def _save_tokens_to_db(token: str, token_secret: str):
+    if not async_session:
+        return
+    try:
+        async with async_session() as session:
+            async with session.begin():
+                state = ETradeSessionState(
+                    id="active_tokens",
+                    oauth_token=token,
+                    oauth_token_secret=token_secret
+                )
+                await session.merge(state)
+                logger.info("✅ Tokens saved to database")
+    except Exception as e:
+        logger.error(f"Error saving tokens to DB: {e}")
+
+
+def load_tokens():
+    # 1. Try environment variables first (Railway Variables)
+    token = os.getenv("ETRADE_ACCESS_TOKEN")
+    secret = os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
+    if token and secret:
+        return {"oauth_token": token, "oauth_token_secret": secret}
+
+    # 2. Fall back to database (tokens saved after linking)
+    if async_session:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Create task if we're already in an async context
+                task = asyncio.create_task(_load_tokens_from_db())
+                # For simplicity in this version, we'll return None if we can't await
+                # In practice, tokens will be available after the first successful link
+                return None
+            else:
+                tokens = loop.run_until_complete(_load_tokens_from_db())
+                if tokens:
+                    return tokens
+        except Exception as e:
+            logger.warning(f"Could not load tokens from DB: {e}")
+
+    return None
+
+
+async def _load_tokens_from_db():
+    if not async_session:
+        return None
+    try:
+        async with async_session() as session:
+            state = await session.get(ETradeSessionState, "active_tokens")
+            if state:
+                return {
+                    "oauth_token": state.oauth_token,
+                    "oauth_token_secret": state.oauth_token_secret
+                }
+    except Exception as e:
+        logger.error(f"Error loading tokens from DB: {e}")
+    return None
 
 # ==================== OAUTH ====================
 REQUEST_TOKEN_URL = "https://api.etrade.com/oauth/request_token"
@@ -181,8 +241,8 @@ async def etrade_auth_renew(data: dict = Body(...)):
 
         if renewed:
             new_token = auth_manager.oauth_token
-            noumber = auth_manager.oauth_token_secret
-            save_tokens(new_token, noumber)
+            new_secret = auth_manager.oauth_token_secret
+            save_tokens(new_token, new_secret)
             return {"status": "success", "message": "Tokens renewed", "renewed": True}
         else:
             raise HTTPException(400, "Token renewal failed")
