@@ -201,15 +201,7 @@ async def etrade_auth_complete(data: dict = Body(...)):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-# ==================== ACCOUNT ====================
-@app.get("/etrade/account")
-async def get_etrade_account():
-    tokens = load_tokens()
-    if not tokens:
-        return {"status": "not_linked", "linked": False}
-    return {"status": "linked", "linked": True}
-
-# ==================== RENEW ====================
+# ==================== IMPROVED RENEW ENDPOINT ====================
 @app.post("/etrade/auth/renew")
 async def etrade_auth_renew(data: dict = Body(...)):
     try:
@@ -219,25 +211,43 @@ async def etrade_auth_renew(data: dict = Body(...)):
         if not access_token or not access_token_secret:
             raise HTTPException(400, "Missing access tokens")
 
+        # Try to validate current tokens first
         try:
-            accounts = pyetrade.ETradeAccounts(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret, dev=is_sandbox)
+            accounts = pyetrade.ETradeAccounts(
+                CONSUMER_KEY, CONSUMER_SECRET,
+                access_token, access_token_secret,
+                dev=is_sandbox
+            )
             await asyncio.to_thread(accounts.list_accounts, resp_format="json")
             return {"status": "success", "message": "Tokens are still valid", "renewed": False}
         except Exception:
-            pass
+            logger.info("Current tokens appear invalid. Attempting renewal...")
 
-        auth_manager = pyetrade.ETradeAccessManager(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret)
-        renewed = await asyncio.to_thread(auth_manager.renew_access_token)
+        # Attempt renewal
+        auth_manager = pyetrade.ETradeAccessManager(
+            CONSUMER_KEY, CONSUMER_SECRET,
+            access_token, access_token_secret
+        )
+
+        try:
+            renewed = await asyncio.to_thread(auth_manager.renew_access_token)
+        except Exception as renew_err:
+            logger.error(f"Renewal call failed: {renew_err}")
+            raise HTTPException(400, "Token renewal failed")
 
         if renewed:
             new_token = auth_manager.oauth_token
             new_secret = auth_manager.oauth_token_secret
             save_tokens(new_token, new_secret)
-            return {"status": "success", "message": "Tokens renewed", "renewed": True}
+            return {"status": "success", "message": "Tokens renewed successfully", "renewed": True}
         else:
-            raise HTTPException(400, "Token renewal failed")
+            raise HTTPException(400, "Token renewal returned false")
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(500, detail=str(e))
+        logger.error(f"Unexpected error in renew: {e}")
+        raise HTTPException(500, detail="Renewal failed")
 
 # ==================== DISCONNECT ====================
 @app.post("/etrade/disconnect")
@@ -324,7 +334,7 @@ async def execute_live_order(payload: dict):
 
     try:
         if instrument == "option":
-            # OPTION ORDER (direct place - no preview for compatibility)
+            # OPTION ORDER (direct place)
             symbol = payload["ticker"]
             strike = payload.get("strike_hint") or payload.get("strike")
             expiry = payload.get("expiration_hint") or payload.get("expiry")
