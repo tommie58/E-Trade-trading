@@ -201,7 +201,7 @@ async def etrade_auth_complete(data: dict = Body(...)):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-# ==================== IMPROVED RENEW ENDPOINT ====================
+# ==================== RENEW ====================
 @app.post("/etrade/auth/renew")
 async def etrade_auth_renew(data: dict = Body(...)):
     try:
@@ -211,29 +211,15 @@ async def etrade_auth_renew(data: dict = Body(...)):
         if not access_token or not access_token_secret:
             raise HTTPException(400, "Missing access tokens")
 
-        # Try to validate current tokens first
         try:
-            accounts = pyetrade.ETradeAccounts(
-                CONSUMER_KEY, CONSUMER_SECRET,
-                access_token, access_token_secret,
-                dev=is_sandbox
-            )
+            accounts = pyetrade.ETradeAccounts(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret, dev=is_sandbox)
             await asyncio.to_thread(accounts.list_accounts, resp_format="json")
             return {"status": "success", "message": "Tokens are still valid", "renewed": False}
         except Exception:
             logger.info("Current tokens appear invalid. Attempting renewal...")
 
-        # Attempt renewal
-        auth_manager = pyetrade.ETradeAccessManager(
-            CONSUMER_KEY, CONSUMER_SECRET,
-            access_token, access_token_secret
-        )
-
-        try:
-            renewed = await asyncio.to_thread(auth_manager.renew_access_token)
-        except Exception as renew_err:
-            logger.error(f"Renewal call failed: {renew_err}")
-            raise HTTPException(400, "Token renewal failed")
+        auth_manager = pyetrade.ETradeAccessManager(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret)
+        renewed = await asyncio.to_thread(auth_manager.renew_access_token)
 
         if renewed:
             new_token = auth_manager.oauth_token
@@ -241,12 +227,11 @@ async def etrade_auth_renew(data: dict = Body(...)):
             save_tokens(new_token, new_secret)
             return {"status": "success", "message": "Tokens renewed successfully", "renewed": True}
         else:
-            raise HTTPException(400, "Token renewal returned false")
-
+            raise HTTPException(400, "Token renewal failed")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error in renew: {e}")
+        logger.error(f"Renew failed: {e}")
         raise HTTPException(500, detail="Renewal failed")
 
 # ==================== DISCONNECT ====================
@@ -308,19 +293,26 @@ async def check_risk_limits():
     if circuit_breaker_open:
         raise HTTPException(503, "Circuit breaker open")
 
-# ==================== LIVE TRADING (Equity + Options) ====================
+# ==================== LIVE TRADING WITH DETAILED LOGGING ====================
 async def execute_live_order(payload: dict):
     global consecutive_failures
 
     mode = payload.get("mode", "paper").lower()
     instrument = payload.get("instrument", "stock").lower()
+    ticker = payload.get("ticker", "UNKNOWN")
+    action = payload.get("action", "UNKNOWN").upper()
+
+    # === NEW DETAILED LOGGING ===
+    logger.info(f"📥 Received signal → mode={mode}, instrument={instrument}, ticker={ticker}, action={action}")
 
     if mode != "live" or not LIVE_TRADING or is_sandbox:
+        logger.info(f"⏭️ Skipping trade (mode={mode}, LIVE_TRADING={LIVE_TRADING}, sandbox={is_sandbox})")
         return {"status": "skipped", "reason": f"mode={mode}"}
 
     await check_risk_limits()
     tokens = load_tokens()
     if not tokens:
+        logger.error("❌ No E*TRADE tokens available")
         raise Exception("E*TRADE tokens not set")
 
     orders = pyetrade.ETradeOrder(
@@ -330,12 +322,10 @@ async def execute_live_order(payload: dict):
     )
 
     client_order_id = str(uuid.uuid4())[:20]
-    action = payload["action"].upper()
 
     try:
         if instrument == "option":
-            # OPTION ORDER (direct place)
-            symbol = payload["ticker"]
+            # OPTION ORDER
             strike = payload.get("strike_hint") or payload.get("strike")
             expiry = payload.get("expiration_hint") or payload.get("expiry")
             call_put = payload.get("option_right", "CALL").upper()
@@ -344,6 +334,8 @@ async def execute_live_order(payload: dict):
 
             if not strike or not expiry:
                 raise Exception("Missing strike or expiration for option order")
+
+            logger.info(f"🚀 Attempting LIVE OPTION order: {ticker} {call_put} {strike} {expiry}")
 
             order_payload = {
                 "Order": [{
@@ -354,7 +346,7 @@ async def execute_live_order(payload: dict):
                     "Instrument": [{
                         "Product": {
                             "securityType": "OPTN",
-                            "symbol": symbol,
+                            "symbol": ticker,
                             "callPut": call_put,
                             "strikePrice": strike,
                             "expiryDate": expiry
@@ -373,16 +365,17 @@ async def execute_live_order(payload: dict):
                 order=order_payload,
                 clientOrderId=client_order_id
             )
-            logger.info(f"✅ LIVE OPTION TRADE: {symbol} {call_put}")
+            logger.info(f"✅ LIVE OPTION TRADE SUCCESS: {ticker} {call_put}")
             return {"status": "success", "response": final}
 
         else:
             # EQUITY ORDER
-            ticker = payload["ticker"]
             quantity = payload.get("position_size_shares", 1)
             price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
             limit_price = payload.get("limit_price")
             order_action = "BUY" if action == "BUY" else "SELL"
+
+            logger.info(f"🚀 Attempting LIVE EQUITY order: {action} {quantity} {ticker}")
 
             order_payload = {
                 "Order": [{
@@ -418,7 +411,7 @@ async def execute_live_order(payload: dict):
                 clientOrderId=client_order_id,
                 previewId=preview_id
             )
-            logger.info(f"✅ LIVE EQUITY TRADE: {ticker}")
+            logger.info(f"✅ LIVE EQUITY TRADE SUCCESS: {action} {quantity} {ticker}")
             return {"status": "success", "response": final}
 
     except Exception as e:
@@ -426,7 +419,7 @@ async def execute_live_order(payload: dict):
         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
             global circuit_breaker_open
             circuit_breaker_open = True
-        logger.error(f"Trade failed: {e}")
+        logger.error(f"❌ LIVE TRADE FAILED: {e}")
         raise
 
 # ==================== WORKER ====================
