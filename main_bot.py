@@ -302,7 +302,6 @@ async def execute_live_order(payload: dict):
     ticker = payload.get("ticker", "UNKNOWN")
     action = payload.get("action", "UNKNOWN").upper()
 
-    # === NEW DETAILED LOGGING ===
     logger.info(f"📥 Received signal → mode={mode}, instrument={instrument}, ticker={ticker}, action={action}")
 
     if mode != "live" or not LIVE_TRADING or is_sandbox:
@@ -325,7 +324,8 @@ async def execute_live_order(payload: dict):
 
     try:
         if instrument == "option":
-            # OPTION ORDER
+            # OPTION ORDER with full payload logging
+            symbol = payload["ticker"]
             strike = payload.get("strike_hint") or payload.get("strike")
             expiry = payload.get("expiration_hint") or payload.get("expiry")
             call_put = payload.get("option_right", "CALL").upper()
@@ -333,9 +333,7 @@ async def execute_live_order(payload: dict):
             order_action = "BUY_OPEN" if action == "BUY" else "SELL_OPEN"
 
             if not strike or not expiry:
-                raise Exception("Missing strike or expiration for option order")
-
-            logger.info(f"🚀 Attempting LIVE OPTION order: {ticker} {call_put} {strike} {expiry}")
+                raise Exception(f"Missing strike or expiration for option order. Got strike={strike}, expiry={expiry}")
 
             order_payload = {
                 "Order": [{
@@ -346,7 +344,7 @@ async def execute_live_order(payload: dict):
                     "Instrument": [{
                         "Product": {
                             "securityType": "OPTN",
-                            "symbol": ticker,
+                            "symbol": symbol,
                             "callPut": call_put,
                             "strikePrice": strike,
                             "expiryDate": expiry
@@ -358,6 +356,8 @@ async def execute_live_order(payload: dict):
                 }]
             }
 
+            logger.info(f"📤 Sending OPTION payload to E*TRADE: {json.dumps(order_payload, indent=2)}")
+
             final = await asyncio.to_thread(
                 orders.place_option_order,
                 resp_format="json",
@@ -365,7 +365,7 @@ async def execute_live_order(payload: dict):
                 order=order_payload,
                 clientOrderId=client_order_id
             )
-            logger.info(f"✅ LIVE OPTION TRADE SUCCESS: {ticker} {call_put}")
+            logger.info(f"✅ LIVE OPTION TRADE SUCCESS: {symbol} {call_put}")
             return {"status": "success", "response": final}
 
         else:
