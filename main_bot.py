@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
-from typing import Optional
+from typing import Optional, Dict
 import pyetrade
 import os
 import json
@@ -47,6 +47,9 @@ QUEUE_KEY = "etrade:placement_queue"
 _worker_task = None
 _worker_stop = False
 
+# In-memory token cache (loaded on startup for reliability)
+_current_tokens: Optional[Dict[str, str]] = None
+
 Base = declarative_base()
 
 class ETradeSessionState(Base):
@@ -79,17 +82,21 @@ class WebhookPayload(BaseModel):
             raise ValueError("Invalid action")
         return str(v).upper()
 
-# ==================== TOKEN PERSISTENCE ====================
+# ==================== TOKEN PERSISTENCE (IMPROVED) ====================
 def save_tokens(token: str, token_secret: str):
+    global _current_tokens
     logger.info("=== NEW TOKENS RECEIVED ===")
     logger.info(f"ETRADE_ACCESS_TOKEN={token}")
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
+
+    # Update in-memory cache immediately
+    _current_tokens = {"oauth_token": token, "oauth_token_secret": token_secret}
 
     if async_session:
         try:
             asyncio.create_task(_save_tokens_to_db(token, token_secret))
         except Exception as e:
-            logger.warning(f"Failed to persist tokens: {e}")
+            logger.warning(f"Failed to persist tokens to DB: {e}")
 
 
 async def _save_tokens_to_db(token: str, token_secret: str):
@@ -109,21 +116,32 @@ async def _save_tokens_to_db(token: str, token_secret: str):
         logger.error(f"Error saving tokens to DB: {e}")
 
 
-def load_tokens():
+def load_tokens() -> Optional[Dict[str, str]]:
+    global _current_tokens
+
+    # 1. Return in-memory tokens if available (fastest and most reliable)
+    if _current_tokens:
+        return _current_tokens
+
+    # 2. Try environment variables
     token = os.getenv("ETRADE_ACCESS_TOKEN")
     secret = os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
     if token and secret:
-        return {"oauth_token": token, "oauth_token_secret": secret}
+        _current_tokens = {"oauth_token": token, "oauth_token_secret": secret}
+        return _current_tokens
 
+    # 3. Fall back to database
     if async_session:
         try:
             loop = asyncio.get_event_loop()
             if not loop.is_running():
                 tokens = loop.run_until_complete(_load_tokens_from_db())
                 if tokens:
+                    _current_tokens = tokens
                     return tokens
         except Exception as e:
             logger.warning(f"Could not load tokens from DB: {e}")
+
     return None
 
 
@@ -141,6 +159,19 @@ async def _load_tokens_from_db():
     except Exception as e:
         logger.error(f"Error loading tokens from DB: {e}")
     return None
+
+
+async def preload_tokens():
+    """Load latest tokens from DB into memory on startup"""
+    global _current_tokens
+    if async_session:
+        try:
+            tokens = await _load_tokens_from_db()
+            if tokens:
+                _current_tokens = tokens
+                logger.info("✅ Tokens pre-loaded from database into memory")
+        except Exception as e:
+            logger.warning(f"Could not preload tokens from DB: {e}")
 
 # ==================== OAUTH ====================
 REQUEST_TOKEN_URL = "https://api.etrade.com/oauth/request_token"
@@ -324,7 +355,6 @@ async def execute_live_order(payload: dict):
 
     try:
         if instrument == "option":
-            # OPTION ORDER with full payload logging
             symbol = payload["ticker"]
             strike = payload.get("strike_hint") or payload.get("strike")
             expiry = payload.get("expiration_hint") or payload.get("expiry")
@@ -369,7 +399,6 @@ async def execute_live_order(payload: dict):
             return {"status": "success", "response": final}
 
         else:
-            # EQUITY ORDER
             quantity = payload.get("position_size_shares", 1)
             price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
             limit_price = payload.get("limit_price")
@@ -460,6 +489,7 @@ async def on_startup():
         redis = None
 
     await init_db()
+    await preload_tokens()          # ← Pre-load tokens into memory
     await start_worker()
     logger.info("✅ Bot ready")
 
