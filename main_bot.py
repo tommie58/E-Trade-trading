@@ -47,7 +47,7 @@ QUEUE_KEY = "etrade:placement_queue"
 _worker_task = None
 _worker_stop = False
 
-# In-memory token cache (loaded on startup for reliability)
+# In-memory token cache
 _current_tokens: Optional[Dict[str, str]] = None
 
 Base = declarative_base()
@@ -89,7 +89,6 @@ def save_tokens(token: str, token_secret: str):
     logger.info(f"ETRADE_ACCESS_TOKEN={token}")
     logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={token_secret}")
 
-    # Update in-memory cache immediately
     _current_tokens = {"oauth_token": token, "oauth_token_secret": token_secret}
 
     if async_session:
@@ -119,18 +118,15 @@ async def _save_tokens_to_db(token: str, token_secret: str):
 def load_tokens() -> Optional[Dict[str, str]]:
     global _current_tokens
 
-    # 1. Return in-memory tokens if available (fastest and most reliable)
     if _current_tokens:
         return _current_tokens
 
-    # 2. Try environment variables
     token = os.getenv("ETRADE_ACCESS_TOKEN")
     secret = os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
     if token and secret:
         _current_tokens = {"oauth_token": token, "oauth_token_secret": secret}
         return _current_tokens
 
-    # 3. Fall back to database
     if async_session:
         try:
             loop = asyncio.get_event_loop()
@@ -162,7 +158,6 @@ async def _load_tokens_from_db():
 
 
 async def preload_tokens():
-    """Load latest tokens from DB into memory on startup"""
     global _current_tokens
     if async_session:
         try:
@@ -254,7 +249,7 @@ async def etrade_auth_renew(data: dict = Body(...)):
 
         if renewed:
             new_token = auth_manager.oauth_token
-            new_secret = auth_manager.oauth_token_secret
+            noug = auth_manager.oauth_token_secret
             save_tokens(new_token, new_secret)
             return {"status": "success", "message": "Tokens renewed successfully", "renewed": True}
         else:
@@ -324,7 +319,7 @@ async def check_risk_limits():
     if circuit_breaker_open:
         raise HTTPException(503, "Circuit breaker open")
 
-# ==================== LIVE TRADING WITH DETAILED LOGGING ====================
+# ==================== LIVE TRADING (with improved option preview flow) ====================
 async def execute_live_order(payload: dict):
     global consecutive_failures
 
@@ -388,17 +383,37 @@ async def execute_live_order(payload: dict):
 
             logger.info(f"📤 Sending OPTION payload to E*TRADE: {json.dumps(order_payload, indent=2)}")
 
-            final = await asyncio.to_thread(
-                orders.place_option_order,
-                resp_format="json",
-                accountIdKey=TARGET_ACCOUNT_ID,
-                order=order_payload,
-                clientOrderId=client_order_id
-            )
+            preview_id = None
+            try:
+                preview_resp = await asyncio.to_thread(
+                    orders.preview_option_order,
+                    resp_format="json",
+                    accountIdKey=TARGET_ACCOUNT_ID,
+                    order=order_payload,
+                    clientOrderId=client_order_id
+                )
+                preview_id = preview_resp['PreviewOrderResponse']['PreviewIds']['PreviewId'][0]['previewId']
+                logger.info(f"Preview successful, previewId = {preview_id}")
+            except AttributeError:
+                logger.warning("preview_option_order method not available — attempting direct place")
+            except Exception as preview_err:
+                logger.warning(f"Preview failed or not supported: {preview_err} — attempting direct place")
+
+            place_kwargs = {
+                "resp_format": "json",
+                "accountIdKey": TARGET_ACCOUNT_ID,
+                "order": order_payload,
+                "clientOrderId": client_order_id
+            }
+            if preview_id:
+                place_kwargs["previewId"] = preview_id
+
+            final = await asyncio.to_thread(orders.place_option_order, **place_kwargs)
             logger.info(f"✅ LIVE OPTION TRADE SUCCESS: {symbol} {call_put}")
             return {"status": "success", "response": final}
 
         else:
+            # EQUITY ORDER (unchanged)
             quantity = payload.get("position_size_shares", 1)
             price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
             limit_price = payload.get("limit_price")
@@ -489,7 +504,7 @@ async def on_startup():
         redis = None
 
     await init_db()
-    await preload_tokens()          # ← Pre-load tokens into memory
+    await preload_tokens()
     await start_worker()
     logger.info("✅ Bot ready")
 
@@ -515,7 +530,6 @@ async def webhook(payload: WebhookPayload = Body(...)):
         except Exception as e:
             logger.warning(f"Redis push failed, processing directly: {e}")
 
-    # Process directly if Redis is unavailable
     try:
         result = await execute_live_order(payload.dict())
         return {"status": "processed_directly", "result": result}
