@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-pyetrade
+pyetrade>=0.7.0
 requests_oauthlib
 sqlalchemy
 aiosqlite
