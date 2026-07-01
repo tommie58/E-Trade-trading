@@ -47,7 +47,6 @@ QUEUE_KEY = "etrade:placement_queue"
 _worker_task = None
 _worker_stop = False
 
-# In-memory token cache
 _current_tokens: Optional[Dict[str, str]] = None
 
 Base = declarative_base()
@@ -227,7 +226,7 @@ async def etrade_auth_complete(data: dict = Body(...)):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-# ==================== RENEW ====================
+# ==================== IMPROVED RENEW ====================
 @app.post("/etrade/auth/renew")
 async def etrade_auth_renew(data: dict = Body(...)):
     try:
@@ -257,6 +256,9 @@ async def etrade_auth_renew(data: dict = Body(...)):
     except HTTPException:
         raise
     except Exception as e:
+        if "401" in str(e) or "Unauthorized" in str(e):
+            logger.warning("Renew failed with 401 from E*TRADE (normal in some cases)")
+            raise HTTPException(400, detail="Renewal not possible with current tokens. Please re-link.")
         logger.error(f"Renew failed: {e}")
         raise HTTPException(500, detail="Renewal failed")
 
@@ -418,7 +420,6 @@ async def execute_live_order(payload: dict):
             return {"status": "success", "response": final}
 
         else:
-            # EQUITY ORDER
             quantity = payload.get("position_size_shares", 1)
             price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
             limit_price = payload.get("limit_price")
@@ -541,6 +542,23 @@ async def webhook(payload: WebhookPayload = Body(...)):
     except Exception as e:
         logger.error(f"Direct processing failed: {e}")
         return {"status": "error", "message": str(e)}
+
+@app.get("/etrade/account")
+async def get_etrade_account():
+    tokens = load_tokens()
+    if not tokens:
+        # Force a DB reload as a last resort
+        if async_session:
+            try:
+                loop = asyncio.get_event_loop()
+                if not loop.is_running():
+                    tokens = loop.run_until_complete(_load_tokens_from_db())
+                    if tokens:
+                        global _current_tokens
+                        _current_tokens = tokens
+            except Exception:
+                pass
+    return {"status": "linked" if tokens else "not_linked", "linked": bool(tokens)}
 
 @app.get("/health")
 async def health():
