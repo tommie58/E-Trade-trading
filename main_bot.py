@@ -82,7 +82,7 @@ class WebhookPayload(BaseModel):
             raise ValueError("Invalid action")
         return str(v).upper()
 
-# ==================== TOKEN PERSISTENCE (IMPROVED) ====================
+# ==================== TOKEN PERSISTENCE ====================
 def save_tokens(token: str, token_secret: str):
     global _current_tokens
     logger.info("=== NEW TOKENS RECEIVED ===")
@@ -249,7 +249,7 @@ async def etrade_auth_renew(data: dict = Body(...)):
 
         if renewed:
             new_token = auth_manager.oauth_token
-            noug = auth_manager.oauth_token_secret
+            new_secret = auth_manager.oauth_token_secret
             save_tokens(new_token, new_secret)
             return {"status": "success", "message": "Tokens renewed successfully", "renewed": True}
         else:
@@ -319,7 +319,7 @@ async def check_risk_limits():
     if circuit_breaker_open:
         raise HTTPException(503, "Circuit breaker open")
 
-# ==================== LIVE TRADING (with improved option preview flow) ====================
+# ==================== LIVE TRADING ====================
 async def execute_live_order(payload: dict):
     global consecutive_failures
 
@@ -384,20 +384,25 @@ async def execute_live_order(payload: dict):
             logger.info(f"📤 Sending OPTION payload to E*TRADE: {json.dumps(order_payload, indent=2)}")
 
             preview_id = None
-            try:
-                preview_resp = await asyncio.to_thread(
-                    orders.preview_option_order,
-                    resp_format="json",
-                    accountIdKey=TARGET_ACCOUNT_ID,
-                    order=order_payload,
-                    clientOrderId=client_order_id
-                )
-                preview_id = preview_resp['PreviewOrderResponse']['PreviewIds']['PreviewId'][0]['previewId']
-                logger.info(f"Preview successful, previewId = {preview_id}")
-            except AttributeError:
-                logger.warning("preview_option_order method not available — attempting direct place")
-            except Exception as preview_err:
-                logger.warning(f"Preview failed or not supported: {preview_err} — attempting direct place")
+            for preview_method in ["preview_option_order", "preview_order"]:
+                try:
+                    method = getattr(orders, preview_method, None)
+                    if method:
+                        preview_resp = await asyncio.to_thread(
+                            method,
+                            resp_format="json",
+                            accountIdKey=TARGET_ACCOUNT_ID,
+                            order=order_payload,
+                            clientOrderId=client_order_id
+                        )
+                        preview_data = preview_resp.get('PreviewOrderResponse', {})
+                        preview_ids = preview_data.get('PreviewIds', {}).get('PreviewId', [{}])
+                        if preview_ids:
+                            preview_id = preview_ids[0].get('previewId')
+                            logger.info(f"Preview successful using {preview_method}, previewId = {preview_id}")
+                            break
+                except Exception as e:
+                    logger.warning(f"Preview with {preview_method} failed: {e}")
 
             place_kwargs = {
                 "resp_format": "json",
@@ -413,7 +418,7 @@ async def execute_live_order(payload: dict):
             return {"status": "success", "response": final}
 
         else:
-            # EQUITY ORDER (unchanged)
+            # EQUITY ORDER
             quantity = payload.get("position_size_shares", 1)
             price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
             limit_price = payload.get("limit_price")
