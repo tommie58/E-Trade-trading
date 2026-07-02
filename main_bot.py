@@ -197,7 +197,6 @@ async def start_linking():
         oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
         result = oauth.get_request_token()
 
-        # Handle both string (URL) and dict return types
         if isinstance(result, str):
             authorize_url = result
             oauth_token = None
@@ -215,6 +214,8 @@ async def start_linking():
 async def complete_linking(verifier: str = Body(..., embed=True)):
     try:
         oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
+        # Initialize session first (fixes 'no attribute session' error)
+        oauth.get_request_token()
         tokens = oauth.get_access_token(verifier)
         save_tokens(tokens)
         logger.info("=== NEW TOKENS RECEIVED ===")
