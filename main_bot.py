@@ -211,13 +211,16 @@ async def start_linking():
         raise HTTPException(500, str(e))
 
 @app.post("/etrade/auth/complete")
-async def complete_linking(verifier: str = Body(..., embed=True)):
+async def complete_linking(
+    verifier: str = Body(..., embed=True),
+    oauth_token: Optional[str] = Body(None, embed=True)   # ← Pass this from /start response
+):
     try:
         oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
-        # Initialize session first (fixes 'no attribute session' error)
-        oauth.get_request_token()
+        oauth.get_request_token()                    # Initialize session
         tokens = oauth.get_access_token(verifier)
         save_tokens(tokens)
+
         logger.info("=== NEW TOKENS RECEIVED ===")
         logger.info(f"ETRADE_ACCESS_TOKEN={tokens['oauth_token']}")
         logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={tokens['oauth_token_secret']}")
