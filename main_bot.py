@@ -107,7 +107,7 @@ async def execute_live_order(payload: dict):
             strike = payload.get("strike") or payload.get("strike_hint")
             expiry = payload.get("expiry") or payload.get("expiration_hint")
             if not strike or not expiry:
-                raise Exception(f"Missing strike or expiry")
+                raise Exception("Missing strike or expiry")
 
             call_put = "CALL" if payload.get("call_put", "call").lower() == "call" else "PUT"
             order_action = "BUY_OPEN" if action == "BUY" else "SELL_CLOSE"
@@ -195,18 +195,24 @@ async def webhook(payload: WebhookPayload = Body(...)):
 async def start_linking():
     try:
         oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
-        # More compatible method across pyetrade versions
-        request_token = oauth.get_request_token()
-        token = request_token.get("oauth_token")
-        authorize_url = f"https://us.etrade.com/e/t/etws/authorize?key={CONSUMER_KEY}&token={token}"
+        result = oauth.get_request_token()
+
+        # Handle both string (URL) and dict return types
+        if isinstance(result, str):
+            authorize_url = result
+            oauth_token = None
+        else:
+            oauth_token = result.get("oauth_token") if isinstance(result, dict) else result
+            authorize_url = f"https://us.etrade.com/e/t/etws/authorize?key={CONSUMER_KEY}&token={oauth_token}"
+
         logger.info("✅ E*TRADE auth URL generated successfully")
-        return {"authorize_url": authorize_url, "oauth_token": token}
+        return {"authorize_url": authorize_url, "oauth_token": oauth_token}
     except Exception as e:
         logger.error(f"Start linking failed: {e}")
         raise HTTPException(500, str(e))
 
 @app.post("/etrade/auth/complete")
-async def complete_linking(verifier: str = Body(..., embed=True), oauth_token: str = Body(None, embed=True)):
+async def complete_linking(verifier: str = Body(..., embed=True)):
     try:
         oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
         tokens = oauth.get_access_token(verifier)
