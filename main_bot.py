@@ -319,17 +319,14 @@ async def check_risk_limits():
     if circuit_breaker_open:
         raise HTTPException(503, "Circuit breaker open")
 
-# ==================== LIVE TRADING (with improved preview logging) ====================
-def _parse_expiry_to_object(expiry: Any) -> Dict:
-    if isinstance(expiry, dict):
+# ==================== LIVE TRADING (FIXED - Flat kwargs for pyetrade) ====================
+def _parse_expiry_to_str(expiry: Any) -> str:
+    """Always return expiry as 'YYYY-MM-DD' string for pyetrade"""
+    if isinstance(expiry, str):
         return expiry
-    if isinstance(expiry, str) and "-" in expiry:
-        try:
-            y, m, d = map(int, expiry.split("-"))
-            return {"year": y, "month": m, "day": d}
-        except Exception:
-            pass
-    return expiry
+    if isinstance(expiry, dict):
+        return f"{expiry.get('year')}-{expiry.get('month'):02d}-{expiry.get('day'):02d}"
+    return str(expiry)
 
 async def execute_live_order(payload: dict):
     global consecutive_failures
@@ -342,11 +339,11 @@ async def execute_live_order(payload: dict):
     logger.info(f"📥 Received signal → mode={mode}, instrument={instrument}, ticker={ticker}, action={action}")
 
     if not TARGET_ACCOUNT_ID:
-        logger.error("❌ TARGET_ACCOUNT_ID is not set in environment variables")
+        logger.error("❌ TARGET_ACCOUNT_ID is not set")
         raise Exception("TARGET_ACCOUNT_ID is missing")
 
     if mode != "live" or not LIVE_TRADING or is_sandbox:
-        logger.info(f"⏭️ Skipping trade (mode={mode}, LIVE_TRADING={LIVE_TRADING}, sandbox={is_sandbox})")
+        logger.info(f"⏭️ Skipping trade (mode={mode})")
         return {"status": "skipped", "reason": f"mode={mode}"}
 
     await check_risk_limits()
@@ -368,87 +365,52 @@ async def execute_live_order(payload: dict):
             symbol = payload["ticker"]
             strike = payload.get("strike_hint") or payload.get("strike")
             raw_expiry = payload.get("expiration_hint") or payload.get("expiry")
-            expiry = _parse_expiry_to_object(raw_expiry)
+            expiry_str = _parse_expiry_to_str(raw_expiry)
             call_put = payload.get("option_right", "CALL").upper()
             quantity = payload.get("option_contracts", 1)
             order_action = "BUY_OPEN" if action == "BUY" else "SELL_OPEN"
 
-            if not strike or not expiry:
-                raise Exception(f"Missing strike or expiration for option order. Got strike={strike}, expiry={expiry}")
+            if not strike or not expiry_str:
+                raise Exception(f"Missing strike or expiry. Got strike={strike}, expiry={expiry_str}")
 
-            logger.info(f"Converted expiry for E*TRADE: {expiry}")
+            # Convert strike to int if it's a whole number (E*TRADE is picky)
+            strike_price = int(strike) if float(strike).is_integer() else float(strike)
 
-            order_payload = {
-                "Order": [{
-                    "allOrNone": False,
-                    "priceType": "MARKET",
-                    "orderTerm": "GOOD_FOR_DAY",
-                    "marketSession": "REGULAR",
-                    "Instrument": [{
-                        "Product": {
-                            "securityType": "OPTN",
-                            "symbol": symbol,
-                            "callPut": call_put,
-                            "strikePrice": strike,
-                            "expiryDate": expiry
-                        },
-                        "orderAction": order_action,
-                        "quantityType": "QUANTITY",
-                        "quantity": quantity
-                    }]
-                }]
-            }
+            logger.info(f"🚀 LIVE OPTION ORDER: {order_action} {quantity} {symbol} {call_put} {strike_price} {expiry_str}")
 
-            logger.info(f"📤 Sending OPTION payload to E*TRADE: {json.dumps(order_payload, indent=2)}")
+            # === CORRECT FLAT KWARGS STYLE (pyetrade expects this) ===
+            final = await asyncio.to_thread(
+                orders.place_option_order,
+                resp_format="json",
+                accountIdKey=TARGET_ACCOUNT_ID,
+                symbol=symbol,
+                callPut=call_put,
+                expiryDate=expiry_str,           # string "2026-07-03"
+                strikePrice=strike_price,
+                orderAction=order_action,
+                clientOrderId=client_order_id,
+                priceType="MARKET",
+                allOrNone=False,
+                quantity=quantity,
+                orderTerm="GOOD_FOR_DAY",
+                marketSession="REGULAR",
+            )
 
-            preview_id = None
-            for preview_method in ["preview_option_order", "preview_order"]:
-                try:
-                    method = getattr(orders, preview_method, None)
-                    if method:
-                        preview_resp = await asyncio.to_thread(
-                            method,
-                            resp_format="json",
-                            accountIdKey=TARGET_ACCOUNT_ID,
-                            order=order_payload,
-                            clientOrderId=client_order_id
-                        )
-                        preview_data = preview_resp.get('PreviewOrderResponse', {})
-                        preview_ids = preview_data.get('PreviewIds', {}).get('PreviewId', [{}])
-                        if preview_ids and preview_ids[0].get('previewId'):
-                            preview_id = preview_ids[0].get('previewId')
-                            logger.info(f"✅ Preview successful using {preview_method}, previewId = {preview_id}")
-                            break
-                except Exception as e:
-                    logger.warning(f"Preview with {preview_method} failed: {e}")
-
-            place_kwargs = {
-                "resp_format": "json",
-                "accountIdKey": TARGET_ACCOUNT_ID,
-                "order": order_payload,
-                "clientOrderId": client_order_id
-            }
-            if preview_id:
-                place_kwargs["previewId"] = preview_id
-            else:
-                logger.warning("No previewId obtained — placing without it (may fail)")
-
-            final = await asyncio.to_thread(orders.place_option_order, **place_kwargs)
-            logger.info(f"✅ LIVE OPTION TRADE SUCCESS: {symbol} {call_put}")
+            logger.info(f"✅ LIVE OPTION TRADE SUCCESS: {symbol} {call_put} {strike_price}")
             return {"status": "success", "response": final}
 
         else:
-            # EQUITY ORDER
+            # EQUITY ORDER (unchanged - already working style)
             quantity = payload.get("position_size_shares", 1)
             price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
             limit_price = payload.get("limit_price")
             order_action = "BUY" if action == "BUY" else "SELL"
 
-            logger.info(f"🚀 Attempting LIVE EQUITY order: {action} {quantity} {ticker}")
+            logger.info(f"🚀 LIVE EQUITY ORDER: {order_action} {quantity} {ticker}")
 
             order_payload = {
                 "Order": [{
-                    "allOrNone": False,
+                    "allOrNone": "false",
                     "priceType": price_type,
                     "orderTerm": "GOOD_FOR_DAY",
                     "marketSession": "REGULAR",
@@ -480,7 +442,7 @@ async def execute_live_order(payload: dict):
                 clientOrderId=client_order_id,
                 previewId=preview_id
             )
-            logger.info(f"✅ LIVE EQUITY TRADE SUCCESS: {action} {quantity} {ticker}")
+            logger.info(f"✅ LIVE EQUITY TRADE SUCCESS: {order_action} {quantity} {ticker}")
             return {"status": "success", "response": final}
 
     except Exception as e:
@@ -525,11 +487,10 @@ async def on_startup():
             redis = await redis_from_url(REDIS_URL, decode_responses=True)
             logger.info("✅ Redis connected")
         except Exception as e:
-            logger.warning(f"Redis not available (running without queue): {e}")
+            logger.warning(f"Redis not available: {e}")
             redis = None
     else:
         logger.warning("No REDIS_URL set — running without Redis queue")
-        redis = None
 
     await init_db()
     await preload_tokens()
