@@ -26,7 +26,6 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 TARGET_ACCOUNT_ID = os.getenv("ETRADE_ACCOUNT_ID")
 REDIS_URL = os.getenv("REDIS_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
-ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 
 is_sandbox = ENV == "sandbox"
 
@@ -40,13 +39,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 redis = None
 engine = None
 async_session = None
-circuit_breaker_open = False
-consecutive_failures = 0
-MAX_CONSECUTIVE_FAILURES = 5
-QUEUE_KEY = "etrade:placement_queue"
-_worker_task = None
-_worker_stop = False
-_current_tokens: Dict[str, str] = {}   # In-memory token cache
+_current_tokens: Dict[str, str] = {}
 
 Base = declarative_base()
 
@@ -59,7 +52,6 @@ class ETradeSessionState(Base):
 
 # ==================== HELPERS ====================
 def _parse_expiry_to_str(expiry) -> str:
-    """Convert expiry to YYYY-MM-DD string for E*TRADE"""
     if isinstance(expiry, str):
         return expiry
     if isinstance(expiry, dict):
@@ -69,7 +61,6 @@ def _parse_expiry_to_str(expiry) -> str:
 def load_tokens() -> Optional[Dict[str, str]]:
     if _current_tokens:
         return _current_tokens
-    # Try environment variables first
     token = os.getenv("ETRADE_ACCESS_TOKEN")
     secret = os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
     if token and secret:
@@ -81,15 +72,15 @@ def save_tokens(tokens: Dict[str, str]):
     _current_tokens = tokens.copy()
     logger.info("✅ Tokens saved to memory cache")
 
-# ==================== DATABASE ====================
+# ==================== DATABASE (SQLite fallback) ====================
 async def init_db():
     global engine, async_session
     try:
-        if not DATABASE_URL:
-            logger.warning("No DATABASE_URL set — using SQLite")
-            db_url = "sqlite+aiosqlite:///./etrade_tokens.db"
-        else:
+        if DATABASE_URL:
             db_url = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://")
+        else:
+            logger.info("Using SQLite for database (recommended)")
+            db_url = "sqlite+aiosqlite:///./etrade_tokens.db"
 
         engine = create_async_engine(db_url, echo=False)
         async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -99,12 +90,10 @@ async def init_db():
 
         logger.info("✅ Database connected")
     except Exception as e:
-        logger.error(f"Database error: {e}")
+        logger.warning(f"Database warning (falling back): {e}")
 
-# ==================== ORDER EXECUTION ====================
+# ==================== LIVE ORDER EXECUTION ====================
 async def execute_live_order(payload: dict):
-    global consecutive_failures
-
     tokens = load_tokens()
     if not tokens:
         raise Exception("No E*TRADE tokens available")
@@ -117,19 +106,17 @@ async def execute_live_order(payload: dict):
     instrument = payload.get("instrument", "stock").lower()
     mode = payload.get("mode", "paper").lower()
     quantity = int(payload.get("quantity", 1))
-
     client_order_id = str(uuid.uuid4())[:20]
 
     logger.info(f"📥 Received signal → mode={mode}, instrument={instrument}, ticker={ticker}, action={action}")
 
     if mode != "live":
-        logger.info("Paper mode — skipping real order")
-        return {"status": "paper", "message": "Paper mode"}
+        return {"status": "paper", "message": "Paper mode - order not sent"}
 
     try:
         if instrument == "option":
             strike = payload.get("strike") or payload.get("strike_hint")
-            expiry = payload.get("expiry") or payload.get("expiration_hint") or payload.get("expiry_date")
+            expiry = payload.get("expiry") or payload.get("expiration_hint")
 
             if not strike or not expiry:
                 raise Exception(f"Missing strike or expiry. Got strike={strike}, expiry={expiry}")
@@ -137,7 +124,7 @@ async def execute_live_order(payload: dict):
             call_put = "CALL" if payload.get("call_put", "call").lower() == "call" else "PUT"
             order_action = "BUY_OPEN" if action == "BUY" else "SELL_CLOSE"
             expiry_str = _parse_expiry_to_str(expiry)
-            strike_price = int(float(strike))   # E*TRADE prefers int for whole numbers
+            strike_price = int(float(strike))
 
             logger.info(f"🚀 LIVE OPTION ORDER: {order_action} {quantity} {ticker} {call_put} {strike_price} {expiry_str}")
 
@@ -165,11 +152,10 @@ async def execute_live_order(payload: dict):
                 orderTerm="GOOD_FOR_DAY",
                 marketSession="REGULAR",
             )
-            logger.info(f"✅ LIVE OPTION ORDER PLACED: {final}")
             return {"status": "success", "result": final}
 
         else:
-            # Equity order
+            # Equity
             logger.info(f"🚀 LIVE EQUITY ORDER: {action} {quantity} {ticker}")
 
             orders = pyetrade.ETradeOrder(
@@ -192,15 +178,13 @@ async def execute_live_order(payload: dict):
                 orderTerm="GOOD_FOR_DAY",
                 marketSession="REGULAR",
             )
-            logger.info(f"✅ LIVE EQUITY ORDER PLACED: {final}")
             return {"status": "success", "result": final}
 
     except Exception as e:
-        consecutive_failures += 1
         logger.error(f"❌ LIVE TRADE FAILED: {e}")
         raise
 
-# ==================== WEBHOOK ====================
+# ==================== MODELS & ENDPOINTS ====================
 class WebhookPayload(BaseModel):
     secret: str
     ticker: str
@@ -216,19 +200,19 @@ class WebhookPayload(BaseModel):
 async def webhook(payload: WebhookPayload = Body(...)):
     if payload.secret != WEBHOOK_SECRET:
         raise HTTPException(403, "Unauthorized")
-
     try:
         result = await execute_live_order(payload.dict())
         return {"status": "processed", "result": result}
     except Exception as e:
         return {"status": "failed", "message": str(e)}
 
-# ==================== AUTH ENDPOINTS ====================
+# ==================== AUTH ====================
 @app.post("/etrade/auth/start")
 async def start_linking():
     try:
         oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
-        authorize_url = oauth.get_authorized_url()
+        # Use get_authorize_url (without 'd') for compatibility
+        authorize_url = oauth.get_authorize_url()
         logger.info("✅ E*TRADE auth URL generated successfully")
         return {"authorize_url": authorize_url}
     except Exception as e:
@@ -244,7 +228,7 @@ async def complete_linking(verifier: str = Body(..., embed=True)):
         logger.info("=== NEW TOKENS RECEIVED ===")
         logger.info(f"ETRADE_ACCESS_TOKEN={tokens['oauth_token']}")
         logger.info(f"ETRADE_ACCESS_TOKEN_SECRET={tokens['oauth_token_secret']}")
-        return {"status": "success", "message": "Tokens received. Add them to Railway Variables."}
+        return {"status": "success", "message": "Add the tokens above to Railway Variables and redeploy"}
     except Exception as e:
         logger.error(f"Complete link failed: {e}")
         raise HTTPException(500, str(e))
@@ -253,11 +237,7 @@ async def complete_linking(verifier: str = Body(..., embed=True)):
 async def get_account():
     tokens = load_tokens()
     if not tokens:
-        return {
-            "status": "not_linked",
-            "linked": False,
-            "message": "No tokens found. Please link your E*TRADE account first."
-        }
+        return {"status": "not_linked", "linked": False, "message": "No tokens found"}
 
     try:
         accounts_client = pyetrade.ETradeAccounts(
@@ -267,7 +247,6 @@ async def get_account():
             resource_token_secret=tokens['oauth_token_secret'],
             dev=False
         )
-
         raw_response = accounts_client.list_accounts()
 
         account_list = []
@@ -287,11 +266,9 @@ async def get_account():
             "status": "linked",
             "linked": True,
             "accounts": account_list,
-            "message": "Copy the accountIdKey you want to use and set it as ETRADE_ACCOUNT_ID in Railway"
+            "message": "Copy the accountIdKey you want and set it as ETRADE_ACCOUNT_ID in Railway"
         }
-
     except Exception as e:
-        logger.error(f"Failed to fetch accounts: {e}")
         return {"status": "error", "message": str(e)}
 
 @app.post("/etrade/auth/renew")
@@ -299,24 +276,19 @@ async def renew_tokens():
     tokens = load_tokens()
     if not tokens:
         raise HTTPException(400, "No tokens to renew")
-
     try:
         auth_manager = pyetrade.authorization.ETradeAccessManager(
-            CONSUMER_KEY, CONSUMER_SECRET,
-            tokens['oauth_token'], tokens['oauth_token_secret']
+            CONSUMER_KEY, CONSUMER_SECRET, tokens['oauth_token'], tokens['oauth_token_secret']
         )
         auth_manager.renew_access_token()
-        logger.info("✅ Token renewed successfully")
         return {"status": "success"}
     except Exception as e:
-        logger.error(f"Renew failed: {e}")
         raise HTTPException(500, str(e))
 
 @app.post("/etrade/disconnect")
 async def disconnect():
     global _current_tokens
     _current_tokens = {}
-    logger.info("User requested account disconnect")
     return {"status": "disconnected"}
 
 # ==================== HEALTH & QUOTE ====================
@@ -336,7 +308,6 @@ async def get_quote(symbols: str = Query(...)):
     tokens = load_tokens()
     if not tokens:
         raise HTTPException(401, "Not linked")
-
     try:
         market = pyetrade.ETradeMarket(
             consumer_key=CONSUMER_KEY,
@@ -345,10 +316,8 @@ async def get_quote(symbols: str = Query(...)):
             oauth_token_secret=tokens['oauth_token_secret'],
             dev=False
         )
-        quotes = market.get_quote(symbols.split(","), resp_format="json")
-        return quotes
+        return market.get_quote(symbols.split(","), resp_format="json")
     except Exception as e:
-        logger.error(f"Quote failed: {e}")
         raise HTTPException(500, str(e))
 
 # ==================== STARTUP ====================
@@ -357,18 +326,17 @@ async def on_startup():
     logger.info(f"Starting → {'SANDBOX' if is_sandbox else 'PRODUCTION'} | LIVE={LIVE_TRADING}")
 
     if not CONSUMER_KEY or not CONSUMER_SECRET:
-        logger.warning("⚠️ ETRADE_CONSUMER_KEY or SECRET not set")
+        logger.warning("⚠️ ETRADE_CONSUMER_KEY or SECRET missing")
 
     if not TARGET_ACCOUNT_ID:
-        logger.warning("⚠️ TARGET_ACCOUNT_ID is not set — live orders will likely fail")
+        logger.warning("⚠️ TARGET_ACCOUNT_ID is not set — live orders will fail")
 
     if REDIS_URL:
         try:
             global redis
             redis = await redis_from_url(REDIS_URL, decode_responses=True)
-            logger.info("✅ Redis connected")
-        except Exception as e:
-            logger.warning(f"No REDIS_URL set — running without Redis queue")
+        except Exception:
+            logger.warning("No REDIS_URL set — running without Redis queue")
 
     await init_db()
     logger.info("✅ Bot ready")
