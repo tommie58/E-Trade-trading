@@ -319,9 +319,8 @@ async def check_risk_limits():
     if circuit_breaker_open:
         raise HTTPException(503, "Circuit breaker open")
 
-# ==================== LIVE TRADING (with expiry object fix) ====================
+# ==================== LIVE TRADING (with improved preview logging) ====================
 def _parse_expiry_to_object(expiry: Any) -> Dict:
-    """Convert '2026-07-03' string to {'year': 2026, 'month': 7, 'day': 3}"""
     if isinstance(expiry, dict):
         return expiry
     if isinstance(expiry, str) and "-" in expiry:
@@ -330,7 +329,7 @@ def _parse_expiry_to_object(expiry: Any) -> Dict:
             return {"year": y, "month": m, "day": d}
         except Exception:
             pass
-    return expiry  # fallback
+    return expiry
 
 async def execute_live_order(payload: dict):
     global consecutive_failures
@@ -341,6 +340,10 @@ async def execute_live_order(payload: dict):
     action = payload.get("action", "UNKNOWN").upper()
 
     logger.info(f"📥 Received signal → mode={mode}, instrument={instrument}, ticker={ticker}, action={action}")
+
+    if not TARGET_ACCOUNT_ID:
+        logger.error("❌ TARGET_ACCOUNT_ID is not set in environment variables")
+        raise Exception("TARGET_ACCOUNT_ID is missing")
 
     if mode != "live" or not LIVE_TRADING or is_sandbox:
         logger.info(f"⏭️ Skipping trade (mode={mode}, LIVE_TRADING={LIVE_TRADING}, sandbox={is_sandbox})")
@@ -412,9 +415,9 @@ async def execute_live_order(payload: dict):
                         )
                         preview_data = preview_resp.get('PreviewOrderResponse', {})
                         preview_ids = preview_data.get('PreviewIds', {}).get('PreviewId', [{}])
-                        if preview_ids:
+                        if preview_ids and preview_ids[0].get('previewId'):
                             preview_id = preview_ids[0].get('previewId')
-                            logger.info(f"Preview successful using {preview_method}, previewId = {preview_id}")
+                            logger.info(f"✅ Preview successful using {preview_method}, previewId = {preview_id}")
                             break
                 except Exception as e:
                     logger.warning(f"Preview with {preview_method} failed: {e}")
@@ -427,6 +430,8 @@ async def execute_live_order(payload: dict):
             }
             if preview_id:
                 place_kwargs["previewId"] = preview_id
+            else:
+                logger.warning("No previewId obtained — placing without it (may fail)")
 
             final = await asyncio.to_thread(orders.place_option_order, **place_kwargs)
             logger.info(f"✅ LIVE OPTION TRADE SUCCESS: {symbol} {call_put}")
@@ -512,6 +517,9 @@ async def on_startup():
     global redis
     logger.info(f"Starting → {'SANDBOX' if is_sandbox else 'PRODUCTION'} | LIVE={LIVE_TRADING}")
 
+    if not TARGET_ACCOUNT_ID:
+        logger.warning("⚠️ TARGET_ACCOUNT_ID is not set — live orders will likely fail")
+
     if REDIS_URL:
         try:
             redis = await redis_from_url(REDIS_URL, decode_responses=True)
@@ -579,7 +587,8 @@ async def health():
         "status": "ok",
         "env": ENV,
         "live_trading": LIVE_TRADING,
-        "linked": bool(tokens)
+        "linked": bool(tokens),
+        "has_account_id": bool(TARGET_ACCOUNT_ID)
     }
 
 if __name__ == "__main__":
