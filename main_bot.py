@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 import pyetrade
 import os
 import json
@@ -116,7 +116,6 @@ async def _save_tokens_to_db(token: str, token_secret: str):
 
 def load_tokens() -> Optional[Dict[str, str]]:
     global _current_tokens
-
     if _current_tokens:
         return _current_tokens
 
@@ -136,7 +135,6 @@ def load_tokens() -> Optional[Dict[str, str]]:
                     return tokens
         except Exception as e:
             logger.warning(f"Could not load tokens from DB: {e}")
-
     return None
 
 
@@ -226,7 +224,7 @@ async def etrade_auth_complete(data: dict = Body(...)):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-# ==================== IMPROVED RENEW ====================
+# ==================== RENEW ====================
 @app.post("/etrade/auth/renew")
 async def etrade_auth_renew(data: dict = Body(...)):
     try:
@@ -321,7 +319,19 @@ async def check_risk_limits():
     if circuit_breaker_open:
         raise HTTPException(503, "Circuit breaker open")
 
-# ==================== LIVE TRADING ====================
+# ==================== LIVE TRADING (with expiry object fix) ====================
+def _parse_expiry_to_object(expiry: Any) -> Dict:
+    """Convert '2026-07-03' string to {'year': 2026, 'month': 7, 'day': 3}"""
+    if isinstance(expiry, dict):
+        return expiry
+    if isinstance(expiry, str) and "-" in expiry:
+        try:
+            y, m, d = map(int, expiry.split("-"))
+            return {"year": y, "month": m, "day": d}
+        except Exception:
+            pass
+    return expiry  # fallback
+
 async def execute_live_order(payload: dict):
     global consecutive_failures
 
@@ -354,13 +364,16 @@ async def execute_live_order(payload: dict):
         if instrument == "option":
             symbol = payload["ticker"]
             strike = payload.get("strike_hint") or payload.get("strike")
-            expiry = payload.get("expiration_hint") or payload.get("expiry")
+            raw_expiry = payload.get("expiration_hint") or payload.get("expiry")
+            expiry = _parse_expiry_to_object(raw_expiry)
             call_put = payload.get("option_right", "CALL").upper()
             quantity = payload.get("option_contracts", 1)
             order_action = "BUY_OPEN" if action == "BUY" else "SELL_OPEN"
 
             if not strike or not expiry:
                 raise Exception(f"Missing strike or expiration for option order. Got strike={strike}, expiry={expiry}")
+
+            logger.info(f"Converted expiry for E*TRADE: {expiry}")
 
             order_payload = {
                 "Order": [{
@@ -420,6 +433,7 @@ async def execute_live_order(payload: dict):
             return {"status": "success", "response": final}
 
         else:
+            # EQUITY ORDER
             quantity = payload.get("position_size_shares", 1)
             price_type = "LIMIT" if payload.get("limit_price") else "MARKET"
             limit_price = payload.get("limit_price")
@@ -546,18 +560,16 @@ async def webhook(payload: WebhookPayload = Body(...)):
 @app.get("/etrade/account")
 async def get_etrade_account():
     tokens = load_tokens()
-    if not tokens:
-        # Force a DB reload as a last resort
-        if async_session:
-            try:
-                loop = asyncio.get_event_loop()
-                if not loop.is_running():
-                    tokens = loop.run_until_complete(_load_tokens_from_db())
-                    if tokens:
-                        global _current_tokens
-                        _current_tokens = tokens
-            except Exception:
-                pass
+    if not tokens and async_session:
+        try:
+            loop = asyncio.get_event_loop()
+            if not loop.is_running():
+                tokens = loop.run_until_complete(_load_tokens_from_db())
+                if tokens:
+                    global _current_tokens
+                    _current_tokens = tokens
+        except Exception:
+            pass
     return {"status": "linked" if tokens else "not_linked", "linked": bool(tokens)}
 
 @app.get("/health")
