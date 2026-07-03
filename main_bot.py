@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== CONFIG ====================
-VERSION = "2.3.0-requests-oauthlib"
+VERSION = "2.3.0-requests-oauthlib-full"
 ENV = os.getenv("ETRADE_ENV", "production").lower()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "true").lower() == "true"
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
@@ -217,8 +217,6 @@ async def start_linking():
             client_secret=CONSUMER_SECRET,
             callback_uri="oob"
         )
-
-        # Get request token
         request_token = oauth.fetch_request_token(
             "https://api.etrade.com/oauth/request_token"
         )
@@ -232,27 +230,16 @@ async def start_linking():
             "secret": oauth_token_secret
         }
 
-        # Build authorize URL (encode only values)
         encoded_token = urllib.parse.quote(oauth_token, safe='')
-        authorize_url = (
-            f"https://us.etrade.com/e/t/etws/authorize?"
-            f"key={CONSUMER_KEY}&token={encoded_token}"
-        )
+        authorize_url = f"https://us.etrade.com/e/t/etws/authorize?key={CONSUMER_KEY}&token={encoded_token}"
 
-        # Guard
         parsed = urllib.parse.urlparse(authorize_url)
         qs = urllib.parse.parse_qs(parsed.query)
         if qs.get("token", [None])[0] != oauth_token:
             raise HTTPException(500, "Failed to build valid authorize URL")
 
-        logger.info(
-            f"✅ [v{VERSION}] Request token generated | token_len={len(oauth_token)}"
-        )
-
-        return {
-            "authorize_url": authorize_url,
-            "request_token": oauth_token
-        }
+        logger.info(f"✅ [v{VERSION}] Request token generated | token_len={len(oauth_token)}")
+        return {"authorize_url": authorize_url, "request_token": oauth_token}
     except Exception as e:
         logger.error(f"Start linking failed: {e}")
         raise HTTPException(500, str(e))
@@ -285,7 +272,6 @@ async def complete_linking(
             resource_owner_secret=oauth_token_secret
         )
 
-        # Exchange for access token
         access_token = oauth.fetch_access_token(
             "https://api.etrade.com/oauth/access_token",
             verifier=verifier
@@ -316,7 +302,68 @@ async def get_account():
     tokens = load_tokens()
     if not tokens:
         return {"status": "not_linked", "linked": False}
-    return {"status": "linked", "linked": True, "accounts": []}
+    try:
+        accounts_client = pyetrade.ETradeAccounts(
+            consumer_key=CONSUMER_KEY,
+            consumer_secret=CONSUMER_SECRET,
+            resource_token=tokens['oauth_token'],
+            resource_token_secret=tokens['oauth_token_secret'],
+            dev=False
+        )
+        raw = accounts_client.list_accounts()
+        account_list = []
+        if raw and 'AccountListResponse' in raw:
+            accs = raw['AccountListResponse'].get('Accounts', {}).get('Account', [])
+            if not isinstance(accs, list):
+                accs = [accs]
+            for a in accs:
+                account_list.append({
+                    "accountIdKey": a.get("accountIdKey"),
+                    "accountId": a.get("accountId"),
+                    "accountType": a.get("accountType")
+                })
+        return {"status": "linked", "linked": True, "accounts": account_list}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/etrade/auth/renew")
+async def renew_tokens():
+    tokens = load_tokens()
+    if not tokens:
+        raise HTTPException(400, "No tokens to renew")
+    try:
+        am = pyetrade.authorization.ETradeAccessManager(
+            CONSUMER_KEY, CONSUMER_SECRET,
+            tokens['oauth_token'], tokens['oauth_token_secret']
+        )
+        am.renew_access_token()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/etrade/disconnect")
+async def disconnect():
+    global _current_tokens
+    _current_tokens = {}
+    return {"status": "disconnected"}
+
+@app.get("/etrade/quote")
+async def get_quote(symbols: str = Query(...)):
+    tokens = load_tokens()
+    if not tokens:
+        raise HTTPException(401, "Not linked")
+    try:
+        market = pyetrade.ETradeMarket(
+            consumer_key=CONSUMER_KEY,
+            consumer_secret=CONSUMER_SECRET,
+            oauth_token=tokens['oauth_token'],
+            oauth_token_secret=tokens['oauth_token_secret'],
+            dev=False
+        )
+        return market.get_quote(symbols.split(","), resp_format="json")
+    except Exception as e:
+        logger.error(f"Quote failed: {e}")
+        raise HTTPException(500, str(e))
 
 @app.get("/health")
 async def health():
@@ -326,14 +373,21 @@ async def health():
         "version": VERSION,
         "env": ENV,
         "live_trading": LIVE_TRADING,
-        "linked": bool(tokens)
+        "linked": bool(tokens),
+        "target_account_set": bool(TARGET_ACCOUNT_ID)
     }
 
 @app.on_event("startup")
 async def on_startup():
     logger.info(f"Starting → PRODUCTION | LIVE={LIVE_TRADING} | version={VERSION}")
     if not TARGET_ACCOUNT_ID:
-        logger.warning("⚠️ TARGET_ACCOUNT_ID not set")
+        logger.warning("⚠️ TARGET_ACCOUNT_ID not set — live orders will fail")
+    if REDIS_URL:
+        try:
+            global redis
+            redis = await redis_from_url(REDIS_URL, decode_responses=True)
+        except:
+            logger.warning("No REDIS_URL set — running without Redis queue")
     await init_db()
     logger.info("✅ Bot ready")
 
