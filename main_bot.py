@@ -7,6 +7,7 @@ import os
 import logging
 import uuid
 import asyncio
+import urllib.parse
 from datetime import datetime, timedelta
 from redis.asyncio import from_url as redis_from_url
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -38,7 +39,7 @@ engine = None
 async_session = None
 _current_tokens: Dict[str, str] = {}
 
-# In-memory pending request tokens (request_token -> info)
+# In-memory pending request tokens
 pending_request_tokens: Dict[str, dict] = {}
 MAX_PENDING_TOKENS = 5
 REQUEST_TOKEN_TTL = timedelta(minutes=5)
@@ -67,15 +68,12 @@ def save_tokens(tokens: Dict[str, str]):
     logger.info("✅ Tokens saved to memory cache")
 
 def _cleanup_pending_tokens():
-    """Remove expired or oldest tokens (keep max 5)"""
     global pending_request_tokens
     now = datetime.utcnow()
-    # Remove expired
     pending_request_tokens = {
         k: v for k, v in pending_request_tokens.items()
         if now - v["timestamp"] < REQUEST_TOKEN_TTL
     }
-    # Keep only the newest 5
     if len(pending_request_tokens) > MAX_PENDING_TOKENS:
         sorted_tokens = sorted(
             pending_request_tokens.items(),
@@ -102,7 +100,7 @@ async def init_db():
     except Exception as e:
         logger.warning(f"Database warning (falling back to SQLite): {e}")
 
-# ==================== LIVE TRADING (kept concise) ====================
+# ==================== LIVE TRADING ====================
 async def execute_live_order(payload: dict):
     tokens = load_tokens()
     if not tokens:
@@ -110,20 +108,83 @@ async def execute_live_order(payload: dict):
     if not TARGET_ACCOUNT_ID:
         raise Exception("TARGET_ACCOUNT_ID is not set")
 
-    # ... (your existing flat-kwargs option + equity logic here)
-    # For space, keeping the structure — paste your working execute_live_order if needed
     ticker = payload.get("ticker")
     action = payload.get("action", "BUY").upper()
     instrument = payload.get("instrument", "stock").lower()
     mode = payload.get("mode", "paper").lower()
     quantity = int(payload.get("quantity", 1))
+    client_order_id = str(uuid.uuid4())[:20]
+
+    logger.info(f"📥 Received signal → mode={mode}, instrument={instrument}, ticker={ticker}, action={action}")
 
     if mode != "live":
-        return {"status": "paper"}
+        return {"status": "paper", "message": "Paper mode"}
 
-    logger.info(f"🚀 LIVE {instrument.upper()} ORDER: {action} {quantity} {ticker}")
-    # Add your full order placement code here (flat kwargs version)
-    return {"status": "success", "message": "Order placed (placeholder)"}
+    try:
+        if instrument == "option":
+            strike = payload.get("strike") or payload.get("strike_hint")
+            expiry = payload.get("expiry") or payload.get("expiration_hint")
+            if not strike or not expiry:
+                raise Exception("Missing strike or expiry")
+
+            call_put = "CALL" if payload.get("call_put", "call").lower() == "call" else "PUT"
+            order_action = "BUY_OPEN" if action == "BUY" else "SELL_CLOSE"
+            expiry_str = str(expiry) if isinstance(expiry, str) else f"{expiry.get('year')}-{str(expiry.get('month')).zfill(2)}-{str(expiry.get('day')).zfill(2)}"
+            strike_price = int(float(strike))
+
+            logger.info(f"🚀 LIVE OPTION ORDER: {order_action} {quantity} {ticker} {call_put} {strike_price}")
+
+            orders = pyetrade.ETradeOrder(
+                consumer_key=CONSUMER_KEY,
+                consumer_secret=CONSUMER_SECRET,
+                resource_token=tokens['oauth_token'],
+                resource_token_secret=tokens['oauth_token_secret'],
+                dev=False
+            )
+
+            final = await asyncio.to_thread(
+                orders.place_option_order,
+                resp_format="json",
+                accountIdKey=TARGET_ACCOUNT_ID,
+                symbol=ticker,
+                callPut=call_put,
+                expiryDate=expiry_str,
+                strikePrice=strike_price,
+                orderAction=order_action,
+                clientOrderId=client_order_id,
+                priceType="MARKET",
+                quantity=quantity,
+                orderTerm="GOOD_FOR_DAY",
+                marketSession="REGULAR",
+            )
+            return {"status": "success", "result": final}
+
+        else:
+            logger.info(f"🚀 LIVE EQUITY ORDER: {action} {quantity} {ticker}")
+            orders = pyetrade.ETradeOrder(
+                consumer_key=CONSUMER_KEY,
+                consumer_secret=CONSUMER_SECRET,
+                resource_token=tokens['oauth_token'],
+                resource_token_secret=tokens['oauth_token_secret'],
+                dev=False
+            )
+            final = await asyncio.to_thread(
+                orders.place_equity_order,
+                resp_format="json",
+                accountIdKey=TARGET_ACCOUNT_ID,
+                symbol=ticker,
+                orderAction=action,
+                clientOrderId=client_order_id,
+                priceType="MARKET",
+                quantity=quantity,
+                orderTerm="GOOD_FOR_DAY",
+                marketSession="REGULAR",
+            )
+            return {"status": "success", "result": final}
+
+    except Exception as e:
+        logger.error(f"❌ LIVE TRADE FAILED: {e}")
+        raise
 
 # ==================== MODELS ====================
 class WebhookPayload(BaseModel):
@@ -167,7 +228,14 @@ async def start_linking():
             "secret": request_secret
         }
 
-        authorize_url = f"https://us.etrade.com/e/t/etws/authorize?key={CONSUMER_KEY}&token={request_token}"
+        # Properly percent-encode key and token
+        encoded_key = urllib.parse.quote(CONSUMER_KEY, safe='')
+        encoded_token = urllib.parse.quote(request_token, safe='')
+
+        authorize_url = (
+            f"https://us.etrade.com/e/t/etws/authorize?"
+            f"key={encoded_key}&token={encoded_token}"
+        )
 
         logger.info("✅ E*TRADE auth URL generated successfully")
         return {
@@ -184,25 +252,23 @@ async def complete_linking(
     request_token: Optional[str] = Body(None, embed=True)
 ):
     if not request_token:
-        raise HTTPException(400, "request_token is required (echo it from /start response)")
+        raise HTTPException(400, "request_token is required (echo it from /start)")
 
     _cleanup_pending_tokens()
 
     if request_token not in pending_request_tokens:
-        raise HTTPException(409, "No matching request token found. Please call /start again.")
+        raise HTTPException(409, "No matching request token. Please call /start again.")
 
     entry = pending_request_tokens[request_token]
-    age = datetime.utcnow() - entry["timestamp"]
-    if age > REQUEST_TOKEN_TTL:
+    if datetime.utcnow() - entry["timestamp"] > REQUEST_TOKEN_TTL:
         del pending_request_tokens[request_token]
-        raise HTTPException(400, "Request token expired (5-minute limit). Please start linking again.")
+        raise HTTPException(400, "Request token expired (5-minute limit). Please start again.")
 
     try:
         oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
-        oauth.get_request_token()  # initialize
+        oauth.get_request_token()
         tokens = oauth.get_access_token(verifier)
 
-        # Success — clean up used token
         del pending_request_tokens[request_token]
         save_tokens(tokens)
 
@@ -217,8 +283,8 @@ async def complete_linking(
             "access_token_secret": tokens["oauth_token_secret"]
         }
     except Exception as e:
-        error_msg = str(e)
-        if "token_rejected" in error_msg.lower() or "401" in error_msg:
+        error_str = str(e).lower()
+        if "token_rejected" in error_str or "401" in error_str:
             raise HTTPException(400, "Invalid or already used verifier code")
         logger.error(f"Complete link failed: {e}")
         raise HTTPException(500, str(e))
@@ -228,8 +294,50 @@ async def get_account():
     tokens = load_tokens()
     if not tokens:
         return {"status": "not_linked", "linked": False}
-    # Add your account listing logic here if needed
-    return {"status": "linked", "linked": True, "accounts": []}
+    try:
+        accounts_client = pyetrade.ETradeAccounts(
+            consumer_key=CONSUMER_KEY,
+            consumer_secret=CONSUMER_SECRET,
+            resource_token=tokens['oauth_token'],
+            resource_token_secret=tokens['oauth_token_secret'],
+            dev=False
+        )
+        raw = accounts_client.list_accounts()
+        account_list = []
+        if raw and 'AccountListResponse' in raw:
+            accs = raw['AccountListResponse'].get('Accounts', {}).get('Account', [])
+            if not isinstance(accs, list):
+                accs = [accs]
+            for a in accs:
+                account_list.append({
+                    "accountIdKey": a.get("accountIdKey"),
+                    "accountId": a.get("accountId"),
+                    "accountType": a.get("accountType")
+                })
+        return {"status": "linked", "linked": True, "accounts": account_list}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/etrade/auth/renew")
+async def renew_tokens():
+    tokens = load_tokens()
+    if not tokens:
+        raise HTTPException(400, "No tokens to renew")
+    try:
+        am = pyetrade.authorization.ETradeAccessManager(
+            CONSUMER_KEY, CONSUMER_SECRET,
+            tokens['oauth_token'], tokens['oauth_token_secret']
+        )
+        am.renew_access_token()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/etrade/disconnect")
+async def disconnect():
+    global _current_tokens
+    _current_tokens = {}
+    return {"status": "disconnected"}
 
 @app.get("/health")
 async def health():
@@ -238,14 +346,37 @@ async def health():
         "status": "ok",
         "env": ENV,
         "live_trading": LIVE_TRADING,
-        "linked": bool(tokens)
+        "linked": bool(tokens),
+        "target_account_set": bool(TARGET_ACCOUNT_ID)
     }
+
+@app.get("/etrade/quote")
+async def get_quote(symbols: str = Query(...)):
+    tokens = load_tokens()
+    if not tokens:
+        raise HTTPException(401, "Not linked")
+    market = pyetrade.ETradeMarket(
+        consumer_key=CONSUMER_KEY,
+        consumer_secret=CONSUMER_SECRET,
+        oauth_token=tokens['oauth_token'],
+        oauth_token_secret=tokens['oauth_token_secret'],
+        dev=False
+    )
+    return market.get_quote(symbols.split(","), resp_format="json")
 
 @app.on_event("startup")
 async def on_startup():
     logger.info(f"Starting → PRODUCTION | LIVE={LIVE_TRADING}")
+    if not CONSUMER_KEY or not CONSUMER_SECRET:
+        logger.warning("⚠️ Missing ETRADE_CONSUMER_KEY or SECRET")
     if not TARGET_ACCOUNT_ID:
         logger.warning("⚠️ TARGET_ACCOUNT_ID not set — live orders will fail")
+    if REDIS_URL:
+        try:
+            global redis
+            redis = await redis_from_url(REDIS_URL, decode_responses=True)
+        except:
+            logger.warning("No REDIS_URL set — running without Redis queue")
     await init_db()
     logger.info("✅ Bot ready")
 
