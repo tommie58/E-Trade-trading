@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== CONFIG ====================
-VERSION = "2.3.0-requests-oauthlib-full"
+VERSION = "2.4.0-final-corrected"
 ENV = os.getenv("ETRADE_ENV", "production").lower()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "true").lower() == "true"
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
@@ -28,6 +28,8 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 TARGET_ACCOUNT_ID = os.getenv("ETRADE_ACCOUNT_ID")
 REDIS_URL = os.getenv("REDIS_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+is_sandbox = ENV == "sandbox"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("etrade-bot")
@@ -115,6 +117,14 @@ async def execute_live_order(payload: dict):
     quantity = int(payload.get("quantity", 1))
     client_order_id = str(uuid.uuid4())[:20]
 
+    # Resolve strike/expiry with full fallback support
+    strike = payload.get("strike") or payload.get("strike_hint")
+    expiry = (
+        payload.get("expiry")
+        or payload.get("expiration_hint")
+        or payload.get("expiration_date")
+    )
+
     logger.info(f"📥 Received signal → mode={mode}, instrument={instrument}, ticker={ticker}, action={action}")
 
     if mode != "live":
@@ -122,24 +132,29 @@ async def execute_live_order(payload: dict):
 
     try:
         if instrument == "option":
-            strike = payload.get("strike") or payload.get("strike_hint")
-            expiry = payload.get("expiry") or payload.get("expiration_hint")
             if not strike or not expiry:
-                raise Exception("Missing strike or expiry")
+                raise Exception(f"Missing strike or expiry. Got strike={strike}, expiry={expiry}")
 
             call_put = "CALL" if payload.get("call_put", "call").lower() == "call" else "PUT"
             order_action = "BUY_OPEN" if action == "BUY" else "SELL_CLOSE"
-            expiry_str = str(expiry) if isinstance(expiry, str) else f"{expiry.get('year')}-{str(expiry.get('month')).zfill(2)}-{str(expiry.get('day')).zfill(2)}"
+
+            # Convert expiry to string if needed
+            if isinstance(expiry, dict):
+                expiry_str = f"{expiry.get('year')}-{str(expiry.get('month')).zfill(2)}-{str(expiry.get('day')).zfill(2)}"
+            else:
+                expiry_str = str(expiry)
+
             strike_price = int(float(strike))
 
-            logger.info(f"🚀 LIVE OPTION ORDER: {order_action} {quantity} {ticker} {call_put} {strike_price}")
+            logger.info(f"🚀 LIVE OPTION ORDER: {order_action} {quantity} {ticker} {call_put} {strike_price} {expiry_str}")
 
+            # Correct positional arguments for pyetrade
             orders = pyetrade.ETradeOrder(
-                consumer_key=CONSUMER_KEY,
-                consumer_secret=CONSUMER_SECRET,
-                resource_token=tokens['oauth_token'],
-                resource_token_secret=tokens['oauth_token_secret'],
-                dev=False
+                CONSUMER_KEY,
+                CONSUMER_SECRET,
+                tokens['oauth_token'],
+                tokens['oauth_token_secret'],
+                dev=is_sandbox
             )
 
             final = await asyncio.to_thread(
@@ -161,13 +176,15 @@ async def execute_live_order(payload: dict):
 
         else:
             logger.info(f"🚀 LIVE EQUITY ORDER: {action} {quantity} {ticker}")
+
             orders = pyetrade.ETradeOrder(
-                consumer_key=CONSUMER_KEY,
-                consumer_secret=CONSUMER_SECRET,
-                resource_token=tokens['oauth_token'],
-                resource_token_secret=tokens['oauth_token_secret'],
-                dev=False
+                CONSUMER_KEY,
+                CONSUMER_SECRET,
+                tokens['oauth_token'],
+                tokens['oauth_token_secret'],
+                dev=is_sandbox
             )
+
             final = await asyncio.to_thread(
                 orders.place_equity_order,
                 resp_format="json",
@@ -195,7 +212,13 @@ class WebhookPayload(BaseModel):
     instrument: Optional[str] = "stock"
     quantity: Optional[int] = 1
     strike: Optional[float] = None
+    strike_hint: Optional[float] = None
     expiry: Optional[str] = None
+    expiration_hint: Optional[str] = None
+    expiration_date: Optional[str] = None
+    expiration_year: Optional[int] = None
+    expiration_month: Optional[int] = None
+    expiration_day: Optional[int] = None
     call_put: Optional[str] = None
 
 # ==================== ENDPOINTS ====================
@@ -232,11 +255,6 @@ async def start_linking():
 
         encoded_token = urllib.parse.quote(oauth_token, safe='')
         authorize_url = f"https://us.etrade.com/e/t/etws/authorize?key={CONSUMER_KEY}&token={encoded_token}"
-
-        parsed = urllib.parse.urlparse(authorize_url)
-        qs = urllib.parse.parse_qs(parsed.query)
-        if qs.get("token", [None])[0] != oauth_token:
-            raise HTTPException(500, "Failed to build valid authorize URL")
 
         logger.info(f"✅ [v{VERSION}] Request token generated | token_len={len(oauth_token)}")
         return {"authorize_url": authorize_url, "request_token": oauth_token}
@@ -304,11 +322,11 @@ async def get_account():
         return {"status": "not_linked", "linked": False}
     try:
         accounts_client = pyetrade.ETradeAccounts(
-            consumer_key=CONSUMER_KEY,
-            consumer_secret=CONSUMER_SECRET,
-            resource_token=tokens['oauth_token'],
-            resource_token_secret=tokens['oauth_token_secret'],
-            dev=False
+            CONSUMER_KEY,
+            CONSUMER_SECRET,
+            tokens['oauth_token'],
+            tokens['oauth_token_secret'],
+            dev=is_sandbox
         )
         raw = accounts_client.list_accounts()
         account_list = []
@@ -354,11 +372,11 @@ async def get_quote(symbols: str = Query(...)):
         raise HTTPException(401, "Not linked")
     try:
         market = pyetrade.ETradeMarket(
-            consumer_key=CONSUMER_KEY,
-            consumer_secret=CONSUMER_SECRET,
-            oauth_token=tokens['oauth_token'],
-            oauth_token_secret=tokens['oauth_token_secret'],
-            dev=False
+            CONSUMER_KEY,
+            CONSUMER_SECRET,
+            tokens['oauth_token'],
+            tokens['oauth_token_secret'],
+            dev=is_sandbox
         )
         return market.get_quote(symbols.split(","), resp_format="json")
     except Exception as e:
