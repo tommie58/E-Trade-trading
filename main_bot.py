@@ -9,6 +9,7 @@ import uuid
 import asyncio
 import urllib.parse
 from datetime import datetime, timedelta
+from requests_oauthlib import OAuth1Session
 from redis.asyncio import from_url as redis_from_url
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -18,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== CONFIG ====================
-VERSION = "2.2.2-auth-url-guard"
+VERSION = "2.3.0-requests-oauthlib"
 ENV = os.getenv("ETRADE_ENV", "production").lower()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "true").lower() == "true"
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
@@ -211,53 +212,47 @@ async def webhook(payload: WebhookPayload = Body(...)):
 @app.post("/etrade/auth/start")
 async def start_linking():
     try:
-        oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
-        result = oauth.get_request_token()
-
-        if isinstance(result, dict):
-            request_token = result.get("oauth_token")
-            request_secret = result.get("oauth_token_secret")
-        else:
-            request_token = result
-            request_secret = None
-
-        _cleanup_pending_tokens()
-        pending_request_tokens[request_token] = {
-            "timestamp": datetime.utcnow(),
-            "secret": request_secret
-        }
-
-        # Encode ONLY the values (never = or &)
-        encoded_key = urllib.parse.quote(CONSUMER_KEY, safe='')
-        encoded_token = urllib.parse.quote(request_token, safe='')
-
-        authorize_url = (
-            f"https://us.etrade.com/e/t/etws/authorize?"
-            f"key={encoded_key}&token={encoded_token}"
+        oauth = OAuth1Session(
+            client_key=CONSUMER_KEY,
+            client_secret=CONSUMER_SECRET,
+            callback_uri="oob"
         )
 
-        # Hard guard - verify URL round-trips correctly
+        # Get request token
+        request_token = oauth.fetch_request_token(
+            "https://api.etrade.com/oauth/request_token"
+        )
+
+        oauth_token = request_token["oauth_token"]
+        oauth_token_secret = request_token["oauth_token_secret"]
+
+        _cleanup_pending_tokens()
+        pending_request_tokens[oauth_token] = {
+            "timestamp": datetime.utcnow(),
+            "secret": oauth_token_secret
+        }
+
+        # Build authorize URL (encode only values)
+        encoded_token = urllib.parse.quote(oauth_token, safe='')
+        authorize_url = (
+            f"https://us.etrade.com/e/t/etws/authorize?"
+            f"key={CONSUMER_KEY}&token={encoded_token}"
+        )
+
+        # Guard
         parsed = urllib.parse.urlparse(authorize_url)
         qs = urllib.parse.parse_qs(parsed.query)
-        decoded_key = qs.get("key", [None])[0]
-        decoded_token = qs.get("token", [None])[0]
-
-        if decoded_key != CONSUMER_KEY or decoded_token != request_token:
-            logger.error("URL encoding guard failed! Blocking malformed URL.")
+        if qs.get("token", [None])[0] != oauth_token:
             raise HTTPException(500, "Failed to build valid authorize URL")
 
-        has_special = any(c in request_token for c in ['+', '/', '='])
         logger.info(
-            f"✅ [v{VERSION}] E*TRADE auth URL generated | "
-            f"token_len={len(request_token)} | has_special_chars={has_special}"
+            f"✅ [v{VERSION}] Request token generated | token_len={len(oauth_token)}"
         )
 
         return {
             "authorize_url": authorize_url,
-            "request_token": request_token
+            "request_token": oauth_token
         }
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Start linking failed: {e}")
         raise HTTPException(500, str(e))
@@ -281,9 +276,25 @@ async def complete_linking(
         raise HTTPException(400, "Request token expired. Please start again.")
 
     try:
-        oauth = pyetrade.ETradeOAuth(CONSUMER_KEY, CONSUMER_SECRET)
-        oauth.get_request_token()
-        tokens = oauth.get_access_token(verifier)
+        oauth_token_secret = entry["secret"]
+
+        oauth = OAuth1Session(
+            client_key=CONSUMER_KEY,
+            client_secret=CONSUMER_SECRET,
+            resource_owner_key=request_token,
+            resource_owner_secret=oauth_token_secret
+        )
+
+        # Exchange for access token
+        access_token = oauth.fetch_access_token(
+            "https://api.etrade.com/oauth/access_token",
+            verifier=verifier
+        )
+
+        tokens = {
+            "oauth_token": access_token["oauth_token"],
+            "oauth_token_secret": access_token["oauth_token_secret"]
+        }
 
         del pending_request_tokens[request_token]
         save_tokens(tokens)
@@ -297,9 +308,6 @@ async def complete_linking(
             "access_token_secret": tokens["oauth_token_secret"]
         }
     except Exception as e:
-        error_str = str(e).lower()
-        if "token_rejected" in error_str:
-            raise HTTPException(400, "Invalid or already used verifier code")
         logger.error(f"Complete link failed: {e}")
         raise HTTPException(500, str(e))
 
