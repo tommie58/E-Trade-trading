@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== CONFIG ====================
-VERSION = "2.2.0-auth-url-encoding"
+VERSION = "2.2.1-enhanced-diagnostics"
 ENV = os.getenv("ETRADE_ENV", "production").lower()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "true").lower() == "true"
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
@@ -227,20 +227,20 @@ async def start_linking():
             "secret": request_secret
         }
 
-        # Proper encoding
+        # Build both raw and encoded URLs for comparison
+        raw_url = f"https://us.etrade.com/e/t/etws/authorize?key={CONSUMER_KEY}&token={request_token}"
         encoded_key = urllib.parse.quote(CONSUMER_KEY, safe='')
         encoded_token = urllib.parse.quote(request_token, safe='')
+        authorize_url = f"https://us.etrade.com/e/t/etws/authorize?key={encoded_key}&token={encoded_token}"
 
-        authorize_url = (
-            f"https://us.etrade.com/e/t/etws/authorize?"
-            f"key={encoded_key}&token={encoded_token}"
-        )
-
-        # Diagnostic logging
+        # Enhanced diagnostic logging
         has_special = any(c in request_token for c in ['+', '/', '='])
         logger.info(
-            f"✅ E*TRADE auth URL generated | token_len={len(request_token)} | "
-            f"has_special_chars={has_special} | encoded_tail={authorize_url[-30:]}"
+            f"✅ [v{VERSION}] E*TRADE auth URL generated | "
+            f"token_len={len(request_token)} | "
+            f"has_special_chars={has_special} | "
+            f"raw_tail={raw_url[-50:]} | "
+            f"encoded_tail={authorize_url[-50:]}"
         )
 
         return {
@@ -297,7 +297,6 @@ async def get_account():
     tokens = load_tokens()
     if not tokens:
         return {"status": "not_linked", "linked": False}
-    # ... (account listing logic)
     return {"status": "linked", "linked": True, "accounts": []}
 
 @app.get("/health")
