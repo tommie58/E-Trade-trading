@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, Dict
+from pydantic import BaseModel, ConfigDict
+from typing import Optional, Dict, Any
 import pyetrade
 import os
 import logging
@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== CONFIG ====================
-VERSION = "2.4.0-final-corrected"
+VERSION = "2.5.0-final-robust"
 ENV = os.getenv("ETRADE_ENV", "production").lower()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "true").lower() == "true"
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
@@ -43,6 +43,7 @@ engine = None
 async_session = None
 _current_tokens: Dict[str, str] = {}
 pending_request_tokens: Dict[str, dict] = {}
+_resolved_account_id: Optional[str] = None
 MAX_PENDING_TOKENS = 5
 REQUEST_TOKEN_TTL = timedelta(minutes=5)
 
@@ -84,6 +85,61 @@ def _cleanup_pending_tokens():
         )
         pending_request_tokens = dict(sorted_tokens[:MAX_PENDING_TOKENS])
 
+async def get_resolved_account_id() -> str:
+    """Auto-resolve the correct accountIdKey after linking"""
+    global _resolved_account_id
+
+    if _resolved_account_id:
+        return _resolved_account_id
+
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("No tokens available to resolve account")
+
+    try:
+        accounts_client = pyetrade.ETradeAccounts(
+            CONSUMER_KEY,
+            CONSUMER_SECRET,
+            tokens['oauth_token'],
+            tokens['oauth_token_secret'],
+            dev=is_sandbox
+        )
+        raw = accounts_client.list_accounts()
+
+        if not raw or 'AccountListResponse' not in raw:
+            raise Exception("Failed to fetch accounts")
+
+        accounts = raw['AccountListResponse'].get('Accounts', {}).get('Account', [])
+        if not isinstance(accounts, list):
+            accounts = [accounts]
+
+        # Try to match TARGET_ACCOUNT_ID against accountId or accountIdKey
+        if TARGET_ACCOUNT_ID:
+            for acc in accounts:
+                if (str(acc.get("accountId")) == str(TARGET_ACCOUNT_ID) or
+                    str(acc.get("accountIdKey")) == str(TARGET_ACCOUNT_ID)):
+                    _resolved_account_id = acc.get("accountIdKey")
+                    logger.info(f"✅ Resolved accountIdKey: {_resolved_account_id}")
+                    return _resolved_account_id
+
+        # Fallback to first active account
+        for acc in accounts:
+            if acc.get("accountStatus", "").upper() == "ACTIVE":
+                _resolved_account_id = acc.get("accountIdKey")
+                logger.info(f"✅ Using first active accountIdKey: {_resolved_account_id}")
+                return _resolved_account_id
+
+        # Last resort
+        if accounts:
+            _resolved_account_id = accounts[0].get("accountIdKey")
+            return _resolved_account_id
+
+        raise Exception("No accounts found")
+
+    except Exception as e:
+        logger.error(f"Failed to resolve account ID: {e}")
+        raise
+
 # ==================== DATABASE ====================
 async def init_db():
     global engine, async_session
@@ -107,8 +163,9 @@ async def execute_live_order(payload: dict):
     tokens = load_tokens()
     if not tokens:
         raise Exception("No E*TRADE tokens available")
-    if not TARGET_ACCOUNT_ID:
-        raise Exception("TARGET_ACCOUNT_ID is not set")
+
+    # Auto-resolve account key
+    account_id_key = await get_resolved_account_id()
 
     ticker = payload.get("ticker")
     action = payload.get("action", "BUY").upper()
@@ -117,13 +174,20 @@ async def execute_live_order(payload: dict):
     quantity = int(payload.get("quantity", 1))
     client_order_id = str(uuid.uuid4())[:20]
 
-    # Resolve strike/expiry with full fallback support
+    # Robust strike/expiry resolution
     strike = payload.get("strike") or payload.get("strike_hint")
     expiry = (
         payload.get("expiry")
         or payload.get("expiration_hint")
         or payload.get("expiration_date")
     )
+
+    # Fallback for expiration_year/month/day
+    if not expiry and payload.get("expiration_year"):
+        y = payload.get("expiration_year")
+        m = payload.get("expiration_month", 1)
+        d = payload.get("expiration_day", 1)
+        expiry = f"{y}-{str(m).zfill(2)}-{str(d).zfill(2)}"
 
     logger.info(f"📥 Received signal → mode={mode}, instrument={instrument}, ticker={ticker}, action={action}")
 
@@ -135,10 +199,9 @@ async def execute_live_order(payload: dict):
             if not strike or not expiry:
                 raise Exception(f"Missing strike or expiry. Got strike={strike}, expiry={expiry}")
 
-            call_put = "CALL" if payload.get("call_put", "call").lower() == "call" else "PUT"
+            call_put = "CALL" if str(payload.get("call_put", "call")).lower() == "call" else "PUT"
             order_action = "BUY_OPEN" if action == "BUY" else "SELL_CLOSE"
 
-            # Convert expiry to string if needed
             if isinstance(expiry, dict):
                 expiry_str = f"{expiry.get('year')}-{str(expiry.get('month')).zfill(2)}-{str(expiry.get('day')).zfill(2)}"
             else:
@@ -148,7 +211,6 @@ async def execute_live_order(payload: dict):
 
             logger.info(f"🚀 LIVE OPTION ORDER: {order_action} {quantity} {ticker} {call_put} {strike_price} {expiry_str}")
 
-            # Correct positional arguments for pyetrade
             orders = pyetrade.ETradeOrder(
                 CONSUMER_KEY,
                 CONSUMER_SECRET,
@@ -160,7 +222,7 @@ async def execute_live_order(payload: dict):
             final = await asyncio.to_thread(
                 orders.place_option_order,
                 resp_format="json",
-                accountIdKey=TARGET_ACCOUNT_ID,
+                accountIdKey=account_id_key,
                 symbol=ticker,
                 callPut=call_put,
                 expiryDate=expiry_str,
@@ -188,7 +250,7 @@ async def execute_live_order(payload: dict):
             final = await asyncio.to_thread(
                 orders.place_equity_order,
                 resp_format="json",
-                accountIdKey=TARGET_ACCOUNT_ID,
+                accountIdKey=account_id_key,
                 symbol=ticker,
                 orderAction=action,
                 clientOrderId=client_order_id,
@@ -205,6 +267,8 @@ async def execute_live_order(payload: dict):
 
 # ==================== MODELS ====================
 class WebhookPayload(BaseModel):
+    model_config = ConfigDict(extra='allow')
+
     secret: str
     ticker: str
     action: str
@@ -220,6 +284,9 @@ class WebhookPayload(BaseModel):
     expiration_month: Optional[int] = None
     expiration_day: Optional[int] = None
     call_put: Optional[str] = None
+    option_right: Optional[str] = None
+    option_contracts: Optional[int] = None
+    option_limit_price: Optional[float] = None
 
 # ==================== ENDPOINTS ====================
 @app.post("/webhook")
@@ -303,6 +370,12 @@ async def complete_linking(
         del pending_request_tokens[request_token]
         save_tokens(tokens)
 
+        # Auto-resolve account key after successful linking
+        try:
+            await get_resolved_account_id()
+        except Exception as e:
+            logger.warning(f"Could not auto-resolve account key yet: {e}")
+
         logger.info("=== NEW TOKENS RECEIVED ===")
         return {
             "status": "success",
@@ -361,8 +434,9 @@ async def renew_tokens():
 
 @app.post("/etrade/disconnect")
 async def disconnect():
-    global _current_tokens
+    global _current_tokens, _resolved_account_id
     _current_tokens = {}
+    _resolved_account_id = None
     return {"status": "disconnected"}
 
 @app.get("/etrade/quote")
@@ -392,14 +466,15 @@ async def health():
         "env": ENV,
         "live_trading": LIVE_TRADING,
         "linked": bool(tokens),
-        "target_account_set": bool(TARGET_ACCOUNT_ID)
+        "target_account_set": bool(TARGET_ACCOUNT_ID),
+        "resolved_account_key": _resolved_account_id
     }
 
 @app.on_event("startup")
 async def on_startup():
     logger.info(f"Starting → PRODUCTION | LIVE={LIVE_TRADING} | version={VERSION}")
     if not TARGET_ACCOUNT_ID:
-        logger.warning("⚠️ TARGET_ACCOUNT_ID not set — live orders will fail")
+        logger.warning("⚠️ TARGET_ACCOUNT_ID not set — will try to auto-resolve after linking")
     if REDIS_URL:
         try:
             global redis
