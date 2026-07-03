@@ -1,14 +1,14 @@
 from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 import pyetrade
 import os
 import logging
 import uuid
 import asyncio
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from requests_oauthlib import OAuth1Session
 from redis.asyncio import from_url as redis_from_url
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== CONFIG ====================
-VERSION = "2.5.0-final-robust"
+VERSION = "2.6.0-option-chain-snap"
 ENV = os.getenv("ETRADE_ENV", "production").lower()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "true").lower() == "true"
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
@@ -86,26 +86,21 @@ def _cleanup_pending_tokens():
         pending_request_tokens = dict(sorted_tokens[:MAX_PENDING_TOKENS])
 
 async def get_resolved_account_id() -> str:
-    """Auto-resolve the correct accountIdKey after linking"""
     global _resolved_account_id
-
     if _resolved_account_id:
         return _resolved_account_id
 
     tokens = load_tokens()
     if not tokens:
-        raise Exception("No tokens available to resolve account")
+        raise Exception("No tokens available")
 
     try:
         accounts_client = pyetrade.ETradeAccounts(
-            CONSUMER_KEY,
-            CONSUMER_SECRET,
-            tokens['oauth_token'],
-            tokens['oauth_token_secret'],
+            CONSUMER_KEY, CONSUMER_SECRET,
+            tokens['oauth_token'], tokens['oauth_token_secret'],
             dev=is_sandbox
         )
         raw = accounts_client.list_accounts()
-
         if not raw or 'AccountListResponse' not in raw:
             raise Exception("Failed to fetch accounts")
 
@@ -113,31 +108,25 @@ async def get_resolved_account_id() -> str:
         if not isinstance(accounts, list):
             accounts = [accounts]
 
-        # Try to match TARGET_ACCOUNT_ID against accountId or accountIdKey
         if TARGET_ACCOUNT_ID:
             for acc in accounts:
-                if (str(acc.get("accountId")) == str(TARGET_ACCOUNT_ID) or
-                    str(acc.get("accountIdKey")) == str(TARGET_ACCOUNT_ID)):
+                if str(acc.get("accountId")) == str(TARGET_ACCOUNT_ID) or \
+                   str(acc.get("accountIdKey")) == str(TARGET_ACCOUNT_ID):
                     _resolved_account_id = acc.get("accountIdKey")
-                    logger.info(f"✅ Resolved accountIdKey: {_resolved_account_id}")
                     return _resolved_account_id
 
-        # Fallback to first active account
         for acc in accounts:
             if acc.get("accountStatus", "").upper() == "ACTIVE":
                 _resolved_account_id = acc.get("accountIdKey")
-                logger.info(f"✅ Using first active accountIdKey: {_resolved_account_id}")
                 return _resolved_account_id
 
-        # Last resort
         if accounts:
             _resolved_account_id = accounts[0].get("accountIdKey")
             return _resolved_account_id
 
         raise Exception("No accounts found")
-
     except Exception as e:
-        logger.error(f"Failed to resolve account ID: {e}")
+        logger.error(f"Account resolution failed: {e}")
         raise
 
 # ==================== DATABASE ====================
@@ -158,13 +147,94 @@ async def init_db():
     except Exception as e:
         logger.warning(f"Database warning (falling back to SQLite): {e}")
 
+# ==================== OPTION CHAIN SNAPPING ====================
+def _snap_to_real_contract(
+    symbol: str,
+    requested_expiry: str,
+    requested_strike: float,
+    call_put: str
+) -> Tuple[str, float]:
+    """
+    Query E*TRADE option chain and snap to nearest real contract.
+    Returns (expiry_str, strike) — falls back to original values on failure.
+    """
+    tokens = load_tokens()
+    if not tokens:
+        return requested_expiry, requested_strike
+
+    try:
+        market = pyetrade.ETradeMarket(
+            CONSUMER_KEY,
+            CONSUMER_SECRET,
+            tokens['oauth_token'],
+            tokens['oauth_token_secret'],
+            dev=is_sandbox
+        )
+
+        chain = market.get_option_chains(
+            symbol=symbol,
+            resp_format="json"
+        )
+
+        if not chain or 'OptionChainResponse' not in chain:
+            return requested_expiry, requested_strike
+
+        # Parse chain (structure can vary slightly by symbol)
+        options = chain.get('OptionChainResponse', {}).get('OptionPair', [])
+        if not isinstance(options, list):
+            options = [options]
+
+        expirations = set()
+        strikes = set()
+
+        for pair in options:
+            for key in ['Call', 'Put']:
+                if key in pair:
+                    opt = pair[key]
+                    exp = opt.get('expiryDate')
+                    if exp:
+                        if isinstance(exp, dict):
+                            exp_str = f"{exp['year']}-{str(exp['month']).zfill(2)}-{str(exp['day']).zfill(2)}"
+                        else:
+                            exp_str = str(exp)
+                        expirations.add(exp_str)
+
+                    strike = opt.get('strikePrice')
+                    if strike:
+                        strikes.add(float(strike))
+
+        if not expirations or not strikes:
+            return requested_expiry, requested_strike
+
+        # Find closest expiry
+        try:
+            req_date = datetime.strptime(requested_expiry, "%Y-%m-%d").date()
+        except:
+            req_date = datetime.strptime(requested_expiry.split("T")[0], "%Y-%m-%d").date()
+
+        closest_expiry = min(
+            expirations,
+            key=lambda x: abs(datetime.strptime(x, "%Y-%m-%d").date() - req_date)
+        )
+
+        # Find closest strike
+        closest_strike = min(strikes, key=lambda x: abs(x - requested_strike))
+
+        if closest_expiry != requested_expiry or closest_strike != requested_strike:
+            logger.info(f"Snapped contract: {requested_expiry}@{requested_strike} → {closest_expiry}@{closest_strike}")
+
+        return closest_expiry, closest_strike
+
+    except Exception as e:
+        logger.warning(f"Option chain lookup failed (using original values): {e}")
+        return requested_expiry, requested_strike
+
 # ==================== LIVE TRADING ====================
 async def execute_live_order(payload: dict):
     tokens = load_tokens()
     if not tokens:
         raise Exception("No E*TRADE tokens available")
 
-    # Auto-resolve account key
     account_id_key = await get_resolved_account_id()
 
     ticker = payload.get("ticker")
@@ -174,7 +244,6 @@ async def execute_live_order(payload: dict):
     quantity = int(payload.get("quantity", 1))
     client_order_id = str(uuid.uuid4())[:20]
 
-    # Robust strike/expiry resolution
     strike = payload.get("strike") or payload.get("strike_hint")
     expiry = (
         payload.get("expiry")
@@ -182,7 +251,6 @@ async def execute_live_order(payload: dict):
         or payload.get("expiration_date")
     )
 
-    # Fallback for expiration_year/month/day
     if not expiry and payload.get("expiration_year"):
         y = payload.get("expiration_year")
         m = payload.get("expiration_month", 1)
@@ -202,12 +270,10 @@ async def execute_live_order(payload: dict):
             call_put = "CALL" if str(payload.get("call_put", "call")).lower() == "call" else "PUT"
             order_action = "BUY_OPEN" if action == "BUY" else "SELL_CLOSE"
 
-            if isinstance(expiry, dict):
-                expiry_str = f"{expiry.get('year')}-{str(expiry.get('month')).zfill(2)}-{str(expiry.get('day')).zfill(2)}"
-            else:
-                expiry_str = str(expiry)
-
-            strike_price = int(float(strike))
+            # === SNAP TO REAL CONTRACT ===
+            expiry_str, strike_price = _snap_to_real_contract(
+                ticker, str(expiry), float(strike), call_put
+            )
 
             logger.info(f"🚀 LIVE OPTION ORDER: {order_action} {quantity} {ticker} {call_put} {strike_price} {expiry_str}")
 
@@ -370,11 +436,10 @@ async def complete_linking(
         del pending_request_tokens[request_token]
         save_tokens(tokens)
 
-        # Auto-resolve account key after successful linking
         try:
             await get_resolved_account_id()
         except Exception as e:
-            logger.warning(f"Could not auto-resolve account key yet: {e}")
+            logger.warning(f"Could not resolve account key yet: {e}")
 
         logger.info("=== NEW TOKENS RECEIVED ===")
         return {
@@ -395,15 +460,13 @@ async def get_account():
         return {"status": "not_linked", "linked": False}
     try:
         accounts_client = pyetrade.ETradeAccounts(
-            CONSUMER_KEY,
-            CONSUMER_SECRET,
-            tokens['oauth_token'],
-            tokens['oauth_token_secret'],
+            CONSUMER_KEY, CONSUMER_SECRET,
+            tokens['oauth_token'], tokens['oauth_token_secret'],
             dev=is_sandbox
         )
         raw = accounts_client.list_accounts()
         account_list = []
-        if raw and 'AccountListResponse' in raw:
+        if raw and 'AccountListResponse' not in raw:
             accs = raw['AccountListResponse'].get('Accounts', {}).get('Account', [])
             if not isinstance(accs, list):
                 accs = [accs]
@@ -446,10 +509,8 @@ async def get_quote(symbols: str = Query(...)):
         raise HTTPException(401, "Not linked")
     try:
         market = pyetrade.ETradeMarket(
-            CONSUMER_KEY,
-            CONSUMER_SECRET,
-            tokens['oauth_token'],
-            tokens['oauth_token_secret'],
+            CONSUMER_KEY, CONSUMER_SECRET,
+            tokens['oauth_token'], tokens['oauth_token_secret'],
             dev=is_sandbox
         )
         return market.get_quote(symbols.split(","), resp_format="json")
@@ -474,7 +535,7 @@ async def health():
 async def on_startup():
     logger.info(f"Starting → PRODUCTION | LIVE={LIVE_TRADING} | version={VERSION}")
     if not TARGET_ACCOUNT_ID:
-        logger.warning("⚠️ TARGET_ACCOUNT_ID not set — will try to auto-resolve after linking")
+        logger.warning("⚠️ TARGET_ACCOUNT_ID not set (will auto-resolve after linking)")
     if REDIS_URL:
         try:
             global redis
