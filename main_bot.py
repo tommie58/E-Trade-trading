@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== CONFIG ====================
-VERSION = "2.2.1-enhanced-diagnostics"
+VERSION = "2.2.2-auth-url-guard"
 ENV = os.getenv("ETRADE_ENV", "production").lower()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "true").lower() == "true"
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
@@ -227,26 +227,38 @@ async def start_linking():
             "secret": request_secret
         }
 
-        # Build both raw and encoded URLs for comparison
-        raw_url = f"https://us.etrade.com/e/t/etws/authorize?key={CONSUMER_KEY}&token={request_token}"
+        # Encode ONLY the values (never the separators)
         encoded_key = urllib.parse.quote(CONSUMER_KEY, safe='')
         encoded_token = urllib.parse.quote(request_token, safe='')
-        authorize_url = f"https://us.etrade.com/e/t/etws/authorize?key={encoded_key}&token={encoded_token}"
 
-        # Enhanced diagnostic logging
+        authorize_url = (
+            f"https://us.etrade.com/e/t/etws/authorize?"
+            f"key={encoded_key}&token={encoded_token}"
+        )
+
+        # === HARD GUARD: Verify the URL round-trips correctly ===
+        parsed = urllib.parse.urlparse(authorize_url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        decoded_key = qs.get("key", [None])[0]
+        decoded_token = qs.get("token", [None])[0]
+
+        if decoded_key != CONSUMER_KEY or decoded_token != request_token:
+            logger.error("URL encoding guard failed! Malformed authorize URL blocked.")
+            raise HTTPException(500, "Failed to build valid authorize URL. Please try again.")
+
+        # Diagnostic logging
         has_special = any(c in request_token for c in ['+', '/', '='])
         logger.info(
             f"✅ [v{VERSION}] E*TRADE auth URL generated | "
-            f"token_len={len(request_token)} | "
-            f"has_special_chars={has_special} | "
-            f"raw_tail={raw_url[-50:]} | "
-            f"encoded_tail={authorize_url[-50:]}"
+            f"token_len={len(request_token)} | has_special_chars={has_special}"
         )
 
         return {
             "authorize_url": authorize_url,
             "request_token": request_token
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Start linking failed: {e}")
         raise HTTPException(500, str(e))
