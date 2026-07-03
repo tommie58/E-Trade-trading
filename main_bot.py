@@ -227,7 +227,7 @@ async def start_linking():
             "secret": request_secret
         }
 
-        # Encode ONLY the values (never the separators)
+        # Encode ONLY the values (never = or &)
         encoded_key = urllib.parse.quote(CONSUMER_KEY, safe='')
         encoded_token = urllib.parse.quote(request_token, safe='')
 
@@ -236,17 +236,16 @@ async def start_linking():
             f"key={encoded_key}&token={encoded_token}"
         )
 
-        # === HARD GUARD: Verify the URL round-trips correctly ===
+        # Hard guard - verify URL round-trips correctly
         parsed = urllib.parse.urlparse(authorize_url)
         qs = urllib.parse.parse_qs(parsed.query)
         decoded_key = qs.get("key", [None])[0]
         decoded_token = qs.get("token", [None])[0]
 
         if decoded_key != CONSUMER_KEY or decoded_token != request_token:
-            logger.error("URL encoding guard failed! Malformed authorize URL blocked.")
-            raise HTTPException(500, "Failed to build valid authorize URL. Please try again.")
+            logger.error("URL encoding guard failed! Blocking malformed URL.")
+            raise HTTPException(500, "Failed to build valid authorize URL")
 
-        # Diagnostic logging
         has_special = any(c in request_token for c in ['+', '/', '='])
         logger.info(
             f"✅ [v{VERSION}] E*TRADE auth URL generated | "
