@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== CONFIG ====================
-VERSION = "2.6.0-option-chain-snap"
+VERSION = "2.8.0-trailing-stop"
 ENV = os.getenv("ETRADE_ENV", "production").lower()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "true").lower() == "true"
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
@@ -154,32 +154,21 @@ def _snap_to_real_contract(
     requested_strike: float,
     call_put: str
 ) -> Tuple[str, float]:
-    """
-    Query E*TRADE option chain and snap to nearest real contract.
-    Returns (expiry_str, strike) — falls back to original values on failure.
-    """
     tokens = load_tokens()
     if not tokens:
         return requested_expiry, requested_strike
 
     try:
         market = pyetrade.ETradeMarket(
-            CONSUMER_KEY,
-            CONSUMER_SECRET,
-            tokens['oauth_token'],
-            tokens['oauth_token_secret'],
+            CONSUMER_KEY, CONSUMER_SECRET,
+            tokens['oauth_token'], tokens['oauth_token_secret'],
             dev=is_sandbox
         )
-
-        chain = market.get_option_chains(
-            symbol=symbol,
-            resp_format="json"
-        )
+        chain = market.get_option_chains(symbol=symbol, resp_format="json")
 
         if not chain or 'OptionChainResponse' not in chain:
             return requested_expiry, requested_strike
 
-        # Parse chain (structure can vary slightly by symbol)
         options = chain.get('OptionChainResponse', {}).get('OptionPair', [])
         if not isinstance(options, list):
             options = [options]
@@ -206,7 +195,6 @@ def _snap_to_real_contract(
         if not expirations or not strikes:
             return requested_expiry, requested_strike
 
-        # Find closest expiry
         try:
             req_date = datetime.strptime(requested_expiry, "%Y-%m-%d").date()
         except:
@@ -216,8 +204,6 @@ def _snap_to_real_contract(
             expirations,
             key=lambda x: abs(datetime.strptime(x, "%Y-%m-%d").date() - req_date)
         )
-
-        # Find closest strike
         closest_strike = min(strikes, key=lambda x: abs(x - requested_strike))
 
         if closest_expiry != requested_expiry or closest_strike != requested_strike:
@@ -228,6 +214,36 @@ def _snap_to_real_contract(
     except Exception as e:
         logger.warning(f"Option chain lookup failed (using original values): {e}")
         return requested_expiry, requested_strike
+
+# ==================== AUTO-RENEW HELPER ====================
+def _get_market_client(tokens: dict):
+    return pyetrade.ETradeMarket(
+        CONSUMER_KEY, CONSUMER_SECRET,
+        tokens['oauth_token'], tokens['oauth_token_secret'],
+        dev=is_sandbox
+    )
+
+def _get_order_client(tokens: dict):
+    return pyetrade.ETradeOrder(
+        CONSUMER_KEY, CONSUMER_SECRET,
+        tokens['oauth_token'], tokens['oauth_token_secret'],
+        dev=is_sandbox
+    )
+
+async def _renew_tokens_if_needed(tokens: dict) -> dict:
+    try:
+        am = pyetrade.authorization.ETradeAccessManager(
+            CONSUMER_KEY, CONSUMER_SECRET,
+            tokens['oauth_token'], tokens['oauth_token_secret']
+        )
+        new_tokens = am.renew_access_token()
+        if new_tokens and 'oauth_token' in new_tokens:
+            save_tokens(new_tokens)
+            logger.info("✅ Tokens automatically renewed")
+            return new_tokens
+    except Exception as e:
+        logger.warning(f"Token renewal failed: {e}")
+    return tokens
 
 # ==================== LIVE TRADING ====================
 async def execute_live_order(payload: dict):
@@ -257,6 +273,11 @@ async def execute_live_order(payload: dict):
         d = payload.get("expiration_day", 1)
         expiry = f"{y}-{str(m).zfill(2)}-{str(d).zfill(2)}"
 
+    # Stop / Trailing Stop parameters
+    stop_price = payload.get("stop_price")
+    trailing_stop_amount = payload.get("trailing_stop_amount")
+    trailing_stop_percent = payload.get("trailing_stop_percent")
+
     logger.info(f"📥 Received signal → mode={mode}, instrument={instrument}, ticker={ticker}, action={action}")
 
     if mode != "live":
@@ -270,61 +291,111 @@ async def execute_live_order(payload: dict):
             call_put = "CALL" if str(payload.get("call_put", "call")).lower() == "call" else "PUT"
             order_action = "BUY_OPEN" if action == "BUY" else "SELL_CLOSE"
 
-            # === SNAP TO REAL CONTRACT ===
             expiry_str, strike_price = _snap_to_real_contract(
                 ticker, str(expiry), float(strike), call_put
             )
 
-            logger.info(f"🚀 LIVE OPTION ORDER: {order_action} {quantity} {ticker} {call_put} {strike_price} {expiry_str}")
+            # Determine price type and stop parameters
+            price_type = "MARKET"
+            stop_params = {}
 
-            orders = pyetrade.ETradeOrder(
-                CONSUMER_KEY,
-                CONSUMER_SECRET,
-                tokens['oauth_token'],
-                tokens['oauth_token_secret'],
-                dev=is_sandbox
-            )
+            if trailing_stop_amount:
+                price_type = "TRAILING_STOP"
+                stop_params = {"trailingStopAmount": float(trailing_stop_amount)}
+                logger.info(f"Using TRAILING STOP with amount: {trailing_stop_amount}")
+            elif trailing_stop_percent:
+                price_type = "TRAILING_STOP"
+                # E*TRADE sometimes expects amount; convert percent if needed
+                stop_params = {"trailingStopAmount": float(trailing_stop_percent)}
+                logger.info(f"Using TRAILING STOP with percent: {trailing_stop_percent}")
+            elif stop_price:
+                price_type = "STOP"
+                stop_params = {"stopPrice": float(stop_price)}
+                logger.info(f"Using STOP order at: {stop_price}")
 
-            final = await asyncio.to_thread(
-                orders.place_option_order,
-                resp_format="json",
-                accountIdKey=account_id_key,
-                symbol=ticker,
-                callPut=call_put,
-                expiryDate=expiry_str,
-                strikePrice=strike_price,
-                orderAction=order_action,
-                clientOrderId=client_order_id,
-                priceType="MARKET",
-                quantity=quantity,
-                orderTerm="GOOD_FOR_DAY",
-                marketSession="REGULAR",
-            )
+            logger.info(f"🚀 LIVE OPTION ORDER: {order_action} {quantity} {ticker} {call_put} {strike_price} {expiry_str} | type={price_type}")
+
+            orders = _get_order_client(tokens)
+
+            try:
+                final = await asyncio.to_thread(
+                    orders.place_option_order,
+                    resp_format="json",
+                    accountIdKey=account_id_key,
+                    symbol=ticker,
+                    callPut=call_put,
+                    expiryDate=expiry_str,
+                    strikePrice=strike_price,
+                    orderAction=order_action,
+                    clientOrderId=client_order_id,
+                    priceType=price_type,
+                    quantity=quantity,
+                    orderTerm="GOOD_FOR_DAY",
+                    marketSession="REGULAR",
+                    **stop_params
+                )
+            except Exception as e:
+                if "401" in str(e) or "Unauthorized" in str(e):
+                    logger.warning("Got 401 on option order — attempting renewal...")
+                    tokens = await _renew_tokens_if_needed(tokens)
+                    orders = _get_order_client(tokens)
+                    final = await asyncio.to_thread(
+                        orders.place_option_order,
+                        resp_format="json",
+                        accountIdKey=account_id_key,
+                        symbol=ticker,
+                        callPut=call_put,
+                        expiryDate=expiry_str,
+                        strikePrice=strike_price,
+                        orderAction=order_action,
+                        clientOrderId=client_order_id,
+                        priceType=price_type,
+                        quantity=quantity,
+                        orderTerm="GOOD_FOR_DAY",
+                        marketSession="REGULAR",
+                        **stop_params
+                    )
+                else:
+                    raise
             return {"status": "success", "result": final}
 
         else:
             logger.info(f"🚀 LIVE EQUITY ORDER: {action} {quantity} {ticker}")
 
-            orders = pyetrade.ETradeOrder(
-                CONSUMER_KEY,
-                CONSUMER_SECRET,
-                tokens['oauth_token'],
-                tokens['oauth_token_secret'],
-                dev=is_sandbox
-            )
+            orders = _get_order_client(tokens)
 
-            final = await asyncio.to_thread(
-                orders.place_equity_order,
-                resp_format="json",
-                accountIdKey=account_id_key,
-                symbol=ticker,
-                orderAction=action,
-                clientOrderId=client_order_id,
-                priceType="MARKET",
-                quantity=quantity,
-                orderTerm="GOOD_FOR_DAY",
-                marketSession="REGULAR",
-            )
+            try:
+                final = await asyncio.to_thread(
+                    orders.place_equity_order,
+                    resp_format="json",
+                    accountIdKey=account_id_key,
+                    symbol=ticker,
+                    orderAction=action,
+                    clientOrderId=client_order_id,
+                    priceType="MARKET",
+                    quantity=quantity,
+                    orderTerm="GOOD_FOR_DAY",
+                    marketSession="REGULAR",
+                )
+            except Exception as e:
+                if "401" in str(e) or "Unauthorized" in str(e):
+                    logger.warning("Got 401 on equity order — attempting renewal...")
+                    tokens = await _renew_tokens_if_needed(tokens)
+                    orders = _get_order_client(tokens)
+                    final = await asyncio.to_thread(
+                        orders.place_equity_order,
+                        resp_format="json",
+                        accountIdKey=account_id_key,
+                        symbol=ticker,
+                        orderAction=action,
+                        clientOrderId=client_order_id,
+                        priceType="MARKET",
+                        quantity=quantity,
+                        orderTerm="GOOD_FOR_DAY",
+                        marketSession="REGULAR",
+                    )
+                else:
+                    raise
             return {"status": "success", "result": final}
 
     except Exception as e:
@@ -353,6 +424,10 @@ class WebhookPayload(BaseModel):
     option_right: Optional[str] = None
     option_contracts: Optional[int] = None
     option_limit_price: Optional[float] = None
+    # Stop / Trailing Stop
+    stop_price: Optional[float] = None
+    trailing_stop_amount: Optional[float] = None
+    trailing_stop_percent: Optional[float] = None
 
 # ==================== ENDPOINTS ====================
 @app.post("/webhook")
@@ -466,7 +541,7 @@ async def get_account():
         )
         raw = accounts_client.list_accounts()
         account_list = []
-        if raw and 'AccountListResponse' not in raw:
+        if raw and 'AccountListResponse' in raw:
             accs = raw['AccountListResponse'].get('Accounts', {}).get('Account', [])
             if not isinstance(accs, list):
                 accs = [accs]
@@ -490,8 +565,11 @@ async def renew_tokens():
             CONSUMER_KEY, CONSUMER_SECRET,
             tokens['oauth_token'], tokens['oauth_token_secret']
         )
-        am.renew_access_token()
-        return {"status": "success"}
+        new_tokens = am.renew_access_token()
+        if new_tokens:
+            save_tokens(new_tokens)
+            return {"status": "success", "new_tokens": new_tokens}
+        return {"status": "failed"}
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -507,14 +585,20 @@ async def get_quote(symbols: str = Query(...)):
     tokens = load_tokens()
     if not tokens:
         raise HTTPException(401, "Not linked")
+
     try:
-        market = pyetrade.ETradeMarket(
-            CONSUMER_KEY, CONSUMER_SECRET,
-            tokens['oauth_token'], tokens['oauth_token_secret'],
-            dev=is_sandbox
-        )
+        market = _get_market_client(tokens)
         return market.get_quote(symbols.split(","), resp_format="json")
     except Exception as e:
+        if "401" in str(e) or "Unauthorized" in str(e):
+            logger.warning("Got 401 on quote — attempting renewal...")
+            tokens = await _renew_tokens_if_needed(tokens)
+            market = _get_market_client(tokens)
+            try:
+                return market.get_quote(symbols.split(","), resp_format="json")
+            except Exception as e2:
+                logger.error(f"Quote still failing after renewal: {e2}")
+                raise HTTPException(401, "Token renewal failed. Please re-link.")
         logger.error(f"Quote failed: {e}")
         raise HTTPException(500, str(e))
 
