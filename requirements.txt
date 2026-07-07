@@ -7,3 +7,5 @@ aiosqlite
 redis
 pydantic
 python-dotenv
+asyncpg
+aioredis
