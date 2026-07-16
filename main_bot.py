@@ -57,10 +57,10 @@ Run:
     cp .env.example .env   # fill in keys + WEBHOOK_SECRET
     uvicorn main_bot:app --host 0.0.0.0 --port 8000
 """
-from fastapi import FastAPI, HTTPException, Body, Query, Header
+from fastapi import FastAPI, HTTPException, Body, Query, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, validator
-from typing import Optional, Dict
+from pydantic import BaseModel, validator, ValidationError
+from typing import Optional, Dict, Any, List, Tuple
 import pyetrade
 import os
 import json
@@ -68,7 +68,13 @@ import math
 import logging
 import uuid
 import asyncio
-from datetime import datetime, date
+import hashlib
+import hmac
+import time
+import threading
+from pathlib import Path
+from datetime import datetime, date, time as dtime, timezone
+from zoneinfo import ZoneInfo
 from redis.asyncio import from_url as redis_from_url
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -95,7 +101,38 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "3.0.0-price-sanitizer"
+BOT_VERSION = "4.0.0-parity"
+
+# ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
+MIN_SCORE = int(os.getenv("MIN_SCORE", "90"))
+MIN_SCORE_TRENDING = int(os.getenv("MIN_SCORE_TRENDING", "85"))
+MIN_RVOL = float(os.getenv("MIN_RVOL", "1.5"))
+MIN_MTF = int(os.getenv("MIN_MTF", "3"))
+ALLOWED_SETUPS = {
+    s.strip().lower()
+    for s in os.getenv(
+        "ALLOWED_SETUPS",
+        "ema cross + adx,bull flag + adx,bear flag + adx,volume breakout",
+    ).split(",")
+    if s.strip()
+}
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
+DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "2.0"))
+DAILY_TRADE_LIMIT = int(os.getenv("DAILY_TRADE_LIMIT", "20"))
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
+PORTFOLIO_HEAT_PCT = float(os.getenv("PORTFOLIO_HEAT_PCT", "6.0"))
+TICKER_COOLDOWN_MINUTES = int(os.getenv("TICKER_COOLDOWN_MINUTES", "15"))
+# Stop-guard: how long an entry may sit unfilled before it is cancelled, and
+# how often the guard polls the broker for fill state.
+ENTRY_FILL_TIMEOUT_MIN = int(os.getenv("ENTRY_FILL_TIMEOUT_MIN", "20"))
+STOP_GUARD_POLL_SECONDS = int(os.getenv("STOP_GUARD_POLL_SECONDS", "10"))
+# Daily state (positions, counters, kill switch, guards) survives restarts here.
+STATE_FILE = Path(os.getenv("ETRADE_STATE_FILE", ".etrade_state.json"))
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware UTC now (datetime.utcnow() is deprecated in 3.12+)."""
+    return datetime.now(timezone.utc)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("etrade-bot")
@@ -135,6 +172,254 @@ _resolved_account_id_key: Optional[str] = None
 _pending_request_tokens: Dict[str, str] = {}
 _latest_request_token: Optional[str] = None
 _MAX_PENDING_REQUEST_TOKENS = 5
+
+# ==================== SAFETY STATE (parity with etrade_bot_handler) ====================
+# All of this state is touched only from the event loop (webhook handlers,
+# placement worker, stop-guard tasks), so plain dicts are safe; _state_lock
+# additionally guards the file write against overlapping saves.
+_state_lock = threading.Lock()
+_open_positions: Dict[str, dict] = {}
+_stop_guards: Dict[str, dict] = {}
+_trades_today = 0
+_realized_pnl_today_pct = 0.0
+_today = _utcnow().date().isoformat()
+_killed = False
+
+
+def _save_state() -> None:
+    """Persist daily counters, open positions, kill switch and stop-guard state
+    so a mid-day restart cannot forget risk limits or unprotected positions."""
+    try:
+        with _state_lock:
+            STATE_FILE.write_text(json.dumps({
+                "date": _today,
+                "trades_today": _trades_today,
+                "realized_pnl_today_pct": _realized_pnl_today_pct,
+                "killed": _killed,
+                "open_positions": _open_positions,
+                "stop_guards": _stop_guards,
+            }, default=str))
+    except (OSError, TypeError, ValueError) as e:
+        logger.error(f"state persist failed: {e}")
+
+
+def _load_state() -> None:
+    """Restore persisted state on boot. Daily counters only restore when the
+    saved date is still today; positions, guards and the kill switch always
+    restore (broker reconciliation remains the source of truth)."""
+    global _today, _trades_today, _realized_pnl_today_pct, _killed, _open_positions, _stop_guards
+    if not STATE_FILE.exists():
+        return
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error(f"state load failed: {e}")
+        return
+    _killed = bool(data.get("killed", False))
+    _open_positions = dict(data.get("open_positions") or {})
+    _stop_guards = dict(data.get("stop_guards") or {})
+    saved_date = str(data.get("date") or "")
+    today = _utcnow().date().isoformat()
+    _today = today
+    if saved_date == today:
+        _trades_today = int(data.get("trades_today") or 0)
+        _realized_pnl_today_pct = float(data.get("realized_pnl_today_pct") or 0.0)
+    logger.info(
+        f"state restored: {len(_open_positions)} open positions, {len(_stop_guards)} stop guards, "
+        f"trades_today={_trades_today}, pnl={_realized_pnl_today_pct:.2f}%, killed={_killed}"
+    )
+
+
+def _reset_daily() -> None:
+    global _today, _trades_today, _realized_pnl_today_pct
+    today = _utcnow().date().isoformat()
+    if today != _today:
+        _today = today
+        _trades_today = 0
+        _realized_pnl_today_pct = 0.0
+        _save_state()
+        logger.info(f"daily counters reset for {today}")
+
+
+class _TTL:
+    """In-memory TTL store for idempotency keys and ticker cooldowns."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._data: Dict[str, Tuple[Any, float]] = {}
+
+    def _purge(self) -> None:
+        now = time.time()
+        for k in [k for k, (_, exp) in self._data.items() if exp and exp < now]:
+            self._data.pop(k, None)
+
+    def set(self, k: str, v: Any, ex: Optional[int] = None, nx: bool = False) -> bool:
+        with self._lock:
+            self._purge()
+            if nx and k in self._data:
+                return False
+            self._data[k] = (v, (time.time() + ex) if ex else 0.0)
+            return True
+
+    def get(self, k: str) -> Optional[Any]:
+        with self._lock:
+            self._purge()
+            return self._data.get(k, (None, 0))[0]
+
+    def exists(self, k: str) -> bool:
+        with self._lock:
+            self._purge()
+            return k in self._data
+
+
+store = _TTL()
+
+
+# ==================== MARKET CALENDAR ====================
+_ET_ZONE = ZoneInfo("America/New_York")
+
+# NYSE/Nasdaq full-closure holidays (observed dates).
+_MARKET_HOLIDAYS = {
+    # 2025
+    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26",
+    "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
+    # 2026
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    # 2027
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+    "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+}
+
+# 1:00pm ET early closes.
+_MARKET_HALF_DAYS = {
+    "2025-07-03", "2025-11-28", "2025-12-24",
+    "2026-11-27", "2026-12-24",
+    "2027-11-26",
+}
+
+
+def _is_market_open() -> bool:
+    """Exchange-aware regular-session check: 9:30–16:00 US/Eastern (13:00 close
+    on half days), weekdays only, NYSE holidays excluded. DST-safe via zoneinfo."""
+    now_et = _utcnow().astimezone(_ET_ZONE)
+    if now_et.weekday() >= 5:
+        return False
+    day = now_et.date().isoformat()
+    if day in _MARKET_HOLIDAYS:
+        return False
+    close = dtime(13, 0) if day in _MARKET_HALF_DAYS else dtime(16, 0)
+    return dtime(9, 30) <= now_et.time() <= close
+
+
+# ==================== WEBHOOK AUTH / IDEMPOTENCY ====================
+def _verify_webhook_auth(
+    raw: bytes,
+    body_secret: Optional[str],
+    secret_header: Optional[str],
+    sig_header: Optional[str],
+) -> None:
+    """Accept the shared secret (body `secret` field or X-Rork-Secret header)
+    or an HMAC-SHA256 signature of the raw body (X-Rork-Signature)."""
+    if not WEBHOOK_SECRET:
+        return
+    if sig_header:
+        expected = hmac.new(WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+        provided = sig_header.split("=", 1)[-1].strip()
+        if hmac.compare_digest(expected, provided):
+            return
+        raise HTTPException(401, "invalid signature")
+    if body_secret == WEBHOOK_SECRET or secret_header == WEBHOOK_SECRET:
+        return
+    raise HTTPException(403, "Unauthorized")
+
+
+def _signal_key(p: dict) -> str:
+    # intent is part of the key so a close is never deduped against the entry
+    # that opened the position.
+    base = (
+        f"{p.get('ticker')}|{p.get('action')}|{p.get('entry')}|{p.get('stop')}|"
+        f"{p.get('target')}|{p.get('timestamp')}|{str(p.get('intent') or 'open').lower()}"
+    )
+    return "sig:" + hashlib.sha1(base.encode()).hexdigest()
+
+
+def _is_close_payload(p: dict) -> bool:
+    """An exit/close must bypass entry gating — closing always reduces risk."""
+    if str(p.get("intent") or "").lower() == "close":
+        return True
+    if str(p.get("order_action") or "").upper() == "SELL_CLOSE":
+        return True
+    return str(p.get("action") or "").upper() in {"EXIT", "CLOSE"}
+
+
+# ==================== ENTRY FILTERS (live entries only) ====================
+def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
+    """Server-side re-filter mirroring the Rork app's gating. Quality checks
+    apply only when the payload carries the field (score/rvol/mtf/setup);
+    risk limits (kill switch, daily loss, trade count, positions, heat,
+    duplicate ticker) always apply."""
+    blocked: List[str] = []
+    if _killed:
+        blocked.append("kill switch active")
+
+    regime = str(p.get("regime") or "").lower()
+    score = p.get("score")
+    if isinstance(score, (int, float)):
+        required = MIN_SCORE_TRENDING if "trending" in regime else MIN_SCORE
+        if score < required:
+            blocked.append(f"score {score} < {required}")
+    rvol = p.get("rvol")
+    if isinstance(rvol, (int, float)) and rvol < MIN_RVOL:
+        blocked.append(f"rvol {rvol} < {MIN_RVOL}")
+    mtf = p.get("mtf_alignment")
+    if isinstance(mtf, str) and mtf.strip():
+        try:
+            if int(mtf.split("/")[0]) < MIN_MTF:
+                blocked.append(f"mtf {mtf} < {MIN_MTF}/5")
+        except (ValueError, IndexError):
+            blocked.append("mtf_alignment unparseable")
+    setup = p.get("setup")
+    if isinstance(setup, str) and setup.strip() and ALLOWED_SETUPS and setup.lower().strip() not in ALLOWED_SETUPS:
+        blocked.append(f"setup '{setup}' not allowlisted")
+
+    _reset_daily()
+    if _realized_pnl_today_pct <= -abs(DAILY_LOSS_LIMIT_PCT):
+        blocked.append(f"daily loss limit ({_realized_pnl_today_pct:.2f}%)")
+    if _trades_today >= DAILY_TRADE_LIMIT:
+        blocked.append(f"daily trade limit ({DAILY_TRADE_LIMIT}) reached")
+    if len(_open_positions) >= MAX_CONCURRENT_POSITIONS:
+        blocked.append(f"max positions ({MAX_CONCURRENT_POSITIONS}) open")
+    ticker = str(p.get("ticker") or "").upper()
+    if ticker and ticker in _open_positions:
+        blocked.append(f"already in {ticker}")
+
+    try:
+        account_ref = float(os.getenv("ACCOUNT_SIZE", "50000"))
+        open_risk = sum(
+            abs(float(pos.get("entry") or 0) - float(pos.get("stop") or 0)) * float(pos.get("qty") or 0)
+            for pos in _open_positions.values()
+            if pos.get("entry") and pos.get("stop")
+        )
+        new_risk = account_ref * (RISK_PER_TRADE_PCT / 100.0)
+        heat = (open_risk + new_risk) / max(account_ref, 1) * 100.0
+        if heat > PORTFOLIO_HEAT_PCT:
+            blocked.append(f"portfolio heat {heat:.2f}% > {PORTFOLIO_HEAT_PCT}%")
+    except (TypeError, ValueError):
+        pass
+
+    return len(blocked) == 0, blocked
+
+
+def _occ_symbol(ticker: str, expiry: str, right: str, strike: float) -> str:
+    """Build an OCC 21-char option symbol: ROOT(6) + YYMMDD + C/P + STRIKE*1000(8)."""
+    try:
+        d = datetime.strptime(str(expiry)[:10], "%Y-%m-%d")
+        date_part = d.strftime("%y%m%d")
+    except ValueError:
+        date_part = "000000"
+    cp = "C" if str(right).upper().startswith("C") else "P"
+    return f"{ticker.upper().ljust(6)}{date_part}{cp}{int(round(float(strike) * 1000)):08d}"
 
 Base = declarative_base()
 
@@ -601,6 +886,328 @@ async def check_risk_limits():
             raise HTTPException(503, f"Circuit breaker open — auto-resets in {remaining}s (or relink the account)")
 
 
+# ==================== STOP GUARD ====================
+# Makes the protective stop REST AT THE BROKER. The entry order goes in first;
+# an async watcher polls the broker until the entry fills, then places a real
+# STOP order at E*TRADE sized to the filled quantity (re-placed as partial
+# fills grow — never two live stops at once). Entries with zero fill by
+# ENTRY_FILL_TIMEOUT_MIN are cancelled. Guard state persists to STATE_FILE and
+# resumes after a restart.
+_TERMINAL_ORDER_STATUSES = {"EXECUTED", "CANCELLED", "REJECTED", "EXPIRED"}
+
+
+def _order_id_from_place(placed: Any) -> Optional[str]:
+    """Extract the numeric orderId from a PlaceOrderResponse."""
+    try:
+        body = placed.get("PlaceOrderResponse", placed) if isinstance(placed, dict) else {}
+        ids = body.get("OrderIds") or body.get("orderIds") or []
+        if isinstance(ids, dict):
+            ids = [ids]
+        for entry in ids:
+            oid = entry.get("orderId") if isinstance(entry, dict) else entry
+            if oid:
+                return str(oid)
+        oid = body.get("orderId") or body.get("OrderId")
+        return str(oid) if oid else None
+    except (AttributeError, TypeError):
+        return None
+
+
+def _orders_client(tokens: Dict[str, str]) -> "pyetrade.ETradeOrder":
+    return pyetrade.ETradeOrder(
+        CONSUMER_KEY, CONSUMER_SECRET,
+        tokens["oauth_token"], tokens["oauth_token_secret"],
+        dev=is_sandbox,
+    )
+
+
+async def _order_state(order_id: Optional[str], client_id: Optional[str]) -> Tuple[str, int]:
+    """Return (status, total filled quantity) for an order, matched by orderId
+    or clientOrderId in the account's recent orders. ('NOT_FOUND', 0) when the
+    order is not in the list."""
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("E*TRADE tokens not set")
+    acct_key = await _resolve_account_id_key(tokens)
+    orders = _orders_client(tokens)
+    resp = await asyncio.to_thread(orders.list_orders, acct_key, resp_format="json")
+    root = (resp or {}).get("OrdersResponse", {}) if isinstance(resp, dict) else {}
+    order_list = root.get("Order") or []
+    if isinstance(order_list, dict):
+        order_list = [order_list]
+    for o in order_list:
+        if not isinstance(o, dict):
+            continue
+        oid = str(o.get("orderId") or "")
+        details = o.get("OrderDetail") or []
+        if isinstance(details, dict):
+            details = [details]
+        matches = bool(order_id) and oid == str(order_id)
+        if not matches and client_id:
+            matches = any(
+                str(d.get("clientOrderId") or "") == client_id
+                for d in details if isinstance(d, dict)
+            )
+        if not matches:
+            continue
+        status = "OPEN"
+        filled = 0
+        for d in details:
+            if not isinstance(d, dict):
+                continue
+            status = str(d.get("status") or status).upper()
+            instruments = d.get("Instrument") or []
+            if isinstance(instruments, dict):
+                instruments = [instruments]
+            for inst in instruments:
+                if not isinstance(inst, dict):
+                    continue
+                try:
+                    filled += int(float(inst.get("filledQuantity") or 0))
+                except (TypeError, ValueError):
+                    pass
+        return status, filled
+    return "NOT_FOUND", 0
+
+
+async def _cancel_order_safe(order_id: Optional[str]) -> bool:
+    """Best-effort broker order cancel. Returns True only when the cancel call
+    succeeded — callers must treat False as 'the order may still be live'."""
+    if not order_id:
+        return False
+    try:
+        tokens = load_tokens()
+        if not tokens:
+            return False
+        acct_key = await _resolve_account_id_key(tokens)
+        orders = _orders_client(tokens)
+        await asyncio.to_thread(orders.cancel_order, acct_key, int(order_id), resp_format="json")
+        logger.info(f"[STOP GUARD] cancelled order {order_id}")
+        return True
+    except Exception as e:
+        logger.warning(f"order cancel failed ({order_id}): {e}")
+        return False
+
+
+async def _place_protective_stop(ticker: str, action: str, qty: int, stop_price: float) -> dict:
+    """Rest a protective STOP order at E*TRADE for a filled equity entry."""
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("E*TRADE tokens not set")
+    acct_key = await _resolve_account_id_key(tokens)
+    orders = _orders_client(tokens)
+    exit_side = "SELL" if action == "BUY" else "BUY_TO_COVER"
+    client_id = str(uuid.uuid4().int)[:18]
+    common = dict(
+        resp_format="json",
+        accountIdKey=acct_key,
+        symbol=ticker,
+        orderAction=exit_side,
+        clientOrderId=client_id,
+        priceType="STOP",
+        stopPrice=round(float(stop_price), 2),
+        quantity=int(qty),
+        orderTerm="GOOD_FOR_DAY",
+        marketSession="REGULAR",
+        allOrNone=False,
+    )
+    placed = await asyncio.to_thread(orders.place_equity_order, **common)
+    order_id = _order_id_from_place(placed)
+    logger.info(
+        f"[STOP GUARD] protective stop RESTING at broker: {exit_side} {ticker} "
+        f"qty={qty} stop={stop_price:.2f} (order={order_id})"
+    )
+    return {"order_id": order_id, "client_id": client_id, "qty": int(qty), "stop": round(float(stop_price), 2)}
+
+
+def _finish_guard(ticker: str, result: str) -> None:
+    g = _stop_guards.get(ticker)
+    if g:
+        g["done"] = True
+        g["result"] = result
+        _save_state()
+    logger.info(f"[STOP GUARD] {ticker} finished: {result}")
+
+
+async def _stop_guard_worker(ticker: str) -> None:
+    """Poll the entry order; once (partially) filled, rest a protective STOP at
+    the broker sized to the filled quantity. Cancel entries with zero fill at
+    the deadline. Retries stop placement on every poll until protected."""
+    logger.info(f"[STOP GUARD] watching {ticker} entry fill")
+    while True:
+        guard = _stop_guards.get(ticker)
+        if not guard or guard.get("done"):
+            return
+
+        status = str(guard.get("last_status") or "OPEN")
+        filled = int(guard.get("last_filled") or 0)
+        try:
+            status, filled = await _order_state(guard.get("entry_order_id"), guard.get("entry_client_id"))
+        except Exception as e:
+            logger.warning(f"[STOP GUARD] {ticker} poll failed: {e}")
+
+        guarded = int(guard.get("guarded_qty") or 0)
+        if filled > guarded:
+            # (Re)place the protective stop for the total filled quantity.
+            can_place = True
+            if guard.get("stop_order_id"):
+                # Replace flow: only place a new stop if the old one is truly
+                # cancelled — never risk two live stops double-selling.
+                can_place = await _cancel_order_safe(guard.get("stop_order_id"))
+            if can_place:
+                try:
+                    stop_info = await _place_protective_stop(
+                        ticker, str(guard.get("action") or "BUY"), filled, float(guard.get("stop") or 0),
+                    )
+                    g = _stop_guards.get(ticker)
+                    if g:
+                        g["guarded_qty"] = filled
+                        g["stop_order_id"] = stop_info["order_id"]
+                        g["stop_client_id"] = stop_info["client_id"]
+                    pos = _open_positions.get(ticker)
+                    if pos:
+                        pos["stop_order_id"] = stop_info["order_id"]
+                        pos["filled_qty"] = filled
+                    _save_state()
+                    guarded = filled
+                except Exception as e:
+                    logger.error(f"[STOP GUARD] {ticker} stop placement FAILED (will retry): {e}")
+
+        g = _stop_guards.get(ticker)
+        if g:
+            g["last_filled"] = filled
+            g["last_status"] = status
+            _save_state()
+
+        if status == "EXECUTED" and filled > 0 and guarded >= filled:
+            _finish_guard(ticker, "filled_and_protected")
+            return
+        if status in _TERMINAL_ORDER_STATUSES and status != "EXECUTED" and filled == 0:
+            _finish_guard(ticker, f"entry_{status.lower()}_unfilled")
+            _open_positions.pop(ticker, None)
+            _save_state()
+            return
+        if time.time() >= float(guard.get("deadline_ts") or 0):
+            if filled == 0:
+                await _cancel_order_safe(guard.get("entry_order_id"))
+                _finish_guard(ticker, "entry_timeout_cancelled")
+                _open_positions.pop(ticker, None)
+                _save_state()
+                return
+            if guarded >= filled:
+                _finish_guard(ticker, "partial_fill_protected")
+                return
+            # Filled but stop never stuck — keep trying rather than walk away.
+            logger.error(f"[STOP GUARD] {ticker} UNPROTECTED at deadline — extending guard")
+            g = _stop_guards.get(ticker)
+            if g:
+                g["deadline_ts"] = time.time() + ENTRY_FILL_TIMEOUT_MIN * 60
+                _save_state()
+        await asyncio.sleep(STOP_GUARD_POLL_SECONDS)
+
+
+def _spawn_guard(ticker: str) -> None:
+    asyncio.create_task(_stop_guard_worker(ticker))
+
+
+def _arm_stop_guard(ticker: str, action: str, stop_price: float, entry_order_id: Optional[str], entry_client_id: str) -> None:
+    _stop_guards[ticker] = {
+        "ticker": ticker,
+        "action": action,
+        "stop": round(float(stop_price), 2),
+        "entry_order_id": entry_order_id,
+        "entry_client_id": entry_client_id,
+        "guarded_qty": 0,
+        "last_filled": 0,
+        "last_status": "OPEN",
+        "stop_order_id": None,
+        "stop_client_id": None,
+        "deadline_ts": time.time() + ENTRY_FILL_TIMEOUT_MIN * 60,
+        "done": False,
+        "result": None,
+    }
+    _save_state()
+    _spawn_guard(ticker)
+
+
+def _resume_guards() -> None:
+    """Respawn watcher tasks for guards interrupted by a restart."""
+    pending = [t for t, g in _stop_guards.items() if not g.get("done")]
+    for t in pending:
+        logger.info(f"[STOP GUARD] resuming guard for {t} after restart")
+        _spawn_guard(t)
+
+
+# ==================== POSITION LEDGER ====================
+def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Optional[float],
+                 target: Optional[float], contract: Optional[dict]) -> None:
+    global _trades_today
+    _reset_daily()
+    _open_positions[ticker] = {
+        "qty": int(qty),
+        "entry": float(entry) if entry else None,
+        "stop": float(stop) if stop else None,
+        "target": float(target) if target else None,
+        "ts": _utcnow().isoformat(),
+        "contract": contract,
+    }
+    _trades_today += 1
+    _save_state()
+
+
+def _record_close(ticker: str, exit_price: Optional[float], payload: dict) -> None:
+    """Pop the position and feed realized pnl (underlying move, signed by
+    direction) into the daily loss-limit accounting."""
+    global _realized_pnl_today_pct
+    pos = _open_positions.pop(ticker, None)
+    _reset_daily()
+    entry = float((pos or {}).get("entry") or payload.get("entry") or 0)
+    exit_px = float(exit_price or payload.get("exit_price") or payload.get("limit_price") or entry or 0)
+    direction = 1.0 if str(payload.get("action") or "BUY").upper() == "BUY" else -1.0
+    if entry > 0 and exit_px > 0:
+        _realized_pnl_today_pct += direction * ((exit_px - entry) / entry * 100.0)
+    _save_state()
+
+
+async def _live_equity() -> Optional[float]:
+    """Fetch real account equity from E*TRADE. Returns None on any failure —
+    live sizing must FAIL CLOSED (reject the trade) rather than silently size
+    off a default."""
+    try:
+        tokens = load_tokens()
+        if not tokens:
+            return None
+        accounts = pyetrade.ETradeAccounts(
+            CONSUMER_KEY, CONSUMER_SECRET,
+            tokens["oauth_token"], tokens["oauth_token_secret"],
+            dev=is_sandbox,
+        )
+        lst = await asyncio.to_thread(accounts.list_accounts, resp_format="json")
+        acct_list = (((lst or {}).get("AccountListResponse") or {}).get("Accounts") or {}).get("Account") or []
+        if isinstance(acct_list, dict):
+            acct_list = [acct_list]
+        if not acct_list:
+            return None
+        acct = acct_list[0]
+        bal = await asyncio.to_thread(
+            accounts.get_account_balance,
+            acct["accountIdKey"],
+            account_type=acct.get("accountType"),
+            institution_type=acct.get("institutionType", "BROKERAGE"),
+            resp_format="json",
+        )
+        val = (
+            (bal or {}).get("BalanceResponse", {})
+            .get("Computed", {})
+            .get("RealTimeValues", {})
+            .get("totalAccountValue")
+        )
+        return float(val) if val else None
+    except Exception as e:
+        logger.error(f"equity fetch failed ({e}) — live sizing will fail closed")
+        return None
+
+
 # ==================== EXPIRY HELPER ====================
 def _resolve_expiry_string(payload: dict) -> Optional[str]:
     """Return a clean 'YYYY-MM-DD' expiry string for pyetrade.
@@ -760,6 +1367,16 @@ async def execute_live_order(payload: dict):
         }
 
     await check_risk_limits()
+
+    # A queued job may execute after conditions changed — re-check the hard
+    # gates for ENTRIES here too (closes always pass: they reduce risk).
+    is_close = _is_close_payload(payload)
+    if not is_close:
+        if _killed:
+            raise Exception("kill switch active — entry refused")
+        if not _is_market_open() and not bool(payload.get("force_execute")):
+            raise Exception("market closed — entry refused (exchange-aware calendar)")
+
     tokens = load_tokens()
     if not tokens:
         logger.error("❌ No E*TRADE tokens available")
@@ -792,7 +1409,7 @@ async def execute_live_order(payload: dict):
                 or payload.get("quantity")
                 or 1
             )
-            order_action = "BUY_OPEN" if action == "BUY" else "SELL_CLOSE"
+            order_action = "SELL_CLOSE" if (is_close or action != "BUY") else "BUY_OPEN"
             is_exit = order_action == "SELL_CLOSE"
 
             if not strike or not expiry:
@@ -898,18 +1515,108 @@ async def execute_live_order(payload: dict):
             final = await asyncio.to_thread(orders.place_option_order, **common)
             logger.info(f"✅ LIVE OPTION TRADE SUCCESS: {symbol} {call_put} {strike} {expiry}")
             consecutive_failures = 0
+            if is_exit:
+                _record_close(str(symbol).upper(), None, payload)
+            else:
+                _record_open(
+                    str(symbol).upper(), quantity,
+                    payload.get("entry"), payload.get("stop") or payload.get("stop_price"),
+                    payload.get("target"),
+                    {
+                        "occ_symbol": _occ_symbol(symbol, expiry, call_put, float(strike)),
+                        "right": call_put,
+                        "strike": float(strike),
+                        "expiration": expiry,
+                    },
+                    action,
+                )
             return {"status": "success", "response": final}
 
         else:
             # EQUITY ORDER
-            quantity = int(payload.get("position_size_shares") or 1)
+            symbol = str(ticker).upper()
             limit_price = payload.get("limit_price")
-            order_action = "BUY" if action == "BUY" else "SELL"
+            is_equity_exit = is_close or action in {"EXIT", "CLOSE"} or (action != "BUY" and symbol in _open_positions)
 
+            if is_equity_exit:
+                # LIVE EQUITY CLOSE — cancel the broker-resting protective stop
+                # FIRST so the close can never double-sell against it.
+                pos = _open_positions.get(symbol) or {}
+                guard = _stop_guards.get(symbol) or {}
+                stop_order_id = pos.get("stop_order_id") or guard.get("stop_order_id")
+                already_closed_by_stop = False
+                if stop_order_id and not await _cancel_order_safe(stop_order_id):
+                    try:
+                        stop_status, _stop_filled = await _order_state(stop_order_id, None)
+                    except Exception as e:
+                        stop_status = "UNKNOWN"
+                        logger.warning(f"stop status check failed for {symbol}: {e}")
+                    if stop_status == "EXECUTED":
+                        already_closed_by_stop = True
+                    elif stop_status not in {"CANCELLED", "REJECTED", "EXPIRED", "NOT_FOUND"}:
+                        raise Exception(
+                            f"could not cancel resting stop {stop_order_id} — refusing to double-sell {symbol}"
+                        )
+                _finish_guard(symbol, "closed_by_app")
+                if already_closed_by_stop:
+                    _record_close(symbol, None, payload)
+                    logger.info(f"[LIVE equity CLOSE] {symbol} already closed by resting stop {stop_order_id}")
+                    return {
+                        "status": "success",
+                        "response": {"note": "resting protective stop already executed at broker", "stop_order_id": stop_order_id},
+                    }
+
+                qty = int(pos.get("filled_qty") or pos.get("qty") or payload.get("position_size_shares") or 0)
+                if qty < 1:
+                    raise Exception(
+                        f"close refused — unknown quantity for {symbol} (no tracked position and no position_size_shares)"
+                    )
+                entry_action = str(pos.get("action") or ("BUY" if action != "BUY" else "SELL")).upper()
+                exit_side = "SELL" if entry_action == "BUY" else "BUY_TO_COVER"
+                common = dict(
+                    resp_format="json",
+                    accountIdKey=account_id_key,
+                    symbol=symbol,
+                    orderAction=exit_side,
+                    clientOrderId=client_order_id,
+                    quantity=qty,
+                    orderTerm="GOOD_FOR_DAY",
+                    marketSession="REGULAR",
+                    allOrNone=False,
+                    priceType="MARKET",  # protective closes prioritize certainty of fill
+                )
+                logger.info(f"📤 Placing EQUITY CLOSE (flat kwargs): {json.dumps(common)}")
+                final = await asyncio.to_thread(orders.place_equity_order, **common)
+                _record_close(symbol, None, payload)
+                logger.info(f"✅ LIVE EQUITY CLOSE SUCCESS: {exit_side} {qty} {symbol}")
+                consecutive_failures = 0
+                return {"status": "success", "response": final}
+
+            # LIVE EQUITY ENTRY — FAIL-CLOSED sizing: never default to 1 share.
+            shares_raw = payload.get("position_size_shares")
+            try:
+                quantity = int(shares_raw) if shares_raw is not None else 0
+            except (TypeError, ValueError):
+                quantity = 0
+            entry_px = float(payload.get("entry") or payload.get("limit_price") or 0)
+            stop_px = float(payload.get("stop") or payload.get("stop_price") or 0)
+            if quantity < 1:
+                dist = abs(entry_px - stop_px)
+                equity_val = await _live_equity()
+                if equity_val and equity_val > 0 and dist > 0:
+                    quantity = int((equity_val * (RISK_PER_TRADE_PCT / 100.0)) // dist)
+                    logger.info(f"sized {symbol} from live equity {equity_val:.2f}: qty={quantity}")
+                if quantity < 1:
+                    raise Exception(
+                        "fail-closed sizing: position_size_shares missing/invalid and cannot size "
+                        "from live equity — refusing to default to 1 share"
+                    )
+
+            order_action = "BUY" if action == "BUY" else "SELL"
             common = dict(
                 resp_format="json",
                 accountIdKey=account_id_key,
-                symbol=ticker,
+                symbol=symbol,
                 orderAction=order_action,
                 clientOrderId=client_order_id,
                 quantity=quantity,
@@ -925,8 +1632,19 @@ async def execute_live_order(payload: dict):
 
             logger.info(f"📤 Placing EQUITY (flat kwargs): {json.dumps(common)}")
             final = await asyncio.to_thread(orders.place_equity_order, **common)
-            logger.info(f"✅ LIVE EQUITY TRADE SUCCESS: {action} {quantity} {ticker}")
+            logger.info(f"✅ LIVE EQUITY TRADE SUCCESS: {action} {quantity} {symbol}")
             consecutive_failures = 0
+
+            _record_open(symbol, quantity, entry_px or None, stop_px or None, payload.get("target"), None, action)
+            entry_order_id = _order_id_from_place(final)
+            if stop_px > 0:
+                # Arm the stop guard: poll the entry fill, then rest a real STOP
+                # at E*TRADE so the position stays protected even if the app
+                # goes offline.
+                _arm_stop_guard(symbol, action, stop_px, entry_order_id, client_order_id)
+                logger.info(f"[STOP GUARD] armed for {symbol} at {stop_px:.2f} (entry order={entry_order_id})")
+            else:
+                logger.warning(f"⚠️ {symbol} live entry has NO stop level — no broker-side protective stop armed")
             return {"status": "success", "response": final}
 
     except Exception as e:
@@ -1010,6 +1728,10 @@ async def on_startup():
         redis = None
     await init_db()
     await preload_tokens()
+    # Restore persisted safety state (positions, guards, counters, kill switch)
+    # and resume any stop-guards interrupted by the restart.
+    _load_state()
+    _resume_guards()
     await start_worker()
     logger.info("✅ Bot ready")
 
@@ -1025,26 +1747,69 @@ async def on_shutdown():
 # ==================== ENDPOINTS ====================
 @app.post("/webhook")
 async def webhook(
-    payload: WebhookPayload = Body(...),
+    request: Request,
     x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+    x_signature: Optional[str] = Header(None, alias="X-Rork-Signature"),
 ):
-    # The app sends the shared secret both in the body (`secret`) and in the
-    # X-Rork-Secret header — accept either.
-    if WEBHOOK_SECRET and payload.secret != WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
-        raise HTTPException(403, "Unauthorized")
-    job = {"payload": payload.dict()}
+    # Raw body first — the HMAC signature (X-Rork-Signature) is computed over
+    # the exact bytes the app sent. Shared secret (body field or X-Rork-Secret
+    # header) is accepted as before.
+    raw = await request.body()
+    try:
+        data = json.loads(raw or b"{}")
+    except json.JSONDecodeError:
+        raise HTTPException(400, "invalid json")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "invalid payload")
+    _verify_webhook_auth(raw, data.get("secret"), x_rork_secret, x_signature)
+    try:
+        payload = WebhookPayload(**data)
+    except ValidationError as e:
+        raise HTTPException(400, f"invalid payload: {e.errors()[:3]}")
+
+    pd = payload.dict()
+    pd.pop("secret", None)  # never persist/queue the shared secret
+    sig_key = _signal_key(pd)
+    is_close = _is_close_payload(pd)
+    mode = str(pd.get("mode") or "paper").lower()
+    live_intent = mode == "live" and LIVE_TRADING and not is_sandbox
+
+    # Atomic idempotency — a network retry can never double-place an order.
+    if not store.set(sig_key, "processing", ex=86400, nx=True):
+        return {"status": "duplicate", "existing_status": store.get(sig_key), "signal_id": sig_key}
+
+    # Server-side gates for LIVE ENTRIES. Closes always pass — a protective
+    # exit must never be blocked by entry gating.
+    if live_intent and not is_close:
+        if not _is_market_open() and not bool(pd.get("force_execute")):
+            store.set(sig_key, "rejected", ex=86400)
+            return {"status": "rejected", "reason": "market_closed", "signal_id": sig_key}
+        ok, blocked = _passes_entry_filters(pd)
+        if not ok:
+            store.set(sig_key, "rejected", ex=86400)
+            return {"status": "rejected", "reason": "; ".join(blocked), "signal_id": sig_key}
+        cooldown_key = f"cooldown:{str(pd.get('ticker') or '').upper()}"
+        if store.exists(cooldown_key):
+            store.set(sig_key, "cooldown", ex=86400)
+            return {"status": "cooldown", "reason": "ticker_in_cooldown", "signal_id": sig_key}
+        store.set(cooldown_key, "1", ex=TICKER_COOLDOWN_MINUTES * 60)
+
+    job = {"payload": pd}
     if redis:
         try:
             await redis.rpush(QUEUE_KEY, json.dumps(job))
-            return {"status": "queued"}
+            store.set(sig_key, "queued", ex=86400)
+            return {"status": "queued", "signal_id": sig_key}
         except Exception as e:
             logger.warning(f"Redis push failed, processing directly: {e}")
     try:
-        result = await execute_live_order(payload.dict())
-        return {"status": "processed_directly", "result": result}
+        result = await execute_live_order(pd)
+        store.set(sig_key, str(result.get("status") or "processed"), ex=86400)
+        return {"status": "processed_directly", "result": result, "signal_id": sig_key}
     except Exception as e:
+        store.set(sig_key, "failed", ex=86400)
         logger.error(f"Direct processing failed: {e}")
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": str(e), "signal_id": sig_key}
 
 
 @app.get("/health")
@@ -1059,7 +1824,64 @@ async def health():
         "target_account_set": bool(TARGET_ACCOUNT_ID),
         "resolved_account_key": bool(_resolved_account_id_key),
         "circuit_breaker_open": circuit_breaker_open,
+        "killed": _killed,
     }
+
+
+@app.get("/healthz")
+async def healthz():
+    """Lightweight liveness probe polled by the app's System Monitor."""
+    return {"ok": True, "ts": _utcnow().isoformat(), "version": BOT_VERSION}
+
+
+@app.get("/status")
+async def status():
+    """Broker-state snapshot polled by the app's Reconciliation engine. The
+    shape matches etrade_bot_handler's /status (open_positions keyed by ticker
+    with qty/entry/stop/target/ts/contract)."""
+    _reset_daily()
+    return {
+        "killed": _killed,
+        "env": ENV,
+        "live_trading": LIVE_TRADING,
+        "version": BOT_VERSION,
+        "market_open": _is_market_open(),
+        "open_positions": _open_positions,
+        "stop_guards": _stop_guards,
+        "trades_today": _trades_today,
+        "realized_pnl_today_pct": _realized_pnl_today_pct,
+        "circuit_breaker_open": circuit_breaker_open,
+        "state_file": str(STATE_FILE),
+        "filters": {
+            "min_score": MIN_SCORE,
+            "min_score_trending": MIN_SCORE_TRENDING,
+            "min_rvol": MIN_RVOL,
+            "min_mtf": MIN_MTF,
+            "allowed_setups": sorted(ALLOWED_SETUPS),
+        },
+    }
+
+
+@app.post("/kill")
+async def kill(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret")):
+    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
+        raise HTTPException(401, "invalid secret")
+    global _killed
+    _killed = True
+    _save_state()
+    logger.warning("KILL SWITCH activated")
+    return {"status": "killed", "open_positions": list(_open_positions.keys())}
+
+
+@app.post("/resume")
+async def resume(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret")):
+    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
+        raise HTTPException(401, "invalid secret")
+    global _killed
+    _killed = False
+    _save_state()
+    logger.info("Kill switch released — trading resumed")
+    return {"status": "resumed"}
 
 
 if __name__ == "__main__":
