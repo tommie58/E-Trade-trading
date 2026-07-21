@@ -94,24 +94,9 @@ V5.1.0 (hardening)
   15 minutes off-hours — reconciliation is a periodic safety net; fill-time
   protection stays event-driven via the stop guards.
 
-V5.4.0 (gate-parity + DB hostname fix for token persistence)
-------------------------------------------------------------
-• Fixed DATABASE_URL handling in init_db() to properly normalize postgres://
-  or postgresql:// URLs to use the asyncpg driver (postgresql+asyncpg://).
-  This was causing create_async_engine to fail silently on platforms that
-  provide DATABASE_URL without the driver prefix (Railway, Render, etc.).
-  Result: DB connection errors → async_session never set → tokens never
-  persisted to DB (only lived in _current_tokens memory) → every restart
-  (daily container cycle) lost tokens → forced daily relink (failure #1).
-  Now tokens persist reliably across restarts; the daily relink cycle ends.
-  Improved logging now surfaces the exact DATABASE_URL hostname/credential
-  issues if connection still fails.
-• Added pool_pre_ping=True for robust connection handling.
-• Minor: consistent id="active_tokens" for access tokens; better error msgs.
-
 Run:
     pip install -r requirements.txt
-    cp .env.example .env   # fill in keys + WEBHOOK_SECRET + REDIS_URL + DATABASE_URL (postgres recommended for persistence)
+    cp .env.example .env   # fill in keys + WEBHOOK_SECRET + REDIS_URL
     uvicorn main_bot:app --host 0.0.0.0 --port 8000
 """
 from fastapi import FastAPI, HTTPException, Body, Query, Header, Request
@@ -171,7 +156,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.4.0-gate-parity-db-fix"
+BOT_VERSION = "5.5.0-balance-db-fix"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 85 / trending 80).
@@ -769,7 +754,16 @@ async def get_etrade_account():
             })
     except Exception as e:
         logger.warning(f"Account enumeration failed (still linked): {e}")
-    return {"status": "linked", "linked": True, "accounts": accounts_out}
+    # Real balances so the app can size positions off the TRUE account value
+    # instead of a stale default. Best-effort — never fail the linked check.
+    balances = await _fetch_broker_balance() or {}
+    return {
+        "status": "linked",
+        "linked": True,
+        "accounts": accounts_out,
+        "equity": balances.get("total"),
+        "cash_buying_power": balances.get("available"),
+    }
 
 
 # ==================== RENEW ====================
@@ -829,87 +823,68 @@ async def get_quotes(symbols: str = Query(...)):
         raise HTTPException(500, detail=str(e))
 
 
-# ==================== DATABASE (FIXED for token persistence) ====================
+# ==================== DATABASE ====================
 async def init_db():
-    """Initialize async DB engine.
+    """Initialize the async DB engine used for token persistence.
 
-    FIX FOR DAILY RELINK CYCLE (failure #1):
-    - DATABASE_URL from hosting platforms (Railway, Render, etc.) is typically
-      "postgres://..." or "postgresql://..." WITHOUT the async driver suffix.
-    - create_async_engine REQUIRES an async driver (asyncpg) in the URL or it
-      fails to connect (or falls back incorrectly).
-    - Previous code passed raw DATABASE_URL when "postgres" in it → engine
-      creation failed silently → async_session stayed None → save_tokens /
-      preload_tokens did nothing → tokens only in RAM → lost on every restart
-      (daily container cycle) → forced relink every day.
-    - This version NORMALIZES the URL to postgresql+asyncpg:// (preserving
-      host, port, user, pass, dbname, query params like sslmode).
-    - If connection still fails (e.g. wrong hostname, bad creds, network),
-      it logs the exact issue and falls back to SQLite (so bot still runs,
-      but tokens won't persist across restarts until DATABASE_URL is fixed).
-    - Result: tokens now persist reliably in DB; daily relink cycle eliminated.
+    FIX FOR THE DAILY RELINK CYCLE: hosting platforms (Railway, Render, …)
+    provide DATABASE_URL as "postgres://…" or "postgresql://…" WITHOUT the
+    async driver suffix. create_async_engine requires asyncpg in the URL —
+    previously the raw URL was passed straight through, engine creation
+    failed silently, async_session stayed None, and tokens only lived in RAM
+    (lost on every container restart → forced daily relink). This normalizes
+    the URL to postgresql+asyncpg:// (preserving credentials/host/params),
+    enables pool_pre_ping for stale-connection recovery, and logs the exact
+    hostname/credential problem when the connection still fails before
+    falling back to SQLite so the bot keeps running.
     """
     global engine, async_session
     engine = None
     async_session = None
-    target_url = "sqlite+aiosqlite:///etrade_cache.db"
-    db_type = "sqlite (fallback)"
 
     if DATABASE_URL:
         url = DATABASE_URL.strip()
-        original_url_for_log = url  # for error reporting (masked below)
-        # Normalize common postgres URLs to asyncpg driver
+        original_url_for_log = url
+        # Normalize common postgres URLs to the asyncpg driver.
         if url.startswith("postgres://"):
             url = "postgresql+asyncpg://" + url[len("postgres://"):]
         elif url.startswith("postgresql://") and "+asyncpg" not in url:
             url = "postgresql+asyncpg://" + url[len("postgresql://"):]
-        # If someone put postgresql+psycopg2:// etc, force asyncpg
         if url.startswith("postgresql+") and "+asyncpg" not in url:
-            # e.g. postgresql+psycopg2://user@host/db → postgresql+asyncpg://user@host/db
-            prefix, rest = url.split("://", 1)
+            # e.g. postgresql+psycopg2://… → force asyncpg
+            _prefix, rest = url.split("://", 1)
             url = "postgresql+asyncpg://" + rest
 
         try:
-            import asyncpg  # noqa: F401  # ensure driver available
+            import asyncpg  # noqa: F401  # ensure the driver is installed
             engine = create_async_engine(
                 url,
                 echo=False,
-                pool_pre_ping=True,  # detect and recover from stale connections (common in cloud DBs)
+                pool_pre_ping=True,  # detect/recover stale cloud-DB connections
             )
-            target_url = url
-            db_type = "postgres + asyncpg"
-            # Log masked hostname for diagnostics (shows if hostname is correct)
-            safe_log = url
-            if "@" in safe_log:
-                safe_log = safe_log.split("@", 1)[1]  # drop user:pass@
-            logger.info(f"✅ DATABASE_URL normalized and engine created for {db_type} @ {safe_log}")
+            safe_log = url.split("@", 1)[1] if "@" in url else url
+            logger.info(f"✅ DATABASE_URL normalized — postgres engine created @ {safe_log}")
         except ImportError:
             logger.warning(
-                "asyncpg package not found in environment — cannot use postgres DATABASE_URL. "
-                "Install with: pip install asyncpg   (tokens will use SQLite fallback and NOT persist across restarts)"
+                "asyncpg not installed — cannot use postgres DATABASE_URL "
+                "(pip install asyncpg). Tokens will use the SQLite fallback "
+                "and will NOT persist across restarts."
             )
             engine = None
         except Exception as conn_err:
-            # This surfaces the real hostname/credential/network error to logs
+            masked = original_url_for_log.split("@")[-1] if "@" in original_url_for_log else original_url_for_log
             logger.error(
-                f"❌ Database connection FAILED using DATABASE_URL "
-                f"(likely wrong hostname, port, credentials, SSL, or network/VPC issue): {conn_err}"
+                f"❌ Database connection FAILED (wrong hostname, port, credentials, "
+                f"SSL, or network issue): {conn_err} | DATABASE_URL host (masked): {masked}"
             )
-            logger.error(
-                f"   Original DATABASE_URL (masked): "
-                f"{original_url_for_log.split('@')[-1] if '@' in original_url_for_log else original_url_for_log}"
-            )
-            logger.warning("   → Falling back to local SQLite (tokens will NOT survive restarts until DATABASE_URL is corrected)")
+            logger.warning("→ Falling back to SQLite — tokens will NOT survive restarts until DATABASE_URL is fixed")
             engine = None
 
     if engine is None:
-        # SQLite fallback (tokens persist only within this container lifetime)
-        target_url = "sqlite+aiosqlite:///etrade_cache.db"
-        db_type = "sqlite"
         try:
-            engine = create_async_engine(target_url, echo=False)
+            engine = create_async_engine("sqlite+aiosqlite:///etrade_cache.db", echo=False)
         except Exception as sqlite_err:
-            logger.error(f"Even SQLite fallback failed: {sqlite_err}")
+            logger.error(f"Even the SQLite fallback failed: {sqlite_err}")
             engine = None
             async_session = None
             return  # bot continues without DB; tokens won't persist at all
@@ -918,10 +893,10 @@ async def init_db():
         async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        logger.info(f"✅ Database ready: {db_type}  (tokens will persist across restarts)")
+        logger.info("✅ Database ready (tokens will persist across restarts)")
     except Exception as e:
         logger.error(f"Database table creation / sessionmaker error: {e}")
-        async_session = None  # ensure downstream checks see failure
+        async_session = None  # downstream checks must see the failure
 
 
 # ==================== ACCOUNT KEY RESOLUTION ====================
@@ -1214,22 +1189,60 @@ def _max_qty_from_insufficient_funds(message: str) -> Optional[int]:
         return None
 
 
-async def _place_entry_with_funds_clamp(kind: str, common: dict, tokens: Dict[str, str]) -> Tuple[Any, int]:
-    """Place an ENTRY order; on an 8400 insufficient-funds rejection, clamp the
-    quantity to what the broker says is affordable (95% safety margin) and
-    retry ONCE with a fresh clientOrderId. Never used for closes — a close
-    must always cover the full tracked position.
+FUNDS_SAFETY_MARGIN = float(os.getenv("FUNDS_SAFETY_MARGIN", "0.95"))
 
+
+async def _place_entry_with_funds_clamp(
+    kind: str, common: dict, tokens: Dict[str, str], unit_cost: Optional[float] = None,
+) -> Tuple[Any, int]:
+    """Place an ENTRY order with three layers of funds protection:
+
+    1. PRE-FLIGHT (proactive): when the per-unit cost is known, clamp the
+       quantity so the estimated cost fits within tracked available funds
+       (95% safety margin) — and refuse outright when even ONE unit is
+       unaffordable, so oversized orders never reach the broker at all.
+    2. BACKSTOP (reactive): on an 8400 insufficient-funds rejection anyway,
+       clamp to the broker's own max-quantity hint and retry ONCE with a
+       fresh clientOrderId.
+    3. LEDGER: debit the tracked balance by the placed cost so back-to-back
+       entries can't over-spend between broker balance refreshes.
+
+    Never used for closes — a close must always cover the full position.
     Returns (broker_response, quantity_actually_sent).
     """
+    requested = int(common["quantity"])
+    unit_name = "contract" if kind == "option" else "share"
+    if unit_cost is not None and unit_cost > 0:
+        available = await _available_funds()
+        if available is not None:
+            budget = max(0.0, available) * FUNDS_SAFETY_MARGIN
+            affordable = int(budget // unit_cost)
+            if affordable < 1:
+                raise Exception(
+                    f"insufficient funds: available ≈${available:.2f}, one {unit_name} of "
+                    f"{common.get('symbol')} costs ≈${unit_cost:.2f} — trade refused before reaching broker"
+                )
+            if requested > affordable:
+                logger.warning(
+                    f"💰 Pre-flight size clamp: {common.get('symbol')} qty {requested} → {affordable} "
+                    f"(available ≈${available:.2f}, {unit_name} cost ≈${unit_cost:.2f})"
+                )
+                common = dict(common)
+                common["quantity"] = affordable
+                requested = affordable
+        else:
+            logger.warning(
+                f"⚠️ No balance available for pre-flight sizing of {common.get('symbol')} — "
+                f"relying on broker-side 8400 clamp backstop"
+            )
+
+    placed_qty = requested
     try:
         final = await _place_order_smart(kind, common, tokens)
-        return final, int(common["quantity"])
     except Exception as e:
         max_qty = _max_qty_from_insufficient_funds(str(e))
         if max_qty is None:
             raise
-        requested = int(common["quantity"])
         clamped = max(1, int(max_qty * 0.95))
         if clamped >= requested:
             raise  # hint doesn't actually reduce the order — don't loop
@@ -1244,7 +1257,13 @@ async def _place_entry_with_funds_clamp(kind: str, common: dict, tokens: Dict[st
         )
         final = await _place_order_smart(kind, retry, tokens)
         logger.info(f"✅ Clamped retry accepted: {clamped}x {common.get('symbol')} (was {requested})")
-        return final, clamped
+        placed_qty = clamped
+    if unit_cost is not None and unit_cost > 0:
+        try:
+            await state.adjust_balance(-float(unit_cost) * placed_qty)
+        except Exception as e:
+            logger.warning(f"balance debit failed (non-fatal): {e}")
+    return final, placed_qty
 
 
 async def _order_state(order_id: Optional[str], client_id: Optional[str]) -> Tuple[str, int]:
@@ -1698,28 +1717,54 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
 
 async def _record_close(ticker: str, exit_price: Optional[float], payload: dict) -> None:
     """Pop the position and feed realized pnl (underlying move, signed by
-    direction) into the daily loss-limit accounting."""
+    direction) into the daily loss-limit accounting — plus credit equity
+    proceeds back into the tracked balance so wins/losses immediately update
+    the funds available for the next entry."""
     pos = await state.delete_position(ticker)
     entry = float((pos or {}).get("entry") or payload.get("entry") or 0)
     exit_px = float(exit_price or payload.get("exit_price") or payload.get("limit_price") or entry or 0)
     direction = 1.0 if str(payload.get("action") or "BUY").upper() == "BUY" else -1.0
+    qty = int((pos or {}).get("filled_qty") or (pos or {}).get("qty") or 0)
+    is_option = bool((pos or {}).get("contract"))
     pnl_pct: Optional[float] = None
+    realized_usd: Optional[float] = None
     if entry > 0 and exit_px > 0:
         pnl_pct = direction * ((exit_px - entry) / entry * 100.0)
         await state.add_realized_pnl(pnl_pct)
+        if qty > 0 and not is_option:
+            realized_usd = direction * (exit_px - entry) * qty
+    # BALANCE TRACKING — equity closes return known proceeds (qty × exit).
+    # Option proceeds can't be derived from underlying prices, so we stay
+    # conservative: credit nothing and let the next fresh broker fetch true it
+    # up (a too-low tracked balance can never cause an insufficient-funds trade).
+    if not is_option and exit_px > 0 and qty > 0:
+        try:
+            await state.adjust_balance(exit_px * qty)
+        except Exception as e:
+            logger.warning(f"balance credit failed (non-fatal): {e}")
     await trade_ledger.record("position_closed", {
         "ticker": ticker,
         "entry": entry or None,
         "exit": exit_px or None,
         "realized_pnl_pct": round(pnl_pct, 4) if pnl_pct is not None else None,
-        "qty": int((pos or {}).get("filled_qty") or (pos or {}).get("qty") or 0) or None,
+        "realized_pnl_usd": round(realized_usd, 2) if realized_usd is not None else None,
+        "qty": qty or None,
     })
 
 
-async def _live_equity() -> Optional[float]:
-    """Fetch real account equity from E*TRADE. Returns None on any failure —
-    live sizing must FAIL CLOSED (reject the trade) rather than silently size
-    off a default."""
+def _positive_float(value: Any) -> Optional[float]:
+    """Parse a broker-reported number; None unless strictly positive."""
+    try:
+        f = float(value)
+        return f if f > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _fetch_broker_balance() -> Optional[Dict[str, Optional[float]]]:
+    """ONE E*TRADE balance call → {'total': totalAccountValue, 'available':
+    cash available for new orders}. Returns None on any failure — callers
+    decide whether to fail closed or fall back to the tracked snapshot."""
     try:
         tokens = load_tokens()
         if not tokens:
@@ -1744,16 +1789,53 @@ async def _live_equity() -> Optional[float]:
             resp_format="json",
             source="balance",
         )
-        val = (
-            (bal or {}).get("BalanceResponse", {})
-            .get("Computed", {})
-            .get("RealTimeValues", {})
-            .get("totalAccountValue")
+        computed = ((bal or {}).get("BalanceResponse", {}) or {}).get("Computed", {}) or {}
+        real_time = computed.get("RealTimeValues", {}) or {}
+        total = _positive_float(real_time.get("totalAccountValue"))
+        # Cash actually spendable on new orders — the number that prevents
+        # 8400 insufficient-funds rejections. Order of preference matches
+        # E*TRADE's own "purchasing power" semantics for cash accounts.
+        available = (
+            _positive_float(computed.get("cashBuyingPower"))
+            or _positive_float(computed.get("cashAvailableForInvestment"))
+            or _positive_float(computed.get("marginBuyingPower"))
+            or total
         )
-        return float(val) if val else None
+        return {"total": total, "available": available}
     except Exception as e:
-        logger.error(f"equity fetch failed ({e}) — live sizing will fail closed")
+        logger.error(f"balance fetch failed ({e})")
         return None
+
+
+async def _live_equity() -> Optional[float]:
+    """Fetch real account equity from E*TRADE. Returns None on any failure —
+    live sizing must FAIL CLOSED (reject the trade) rather than silently size
+    off a default."""
+    bal = await _fetch_broker_balance()
+    return (bal or {}).get("total")
+
+
+async def _available_funds() -> Optional[float]:
+    """Best estimate of funds available for a NEW entry. A fresh broker fetch
+    is always preferred (and refreshes the tracked snapshot); during broker
+    hiccups it falls back to the last snapshot ± the win/loss/cost delta
+    accumulated since. None when neither source is usable."""
+    bal = await _fetch_broker_balance()
+    fresh = (bal or {}).get("available")
+    if fresh is not None and fresh > 0:
+        try:
+            await state.set_balance_snapshot(fresh)
+        except Exception as e:
+            logger.warning(f"balance snapshot store failed (non-fatal): {e}")
+        return fresh
+    tracked = await state.tracked_balance()
+    if tracked is not None:
+        logger.warning(
+            f"💰 broker balance fetch unavailable — sizing from tracked balance ≈${tracked:.2f} "
+            f"(last snapshot ± wins/losses/open orders)"
+        )
+        return tracked
+    return None
 
 
 # ==================== EXPIRY HELPER ====================
@@ -2093,7 +2175,14 @@ async def execute_live_order(payload: dict):
                 # Closes must always cover the full tracked position — never clamp.
                 final = await _place_order_smart("option", common, tokens)
             else:
-                final, quantity = await _place_entry_with_funds_clamp("option", common, tokens)
+                # Per-contract cost = premium × 100 shares. Prefer the sanitized
+                # limit price (set from the real ask above); fall back to the
+                # raw ask for MARKET orders.
+                premium_ref = float(common.get("limitPrice") or 0) or float(real_ask or 0)
+                final, quantity = await _place_entry_with_funds_clamp(
+                    "option", common, tokens,
+                    unit_cost=premium_ref * 100.0 if premium_ref > 0 else None,
+                )
             logger.info(f"✅ LIVE OPTION TRADE SUCCESS: {symbol} {call_put} {strike} {expiry}")
             await _record_api_success()
             if is_exit:
@@ -2279,7 +2368,13 @@ async def execute_live_order(payload: dict):
                     logger.warning(f"OTOCO attempt failed ({e}) — falling back to entry + stop guard")
 
             logger.info(f"📤 Placing EQUITY: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
-            final, quantity = await _place_entry_with_funds_clamp("equity", common, tokens)
+            # Per-share cost for the pre-flight funds clamp — the limit price
+            # when set, otherwise the signal's entry estimate for MARKET orders.
+            share_cost = float(common.get("limitPrice") or 0) or (entry_px if entry_px > 0 else 0)
+            final, quantity = await _place_entry_with_funds_clamp(
+                "equity", common, tokens,
+                unit_cost=share_cost if share_cost > 0 else None,
+            )
             logger.info(f"✅ LIVE EQUITY TRADE SUCCESS: {action} {quantity} {symbol}")
             await _record_api_success()
 
