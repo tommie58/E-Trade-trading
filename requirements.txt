@@ -2,18 +2,21 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 pydantic>=2.5
 python-dotenv>=1.0
+pydantic-settings>=2.0          # optional but nice
 
 # Broker access
-pyetrade>=2.1.0            # simple reads (quotes, accounts, auth/renew) + fallback
+pyetrade>=2.1.0                 # simple reads (quotes, accounts, auth/renew) + fallback
 requests>=2.31
-requests-oauthlib>=1.3     # OAuth link flow (request/access token exchange)
-rauth>=0.7.3
+requests-oauthlib>=1.3          # OAuth link flow
+# rauth>=0.7.3                  # consider removing after testing
 
 # V5 async foundation
-httpx>=0.27                # raw async Order API payloads
-oauthlib>=3.2              # OAuth1 signing for httpx requests
-redis>=5.0                 # distributed state + locks + placement queue
+httpx>=0.27                     # raw async Order API payloads
+oauthlib>=3.2                   # OAuth1 signing for httpx
+redis>=5.0                      # distributed state + locks + placement queue
 
 # Token persistence (Postgres on Railway/Render, SQLite locally)
 sqlalchemy[asyncio]>=2.0
 aiosqlite>=0.19
+asyncpg>=0.29.0                 # ← critical for Postgres
+alembic>=1.13                   # migrations (recommended)
