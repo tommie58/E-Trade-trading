@@ -1883,7 +1883,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.5.0-balance-db-fix"
+BOT_VERSION = "5.6.0-balance-compat-park-replay"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 85 / trending 80).
@@ -1990,6 +1990,14 @@ _worker_stop = False
 # In-memory token cache
 _current_tokens: Optional[Dict[str, str]] = None
 
+# Live signals that failed ONLY because the E*TRADE session was expired (401)
+# are parked here and replayed automatically the moment the account is
+# relinked. Entries expire after PARKED_SIGNAL_TTL_SECONDS and never replay
+# into a closed market; closes always replay (they reduce risk).
+_parked_signals: List[Dict[str, Any]] = []
+PARKED_SIGNAL_TTL_SECONDS = int(os.getenv("PARKED_SIGNAL_TTL_SECONDS", "600"))
+_MAX_PARKED_SIGNALS = 10
+
 # Cached E*TRADE accountIdKey. Order APIs require the opaque accountIdKey from
 # /accounts/list — NOT the visible account number. Users typically set
 # ETRADE_ACCOUNT_ID to the account number, which E*TRADE rejects with
@@ -2080,6 +2088,67 @@ def _signal_key(p: dict) -> str:
         f"{p.get('target')}|{p.get('timestamp')}|{str(p.get('intent') or 'open').lower()}"
     )
     return "sig:" + hashlib.sha1(base.encode()).hexdigest()
+
+
+def _is_auth_error(err: str) -> bool:
+    """True when a broker failure is an expired/invalid OAuth session (401)."""
+    low = str(err).lower()
+    return "401" in low or "unauthorized" in low
+
+
+def _park_signal(pd: dict) -> None:
+    """Park a live signal that failed ONLY because the session was expired.
+    One parked signal per ticker — the newest wins."""
+    ticker = str(pd.get("ticker") or "").upper()
+    _parked_signals[:] = [
+        p for p in _parked_signals
+        if str(p["payload"].get("ticker") or "").upper() != ticker
+    ]
+    _parked_signals.append({"payload": dict(pd), "ts": time.time()})
+    while len(_parked_signals) > _MAX_PARKED_SIGNALS:
+        _parked_signals.pop(0)
+    logger.warning(
+        f"\U0001f17f\ufe0f Parked live signal {ticker} {pd.get('action')} — E*TRADE session expired; "
+        f"will auto-replay after relink (entries valid {PARKED_SIGNAL_TTL_SECONDS // 60} min)"
+    )
+
+
+async def _replay_parked_signals() -> None:
+    """Runs right after a successful relink: replay signals that failed solely
+    on the expired session. Closes always replay (they reduce risk); entries
+    only while fresh AND the market is open."""
+    if not _parked_signals:
+        return
+    await asyncio.sleep(2.0)  # let the fresh session settle before ordering
+    pending = list(_parked_signals)
+    _parked_signals.clear()
+    for item in pending:
+        pd = dict(item["payload"])
+        ticker = str(pd.get("ticker") or "").upper()
+        age = time.time() - float(item.get("ts") or 0)
+        if not _is_close_payload(pd):
+            if age > PARKED_SIGNAL_TTL_SECONDS:
+                logger.info(f"\U0001f17f\ufe0f Dropping stale parked entry {ticker} (age {age:.0f}s)")
+                await trade_ledger.record("parked_signal_dropped", {"ticker": ticker, "age_seconds": int(age), "reason": "stale"})
+                continue
+            if not _is_market_open() and not bool(pd.get("force_execute")):
+                logger.info(f"\U0001f17f\ufe0f Dropping parked entry {ticker} — market closed")
+                await trade_ledger.record("parked_signal_dropped", {"ticker": ticker, "age_seconds": int(age), "reason": "market_closed"})
+                continue
+        try:
+            result = await execute_live_order(pd)
+            logger.info(f"\u2705 Replayed parked signal {ticker}: {result.get('status')}")
+            await trade_ledger.record("parked_signal_replayed", {
+                "ticker": ticker, "action": pd.get("action"),
+                "age_seconds": int(age), "result": str(result.get("status") or ""),
+            })
+        except Exception as e:
+            logger.error(f"\u274c Parked signal replay failed for {ticker}: {e}")
+            await alerts.send(
+                "error", "parked_replay_failed",
+                f"{ticker} {pd.get('action')}: replay after relink failed: {e}",
+                dedupe_key=f"parked:{ticker}",
+            )
 
 
 def _is_close_payload(p: dict) -> bool:
@@ -2236,6 +2305,9 @@ def save_tokens(token: str, token_secret: str):
     # the relinked session starts clean instead of rejecting with 503.
     try:
         asyncio.create_task(_reset_circuit_breaker("account relinked"))
+        # Replay live signals that failed solely on the expired session — this
+        # closes the disconnect→relink gap where dispatches used to be lost.
+        asyncio.create_task(_replay_parked_signals())
     except RuntimeError:
         pass  # no running loop (e.g. import-time) — TTL reset still applies
     if async_session:
@@ -3488,6 +3560,34 @@ def _positive_float(value: Any) -> Optional[float]:
         return None
 
 
+async def _get_balance_compat(accounts: "pyetrade.ETradeAccounts", acct: Dict[str, Any]) -> Any:
+    """Version-tolerant get_account_balance. pyetrade's signature changed
+    across releases — older builds accept institution_type, newer ones raise
+    "unexpected keyword argument 'institution_type'" (the exact failure seen
+    in production). Try the richest kwargs first and strip unsupported ones
+    on TypeError so balance-aware sizing works on every deployed pyetrade."""
+    kwarg_sets: List[Dict[str, Any]] = [
+        dict(account_type=acct.get("accountType"),
+             institution_type=acct.get("institutionType", "BROKERAGE"),
+             resp_format="json"),
+        dict(account_type=acct.get("accountType"), real_time=True, resp_format="json"),
+        dict(account_type=acct.get("accountType"), resp_format="json"),
+        dict(resp_format="json"),
+    ]
+    last_error: Optional[Exception] = None
+    for kwargs in kwarg_sets:
+        try:
+            return await _etrade_call(
+                accounts.get_account_balance, acct["accountIdKey"],
+                source="balance", **kwargs,
+            )
+        except TypeError as e:
+            if "unexpected keyword argument" not in str(e):
+                raise
+            last_error = e
+    raise last_error or TypeError("get_account_balance: no compatible signature found")
+
+
 async def _fetch_broker_balance() -> Optional[Dict[str, Optional[float]]]:
     """ONE E*TRADE balance call → {'total': totalAccountValue, 'available':
     cash available for new orders}. Returns None on any failure — callers
@@ -3508,14 +3608,7 @@ async def _fetch_broker_balance() -> Optional[Dict[str, Optional[float]]]:
         if not acct_list:
             return None
         acct = acct_list[0]
-        bal = await _etrade_call(
-            accounts.get_account_balance,
-            acct["accountIdKey"],
-            account_type=acct.get("accountType"),
-            institution_type=acct.get("institutionType", "BROKERAGE"),
-            resp_format="json",
-            source="balance",
-        )
+        bal = await _get_balance_compat(accounts, acct)
         computed = ((bal or {}).get("BalanceResponse", {}) or {}).get("Computed", {}) or {}
         real_time = computed.get("RealTimeValues", {}) or {}
         total = _positive_float(real_time.get("totalAccountValue"))
@@ -4421,6 +4514,19 @@ async def webhook(
         await state.set(sig_key, str(result.get("status") or "processed"), ex=86400)
         return {"status": "processed_directly", "result": result, "signal_id": sig_key}
     except Exception as e:
+        err = str(e)
+        # A 401 here means the E*TRADE session died between dispatch and
+        # placement (the disconnect→relink gap). Park the signal so the relink
+        # replays it instead of silently losing the trade.
+        if live_intent and _is_auth_error(err):
+            _park_signal(pd)
+            await state.set(sig_key, "parked", ex=86400)
+            return {
+                "status": "error",
+                "message": f"{err} — signal parked; auto-replays after relink",
+                "parked": True,
+                "signal_id": sig_key,
+            }
         await state.set(sig_key, "failed", ex=86400)
         logger.error(f"Direct processing failed: {e}")
         return {"status": "error", "message": str(e), "signal_id": sig_key}
