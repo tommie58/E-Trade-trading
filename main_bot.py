@@ -2818,3 +2818,1692 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main_bot:app", host="0.0.0.0", port=port)
+
+"""
+Distributed state store — Redis-first, with a loud in-memory fallback.
+=====================================================================
+
+Replaces the old STATE_FILE + in-memory dicts (_open_positions, _stop_guards)
+and the _TTL idempotency store with Redis so that:
+
+  • multiple workers share ONE source of truth (safe horizontal scaling)
+  • Railway/Render cold starts lose nothing (state lives in Redis, not RAM/disk)
+  • critical sections (order placement, close, reconciliation) run under a
+    distributed lock so two workers can never double-place or double-close
+
+Key layout (exact names, no surprises):
+
+  open_positions:{TICKER}      JSON position record
+  open_positions:index         SET of tickers with an open position
+  stop_guard:{TICKER}          JSON guard record (equity or option)
+  stop_guards:index            SET of tickers with a guard record
+  daily:{YYYY-MM-DD}           HASH {trades_today, realized_pnl_today_pct} (3-day TTL)
+  balance:snapshot             JSON {value, ts} — last broker buying-power fetch
+  balance:delta                HASH {delta} — running win/loss/cost adjustment since snapshot
+  killed                       "1" when the kill switch is engaged
+  sig:{sha1}                   idempotency keys (24h TTL, SET NX)
+  cooldown:{TICKER}            ticker cooldown (TTL)
+  lock:{name}                  distributed locks (SET NX PX + token + Lua release)
+  reconcile:last               JSON report of the last reconciliation pass
+
+Every method is async. When REDIS_URL is absent or Redis is unreachable the
+store degrades to a single-process in-memory backend and logs a loud warning —
+correct for local dev, NOT safe for multi-worker production.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("etrade-bot.state")
+
+# Lua: release the lock only if we still own it (token match) — never delete
+# a lock another worker re-acquired after our TTL expired.
+_RELEASE_LUA = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+"""
+
+# Lua: extend the lock only if we still own it.
+_EXTEND_LUA = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("pexpire", KEYS[1], ARGV[2])
+else
+    return 0
+end
+"""
+
+POSITIONS_INDEX = "open_positions:index"
+GUARDS_INDEX = "stop_guards:index"
+DAILY_TTL_SECONDS = 3 * 24 * 3600
+BALANCE_SNAPSHOT_KEY = "balance:snapshot"
+BALANCE_DELTA_KEY = "balance:delta"
+# A tracked balance older than this is unusable — sizing must fail closed
+# (or fall back to the broker's own funds check) instead of trusting it.
+BALANCE_TTL_SECONDS = 15 * 60
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _today() -> str:
+    return _utcnow().date().isoformat()
+
+
+def _dumps(value: Any) -> str:
+    return json.dumps(value, default=str)
+
+
+class LockNotAcquired(Exception):
+    """Raised when a blocking lock acquire times out."""
+
+
+class DistributedLock:
+    """SET key token NX PX lock with safe (token-checked) release.
+
+    Usage:
+        async with state.lock("order:AAPL", ttl_ms=30_000):
+            ... critical section ...
+
+    Non-blocking probe:
+        lock = state.lock("reconcile", ttl_ms=60_000)
+        if await lock.try_acquire():
+            try: ...
+            finally: await lock.release()
+    """
+
+    def __init__(self, store: "StateStore", name: str, ttl_ms: int = 30_000,
+                 wait_timeout: float = 10.0, retry_delay: float = 0.1) -> None:
+        self._store = store
+        self.key = f"lock:{name}"
+        self.ttl_ms = int(ttl_ms)
+        self.wait_timeout = wait_timeout
+        self.retry_delay = retry_delay
+        self.token = uuid.uuid4().hex
+        self.acquired = False
+
+    async def try_acquire(self) -> bool:
+        ok = await self._store._set_raw(self.key, self.token, px=self.ttl_ms, nx=True)
+        self.acquired = bool(ok)
+        return self.acquired
+
+    async def acquire(self) -> None:
+        deadline = time.monotonic() + self.wait_timeout
+        while True:
+            if await self.try_acquire():
+                return
+            if time.monotonic() >= deadline:
+                raise LockNotAcquired(f"could not acquire {self.key} within {self.wait_timeout}s")
+            await asyncio.sleep(self.retry_delay)
+
+    async def extend(self, ttl_ms: Optional[int] = None) -> bool:
+        if not self.acquired:
+            return False
+        return await self._store._extend_lock(self.key, self.token, ttl_ms or self.ttl_ms)
+
+    async def release(self) -> None:
+        if not self.acquired:
+            return
+        self.acquired = False
+        await self._store._release_lock(self.key, self.token)
+
+    async def __aenter__(self) -> "DistributedLock":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        await self.release()
+
+
+class _MemoryBackend:
+    """Single-process fallback with the same semantics (TTLs, NX, sets).
+    Only used when Redis is unavailable — logged loudly at startup."""
+
+    def __init__(self) -> None:
+        self._kv: Dict[str, Tuple[str, float]] = {}   # key -> (value, expiry_ts or 0)
+        self._sets: Dict[str, set] = {}
+        self._hashes: Dict[str, Tuple[Dict[str, str], float]] = {}
+        self._lock = asyncio.Lock()
+
+    def _purge(self) -> None:
+        now = time.time()
+        for k in [k for k, (_, exp) in self._kv.items() if exp and exp < now]:
+            self._kv.pop(k, None)
+        for k in [k for k, (_, exp) in self._hashes.items() if exp and exp < now]:
+            self._hashes.pop(k, None)
+
+    async def set(self, key: str, value: str, px: Optional[int] = None,
+                  ex: Optional[int] = None, nx: bool = False) -> bool:
+        async with self._lock:
+            self._purge()
+            if nx and key in self._kv:
+                return False
+            ttl = 0.0
+            if px:
+                ttl = time.time() + px / 1000.0
+            elif ex:
+                ttl = time.time() + ex
+            self._kv[key] = (value, ttl)
+            return True
+
+    async def get(self, key: str) -> Optional[str]:
+        async with self._lock:
+            self._purge()
+            item = self._kv.get(key)
+            return item[0] if item else None
+
+    async def delete(self, *keys: str) -> None:
+        async with self._lock:
+            for key in keys:
+                self._kv.pop(key, None)
+                self._sets.pop(key, None)
+                self._hashes.pop(key, None)
+
+    async def exists(self, key: str) -> bool:
+        return (await self.get(key)) is not None
+
+    async def eval_compare_del(self, key: str, token: str) -> bool:
+        async with self._lock:
+            item = self._kv.get(key)
+            if item and item[0] == token:
+                self._kv.pop(key, None)
+                return True
+            return False
+
+    async def eval_compare_extend(self, key: str, token: str, px: int) -> bool:
+        async with self._lock:
+            item = self._kv.get(key)
+            if item and item[0] == token:
+                self._kv[key] = (item[0], time.time() + px / 1000.0)
+                return True
+            return False
+
+    async def sadd(self, key: str, member: str) -> None:
+        async with self._lock:
+            self._sets.setdefault(key, set()).add(member)
+
+    async def srem(self, key: str, member: str) -> None:
+        async with self._lock:
+            self._sets.get(key, set()).discard(member)
+
+    async def smembers(self, key: str) -> List[str]:
+        async with self._lock:
+            return sorted(self._sets.get(key, set()))
+
+    async def hincrbyfloat(self, key: str, field: str, amount: float, ex: int) -> float:
+        async with self._lock:
+            self._purge()
+            fields, _ = self._hashes.get(key, ({}, 0.0))
+            new_val = float(fields.get(field, "0") or 0) + amount
+            fields[field] = repr(new_val)
+            self._hashes[key] = (fields, time.time() + ex)
+            return new_val
+
+    async def hgetall(self, key: str) -> Dict[str, str]:
+        async with self._lock:
+            self._purge()
+            fields, _ = self._hashes.get(key, ({}, 0.0))
+            return dict(fields)
+
+    async def incr(self, key: str, ex: Optional[int] = None) -> int:
+        async with self._lock:
+            self._purge()
+            item = self._kv.get(key)
+            try:
+                val = int(float(item[0])) + 1 if item else 1
+            except (TypeError, ValueError):
+                val = 1
+            ttl = time.time() + ex if ex else (item[1] if item else 0.0)
+            self._kv[key] = (str(val), ttl)
+            return val
+
+    async def lpush_capped(self, key: str, value: str, max_len: int) -> None:
+        async with self._lock:
+            existing = self._kv.get(key)
+            items: List[str] = json.loads(existing[0]) if existing else []
+            items.insert(0, value)
+            self._kv[key] = (json.dumps(items[:max_len]), 0.0)
+
+    async def lrange_head(self, key: str, count: int) -> List[str]:
+        async with self._lock:
+            existing = self._kv.get(key)
+            if not existing:
+                return []
+            try:
+                items: List[str] = json.loads(existing[0])
+            except json.JSONDecodeError:
+                return []
+            return items[:count]
+
+    async def rpush(self, key: str, value: str) -> None:
+        async with self._lock:
+            existing = self._kv.get(key)
+            queue: List[str] = json.loads(existing[0]) if existing else []
+            queue.append(value)
+            self._kv[key] = (json.dumps(queue), 0.0)
+
+    async def lpop(self, key: str) -> Optional[str]:
+        async with self._lock:
+            existing = self._kv.get(key)
+            if not existing:
+                return None
+            queue: List[str] = json.loads(existing[0])
+            if not queue:
+                return None
+            head = queue.pop(0)
+            self._kv[key] = (json.dumps(queue), 0.0)
+            return head
+
+    async def ping(self) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
+class StateStore:
+    """Unified async state API over Redis (or the memory fallback)."""
+
+    def __init__(self, redis_client: Any = None) -> None:
+        self.redis = redis_client            # redis.asyncio client or None
+        self._memory = _MemoryBackend()
+        self._release_sha: Optional[str] = None
+        self._extend_sha: Optional[str] = None
+
+    @property
+    def backend_name(self) -> str:
+        return "redis" if self.redis is not None else "memory"
+
+    @property
+    def is_distributed(self) -> bool:
+        return self.redis is not None
+
+    @classmethod
+    async def create(cls, redis_url: Optional[str]) -> "StateStore":
+        """Connect to Redis when configured; otherwise return the memory
+        fallback with a loud warning."""
+        if redis_url:
+            try:
+                from redis.asyncio import from_url as redis_from_url
+                client = redis_from_url(
+                    redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=5,
+                    socket_timeout=10,
+                    health_check_interval=30,
+                )
+                await client.ping()
+                logger.info("✅ StateStore: Redis connected — distributed state + locks active")
+                return cls(client)
+            except Exception as e:
+                logger.error(
+                    f"⛔ StateStore: Redis unreachable ({e}) — FALLING BACK to in-memory state. "
+                    f"NOT safe for multi-worker deployments."
+                )
+        else:
+            logger.warning(
+                "⚠️ StateStore: no REDIS_URL — using in-memory state. "
+                "Set REDIS_URL for restart-safe, multi-worker-safe state."
+            )
+        return cls(None)
+
+    # ---------------- raw primitives ----------------
+    async def _set_raw(self, key: str, value: str, px: Optional[int] = None,
+                       ex: Optional[int] = None, nx: bool = False) -> bool:
+        if self.redis is not None:
+            ok = await self.redis.set(key, value, px=px, ex=ex, nx=nx if nx else None)
+            return bool(ok)
+        return await self._memory.set(key, value, px=px, ex=ex, nx=nx)
+
+    async def _release_lock(self, key: str, token: str) -> bool:
+        if self.redis is not None:
+            try:
+                res = await self.redis.eval(_RELEASE_LUA, 1, key, token)
+                return bool(res)
+            except Exception as e:
+                logger.warning(f"lock release failed for {key}: {e}")
+                return False
+        return await self._memory.eval_compare_del(key, token)
+
+    async def _extend_lock(self, key: str, token: str, px: int) -> bool:
+        if self.redis is not None:
+            try:
+                res = await self.redis.eval(_EXTEND_LUA, 1, key, token, px)
+                return bool(res)
+            except Exception as e:
+                logger.warning(f"lock extend failed for {key}: {e}")
+                return False
+        return await self._memory.eval_compare_extend(key, token, px)
+
+    # ---------------- generic KV (idempotency, cooldowns) ----------------
+    async def set(self, key: str, value: str, ex: Optional[int] = None, nx: bool = False) -> bool:
+        return await self._set_raw(key, value, ex=ex, nx=nx)
+
+    async def get(self, key: str) -> Optional[str]:
+        if self.redis is not None:
+            return await self.redis.get(key)
+        return await self._memory.get(key)
+
+    async def exists(self, key: str) -> bool:
+        if self.redis is not None:
+            return bool(await self.redis.exists(key))
+        return await self._memory.exists(key)
+
+    async def delete(self, *keys: str) -> None:
+        if not keys:
+            return
+        if self.redis is not None:
+            await self.redis.delete(*keys)
+            return
+        await self._memory.delete(*keys)
+
+    # ---------------- counters (circuit breaker) ----------------
+    async def incr(self, key: str, ex: Optional[int] = None) -> int:
+        """Atomic increment (used by the distributed circuit breaker's
+        consecutive-failure counter). `ex` refreshes the TTL on every hit so
+        the failure window is rolling."""
+        if self.redis is not None:
+            val = await self.redis.incr(key)
+            if ex:
+                await self.redis.expire(key, ex)
+            return int(val)
+        return await self._memory.incr(key, ex)
+
+    # ---------------- capped lists (recent alerts) ----------------
+    async def list_push_capped(self, key: str, value: str, max_len: int = 200) -> None:
+        """LPUSH + LTRIM: newest first, bounded memory."""
+        if self.redis is not None:
+            await self.redis.lpush(key, value)
+            await self.redis.ltrim(key, 0, max_len - 1)
+            return
+        await self._memory.lpush_capped(key, value, max_len)
+
+    async def list_range(self, key: str, count: int = 50) -> List[str]:
+        if self.redis is not None:
+            return await self.redis.lrange(key, 0, count - 1)
+        return await self._memory.lrange_head(key, count)
+
+    # ---------------- queue (placement worker) ----------------
+    async def queue_push(self, key: str, value: str) -> None:
+        if self.redis is not None:
+            await self.redis.rpush(key, value)
+            return
+        await self._memory.rpush(key, value)
+
+    async def queue_pop(self, key: str) -> Optional[str]:
+        if self.redis is not None:
+            return await self.redis.lpop(key)
+        return await self._memory.lpop(key)
+
+    # ---------------- positions ----------------
+    @staticmethod
+    def _pos_key(ticker: str) -> str:
+        return f"open_positions:{ticker.upper()}"
+
+    async def get_position(self, ticker: str) -> Optional[dict]:
+        raw = await self.get(self._pos_key(ticker))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    async def set_position(self, ticker: str, position: dict) -> None:
+        ticker = ticker.upper()
+        await self._set_raw(self._pos_key(ticker), _dumps(position))
+        if self.redis is not None:
+            await self.redis.sadd(POSITIONS_INDEX, ticker)
+        else:
+            await self._memory.sadd(POSITIONS_INDEX, ticker)
+
+    async def delete_position(self, ticker: str) -> Optional[dict]:
+        ticker = ticker.upper()
+        existing = await self.get_position(ticker)
+        await self.delete(self._pos_key(ticker))
+        if self.redis is not None:
+            await self.redis.srem(POSITIONS_INDEX, ticker)
+        else:
+            await self._memory.srem(POSITIONS_INDEX, ticker)
+        return existing
+
+    async def position_tickers(self) -> List[str]:
+        if self.redis is not None:
+            members = await self.redis.smembers(POSITIONS_INDEX)
+            return sorted(members)
+        return await self._memory.smembers(POSITIONS_INDEX)
+
+    async def all_positions(self) -> Dict[str, dict]:
+        out: Dict[str, dict] = {}
+        stale: List[str] = []
+        for ticker in await self.position_tickers():
+            pos = await self.get_position(ticker)
+            if pos is not None:
+                out[ticker] = pos
+            else:
+                stale.append(ticker)
+        # Self-heal index entries whose value key vanished.
+        for ticker in stale:
+            if self.redis is not None:
+                await self.redis.srem(POSITIONS_INDEX, ticker)
+            else:
+                await self._memory.srem(POSITIONS_INDEX, ticker)
+        return out
+
+    async def position_count(self) -> int:
+        return len(await self.all_positions())
+
+    # ---------------- stop guards ----------------
+    @staticmethod
+    def _guard_key(ticker: str) -> str:
+        return f"stop_guard:{ticker.upper()}"
+
+    async def get_guard(self, ticker: str) -> Optional[dict]:
+        raw = await self.get(self._guard_key(ticker))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    async def set_guard(self, ticker: str, guard: dict) -> None:
+        ticker = ticker.upper()
+        await self._set_raw(self._guard_key(ticker), _dumps(guard))
+        if self.redis is not None:
+            await self.redis.sadd(GUARDS_INDEX, ticker)
+        else:
+            await self._memory.sadd(GUARDS_INDEX, ticker)
+
+    async def update_guard(self, ticker: str, **fields: Any) -> Optional[dict]:
+        """Read-modify-write of guard fields. Callers mutating from concurrent
+        workers must hold the guard's distributed lock."""
+        guard = await self.get_guard(ticker)
+        if guard is None:
+            return None
+        guard.update(fields)
+        await self.set_guard(ticker, guard)
+        return guard
+
+    async def delete_guard(self, ticker: str) -> None:
+        ticker = ticker.upper()
+        await self.delete(self._guard_key(ticker))
+        if self.redis is not None:
+            await self.redis.srem(GUARDS_INDEX, ticker)
+        else:
+            await self._memory.srem(GUARDS_INDEX, ticker)
+
+    async def all_guards(self) -> Dict[str, dict]:
+        out: Dict[str, dict] = {}
+        tickers = (await self.redis.smembers(GUARDS_INDEX)) if self.redis is not None \
+            else await self._memory.smembers(GUARDS_INDEX)
+        for ticker in sorted(tickers):
+            guard = await self.get_guard(ticker)
+            if guard is not None:
+                out[ticker] = guard
+        return out
+
+    async def pending_guards(self) -> Dict[str, dict]:
+        return {t: g for t, g in (await self.all_guards()).items() if not g.get("done")}
+
+    # ---------------- daily counters ----------------
+    @staticmethod
+    def _daily_key() -> str:
+        return f"daily:{_today()}"
+
+    async def get_daily(self) -> Dict[str, float]:
+        key = self._daily_key()
+        fields = (await self.redis.hgetall(key)) if self.redis is not None \
+            else await self._memory.hgetall(key)
+        return {
+            "trades_today": int(float(fields.get("trades_today", "0") or 0)),
+            "realized_pnl_today_pct": float(fields.get("realized_pnl_today_pct", "0") or 0),
+        }
+
+    async def incr_trades_today(self) -> int:
+        key = self._daily_key()
+        if self.redis is not None:
+            val = await self.redis.hincrby(key, "trades_today", 1)
+            await self.redis.expire(key, DAILY_TTL_SECONDS)
+            return int(val)
+        return int(await self._memory.hincrbyfloat(key, "trades_today", 1, DAILY_TTL_SECONDS))
+
+    async def add_realized_pnl(self, pct: float) -> float:
+        key = self._daily_key()
+        if self.redis is not None:
+            val = await self.redis.hincrbyfloat(key, "realized_pnl_today_pct", pct)
+            await self.redis.expire(key, DAILY_TTL_SECONDS)
+            return float(val)
+        return await self._memory.hincrbyfloat(key, "realized_pnl_today_pct", pct, DAILY_TTL_SECONDS)
+
+    # ---------------- balance tracker ----------------
+    # Tracks available funds between broker refreshes so consecutive entries
+    # (and wins/losses) can never over-spend during a balance-fetch outage.
+    # A fresh broker fetch is ALWAYS preferred; the delta only bridges gaps.
+    async def set_balance_snapshot(self, value: float) -> None:
+        """Store a fresh broker buying-power snapshot and clear the running
+        win/loss delta (the snapshot already reflects settled reality)."""
+        payload = _dumps({"value": float(value), "ts": _utcnow().timestamp()})
+        await self.set(BALANCE_SNAPSHOT_KEY, payload, ex=BALANCE_TTL_SECONDS)
+        await self.delete(BALANCE_DELTA_KEY)
+
+    async def adjust_balance(self, amount: float) -> float:
+        """Adjust tracked funds between broker refreshes: order costs subtract,
+        closed-position proceeds add back. Returns the accumulated delta."""
+        if self.redis is not None:
+            val = await self.redis.hincrbyfloat(BALANCE_DELTA_KEY, "delta", amount)
+            await self.redis.expire(BALANCE_DELTA_KEY, BALANCE_TTL_SECONDS)
+            return float(val)
+        return await self._memory.hincrbyfloat(BALANCE_DELTA_KEY, "delta", amount, BALANCE_TTL_SECONDS)
+
+    async def tracked_balance(self) -> Optional[float]:
+        """Snapshot ± win/loss delta, or None when no fresh snapshot exists
+        (the key TTL enforces staleness — expired snapshots simply vanish)."""
+        raw = await self.get(BALANCE_SNAPSHOT_KEY)
+        if not raw:
+            return None
+        try:
+            snap = json.loads(raw)
+            value = float(snap.get("value") or 0)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        fields = (await self.redis.hgetall(BALANCE_DELTA_KEY)) if self.redis is not None \
+            else await self._memory.hgetall(BALANCE_DELTA_KEY)
+        try:
+            delta = float(fields.get("delta", "0") or 0)
+        except (TypeError, ValueError):
+            delta = 0.0
+        return value + delta
+
+    # ---------------- kill switch ----------------
+    async def is_killed(self) -> bool:
+        return (await self.get("killed")) == "1"
+
+    async def set_killed(self, killed: bool) -> None:
+        if killed:
+            await self.set("killed", "1")
+        else:
+            await self.delete("killed")
+
+    # ---------------- locks ----------------
+    def lock(self, name: str, ttl_ms: int = 30_000, wait_timeout: float = 10.0) -> DistributedLock:
+        return DistributedLock(self, name, ttl_ms=ttl_ms, wait_timeout=wait_timeout)
+
+    # ---------------- legacy STATE_FILE migration ----------------
+    async def migrate_from_file(self, path: Path) -> bool:
+        """One-time migration of the old JSON STATE_FILE into Redis. Only runs
+        when the store has no positions AND no guards yet (never clobbers live
+        Redis state), then renames the file so it never re-imports."""
+        if not path.exists():
+            return False
+        if await self.position_tickers() or await self.all_guards():
+            logger.info("StateStore: Redis already has state — skipping STATE_FILE migration")
+            return False
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(f"StateStore: legacy state file unreadable ({e}) — skipping migration")
+            return False
+        positions = dict(data.get("open_positions") or {})
+        guards = dict(data.get("stop_guards") or {})
+        for ticker, pos in positions.items():
+            await self.set_position(str(ticker), dict(pos))
+        for ticker, guard in guards.items():
+            await self.set_guard(str(ticker), dict(guard))
+        if bool(data.get("killed", False)):
+            await self.set_killed(True)
+        if str(data.get("date") or "") == _today():
+            trades = int(data.get("trades_today") or 0)
+            for _ in range(trades):
+                await self.incr_trades_today()
+            pnl = float(data.get("realized_pnl_today_pct") or 0.0)
+            if pnl:
+                await self.add_realized_pnl(pnl)
+        try:
+            path.rename(path.with_suffix(path.suffix + ".migrated"))
+        except OSError as e:
+            logger.warning(f"StateStore: could not rename migrated state file: {e}")
+        logger.info(
+            f"✅ StateStore: migrated legacy state file → {len(positions)} positions, "
+            f"{len(guards)} guards, killed={bool(data.get('killed', False))}"
+        )
+        return True
+
+    async def close(self) -> None:
+        if self.redis is not None:
+            try:
+                await self.redis.close()
+            except Exception:
+                pass
+"""
+Async E*TRADE client — httpx + OAuth1 + raw Order API payloads.
+===============================================================
+
+Replaces synchronous pyetrade for ORDER PLACEMENT with direct, fully-controlled
+JSON payloads against E*TRADE's Order API:
+
+  POST /v1/accounts/{accountIdKey}/orders/preview.json
+  POST /v1/accounts/{accountIdKey}/orders/place.json
+  PUT  /v1/accounts/{accountIdKey}/orders/cancel.json
+  GET  /v1/accounts/{accountIdKey}/orders.json
+  GET  /v1/accounts/{accountIdKey}/portfolio.json
+
+Why raw payloads:
+  • pyetrade rebuilds Order/Instrument/Product from flat kwargs and cannot
+    express multi-detail structures at all.
+  • Raw JSON gives a realistic path to linked Entry+Stop+Target (OTOCO-style)
+    submissions where E*TRADE accepts them, with clean fallback where not.
+
+E*TRADE REALITY (important): the public Order API documents single-Order
+requests (orderType EQ / OPTN / SPREADS ...). True OCO/OTOCO is NOT officially
+supported. `place_otoco_best_effort` therefore ATTEMPTS an atomic multi-detail
+submission once, and raises `OTOCOUnsupported` on rejection so the caller can
+fall back to entry + stop-guard (the proven hybrid). The result is maximum
+control with zero regression risk.
+
+OAuth1 signing is done with oauthlib directly (HMAC-SHA1, header auth) — the
+same scheme pyetrade uses via requests_oauthlib, but async-safe over httpx.
+pyetrade remains in use for simpler read paths elsewhere (quotes, auth/renew).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import random
+from typing import Any, Dict, List, Optional
+
+import httpx
+from oauthlib.oauth1 import Client as OAuth1Client
+
+logger = logging.getLogger("etrade-bot.async-client")
+
+PROD_BASE = "https://api.etrade.com"
+SANDBOX_BASE = "https://apisb.etrade.com"
+
+# ---- Exponential backoff (shared env config with main_bot.py) ----
+RETRY_MAX_ATTEMPTS = max(1, int(os.getenv("ETRADE_RETRY_ATTEMPTS", "4")))
+RETRY_BASE_SECONDS = float(os.getenv("ETRADE_RETRY_BASE_SECONDS", "2"))
+RETRY_MAX_SECONDS = float(os.getenv("ETRADE_RETRY_MAX_SECONDS", "8"))
+# Statuses worth retrying: throttle, timeout, and server-side failures.
+RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
+
+
+def backoff_delay(attempt: int, exact: bool = False) -> float:
+    """Exponential backoff: base * 2^attempt capped at the max.
+    exact=True (429 throttle) honours the full schedule — 2s, 4s, 8s with the
+    defaults — because a throttle wait must never be shortened. Other errors
+    apply a [0.5, 1.0] jitter factor to de-synchronize workers."""
+    delay = min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * (2 ** attempt))
+    if exact:
+        return delay
+    return delay * (0.5 + random.random() * 0.5)
+
+
+class ETradeAPIError(Exception):
+    """Non-2xx response from E*TRADE. Carries status + parsed error message."""
+
+    def __init__(self, status_code: int, message: str, body: str = "") -> None:
+        super().__init__(f"E*TRADE {status_code}: {message}")
+        self.status_code = status_code
+        self.message = message
+        self.body = body
+
+
+class OTOCOUnsupported(ETradeAPIError):
+    """The atomic multi-leg submission was rejected — fall back to sequential
+    placement + stop guard."""
+
+
+def _extract_error_message(body: str) -> str:
+    try:
+        data = json.loads(body)
+        err = (data.get("Error") or {}) if isinstance(data, dict) else {}
+        msg = err.get("message") or err.get("Message")
+        if msg:
+            code = err.get("code") or err.get("Code")
+            return f"[{code}] {msg}" if code else str(msg)
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return body[:300] if body else "no error body"
+
+
+class ETradeAsyncClient:
+    """OAuth1-signed async client. One instance per (token, secret) session —
+    cheap to build per request batch; the underlying httpx client pools."""
+
+    def __init__(self, consumer_key: str, consumer_secret: str,
+                 oauth_token: str, oauth_token_secret: str,
+                 sandbox: bool = False, timeout: float = 20.0) -> None:
+        self._signer = OAuth1Client(
+            client_key=consumer_key,
+            client_secret=consumer_secret,
+            resource_owner_key=oauth_token,
+            resource_owner_secret=oauth_token_secret,
+            signature_type="AUTH_HEADER",
+        )
+        self.base = SANDBOX_BASE if sandbox else PROD_BASE
+        self._timeout = timeout
+
+    async def _request(self, method: str, path: str,
+                       params: Optional[Dict[str, Any]] = None,
+                       json_body: Optional[Dict[str, Any]] = None,
+                       idempotent: bool = True) -> Dict[str, Any]:
+        """Signed request with EXPONENTIAL BACKOFF. `idempotent=False` (order
+        place) is retried ONLY when the request provably never reached the
+        broker (connect failure) or was throttled before processing (429) —
+        a blind retry of a placed order risks a double fill."""
+        url = f"{self.base}{path}"
+        if params:
+            url = f"{url}?{httpx.QueryParams(params)}"
+        body_bytes: Optional[bytes] = None
+        if json_body is not None:
+            body_bytes = json.dumps(json_body).encode()
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(RETRY_MAX_ATTEMPTS):
+            headers: Dict[str, str] = {"Accept": "application/json"}
+            if body_bytes is not None:
+                headers["Content-Type"] = "application/json"
+            # Re-sign EVERY attempt — OAuth1 nonces/timestamps are single-use,
+            # so a retried request must carry a fresh Authorization header.
+            # (For non-form bodies OAuth1 signs only the URL + oauth params —
+            # the JSON body is intentionally NOT part of the signature base,
+            # matching how requests_oauthlib/pyetrade sign JSON requests.)
+            signed_url, signed_headers, _ = self._signer.sign(url, http_method=method.upper())
+            headers["Authorization"] = signed_headers["Authorization"]
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    resp = await client.request(method.upper(), signed_url, content=body_bytes, headers=headers)
+            except (httpx.TimeoutException, httpx.TransportError) as e:
+                # Network-level failure. Non-idempotent requests retry only on
+                # connect errors — a timeout AFTER sending may have landed.
+                last_exc = e
+                can_retry = idempotent or isinstance(e, httpx.ConnectError)
+                if can_retry and attempt < RETRY_MAX_ATTEMPTS - 1:
+                    delay = backoff_delay(attempt)
+                    logger.warning(
+                        f"E*TRADE network error on {method} {path} "
+                        f"(attempt {attempt + 1}/{RETRY_MAX_ATTEMPTS}): {e} — retrying in {delay:.1f}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+            if resp.status_code >= 400:
+                # 429 never processed the request — always safe to retry.
+                # Other retryable statuses (408/5xx) retry only when the call
+                # is idempotent (a 5xx on place.json may follow acceptance).
+                retryable_status = resp.status_code in RETRYABLE_STATUSES and (
+                    idempotent or resp.status_code == 429
+                )
+                if retryable_status and attempt < RETRY_MAX_ATTEMPTS - 1:
+                    # 429 uses the exact schedule (2s → 4s → 8s by default);
+                    # other statuses keep jitter to spread retries.
+                    delay = backoff_delay(attempt, exact=(resp.status_code == 429))
+                    logger.warning(
+                        f"E*TRADE {resp.status_code} on {method} {path} "
+                        f"(attempt {attempt + 1}/{RETRY_MAX_ATTEMPTS}) — retrying in {delay:.1f}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise ETradeAPIError(resp.status_code, _extract_error_message(resp.text), resp.text)
+            if not resp.text.strip():
+                return {}
+            try:
+                return resp.json()
+            except json.JSONDecodeError:
+                raise ETradeAPIError(resp.status_code, f"non-JSON response: {resp.text[:200]}")
+        raise last_exc if last_exc else ETradeAPIError(0, "E*TRADE request retries exhausted")
+
+    # ------------------------------------------------------------------
+    # Read endpoints
+    # ------------------------------------------------------------------
+    async def list_accounts(self) -> Dict[str, Any]:
+        return await self._request("GET", "/v1/accounts/list.json")
+
+    async def list_orders(self, account_id_key: str,
+                          status: Optional[str] = None, count: int = 50) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"count": count}
+        if status:
+            params["status"] = status
+        return await self._request("GET", f"/v1/accounts/{account_id_key}/orders.json", params=params)
+
+    async def get_portfolio(self, account_id_key: str) -> Dict[str, Any]:
+        return await self._request("GET", f"/v1/accounts/{account_id_key}/portfolio.json")
+
+    async def get_balance(self, account_id_key: str, institution_type: str = "BROKERAGE") -> Dict[str, Any]:
+        return await self._request(
+            "GET", f"/v1/accounts/{account_id_key}/balance.json",
+            params={"instType": institution_type, "realTimeNAV": "true"},
+        )
+
+    # ------------------------------------------------------------------
+    # Payload builders (pure functions — unit-testable)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def equity_instrument(symbol: str, order_action: str, quantity: int) -> Dict[str, Any]:
+        return {
+            "Product": {"securityType": "EQ", "symbol": symbol.upper()},
+            "orderAction": order_action,
+            "quantityType": "QUANTITY",
+            "quantity": int(quantity),
+        }
+
+    @staticmethod
+    def option_instrument(symbol: str, call_put: str, strike: float,
+                          expiry_iso: str, order_action: str, quantity: int) -> Dict[str, Any]:
+        y, m, d = str(expiry_iso)[:10].split("-")
+        return {
+            "Product": {
+                "securityType": "OPTN",
+                "symbol": symbol.upper(),
+                "callPut": "CALL" if str(call_put).upper().startswith("C") else "PUT",
+                "strikePrice": float(strike),
+                "expiryYear": int(y),
+                "expiryMonth": int(m),
+                "expiryDay": int(d),
+            },
+            "orderAction": order_action,
+            "orderedQuantity": int(quantity),
+            "quantity": int(quantity),
+        }
+
+    @staticmethod
+    def order_detail(instruments: List[Dict[str, Any]], price_type: str,
+                     limit_price: Optional[float] = None, stop_price: Optional[float] = None,
+                     order_term: str = "GOOD_FOR_DAY", market_session: str = "REGULAR",
+                     all_or_none: bool = False) -> Dict[str, Any]:
+        detail: Dict[str, Any] = {
+            "allOrNone": bool(all_or_none),
+            "priceType": price_type,
+            "orderTerm": order_term,
+            "marketSession": market_session,
+            "Instrument": instruments,
+        }
+        if limit_price is not None:
+            detail["limitPrice"] = round(float(limit_price), 2)
+        if stop_price is not None:
+            detail["stopPrice"] = round(float(stop_price), 2)
+        return detail
+
+    # ------------------------------------------------------------------
+    # Preview → place flow
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _preview_ids(preview_resp: Dict[str, Any]) -> List[Dict[str, Any]]:
+        body = preview_resp.get("PreviewOrderResponse", preview_resp) or {}
+        ids = body.get("PreviewIds") or []
+        if isinstance(ids, dict):
+            ids = [ids]
+        out = []
+        for entry in ids:
+            pid = entry.get("previewId") if isinstance(entry, dict) else entry
+            if pid is not None:
+                out.append({"previewId": pid})
+        return out
+
+    @staticmethod
+    def order_id_from_place(place_resp: Dict[str, Any]) -> Optional[str]:
+        body = place_resp.get("PlaceOrderResponse", place_resp) if isinstance(place_resp, dict) else {}
+        ids = body.get("OrderIds") or body.get("orderIds") or []
+        if isinstance(ids, dict):
+            ids = [ids]
+        for entry in ids:
+            oid = entry.get("orderId") if isinstance(entry, dict) else entry
+            if oid:
+                return str(oid)
+        oid = body.get("orderId") or body.get("OrderId")
+        return str(oid) if oid else None
+
+    async def preview_and_place(self, account_id_key: str, order_type: str,
+                                client_order_id: str, details: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Atomic preview → place of a raw order request. `details` is the
+        Order array — one detail for standard orders, multiple for the OTOCO
+        best-effort path."""
+        preview_req = {
+            "PreviewOrderRequest": {
+                "orderType": order_type,
+                "clientOrderId": client_order_id,
+                "Order": details,
+            }
+        }
+        logger.info(f"📤 RAW preview {order_type}: {json.dumps(preview_req)[:600]}")
+        preview = await self._request(
+            "POST", f"/v1/accounts/{account_id_key}/orders/preview.json", json_body=preview_req,
+        )
+        preview_ids = self._preview_ids(preview)
+        if not preview_ids:
+            raise ETradeAPIError(422, "preview returned no previewId", json.dumps(preview)[:300])
+        place_req = {
+            "PlaceOrderRequest": {
+                "orderType": order_type,
+                "clientOrderId": client_order_id,
+                "PreviewIds": preview_ids,
+                "Order": details,
+            }
+        }
+        # NON-IDEMPOTENT: place.json is retried only on connect errors / 429
+        # (see _request) — never after the order may have reached the broker.
+        placed = await self._request(
+            "POST", f"/v1/accounts/{account_id_key}/orders/place.json", json_body=place_req,
+            idempotent=False,
+        )
+        logger.info(f"✅ RAW placed {order_type} clientOrderId={client_order_id} orderId={self.order_id_from_place(placed)}")
+        return placed
+
+    async def cancel_order(self, account_id_key: str, order_id: int) -> Dict[str, Any]:
+        return await self._request(
+            "PUT", f"/v1/accounts/{account_id_key}/orders/cancel.json",
+            json_body={"CancelOrderRequest": {"orderId": int(order_id)}},
+        )
+
+    # ------------------------------------------------------------------
+    # High-level order helpers
+    # ------------------------------------------------------------------
+    async def place_equity(self, account_id_key: str, client_order_id: str, symbol: str,
+                           order_action: str, quantity: int, price_type: str,
+                           limit_price: Optional[float] = None,
+                           stop_price: Optional[float] = None) -> Dict[str, Any]:
+        detail = self.order_detail(
+            [self.equity_instrument(symbol, order_action, quantity)],
+            price_type, limit_price=limit_price, stop_price=stop_price,
+        )
+        return await self.preview_and_place(account_id_key, "EQ", client_order_id, [detail])
+
+    async def place_option(self, account_id_key: str, client_order_id: str, symbol: str,
+                           call_put: str, strike: float, expiry_iso: str,
+                           order_action: str, quantity: int, price_type: str,
+                           limit_price: Optional[float] = None,
+                           stop_price: Optional[float] = None) -> Dict[str, Any]:
+        detail = self.order_detail(
+            [self.option_instrument(symbol, call_put, strike, expiry_iso, order_action, quantity)],
+            price_type, limit_price=limit_price, stop_price=stop_price,
+        )
+        return await self.preview_and_place(account_id_key, "OPTN", client_order_id, [detail])
+
+    async def place_otoco_best_effort(self, account_id_key: str, client_order_id: str,
+                                      order_type: str, entry_detail: Dict[str, Any],
+                                      stop_detail: Dict[str, Any],
+                                      target_detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """ATTEMPT a linked Entry + Protective Stop (+ Take-Profit) in one
+        atomic request. E*TRADE's public API does not officially support OCO/
+        OTOCO, so a 4xx here raises OTOCOUnsupported — callers MUST catch it
+        and fall back to sequential entry + stop-guard."""
+        details = [entry_detail, stop_detail] + ([target_detail] if target_detail else [])
+        try:
+            return await self.preview_and_place(account_id_key, order_type, client_order_id, details)
+        except ETradeAPIError as e:
+            if 400 <= e.status_code < 500:
+                raise OTOCOUnsupported(e.status_code, e.message, e.body) from e
+            raise
+
+"""
+Background Reconciliation Engine — Redis + async.
+=================================================
+
+A continuous async task that, every RECONCILE_INTERVAL_SECONDS during market
+hours (and at a slower cadence off-hours), pulls:
+
+  • open orders from E*TRADE   (GET /orders.json)
+  • current positions          (GET /portfolio.json)
+
+…compares them against Redis state, and auto-heals discrepancies:
+
+  • updates filled quantities on tracked positions
+  • marks/removes GHOST positions (tracked in Redis, absent at the broker,
+    older than a grace period so an in-flight entry is never nuked)
+  • detects ORPHANED protective stops (live stop order at the broker with no
+    tracked position) and cancels them when auto-heal is enabled
+  • flags UNPROTECTED positions (tracked position, no live stop order, no
+    active guard) and re-arms the stop guard via the injected callback
+
+Only ONE instance reconciles at a time — the pass runs under the Redis
+distributed lock `lock:reconcile`, so this is safe with multiple workers.
+The reconciled Redis state is the single source of truth the Stop Guard and
+close logic read from. The last report is stored at `reconcile:last`.
+
+All broker/client access is dependency-injected so this module never imports
+main_bot (no circular imports) and stays unit-testable.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+try:  # package-style import (python -m bot...) or flat (uvicorn main_bot:app)
+    from .state_store import StateStore
+except ImportError:
+    from state_store import StateStore
+
+logger = logging.getLogger("etrade-bot.reconcile")
+
+RECONCILE_LOCK = "reconcile"
+RECONCILE_REPORT_KEY = "reconcile:last"
+# A just-placed entry may not appear in /portfolio yet — never ghost-remove
+# a position younger than this.
+GHOST_GRACE_SECONDS = 180
+_OPEN_ORDER_STATUSES = {"OPEN", "PARTIAL", "INDIVIDUAL_FILLS", "PENDING", "DO_NOT_EXERCISE"}
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _as_list(node: Any) -> List[dict]:
+    if isinstance(node, dict):
+        return [node]
+    if isinstance(node, list):
+        return [n for n in node if isinstance(n, dict)]
+    return []
+
+
+def parse_broker_positions(portfolio_resp: Dict[str, Any]) -> Dict[str, dict]:
+    """Flatten a PortfolioResponse into {SYMBOL: {qty, security_type, occ}}.
+    Options are keyed by UNDERLYING symbol (matching how the bot tracks
+    positions) with the OCC display symbol preserved."""
+    out: Dict[str, dict] = {}
+    root = (portfolio_resp or {}).get("PortfolioResponse", {}) or {}
+    for acct in _as_list(root.get("AccountPortfolio")):
+        for pos in _as_list(acct.get("Position")):
+            product = pos.get("Product") or {}
+            sec_type = str(product.get("securityType") or "EQ").upper()
+            symbol = str(product.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            try:
+                qty = int(float(pos.get("quantity") or 0))
+            except (TypeError, ValueError):
+                qty = 0
+            record = out.setdefault(symbol, {"qty": 0, "security_type": sec_type, "occ": None})
+            record["qty"] += qty
+            if sec_type == "OPTN":
+                record["security_type"] = "OPTN"
+                record["occ"] = pos.get("symbolDescription") or product.get("displaySymbol")
+    return out
+
+
+def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
+    """Flatten an OrdersResponse into live (non-terminal) order records:
+    {order_id, symbol, status, price_type, order_action, filled, ordered}."""
+    out: List[dict] = []
+    root = (orders_resp or {}).get("OrdersResponse", {}) or {}
+    for order in _as_list(root.get("Order")):
+        order_id = str(order.get("orderId") or "")
+        for detail in _as_list(order.get("OrderDetail")):
+            status = str(detail.get("status") or "OPEN").upper()
+            for inst in _as_list(detail.get("Instrument")):
+                product = inst.get("Product") or {}
+                try:
+                    filled = int(float(inst.get("filledQuantity") or 0))
+                except (TypeError, ValueError):
+                    filled = 0
+                try:
+                    ordered = int(float(inst.get("orderedQuantity") or inst.get("quantity") or 0))
+                except (TypeError, ValueError):
+                    ordered = 0
+                out.append({
+                    "order_id": order_id,
+                    "symbol": str(product.get("symbol") or "").upper(),
+                    "security_type": str(product.get("securityType") or "EQ").upper(),
+                    "status": status,
+                    "price_type": str(detail.get("priceType") or "").upper(),
+                    "order_action": str(inst.get("orderAction") or "").upper(),
+                    "filled": filled,
+                    "ordered": ordered,
+                })
+    return out
+
+
+async def reconcile_once(
+    state: StateStore,
+    fetch_portfolio: Callable[[], Awaitable[Dict[str, Any]]],
+    fetch_orders: Callable[[], Awaitable[Dict[str, Any]]],
+    cancel_order: Callable[[str], Awaitable[bool]],
+    rearm_guard: Optional[Callable[[str, dict], Awaitable[None]]] = None,
+    auto_heal: bool = True,
+    alert: Optional[Callable[..., Awaitable[None]]] = None,
+) -> Dict[str, Any]:
+    """One reconciliation pass. Caller must already hold the reconcile lock.
+    `alert(severity, event, message, dedupe_key=...)` is an optional async
+    callback for real-time alerting — failures in it are swallowed."""
+
+    async def _alert(severity: str, event: str, message: str,
+                     dedupe_key: Optional[str] = None) -> None:
+        if alert is None:
+            return
+        try:
+            await alert(severity, event, message, dedupe_key=dedupe_key)
+        except Exception:
+            logger.debug("reconcile alert delivery failed", exc_info=True)
+
+    report: Dict[str, Any] = {
+        "ts": _utcnow_iso(),
+        "ok": False,
+        "healed": [],
+        "warnings": [],
+        "tracked_positions": 0,
+        "broker_positions": 0,
+        "live_orders": 0,
+    }
+    try:
+        portfolio_resp, orders_resp = await asyncio.gather(fetch_portfolio(), fetch_orders())
+    except Exception as e:
+        report["warnings"].append(f"broker fetch failed: {e}")
+        await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
+        logger.warning(f"[RECONCILE] broker fetch failed: {e}")
+        await _alert("error", "reconcile_fetch_failed",
+                     f"Reconciliation could not read broker state: {e}",
+                     dedupe_key="reconcile_fetch")
+        return report
+
+    broker_positions = parse_broker_positions(portfolio_resp)
+    all_orders = parse_open_orders(orders_resp)
+    live_orders = [o for o in all_orders if o["status"] in _OPEN_ORDER_STATUSES]
+    tracked = await state.all_positions()
+    guards = await state.all_guards()
+
+    report["tracked_positions"] = len(tracked)
+    report["broker_positions"] = len(broker_positions)
+    report["live_orders"] = len(live_orders)
+
+    now = time.time()
+    live_stop_symbols = {
+        o["symbol"] for o in live_orders
+        if o["price_type"] in {"STOP", "STOP_LIMIT", "TRAILING_STOP_CNST", "TRAILING_STOP_PRCT"}
+    }
+
+    # --- 1) tracked positions vs broker ---
+    for ticker, pos in tracked.items():
+        broker = broker_positions.get(ticker)
+        opened_ts = 0.0
+        try:
+            opened_ts = datetime.fromisoformat(str(pos.get("ts"))).timestamp()
+        except (TypeError, ValueError):
+            pass
+        age = now - opened_ts if opened_ts else 1e9
+
+        if broker is None:
+            # Not at the broker. In-flight entries get a grace period; a live
+            # unfilled entry order also keeps the position tracked.
+            has_live_entry = any(
+                o["symbol"] == ticker and o["order_action"] in {"BUY", "BUY_OPEN", "SELL_SHORT"}
+                for o in live_orders
+            )
+            if has_live_entry or age < GHOST_GRACE_SECONDS:
+                continue
+            if auto_heal:
+                await state.delete_position(ticker)
+                guard = guards.get(ticker)
+                if guard and not guard.get("done"):
+                    await state.update_guard(ticker, done=True, result="reconciled_ghost")
+                report["healed"].append(f"{ticker}: ghost position removed (not at broker)")
+                logger.warning(f"[RECONCILE] 👻 {ticker} ghost position removed — not present at broker")
+                await _alert("warning", "ghost_position_removed",
+                             f"{ticker}: tracked position absent at broker — removed from state",
+                             dedupe_key=f"ghost:{ticker}")
+            else:
+                report["warnings"].append(f"{ticker}: ghost position (not at broker)")
+            continue
+
+        # Sync filled quantity from the broker's actual position size.
+        broker_qty = abs(int(broker.get("qty") or 0))
+        tracked_qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
+        if broker_qty > 0 and broker_qty != tracked_qty:
+            pos["filled_qty"] = broker_qty
+            pos["reconciled_at"] = _utcnow_iso()
+            await state.set_position(ticker, pos)
+            report["healed"].append(f"{ticker}: filled_qty {tracked_qty} → {broker_qty}")
+            logger.info(f"[RECONCILE] {ticker} filled_qty synced {tracked_qty} → {broker_qty}")
+
+        # Unprotected: real position, no live stop order, no active guard.
+        guard = guards.get(ticker)
+        guard_active = bool(guard) and not guard.get("done")
+        if ticker not in live_stop_symbols and not guard_active and float(pos.get("stop") or 0) > 0:
+            msg = f"{ticker}: UNPROTECTED — position at broker with no live stop and no active guard"
+            report["warnings"].append(msg)
+            logger.error(f"[RECONCILE] 🚨 {msg}")
+            await _alert("critical", "position_unprotected", msg,
+                         dedupe_key=f"unprotected:{ticker}")
+            if auto_heal and rearm_guard is not None:
+                try:
+                    await rearm_guard(ticker, pos)
+                    report["healed"].append(f"{ticker}: stop guard re-armed")
+                except Exception as e:
+                    report["warnings"].append(f"{ticker}: guard re-arm failed: {e}")
+                    await _alert("critical", "guard_rearm_failed",
+                                 f"{ticker}: protective stop re-arm FAILED: {e}",
+                                 dedupe_key=f"rearm_fail:{ticker}")
+
+    # --- 2) orphaned protective stops (stop order live, no tracked position,
+    #        no broker position) ---
+    for order in live_orders:
+        if order["price_type"] not in {"STOP", "STOP_LIMIT"}:
+            continue
+        symbol = order["symbol"]
+        if symbol in tracked or symbol in broker_positions:
+            continue
+        if auto_heal:
+            cancelled = await cancel_order(order["order_id"])
+            if cancelled:
+                report["healed"].append(f"{symbol}: orphaned stop {order['order_id']} cancelled")
+                logger.warning(f"[RECONCILE] 🧹 cancelled orphaned stop {order['order_id']} on {symbol}")
+            else:
+                report["warnings"].append(f"{symbol}: orphaned stop {order['order_id']} cancel FAILED")
+                await _alert("critical", "orphan_stop_cancel_failed",
+                             f"{symbol}: orphaned stop order {order['order_id']} could not be cancelled",
+                             dedupe_key=f"orphan:{symbol}")
+        else:
+            report["warnings"].append(f"{symbol}: orphaned stop order {order['order_id']}")
+
+    # --- 3) finished guards referencing dead entry orders (stale cleanup) ---
+    live_order_ids = {o["order_id"] for o in live_orders}
+    for ticker, guard in guards.items():
+        if guard.get("done"):
+            continue
+        entry_id = str(guard.get("entry_order_id") or "")
+        deadline = float(guard.get("deadline_ts") or 0)
+        if entry_id and entry_id not in live_order_ids and ticker not in broker_positions \
+                and deadline and now > deadline + GHOST_GRACE_SECONDS:
+            await state.update_guard(ticker, done=True, result="reconciled_stale_guard")
+            report["healed"].append(f"{ticker}: stale guard closed (entry gone, no position)")
+
+    report["ok"] = True
+    await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
+    if report["healed"] or report["warnings"]:
+        logger.info(f"[RECONCILE] pass done — healed={len(report['healed'])} warnings={len(report['warnings'])}")
+    return report
+
+
+async def reconciliation_loop(
+    state: StateStore,
+    fetch_portfolio: Callable[[], Awaitable[Dict[str, Any]]],
+    fetch_orders: Callable[[], Awaitable[Dict[str, Any]]],
+    cancel_order: Callable[[str], Awaitable[bool]],
+    is_market_open: Callable[[], bool],
+    has_tokens: Callable[[], bool],
+    rearm_guard: Optional[Callable[[str, dict], Awaitable[None]]] = None,
+    interval_seconds: int = 300,
+    offhours_interval_seconds: int = 900,
+    auto_heal: bool = True,
+    stop_flag: Callable[[], bool] = lambda: False,
+    alert: Optional[Callable[..., Awaitable[None]]] = None,
+) -> None:
+    """Continuous reconciler. Runs each pass under the distributed
+    `lock:reconcile` so exactly one worker reconciles at a time.
+
+    Cadence: every 5 minutes in-session / 15 minutes off-hours by default —
+    reconciliation is a periodic safety net, not the fast path. Fill-time
+    protection is event-driven (stop guards poll their own orders), so a
+    minute-level reconcile cadence only burns broker API quota."""
+    logger.info(
+        f"[RECONCILE] engine started — every {interval_seconds}s in-session, "
+        f"{offhours_interval_seconds}s off-hours, auto_heal={auto_heal}"
+    )
+    while not stop_flag():
+        delay = interval_seconds if is_market_open() else offhours_interval_seconds
+        try:
+            if has_tokens():
+                lock = state.lock(RECONCILE_LOCK, ttl_ms=max(60_000, interval_seconds * 2000))
+                if await lock.try_acquire():
+                    try:
+                        await reconcile_once(
+                            state, fetch_portfolio, fetch_orders, cancel_order,
+                            rearm_guard=rearm_guard, auto_heal=auto_heal, alert=alert,
+                        )
+                    finally:
+                        await lock.release()
+                # else: another worker holds the lock — its pass covers us.
+        except Exception as e:
+            logger.error(f"[RECONCILE] loop error: {e}")
+            if alert is not None:
+                try:
+                    await alert("error", "reconcile_loop_error", str(e), dedupe_key="reconcile_loop")
+                except Exception:
+                    logger.debug("reconcile loop alert failed", exc_info=True)
+        await asyncio.sleep(delay)
+
+"""
+Real-time alerting — kill switch, failed guards, API problems.
+==============================================================
+
+Severity levels: info | warning | error | critical.
+
+Delivery (every alert, in order):
+  • ALWAYS logged, greppable:  [ALERT][SEVERITY] event — message
+  • Stored in the Redis capped list `alerts:recent` (newest first, last 200)
+    so the app can poll GET /alerts
+  • Pushed to ALERT_WEBHOOK_URL when configured. The payload carries `text`
+    (Slack-compatible), `content` (Discord-compatible) AND the full structured
+    record, so a single URL works for Slack, Discord, ntfy, or any generic
+    JSON receiver.
+
+Duplicate storms are suppressed: the same `dedupe_key` reaches the webhook at
+most once per `dedupe_seconds` (Redis SET NX + TTL — multi-worker safe).
+Deduped alerts still land in the log and the recent list.
+
+Fire-and-forget by design: an alerting failure must NEVER break trading, so
+every path here swallows and logs its own errors.
+"""
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger("etrade-bot.alerts")
+
+ALERTS_RECENT_KEY = "alerts:recent"
+ALERTS_RECENT_MAX = 200
+_VALID_SEVERITIES = {"info", "warning", "error", "critical"}
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class AlertManager:
+    def __init__(self, state: Any, webhook_url: Optional[str] = None,
+                 dedupe_seconds: int = 300) -> None:
+        self._state = state
+        self._webhook_url = (webhook_url or "").strip() or None
+        self._dedupe_seconds = max(10, int(dedupe_seconds))
+
+    @property
+    def webhook_configured(self) -> bool:
+        return self._webhook_url is not None
+
+    async def send(self, severity: str, event: str, message: str,
+                   dedupe_key: Optional[str] = None,
+                   data: Optional[Dict[str, Any]] = None) -> None:
+        severity = severity.lower() if severity.lower() in _VALID_SEVERITIES else "warning"
+        record: Dict[str, Any] = {
+            "ts": _utcnow_iso(),
+            "severity": severity,
+            "event": event,
+            "message": str(message)[:1000],
+        }
+        if data:
+            record["data"] = data
+
+        # 1) Always log.
+        log_fn = logger.info if severity == "info" else (
+            logger.warning if severity == "warning" else logger.error
+        )
+        log_fn(f"[ALERT][{severity.upper()}] {event} — {record['message']}")
+
+        # 2) Always store in the recent list (best-effort).
+        try:
+            await self._state.list_push_capped(
+                ALERTS_RECENT_KEY, json.dumps(record, default=str), ALERTS_RECENT_MAX,
+            )
+        except Exception as e:
+            logger.warning(f"alert store failed: {e}")
+
+        # 3) Webhook — deduped, best-effort.
+        if not self._webhook_url:
+            return
+        if dedupe_key:
+            try:
+                fresh = await self._state.set(
+                    f"alert:dedupe:{dedupe_key}", "1",
+                    ex=self._dedupe_seconds, nx=True,
+                )
+                if not fresh:
+                    return  # same alert fired recently — webhook suppressed
+            except Exception as e:
+                logger.warning(f"alert dedupe check failed (sending anyway): {e}")
+        await self._post_webhook(record)
+
+    async def _post_webhook(self, record: Dict[str, Any]) -> None:
+        try:
+            import httpx  # lazy import — alerting must not hard-require httpx
+            text = f"[{record['severity'].upper()}] {record['event']}: {record['message']}"
+            payload = {"text": text, "content": text, **record}
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(self._webhook_url, json=payload)
+                if resp.status_code >= 400:
+                    logger.warning(f"alert webhook returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"alert webhook delivery failed: {e}")
+
+    async def recent(self, count: int = 50) -> List[Dict[str, Any]]:
+        try:
+            raw = await self._state.list_range(ALERTS_RECENT_KEY, count)
+        except Exception as e:
+            logger.warning(f"alert list read failed: {e}")
+            return []
+        out: List[Dict[str, Any]] = []
+        for item in raw:
+            try:
+                out.append(json.loads(item))
+            except (TypeError, json.JSONDecodeError):
+                continue
+        return out
+
+
+_manager: Optional[AlertManager] = None
+
+
+def init(state: Any, webhook_url: Optional[str], dedupe_seconds: int = 300) -> None:
+    """Configure the module-level manager (called once at startup)."""
+    global _manager
+    _manager = AlertManager(state, webhook_url, dedupe_seconds)
+    logger.info(
+        f"alerting ready — webhook={'configured' if _manager.webhook_configured else 'NOT configured (log + /alerts only)'}"
+    )
+
+
+def webhook_configured() -> bool:
+    return _manager is not None and _manager.webhook_configured
+
+
+async def send(severity: str, event: str, message: str,
+               dedupe_key: Optional[str] = None,
+               data: Optional[Dict[str, Any]] = None) -> None:
+    """Fire an alert. Safe to call before init (logs only) and never raises."""
+    try:
+        if _manager is None:
+            logger.warning(f"[ALERT][{severity.upper()}] {event} — {message} (alerting not initialised)")
+            return
+        await _manager.send(severity, event, message, dedupe_key=dedupe_key, data=data)
+    except Exception as e:
+        logger.error(f"alert send failed ({event}): {e}")
+
+
+async def recent(count: int = 50) -> List[Dict[str, Any]]:
+    if _manager is None:
+        return []
+    return await _manager.recent(count)
+
+"""
+Immutable trade ledger — append-only, hash-chained JSONL.
+=========================================================
+
+Every trading-relevant event (orders placed, positions opened/closed,
+protective stops, guard results, kill switch, circuit breaker trips,
+reconciliation heals, failures) is appended as one JSON line to
+TRADE_LEDGER_FILE. Records are NEVER modified or deleted.
+
+Tamper evidence: each record carries `prev_hash` (the SHA-256 of the previous
+record) and `hash` (SHA-256 over prev_hash + the record's canonical JSON).
+Editing or removing any historical line breaks the chain, which
+`verify_chain()` detects — exposed via GET /ledger.
+
+Durability: writes append + flush + fsync under an asyncio lock, so a crash
+can lose at most the record being written, never corrupt existing history.
+
+Best-effort by design: a ledger failure must never block an order, so the
+module-level `record()` swallows and logs its own errors.
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("etrade-bot.ledger")
+
+GENESIS_HASH = "0" * 64
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _canonical(record: Dict[str, Any]) -> str:
+    return json.dumps(record, sort_keys=True, default=str)
+
+
+def _chain_hash(prev_hash: str, body: str) -> str:
+    return hashlib.sha256((prev_hash + body).encode("utf-8")).hexdigest()
+
+
+class TradeLedger:
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._lock = asyncio.Lock()
+        self._seq, self._prev_hash = self._load_tail()
+        logger.info(
+            f"trade ledger ready at {self.path} — {self._seq} record(s), chain head {self._prev_hash[:12]}…"
+        )
+
+    def _load_tail(self) -> Tuple[int, str]:
+        """Resume the hash chain from the last line of an existing ledger."""
+        try:
+            if not self.path.exists():
+                return 0, GENESIS_HASH
+            last_line = ""
+            with open(self.path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        last_line = line
+            if not last_line:
+                return 0, GENESIS_HASH
+            rec = json.loads(last_line)
+            return int(rec.get("seq") or 0), str(rec.get("hash") or GENESIS_HASH)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+            logger.error(f"ledger tail unreadable ({e}) — starting a fresh chain segment")
+            return 0, GENESIS_HASH
+
+    def _append_line(self, line: str) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    async def record(self, event: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        async with self._lock:
+            self._seq += 1
+            rec: Dict[str, Any] = {
+                "seq": self._seq,
+                "ts": _utcnow_iso(),
+                "event": str(event),
+                "data": data or {},
+                "prev_hash": self._prev_hash,
+            }
+            rec["hash"] = _chain_hash(self._prev_hash, _canonical(rec))
+            await asyncio.to_thread(self._append_line, _canonical(rec))
+            self._prev_hash = rec["hash"]
+            return rec
+
+    def tail(self, count: int = 100) -> List[Dict[str, Any]]:
+        """Last `count` records, newest first."""
+        out: List[Dict[str, Any]] = []
+        try:
+            if not self.path.exists():
+                return []
+            with open(self.path, "r", encoding="utf-8") as f:
+                lines = [ln for ln in f if ln.strip()]
+            for line in lines[-count:]:
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except OSError as e:
+            logger.warning(f"ledger tail read failed: {e}")
+        out.reverse()
+        return out
+
+    def verify_chain(self) -> Tuple[bool, int, Optional[str]]:
+        """Walk the full chain and recompute every hash.
+        Returns (ok, records_checked, first_error)."""
+        checked = 0
+        prev = GENESIS_HASH
+        try:
+            if not self.path.exists():
+                return True, 0, None
+            with open(self.path, "r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        return False, checked, f"line {line_no}: unparseable"
+                    claimed = str(rec.pop("hash", ""))
+                    if str(rec.get("prev_hash")) != prev:
+                        # A fresh chain segment is allowed after a tail-read
+                        # failure — a segment restart references GENESIS.
+                        if str(rec.get("prev_hash")) != GENESIS_HASH:
+                            return False, checked, f"line {line_no}: prev_hash broken"
+                    if _chain_hash(str(rec.get("prev_hash")), _canonical(rec)) != claimed:
+                        return False, checked, f"line {line_no}: hash mismatch (record altered)"
+                    prev = claimed
+                    checked += 1
+            return True, checked, None
+        except OSError as e:
+            return False, checked, f"read failed: {e}"
+
+
+_ledger: Optional[TradeLedger] = None
+
+
+def init(path: Path) -> None:
+    """Configure the module-level ledger (called once at startup)."""
+    global _ledger
+    _ledger = TradeLedger(path)
+
+
+async def record(event: str, data: Optional[Dict[str, Any]] = None) -> None:
+    """Append an event. Never raises — a ledger failure must not block trading."""
+    try:
+        if _ledger is None:
+            logger.warning(f"ledger not initialised — dropped event '{event}'")
+            return
+        await _ledger.record(event, data)
+    except Exception as e:
+        logger.error(f"ledger append failed ({event}): {e}")
+
+
+def tail(count: int = 100) -> List[Dict[str, Any]]:
+    if _ledger is None:
+        return []
+    return _ledger.tail(count)
+
+
+def verify() -> Tuple[bool, int, Optional[str]]:
+    if _ledger is None:
+        return True, 0, None
+    return _ledger.verify_chain()
