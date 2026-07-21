@@ -52,9 +52,66 @@ bot. Key decisions:
 - Response statuses stay in the vocabulary the app's parser understands:
   `queued`, `processed_directly` (with nested `result`), `skipped`, `error`.
 
+V5.0.0 (redis-async foundation)
+-------------------------------
+• ALL trading state (positions, stop guards, daily counters, kill switch,
+  idempotency keys, cooldowns) now lives in Redis via state_store.py — the
+  old STATE_FILE + in-memory dicts are migrated once at startup and retired.
+  Multi-worker deployments are safe; Railway/Render cold starts lose nothing.
+• Critical sections (order placement, close, reconciliation, stop guards) run
+  under Redis distributed locks (SET NX PX + token + Lua release).
+• Order placement moved to raw async JSON payloads against E*TRADE's Order
+  API (httpx + OAuth1, etrade_async.py) with an atomic Entry+Stop OTOCO
+  best-effort and automatic fallback to pyetrade. pyetrade remains for simple
+  reads (quotes, accounts, order listing) wrapped in asyncio.to_thread.
+• A background reconciliation engine (reconciliation.py) polls broker orders
+  + positions every RECONCILE_INTERVAL_SECONDS under the reconcile lock and
+  auto-heals Redis state (fill sync, ghost positions, orphaned stops,
+  unprotected positions → guard re-arm). Reconciled Redis state is the single
+  source of truth for the stop guard and close logic.
+• Option positions now get the same broker-resting protection as equities:
+  an async option guard polls the entry fill and rests a SELL_CLOSE STOP on
+  the same OCC contract, state persisted in Redis so it survives restarts.
+
+V5.1.0 (hardening)
+------------------
+• STARTUP RECONCILIATION: a blocking broker→Redis reconciliation pass runs at
+  boot — BEFORE the placement worker accepts any job — so cold starts begin
+  from broker truth, not stale state.
+• REAL-TIME ALERTING (alerts.py): kill switch, failed guards, unprotected
+  positions, circuit-breaker trips and API problems are logged, kept in Redis
+  (`alerts:recent`, GET /alerts) and pushed to ALERT_WEBHOOK_URL
+  (Slack/Discord/generic JSON), with per-key dedupe to stop alert storms.
+• IMMUTABLE TRADE LEDGER (trade_ledger.py): every order, position open/close,
+  protective stop, guard result and safety event is appended to a
+  hash-chained JSONL file. GET /ledger returns the tail and verifies the
+  chain end-to-end.
+• DISTRIBUTED CIRCUIT BREAKER: the consecutive-failure breaker moved to Redis
+  (`breaker:*`), so ALL workers halt order placement together. It auto-resets
+  via TTL after the cooldown and immediately on account relink; trips are
+  alerted and ledgered.
+• RECONCILIATION CADENCE: default every 5 minutes in-session (was 30s) and
+  15 minutes off-hours — reconciliation is a periodic safety net; fill-time
+  protection stays event-driven via the stop guards.
+
+V5.4.0 (gate-parity + DB hostname fix for token persistence)
+------------------------------------------------------------
+• Fixed DATABASE_URL handling in init_db() to properly normalize postgres://
+  or postgresql:// URLs to use the asyncpg driver (postgresql+asyncpg://).
+  This was causing create_async_engine to fail silently on platforms that
+  provide DATABASE_URL without the driver prefix (Railway, Render, etc.).
+  Result: DB connection errors → async_session never set → tokens never
+  persisted to DB (only lived in _current_tokens memory) → every restart
+  (daily container cycle) lost tokens → forced daily relink (failure #1).
+  Now tokens persist reliably across restarts; the daily relink cycle ends.
+  Improved logging now surfaces the exact DATABASE_URL hostname/credential
+  issues if connection still fails.
+• Added pool_pre_ping=True for robust connection handling.
+• Minor: consistent id="active_tokens" for access tokens; better error msgs.
+
 Run:
     pip install -r requirements.txt
-    cp .env.example .env   # fill in keys + WEBHOOK_SECRET
+    cp .env.example .env   # fill in keys + WEBHOOK_SECRET + REDIS_URL + DATABASE_URL (postgres recommended for persistence)
     uvicorn main_bot:app --host 0.0.0.0 --port 8000
 """
 from fastapi import FastAPI, HTTPException, Body, Query, Header, Request
@@ -65,23 +122,36 @@ import pyetrade
 import os
 import json
 import math
+import re
 import logging
+import random
 import uuid
 import asyncio
 import hashlib
 import hmac
 import time
-import threading
 from pathlib import Path
 from datetime import datetime, date, time as dtime, timezone
 from zoneinfo import ZoneInfo
-from redis.asyncio import from_url as redis_from_url
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import Column, String, Text, DateTime
 from requests_oauthlib import OAuth1Session
 from urllib.parse import quote
 from dotenv import load_dotenv
+
+try:  # package-style import (python -m bot.main_bot) or flat (uvicorn main_bot:app)
+    from .state_store import StateStore, LockNotAcquired
+    from .etrade_async import ETradeAsyncClient, ETradeAPIError, OTOCOUnsupported
+    from . import reconciliation
+    from . import alerts
+    from . import trade_ledger
+except ImportError:
+    from state_store import StateStore, LockNotAcquired
+    from etrade_async import ETradeAsyncClient, ETradeAPIError, OTOCOUnsupported
+    import reconciliation
+    import alerts
+    import trade_ledger
 
 load_dotenv()
 
@@ -101,18 +171,22 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "4.0.0-parity"
+BOT_VERSION = "5.4.0-gate-parity-db-fix"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
-MIN_SCORE = int(os.getenv("MIN_SCORE", "90"))
-MIN_SCORE_TRENDING = int(os.getenv("MIN_SCORE_TRENDING", "85"))
+# Gate parity with the Rork app (app defaults: minScore 85 / trending 80).
+# A stricter bot default silently rejects every score the app clears — the
+# thresholds MUST match unless deliberately overridden via env.
+MIN_SCORE = int(os.getenv("MIN_SCORE", "85"))
+MIN_SCORE_TRENDING = int(os.getenv("MIN_SCORE_TRENDING", "80"))
 MIN_RVOL = float(os.getenv("MIN_RVOL", "1.5"))
 MIN_MTF = int(os.getenv("MIN_MTF", "3"))
 ALLOWED_SETUPS = {
     s.strip().lower()
     for s in os.getenv(
         "ALLOWED_SETUPS",
-        "ema cross + adx,bull flag + adx,bear flag + adx,volume breakout",
+        "ema cross + adx,ema cross,bull flag + adx,bull flag,bear flag + adx,"
+        "bear flag,volume breakout,breakout,vwap reclaim,momentum",
     ).split(",")
     if s.strip()
 }
@@ -126,8 +200,50 @@ TICKER_COOLDOWN_MINUTES = int(os.getenv("TICKER_COOLDOWN_MINUTES", "15"))
 # how often the guard polls the broker for fill state.
 ENTRY_FILL_TIMEOUT_MIN = int(os.getenv("ENTRY_FILL_TIMEOUT_MIN", "20"))
 STOP_GUARD_POLL_SECONDS = int(os.getenv("STOP_GUARD_POLL_SECONDS", "10"))
-# Daily state (positions, counters, kill switch, guards) survives restarts here.
+# Legacy JSON state file — migrated into Redis once at startup, then retired.
 STATE_FILE = Path(os.getenv("ETRADE_STATE_FILE", ".etrade_state.json"))
+
+# ---- V5 architecture config ----
+# Raw async Order API (httpx + OAuth1) is the primary placement path; pyetrade
+# remains the fallback and handles simple reads (quotes, auth, renew).
+USE_RAW_ORDER_API = os.getenv("USE_RAW_ORDER_API", "true").lower() == "true"
+# Attempt an atomic Entry+Stop (OTOCO-style) submission. E*TRADE's public API
+# doesn't officially support OCO/OTOCO, so a rejection falls back to entry +
+# stop guard and is remembered for OTOCO_UNSUPPORTED_TTL to stop retrying.
+ENABLE_RAW_OTOCO = os.getenv("ENABLE_RAW_OTOCO", "true").lower() == "true"
+OTOCO_UNSUPPORTED_TTL = int(os.getenv("OTOCO_UNSUPPORTED_TTL", str(24 * 3600)))
+# Background reconciliation engine cadence (seconds). Periodic safety net —
+# NOT the fast path (stop guards are event-driven), so 5–10 min is the right
+# cadence: broker-API friendly, still catches drift quickly. A blocking pass
+# also runs at startup before any order is accepted.
+RECONCILE_INTERVAL_SECONDS = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "300"))
+RECONCILE_OFFHOURS_SECONDS = int(os.getenv("RECONCILE_OFFHOURS_SECONDS", "900"))
+RECONCILE_AUTO_HEAL = os.getenv("RECONCILE_AUTO_HEAL", "true").lower() == "true"
+STARTUP_RECONCILE_TIMEOUT_SECONDS = int(os.getenv("STARTUP_RECONCILE_TIMEOUT_SECONDS", "90"))
+# Real-time alerting: Slack/Discord/generic JSON webhook. Alerts always land
+# in the log and GET /alerts even without a webhook.
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
+ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", "300"))
+# Immutable trade ledger — append-only, hash-chained JSONL (GET /ledger).
+TRADE_LEDGER_FILE = Path(os.getenv("TRADE_LEDGER_FILE", "trade_ledger.jsonl"))
+# Option stop protection: when the app doesn't send an explicit option stop
+# premium, protect at this percent below the entry premium (0 disables).
+OPTION_STOP_LOSS_PCT = float(os.getenv("OPTION_STOP_LOSS_PCT", "30"))
+
+# ---- V5.2 hardening ----
+# Exponential backoff for ALL E*TRADE API calls. The same env vars configure
+# the raw async client (etrade_async.py). Non-idempotent calls (order
+# placement) are NEVER blind-retried — a failed place may still have landed.
+# 429 throttles follow the exact schedule: 2s → 4s → 8s (base × 2^attempt,
+# capped at max, no jitter). Other transient errors keep jitter.
+ETRADE_RETRY_ATTEMPTS = max(1, int(os.getenv("ETRADE_RETRY_ATTEMPTS", "4")))
+ETRADE_RETRY_BASE_SECONDS = float(os.getenv("ETRADE_RETRY_BASE_SECONDS", "2"))
+ETRADE_RETRY_MAX_SECONDS = float(os.getenv("ETRADE_RETRY_MAX_SECONDS", "8"))
+# STOP PLACEMENT TIMEOUT: a guarded entry must have its protective stop
+# RESTING at the broker within this many seconds of entry placement. At the
+# deadline with no stop: an unfilled entry is auto-cancelled; a filled entry
+# is emergency-flattened at market (a fill cannot be cancelled). 0 disables.
+STOP_PLACEMENT_TIMEOUT_SECONDS = int(os.getenv("STOP_PLACEMENT_TIMEOUT_SECONDS", "60"))
 
 
 def _utcnow() -> datetime:
@@ -141,16 +257,20 @@ app = FastAPI(title="E*TRADE Trading Bot")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ==================== GLOBALS ====================
-redis = None
+# Distributed state store (Redis-first; loud in-memory fallback for local dev).
+# Replaced at startup by StateStore.create(REDIS_URL).
+state: StateStore = StateStore(None)
 engine = None
 async_session = None
-circuit_breaker_open = False
-circuit_breaker_opened_at: Optional[datetime] = None
-consecutive_failures = 0
-MAX_CONSECUTIVE_FAILURES = 5
-# Auto-reset the breaker after a cooldown so one bad burst (e.g. stale prices
-# before this fix) doesn't silently block trading for the rest of the day.
-CIRCUIT_BREAKER_COOLDOWN_SECONDS = 10 * 60
+# Circuit breaker — DISTRIBUTED (Redis `breaker:*` keys) so every worker halts
+# order placement together. Opens after MAX_CONSECUTIVE_FAILURES broker API
+# failures within a rolling BREAKER_FAILURE_WINDOW_SECONDS; auto-resets via
+# TTL after the cooldown, and immediately on account relink.
+MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "5"))
+CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", str(10 * 60)))
+BREAKER_FAILURE_WINDOW_SECONDS = int(os.getenv("BREAKER_FAILURE_WINDOW_SECONDS", "600"))
+BREAKER_OPEN_KEY = "breaker:open"
+BREAKER_FAILURES_KEY = "breaker:failures"
 QUEUE_KEY = "etrade:placement_queue"
 _worker_task = None
 _worker_stop = False
@@ -173,106 +293,12 @@ _pending_request_tokens: Dict[str, str] = {}
 _latest_request_token: Optional[str] = None
 _MAX_PENDING_REQUEST_TOKENS = 5
 
-# ==================== SAFETY STATE (parity with etrade_bot_handler) ====================
-# All of this state is touched only from the event loop (webhook handlers,
-# placement worker, stop-guard tasks), so plain dicts are safe; _state_lock
-# additionally guards the file write against overlapping saves.
-_state_lock = threading.Lock()
-_open_positions: Dict[str, dict] = {}
-_stop_guards: Dict[str, dict] = {}
-_trades_today = 0
-_realized_pnl_today_pct = 0.0
-_today = _utcnow().date().isoformat()
-_killed = False
-
-
-def _save_state() -> None:
-    """Persist daily counters, open positions, kill switch and stop-guard state
-    so a mid-day restart cannot forget risk limits or unprotected positions."""
-    try:
-        with _state_lock:
-            STATE_FILE.write_text(json.dumps({
-                "date": _today,
-                "trades_today": _trades_today,
-                "realized_pnl_today_pct": _realized_pnl_today_pct,
-                "killed": _killed,
-                "open_positions": _open_positions,
-                "stop_guards": _stop_guards,
-            }, default=str))
-    except (OSError, TypeError, ValueError) as e:
-        logger.error(f"state persist failed: {e}")
-
-
-def _load_state() -> None:
-    """Restore persisted state on boot. Daily counters only restore when the
-    saved date is still today; positions, guards and the kill switch always
-    restore (broker reconciliation remains the source of truth)."""
-    global _today, _trades_today, _realized_pnl_today_pct, _killed, _open_positions, _stop_guards
-    if not STATE_FILE.exists():
-        return
-    try:
-        data = json.loads(STATE_FILE.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        logger.error(f"state load failed: {e}")
-        return
-    _killed = bool(data.get("killed", False))
-    _open_positions = dict(data.get("open_positions") or {})
-    _stop_guards = dict(data.get("stop_guards") or {})
-    saved_date = str(data.get("date") or "")
-    today = _utcnow().date().isoformat()
-    _today = today
-    if saved_date == today:
-        _trades_today = int(data.get("trades_today") or 0)
-        _realized_pnl_today_pct = float(data.get("realized_pnl_today_pct") or 0.0)
-    logger.info(
-        f"state restored: {len(_open_positions)} open positions, {len(_stop_guards)} stop guards, "
-        f"trades_today={_trades_today}, pnl={_realized_pnl_today_pct:.2f}%, killed={_killed}"
-    )
-
-
-def _reset_daily() -> None:
-    global _today, _trades_today, _realized_pnl_today_pct
-    today = _utcnow().date().isoformat()
-    if today != _today:
-        _today = today
-        _trades_today = 0
-        _realized_pnl_today_pct = 0.0
-        _save_state()
-        logger.info(f"daily counters reset for {today}")
-
-
-class _TTL:
-    """In-memory TTL store for idempotency keys and ticker cooldowns."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._data: Dict[str, Tuple[Any, float]] = {}
-
-    def _purge(self) -> None:
-        now = time.time()
-        for k in [k for k, (_, exp) in self._data.items() if exp and exp < now]:
-            self._data.pop(k, None)
-
-    def set(self, k: str, v: Any, ex: Optional[int] = None, nx: bool = False) -> bool:
-        with self._lock:
-            self._purge()
-            if nx and k in self._data:
-                return False
-            self._data[k] = (v, (time.time() + ex) if ex else 0.0)
-            return True
-
-    def get(self, k: str) -> Optional[Any]:
-        with self._lock:
-            self._purge()
-            return self._data.get(k, (None, 0))[0]
-
-    def exists(self, k: str) -> bool:
-        with self._lock:
-            self._purge()
-            return k in self._data
-
-
-store = _TTL()
+# ==================== SAFETY STATE (Redis-backed) ====================
+# Positions, stop guards, daily counters, kill switch, idempotency keys and
+# ticker cooldowns all live in the distributed StateStore (state_store.py):
+#   open_positions:{ticker} · stop_guard:{ticker} · daily:{date} · killed
+# Daily counters are keyed by date, so the old midnight reset is implicit.
+# The legacy STATE_FILE is migrated into Redis once at startup, then retired.
 
 
 # ==================== MARKET CALENDAR ====================
@@ -354,13 +380,14 @@ def _is_close_payload(p: dict) -> bool:
 
 
 # ==================== ENTRY FILTERS (live entries only) ====================
-def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
-    """Server-side re-filter mirroring the Rork app's gating. Quality checks
-    apply only when the payload carries the field (score/rvol/mtf/setup);
-    risk limits (kill switch, daily loss, trade count, positions, heat,
-    duplicate ticker) always apply."""
+async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
+    """Server-side re-filter mirroring the Rork app's gating, evaluated against
+    the reconciled Redis state (single source of truth). Quality checks apply
+    only when the payload carries the field (score/rvol/mtf/setup); risk
+    limits (kill switch, daily loss, trade count, positions, heat, duplicate
+    ticker) always apply."""
     blocked: List[str] = []
-    if _killed:
+    if await state.is_killed():
         blocked.append("kill switch active")
 
     regime = str(p.get("regime") or "").lower()
@@ -383,22 +410,23 @@ def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     if isinstance(setup, str) and setup.strip() and ALLOWED_SETUPS and setup.lower().strip() not in ALLOWED_SETUPS:
         blocked.append(f"setup '{setup}' not allowlisted")
 
-    _reset_daily()
-    if _realized_pnl_today_pct <= -abs(DAILY_LOSS_LIMIT_PCT):
-        blocked.append(f"daily loss limit ({_realized_pnl_today_pct:.2f}%)")
-    if _trades_today >= DAILY_TRADE_LIMIT:
+    daily = await state.get_daily()
+    open_positions = await state.all_positions()
+    if daily["realized_pnl_today_pct"] <= -abs(DAILY_LOSS_LIMIT_PCT):
+        blocked.append(f"daily loss limit ({daily['realized_pnl_today_pct']:.2f}%)")
+    if daily["trades_today"] >= DAILY_TRADE_LIMIT:
         blocked.append(f"daily trade limit ({DAILY_TRADE_LIMIT}) reached")
-    if len(_open_positions) >= MAX_CONCURRENT_POSITIONS:
+    if len(open_positions) >= MAX_CONCURRENT_POSITIONS:
         blocked.append(f"max positions ({MAX_CONCURRENT_POSITIONS}) open")
     ticker = str(p.get("ticker") or "").upper()
-    if ticker and ticker in _open_positions:
+    if ticker and ticker in open_positions:
         blocked.append(f"already in {ticker}")
 
     try:
         account_ref = float(os.getenv("ACCOUNT_SIZE", "50000"))
         open_risk = sum(
             abs(float(pos.get("entry") or 0) - float(pos.get("stop") or 0)) * float(pos.get("qty") or 0)
-            for pos in _open_positions.values()
+            for pos in open_positions.values()
             if pos.get("entry") and pos.get("stop")
         )
         new_risk = account_ref * (RISK_PER_TRADE_PCT / 100.0)
@@ -468,6 +496,9 @@ class WebhookPayload(BaseModel):
     trailing_stop_percent: Optional[float] = None
     broker_stop: Optional[bool] = None
     exit_limit_price: Optional[float] = None
+    # Option stop protection: explicit protective stop PREMIUM for the option
+    # guard (falls back to OPTION_STOP_LOSS_PCT below the entry premium).
+    option_stop_price: Optional[float] = None
 
     class Config:
         # Keep unknown fields instead of silently dropping them. A trimmed
@@ -486,17 +517,15 @@ class WebhookPayload(BaseModel):
 # ==================== TOKEN PERSISTENCE ====================
 def save_tokens(token: str, token_secret: str):
     global _current_tokens, _resolved_account_id_key
-    global circuit_breaker_open, circuit_breaker_opened_at, consecutive_failures
     logger.info("=== NEW TOKENS RECEIVED ===")
     _current_tokens = {"oauth_token": token, "oauth_token_secret": token_secret}
     _resolved_account_id_key = None  # re-resolve accountIdKey for the new session
     # A fresh link is an explicit user action — clear any tripped breaker so
     # the relinked session starts clean instead of rejecting with 503.
-    if circuit_breaker_open:
-        logger.info("🔓 Circuit breaker reset by account relink")
-    circuit_breaker_open = False
-    circuit_breaker_opened_at = None
-    consecutive_failures = 0
+    try:
+        asyncio.create_task(_reset_circuit_breaker("account relinked"))
+    except RuntimeError:
+        pass  # no running loop (e.g. import-time) — TTL reset still applies
     if async_session:
         try:
             asyncio.create_task(_save_tokens_to_db(token, token_secret))
@@ -566,7 +595,13 @@ async def etrade_auth_start():
     global _latest_request_token
     try:
         etrade_session = OAuth1Session(client_key=CONSUMER_KEY, client_secret=CONSUMER_SECRET, callback_uri="oob")
-        fetch_response = etrade_session.fetch_request_token(REQUEST_TOKEN_URL)
+        # Request tokens are disposable — fetching is safe to retry with
+        # backoff (unlike the access-token exchange, whose verifier is
+        # single-use and must NEVER be retried).
+        fetch_response = await asyncio.to_thread(
+            _sync_etrade_call, etrade_session.fetch_request_token, REQUEST_TOKEN_URL,
+            source="request_token",
+        )
         token_val = fetch_response.get("oauth_token")
         secret_val = fetch_response.get("oauth_token_secret")
         if not token_val or not secret_val:
@@ -721,7 +756,7 @@ async def get_etrade_account():
             tokens["oauth_token"], tokens["oauth_token_secret"],
             dev=is_sandbox,
         )
-        resp = await asyncio.to_thread(accounts_api.list_accounts, resp_format="json")
+        resp = await _etrade_call(accounts_api.list_accounts, resp_format="json", source="list_accounts")
         raw = (((resp or {}).get("AccountListResponse") or {}).get("Accounts") or {}).get("Account") or []
         if isinstance(raw, dict):
             raw = [raw]
@@ -757,7 +792,7 @@ async def etrade_auth_renew(data: dict = Body(...)):
         except Exception:
             logger.info("Current tokens appear invalid. Attempting renewal...")
         auth_manager = pyetrade.ETradeAccessManager(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret)
-        renewed = await asyncio.to_thread(auth_manager.renew_access_token)
+        renewed = await _etrade_call(auth_manager.renew_access_token, source="token_renew")
         if renewed:
             save_tokens(auth_manager.oauth_token, auth_manager.oauth_token_secret)
             return {"status": "success", "message": "Tokens renewed successfully", "renewed": True}
@@ -786,36 +821,107 @@ async def get_quotes(symbols: str = Query(...)):
         raise HTTPException(401, "E*TRADE account not linked")
     market = pyetrade.ETradeMarket(CONSUMER_KEY, CONSUMER_SECRET, tokens["oauth_token"], tokens["oauth_token_secret"], dev=is_sandbox)
     symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
-    for attempt in range(1, 5):
-        try:
-            return await asyncio.to_thread(market.get_quote, symbol_list, resp_format="json")
-        except Exception as e:
-            if attempt < 4 and ("401" in str(e) or "Unauthorized" in str(e)):
-                await asyncio.sleep(3)
-                continue
-            raise HTTPException(500, detail=str(e))
-
-
-# ==================== DATABASE ====================
-async def init_db():
-    global engine, async_session
-    use_postgres = False
-    if DATABASE_URL and "postgres" in DATABASE_URL:
-        try:
-            import asyncpg  # noqa: F401
-            use_postgres = True
-        except ImportError:
-            logger.warning("asyncpg not found — falling back to SQLite")
-            use_postgres = False
-    target_url = DATABASE_URL if use_postgres else "sqlite+aiosqlite:///etrade_cache.db"
     try:
-        engine = create_async_engine(target_url, echo=False)
+        # Exponential backoff covers throttles, 5xx AND the post-renewal 401s
+        # the old hand-rolled fixed-sleep loop existed for.
+        return await _etrade_call(market.get_quote, symbol_list, resp_format="json", source="quote")
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+
+# ==================== DATABASE (FIXED for token persistence) ====================
+async def init_db():
+    """Initialize async DB engine.
+
+    FIX FOR DAILY RELINK CYCLE (failure #1):
+    - DATABASE_URL from hosting platforms (Railway, Render, etc.) is typically
+      "postgres://..." or "postgresql://..." WITHOUT the async driver suffix.
+    - create_async_engine REQUIRES an async driver (asyncpg) in the URL or it
+      fails to connect (or falls back incorrectly).
+    - Previous code passed raw DATABASE_URL when "postgres" in it → engine
+      creation failed silently → async_session stayed None → save_tokens /
+      preload_tokens did nothing → tokens only in RAM → lost on every restart
+      (daily container cycle) → forced relink every day.
+    - This version NORMALIZES the URL to postgresql+asyncpg:// (preserving
+      host, port, user, pass, dbname, query params like sslmode).
+    - If connection still fails (e.g. wrong hostname, bad creds, network),
+      it logs the exact issue and falls back to SQLite (so bot still runs,
+      but tokens won't persist across restarts until DATABASE_URL is fixed).
+    - Result: tokens now persist reliably in DB; daily relink cycle eliminated.
+    """
+    global engine, async_session
+    engine = None
+    async_session = None
+    target_url = "sqlite+aiosqlite:///etrade_cache.db"
+    db_type = "sqlite (fallback)"
+
+    if DATABASE_URL:
+        url = DATABASE_URL.strip()
+        original_url_for_log = url  # for error reporting (masked below)
+        # Normalize common postgres URLs to asyncpg driver
+        if url.startswith("postgres://"):
+            url = "postgresql+asyncpg://" + url[len("postgres://"):]
+        elif url.startswith("postgresql://") and "+asyncpg" not in url:
+            url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+        # If someone put postgresql+psycopg2:// etc, force asyncpg
+        if url.startswith("postgresql+") and "+asyncpg" not in url:
+            # e.g. postgresql+psycopg2://user@host/db → postgresql+asyncpg://user@host/db
+            prefix, rest = url.split("://", 1)
+            url = "postgresql+asyncpg://" + rest
+
+        try:
+            import asyncpg  # noqa: F401  # ensure driver available
+            engine = create_async_engine(
+                url,
+                echo=False,
+                pool_pre_ping=True,  # detect and recover from stale connections (common in cloud DBs)
+            )
+            target_url = url
+            db_type = "postgres + asyncpg"
+            # Log masked hostname for diagnostics (shows if hostname is correct)
+            safe_log = url
+            if "@" in safe_log:
+                safe_log = safe_log.split("@", 1)[1]  # drop user:pass@
+            logger.info(f"✅ DATABASE_URL normalized and engine created for {db_type} @ {safe_log}")
+        except ImportError:
+            logger.warning(
+                "asyncpg package not found in environment — cannot use postgres DATABASE_URL. "
+                "Install with: pip install asyncpg   (tokens will use SQLite fallback and NOT persist across restarts)"
+            )
+            engine = None
+        except Exception as conn_err:
+            # This surfaces the real hostname/credential/network error to logs
+            logger.error(
+                f"❌ Database connection FAILED using DATABASE_URL "
+                f"(likely wrong hostname, port, credentials, SSL, or network/VPC issue): {conn_err}"
+            )
+            logger.error(
+                f"   Original DATABASE_URL (masked): "
+                f"{original_url_for_log.split('@')[-1] if '@' in original_url_for_log else original_url_for_log}"
+            )
+            logger.warning("   → Falling back to local SQLite (tokens will NOT survive restarts until DATABASE_URL is corrected)")
+            engine = None
+
+    if engine is None:
+        # SQLite fallback (tokens persist only within this container lifetime)
+        target_url = "sqlite+aiosqlite:///etrade_cache.db"
+        db_type = "sqlite"
+        try:
+            engine = create_async_engine(target_url, echo=False)
+        except Exception as sqlite_err:
+            logger.error(f"Even SQLite fallback failed: {sqlite_err}")
+            engine = None
+            async_session = None
+            return  # bot continues without DB; tokens won't persist at all
+
+    try:
         async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        logger.info("✅ Database connected")
+        logger.info(f"✅ Database ready: {db_type}  (tokens will persist across restarts)")
     except Exception as e:
-        logger.error(f"Database error: {e}")
+        logger.error(f"Database table creation / sessionmaker error: {e}")
+        async_session = None  # ensure downstream checks see failure
 
 
 # ==================== ACCOUNT KEY RESOLUTION ====================
@@ -837,7 +943,7 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
         tokens["oauth_token"], tokens["oauth_token_secret"],
         dev=is_sandbox,
     )
-    resp = await asyncio.to_thread(accounts_api.list_accounts, resp_format="json")
+    resp = await _etrade_call(accounts_api.list_accounts, resp_format="json", source="resolve_account")
     account_list = (((resp or {}).get("AccountListResponse") or {}).get("Accounts") or {}).get("Account") or []
     if isinstance(account_list, dict):
         account_list = [account_list]
@@ -871,19 +977,137 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
     return _resolved_account_id_key
 
 
-# ==================== SAFETY ====================
+# ==================== SAFETY (distributed circuit breaker) ====================
+async def _breaker_is_open() -> bool:
+    return await state.exists(BREAKER_OPEN_KEY)
+
+
+async def _reset_circuit_breaker(reason: str) -> None:
+    try:
+        if await state.exists(BREAKER_OPEN_KEY):
+            logger.info(f"🔓 Circuit breaker reset — {reason}")
+            await alerts.send("info", "circuit_breaker_reset",
+                              f"Circuit breaker reset — {reason}",
+                              dedupe_key="breaker_reset")
+        await state.delete(BREAKER_OPEN_KEY, BREAKER_FAILURES_KEY)
+    except Exception as e:
+        logger.warning(f"breaker reset failed: {e}")
+
+
+async def _record_api_success() -> None:
+    """A successful broker call closes the failure streak."""
+    await state.delete(BREAKER_FAILURES_KEY)
+
+
+async def _record_api_failure(source: str, error: str) -> None:
+    """Count a broker/API failure toward the DISTRIBUTED breaker; trip it
+    (TTL = cooldown → auto-reset) and alert when the threshold is crossed."""
+    try:
+        fails = await state.incr(BREAKER_FAILURES_KEY, ex=BREAKER_FAILURE_WINDOW_SECONDS)
+    except Exception as e:
+        logger.warning(f"breaker failure count error: {e}")
+        return
+    logger.warning(f"⚠️ API failure {fails}/{MAX_CONSECUTIVE_FAILURES} ({source}): {error}")
+    if fails >= MAX_CONSECUTIVE_FAILURES and not await state.exists(BREAKER_OPEN_KEY):
+        await state.set(BREAKER_OPEN_KEY, source, ex=CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+        logger.error(
+            f"⛔ Circuit breaker OPEN after {fails} consecutive API failures ({source}) "
+            f"— all workers halted; auto-resets in {CIRCUIT_BREAKER_COOLDOWN_SECONDS // 60} minutes"
+        )
+        await trade_ledger.record("circuit_breaker_tripped", {
+            "source": source, "failures": fails, "last_error": str(error)[:300],
+            "cooldown_seconds": CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+        })
+        await alerts.send(
+            "critical", "circuit_breaker_tripped",
+            f"Order placement HALTED after {fails} consecutive API failures ({source}): {error}",
+            dedupe_key="breaker_trip",
+        )
+
+
 async def check_risk_limits():
-    global circuit_breaker_open, circuit_breaker_opened_at, consecutive_failures
-    if circuit_breaker_open:
-        elapsed = (datetime.utcnow() - circuit_breaker_opened_at).total_seconds() if circuit_breaker_opened_at else 1e9
-        if elapsed >= CIRCUIT_BREAKER_COOLDOWN_SECONDS:
-            logger.info("🔓 Circuit breaker cooldown elapsed — resetting and resuming")
-            circuit_breaker_open = False
-            circuit_breaker_opened_at = None
-            consecutive_failures = 0
-        else:
-            remaining = int(CIRCUIT_BREAKER_COOLDOWN_SECONDS - elapsed)
-            raise HTTPException(503, f"Circuit breaker open — auto-resets in {remaining}s (or relink the account)")
+    if await _breaker_is_open():
+        raise HTTPException(
+            503,
+            f"Circuit breaker open — broker API failing; auto-resets within "
+            f"{CIRCUIT_BREAKER_COOLDOWN_SECONDS // 60} minutes (or relink the account)",
+        )
+
+
+# ==================== E*TRADE CALL BACKOFF ====================
+# Every E*TRADE API call goes through exponential backoff with jitter — the
+# raw async client retries inside etrade_async._request; the pyetrade paths
+# retry through _etrade_call / _sync_etrade_call below.
+_RETRYABLE_ERROR_MARKERS = (
+    "408", "429", "500", "502", "503", "504",
+    "timeout", "timed out", "connection", "temporarily", "unavailable",
+    "reset by peer", "max retries", "401", "unauthorized",
+)
+
+
+def _backoff_delay(attempt: int, exact: bool = False) -> float:
+    """Exponential backoff: base * 2^attempt capped at the max.
+    exact=True (429 throttle) honours the full schedule — 2s, 4s, 8s with the
+    defaults — because a throttle wait must never be shortened. Other errors
+    apply a [0.5, 1.0] jitter factor to de-synchronize workers."""
+    delay = min(ETRADE_RETRY_MAX_SECONDS, ETRADE_RETRY_BASE_SECONDS * (2 ** attempt))
+    if exact:
+        return delay
+    return delay * (0.5 + random.random() * 0.5)
+
+
+def _is_throttle(e: Exception) -> bool:
+    """429 rate-limit errors: the broker never processed the request, so a
+    retry is safe even for order placement."""
+    return "429" in str(e)
+
+
+def _is_retryable_error(e: Exception) -> bool:
+    """Transient broker failures worth retrying: throttles (429), 5xx, network
+    drops, and 401s (E*TRADE tokens briefly 401 right after issue/renewal).
+    Validation rejections (1011/2040/2009, missing params) are NOT retried."""
+    text = str(e).lower()
+    return any(marker in text for marker in _RETRYABLE_ERROR_MARKERS)
+
+
+def _sync_etrade_call(fn, *args, source: str = "etrade", **kwargs):
+    """Exponential-backoff wrapper for SYNC pyetrade calls running inside a
+    worker thread (e.g. contract snapping) — blocking sleeps are fine there."""
+    for attempt in range(ETRADE_RETRY_ATTEMPTS):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if attempt >= ETRADE_RETRY_ATTEMPTS - 1 or not _is_retryable_error(e):
+                raise
+            delay = _backoff_delay(attempt, exact=_is_throttle(e))
+            logger.warning(
+                f"E*TRADE {source} failed (attempt {attempt + 1}/{ETRADE_RETRY_ATTEMPTS}): {e} "
+                f"— retrying in {delay:.1f}s"
+            )
+            time.sleep(delay)
+
+
+async def _etrade_call(fn, *args, source: str = "etrade", idempotent: bool = True, **kwargs):
+    """Run a sync pyetrade call in a thread with exponential backoff + jitter.
+    idempotent=False (order placement) executes EXACTLY once — a failed place
+    may still have reached the broker, so a blind retry risks a double order
+    (the reconciliation engine heals whatever state results)."""
+    for attempt in range(ETRADE_RETRY_ATTEMPTS):
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        except Exception as e:
+            # A 429 was never processed by the broker — safe to retry even for
+            # non-idempotent calls (order placement). Anything else follows the
+            # exactly-once rule for non-idempotent requests.
+            throttled = _is_throttle(e)
+            if (not idempotent and not throttled) or attempt >= ETRADE_RETRY_ATTEMPTS - 1 or not _is_retryable_error(e):
+                raise
+            delay = _backoff_delay(attempt, exact=throttled)
+            logger.warning(
+                f"E*TRADE {source} failed (attempt {attempt + 1}/{ETRADE_RETRY_ATTEMPTS}): {e} "
+                f"— retrying in {delay:.1f}s"
+            )
+            await asyncio.sleep(delay)
 
 
 # ==================== STOP GUARD ====================
@@ -921,6 +1145,108 @@ def _orders_client(tokens: Dict[str, str]) -> "pyetrade.ETradeOrder":
     )
 
 
+def _raw_client(tokens: Dict[str, str]) -> ETradeAsyncClient:
+    """Async httpx client with raw JSON Order API payloads (primary path)."""
+    return ETradeAsyncClient(
+        CONSUMER_KEY, CONSUMER_SECRET,
+        tokens["oauth_token"], tokens["oauth_token_secret"],
+        sandbox=is_sandbox,
+    )
+
+
+async def _place_order_smart(kind: str, common: dict, tokens: Dict[str, str]) -> Any:
+    """Primary path: raw async JSON payload against E*TRADE's Order API
+    (full control, true multi-leg capable). Fallback: pyetrade flat kwargs —
+    the proven v4 path. `common` uses the flat pyetrade vocabulary so both
+    paths share one source of truth."""
+    if USE_RAW_ORDER_API:
+        try:
+            client = _raw_client(tokens)
+            acct = common["accountIdKey"]
+            cid = str(common["clientOrderId"])
+            price_type = str(common.get("priceType") or "MARKET")
+            limit_price = common.get("limitPrice")
+            stop_price = common.get("stopPrice")
+            if kind == "option":
+                return await client.place_option(
+                    acct, cid, str(common["symbol"]), str(common["callPut"]),
+                    float(common["strikePrice"]), str(common["expiryDate"]),
+                    str(common["orderAction"]), int(common["quantity"]),
+                    price_type, limit_price=limit_price, stop_price=stop_price,
+                )
+            return await client.place_equity(
+                acct, cid, str(common["symbol"]), str(common["orderAction"]),
+                int(common["quantity"]), price_type,
+                limit_price=limit_price, stop_price=stop_price,
+            )
+        except ETradeAPIError as e:
+            logger.warning(f"RAW order path rejected ({e}) — falling back to pyetrade")
+        except Exception as e:
+            logger.warning(f"RAW order path error ({e}) — falling back to pyetrade")
+    orders = _orders_client(tokens)
+    fn = orders.place_option_order if kind == "option" else orders.place_equity_order
+    # NON-IDEMPOTENT — executed exactly once (no blind retry of a place).
+    return await _etrade_call(fn, source=f"place_{kind}", idempotent=False, **common)
+
+
+_INSUFFICIENT_FUNDS_QTY_RE = re.compile(
+    r"maximum allowable quantity was estimated to be\s+(\d+)", re.IGNORECASE
+)
+
+
+def _max_qty_from_insufficient_funds(message: str) -> Optional[int]:
+    """Parse E*TRADE error 8400's embedded max quantity hint.
+
+    E*TRADE rejects over-sized orders with:
+      "Code: 8400 ... insufficient funds ... the maximum allowable quantity
+       was estimated to be 57."
+    Returns the parsed integer, or None when the message carries no hint.
+    """
+    if not message or ("8400" not in message and "insufficient funds" not in message.lower()):
+        return None
+    m = _INSUFFICIENT_FUNDS_QTY_RE.search(message)
+    if not m:
+        return None
+    try:
+        qty = int(m.group(1))
+        return qty if qty > 0 else None
+    except ValueError:
+        return None
+
+
+async def _place_entry_with_funds_clamp(kind: str, common: dict, tokens: Dict[str, str]) -> Tuple[Any, int]:
+    """Place an ENTRY order; on an 8400 insufficient-funds rejection, clamp the
+    quantity to what the broker says is affordable (95% safety margin) and
+    retry ONCE with a fresh clientOrderId. Never used for closes — a close
+    must always cover the full tracked position.
+
+    Returns (broker_response, quantity_actually_sent).
+    """
+    try:
+        final = await _place_order_smart(kind, common, tokens)
+        return final, int(common["quantity"])
+    except Exception as e:
+        max_qty = _max_qty_from_insufficient_funds(str(e))
+        if max_qty is None:
+            raise
+        requested = int(common["quantity"])
+        clamped = max(1, int(max_qty * 0.95))
+        if clamped >= requested:
+            raise  # hint doesn't actually reduce the order — don't loop
+        retry = dict(common)
+        retry["quantity"] = clamped
+        # A rejected order may still burn the clientOrderId — retry with a
+        # fresh one (E*TRADE caps clientOrderId at 20 chars).
+        retry["clientOrderId"] = (str(common["clientOrderId"])[:19] + "R")
+        logger.warning(
+            f"💰 Insufficient funds for qty={requested} {common.get('symbol')} — "
+            f"broker max ≈{max_qty}; retrying ONCE with clamped qty={clamped}"
+        )
+        final = await _place_order_smart(kind, retry, tokens)
+        logger.info(f"✅ Clamped retry accepted: {clamped}x {common.get('symbol')} (was {requested})")
+        return final, clamped
+
+
 async def _order_state(order_id: Optional[str], client_id: Optional[str]) -> Tuple[str, int]:
     """Return (status, total filled quantity) for an order, matched by orderId
     or clientOrderId in the account's recent orders. ('NOT_FOUND', 0) when the
@@ -930,7 +1256,7 @@ async def _order_state(order_id: Optional[str], client_id: Optional[str]) -> Tup
         raise Exception("E*TRADE tokens not set")
     acct_key = await _resolve_account_id_key(tokens)
     orders = _orders_client(tokens)
-    resp = await asyncio.to_thread(orders.list_orders, acct_key, resp_format="json")
+    resp = await _etrade_call(orders.list_orders, acct_key, resp_format="json", source="list_orders")
     root = (resp or {}).get("OrdersResponse", {}) if isinstance(resp, dict) else {}
     order_list = root.get("Order") or []
     if isinstance(order_list, dict):
@@ -981,7 +1307,7 @@ async def _cancel_order_safe(order_id: Optional[str]) -> bool:
             return False
         acct_key = await _resolve_account_id_key(tokens)
         orders = _orders_client(tokens)
-        await asyncio.to_thread(orders.cancel_order, acct_key, int(order_id), resp_format="json")
+        await _etrade_call(orders.cancel_order, acct_key, int(order_id), resp_format="json", source="cancel_order")
         logger.info(f"[STOP GUARD] cancelled order {order_id}")
         return True
     except Exception as e:
@@ -995,7 +1321,6 @@ async def _place_protective_stop(ticker: str, action: str, qty: int, stop_price:
     if not tokens:
         raise Exception("E*TRADE tokens not set")
     acct_key = await _resolve_account_id_key(tokens)
-    orders = _orders_client(tokens)
     exit_side = "SELL" if action == "BUY" else "BUY_TO_COVER"
     client_id = str(uuid.uuid4().int)[:18]
     common = dict(
@@ -1011,110 +1336,314 @@ async def _place_protective_stop(ticker: str, action: str, qty: int, stop_price:
         marketSession="REGULAR",
         allOrNone=False,
     )
-    placed = await asyncio.to_thread(orders.place_equity_order, **common)
+    placed = await _place_order_smart("equity", common, tokens)
     order_id = _order_id_from_place(placed)
     logger.info(
         f"[STOP GUARD] protective stop RESTING at broker: {exit_side} {ticker} "
         f"qty={qty} stop={stop_price:.2f} (order={order_id})"
     )
+    await trade_ledger.record("protective_stop_placed", {
+        "ticker": ticker, "kind": "equity", "side": exit_side,
+        "qty": int(qty), "stop": round(float(stop_price), 2), "order_id": order_id,
+    })
     return {"order_id": order_id, "client_id": client_id, "qty": int(qty), "stop": round(float(stop_price), 2)}
 
 
-def _finish_guard(ticker: str, result: str) -> None:
-    g = _stop_guards.get(ticker)
-    if g:
-        g["done"] = True
-        g["result"] = result
-        _save_state()
+async def _place_option_protective_stop(ticker: str, contract: dict, qty: int, stop_premium: float) -> dict:
+    """Rest a protective SELL_CLOSE STOP at E*TRADE on the same OCC contract
+    for a filled option entry — the option-side equivalent of the equity stop
+    guard. `stop_premium` is the option PREMIUM trigger, tick-rounded."""
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("E*TRADE tokens not set")
+    if not contract or not contract.get("right") or not contract.get("expiration"):
+        raise Exception(f"option guard for {ticker} missing contract details")
+    acct_key = await _resolve_account_id_key(tokens)
+    client_id = str(uuid.uuid4().int)[:18]
+    stop_px = _round_to_option_tick(float(stop_premium), "down")
+    common = dict(
+        resp_format="json",
+        accountIdKey=acct_key,
+        symbol=ticker,
+        orderAction="SELL_CLOSE",
+        clientOrderId=client_id,
+        priceType="STOP",
+        stopPrice=stop_px,
+        quantity=int(qty),
+        orderTerm="GOOD_FOR_DAY",
+        marketSession="REGULAR",
+        allOrNone=False,
+        callPut=str(contract["right"]).upper(),
+        strikePrice=float(contract["strike"]),
+        expiryDate=str(contract["expiration"])[:10],
+    )
+    placed = await _place_order_smart("option", common, tokens)
+    order_id = _order_id_from_place(placed)
+    logger.info(
+        f"[STOP GUARD] option protective stop RESTING at broker: SELL_CLOSE {ticker} "
+        f"{contract.get('right')} {contract.get('strike')} {contract.get('expiration')} "
+        f"qty={qty} stop_premium={stop_px:.2f} (order={order_id})"
+    )
+    await trade_ledger.record("protective_stop_placed", {
+        "ticker": ticker, "kind": "option", "side": "SELL_CLOSE",
+        "qty": int(qty), "stop_premium": stop_px, "order_id": order_id,
+        "contract": {"right": contract.get("right"), "strike": contract.get("strike"),
+                     "expiration": contract.get("expiration")},
+    })
+    return {"order_id": order_id, "client_id": client_id, "qty": int(qty), "stop": stop_px}
+
+
+async def _emergency_flatten(ticker: str, guard: dict, qty: int) -> Optional[str]:
+    """LAST-RESORT market close of a filled-but-unprotected entry (stop
+    placement timeout). Certainty of fill beats price — always MARKET."""
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("E*TRADE tokens not set")
+    acct_key = await _resolve_account_id_key(tokens)
+    client_id = str(uuid.uuid4().int)[:18]
+    is_option = str(guard.get("kind") or "equity") == "option"
+    if is_option:
+        contract = dict(guard.get("contract") or {})
+        if not contract.get("right") or not contract.get("expiration"):
+            raise Exception(f"cannot flatten {ticker} — option contract details missing")
+        common = dict(
+            resp_format="json",
+            accountIdKey=acct_key,
+            symbol=ticker,
+            orderAction="SELL_CLOSE",
+            clientOrderId=client_id,
+            priceType="MARKET",
+            quantity=int(qty),
+            orderTerm="GOOD_FOR_DAY",
+            marketSession="REGULAR",
+            allOrNone=False,
+            callPut=str(contract["right"]).upper(),
+            strikePrice=float(contract["strike"]),
+            expiryDate=str(contract["expiration"])[:10],
+        )
+        placed = await _place_order_smart("option", common, tokens)
+    else:
+        exit_side = "SELL" if str(guard.get("action") or "BUY").upper() == "BUY" else "BUY_TO_COVER"
+        common = dict(
+            resp_format="json",
+            accountIdKey=acct_key,
+            symbol=ticker,
+            orderAction=exit_side,
+            clientOrderId=client_id,
+            priceType="MARKET",
+            quantity=int(qty),
+            orderTerm="GOOD_FOR_DAY",
+            marketSession="REGULAR",
+            allOrNone=False,
+        )
+        placed = await _place_order_smart("equity", common, tokens)
+    return _order_id_from_place(placed)
+
+
+async def _finish_guard(ticker: str, result: str) -> None:
+    await state.update_guard(ticker, done=True, result=result)
     logger.info(f"[STOP GUARD] {ticker} finished: {result}")
+    await trade_ledger.record("guard_finished", {"ticker": ticker, "result": result})
 
 
 async def _stop_guard_worker(ticker: str) -> None:
     """Poll the entry order; once (partially) filled, rest a protective STOP at
-    the broker sized to the filled quantity. Cancel entries with zero fill at
-    the deadline. Retries stop placement on every poll until protected."""
+    the broker sized to the filled quantity (equity STOP, or SELL_CLOSE STOP on
+    the same OCC contract for options). Cancel entries with zero fill at the
+    deadline. Guard state lives in Redis (survives restarts); the per-ticker
+    distributed lock guarantees exactly one worker guards a ticker across all
+    instances."""
+    lock = state.lock(f"guard:{ticker}", ttl_ms=(STOP_GUARD_POLL_SECONDS + 60) * 1000, wait_timeout=0.5)
+    if not await lock.try_acquire():
+        logger.info(f"[STOP GUARD] {ticker} already guarded by another worker — skipping")
+        return
     logger.info(f"[STOP GUARD] watching {ticker} entry fill")
-    while True:
-        guard = _stop_guards.get(ticker)
-        if not guard or guard.get("done"):
-            return
-
-        status = str(guard.get("last_status") or "OPEN")
-        filled = int(guard.get("last_filled") or 0)
-        try:
-            status, filled = await _order_state(guard.get("entry_order_id"), guard.get("entry_client_id"))
-        except Exception as e:
-            logger.warning(f"[STOP GUARD] {ticker} poll failed: {e}")
-
-        guarded = int(guard.get("guarded_qty") or 0)
-        if filled > guarded:
-            # (Re)place the protective stop for the total filled quantity.
-            can_place = True
-            if guard.get("stop_order_id"):
-                # Replace flow: only place a new stop if the old one is truly
-                # cancelled — never risk two live stops double-selling.
-                can_place = await _cancel_order_safe(guard.get("stop_order_id"))
-            if can_place:
-                try:
-                    stop_info = await _place_protective_stop(
-                        ticker, str(guard.get("action") or "BUY"), filled, float(guard.get("stop") or 0),
-                    )
-                    g = _stop_guards.get(ticker)
-                    if g:
-                        g["guarded_qty"] = filled
-                        g["stop_order_id"] = stop_info["order_id"]
-                        g["stop_client_id"] = stop_info["client_id"]
-                    pos = _open_positions.get(ticker)
-                    if pos:
-                        pos["stop_order_id"] = stop_info["order_id"]
-                        pos["filled_qty"] = filled
-                    _save_state()
-                    guarded = filled
-                except Exception as e:
-                    logger.error(f"[STOP GUARD] {ticker} stop placement FAILED (will retry): {e}")
-
-        g = _stop_guards.get(ticker)
-        if g:
-            g["last_filled"] = filled
-            g["last_status"] = status
-            _save_state()
-
-        if status == "EXECUTED" and filled > 0 and guarded >= filled:
-            _finish_guard(ticker, "filled_and_protected")
-            return
-        if status in _TERMINAL_ORDER_STATUSES and status != "EXECUTED" and filled == 0:
-            _finish_guard(ticker, f"entry_{status.lower()}_unfilled")
-            _open_positions.pop(ticker, None)
-            _save_state()
-            return
-        if time.time() >= float(guard.get("deadline_ts") or 0):
-            if filled == 0:
-                await _cancel_order_safe(guard.get("entry_order_id"))
-                _finish_guard(ticker, "entry_timeout_cancelled")
-                _open_positions.pop(ticker, None)
-                _save_state()
+    try:
+        while True:
+            await lock.extend()
+            guard = await state.get_guard(ticker)
+            if not guard or guard.get("done"):
                 return
-            if guarded >= filled:
-                _finish_guard(ticker, "partial_fill_protected")
+            is_option = str(guard.get("kind") or "equity") == "option"
+
+            status = str(guard.get("last_status") or "OPEN")
+            filled = int(guard.get("last_filled") or 0)
+            try:
+                status, filled = await _order_state(guard.get("entry_order_id"), guard.get("entry_client_id"))
+            except Exception as e:
+                logger.warning(f"[STOP GUARD] {ticker} poll failed: {e}")
+
+            # TIMEOUT CIRCUIT BREAKER anchor — the moment the FIRST fill is
+            # detected, the stop-placement clock restarts: the protective stop
+            # must rest at the broker within STOP_PLACEMENT_TIMEOUT_SECONDS of
+            # the fill (not of entry placement), or the breaker below trips.
+            if filled > 0 and not guard.get("fill_detected_ts") and STOP_PLACEMENT_TIMEOUT_SECONDS > 0:
+                guard = await state.update_guard(
+                    ticker,
+                    fill_detected_ts=time.time(),
+                    stop_deadline_ts=time.time() + STOP_PLACEMENT_TIMEOUT_SECONDS,
+                ) or guard
+
+            guarded = int(guard.get("guarded_qty") or 0)
+            if filled > guarded:
+                # (Re)place the protective stop for the total filled quantity.
+                can_place = True
+                if guard.get("stop_order_id"):
+                    # Replace flow: only place a new stop if the old one is truly
+                    # cancelled — never risk two live stops double-selling.
+                    can_place = await _cancel_order_safe(guard.get("stop_order_id"))
+                if can_place:
+                    try:
+                        if is_option:
+                            stop_info = await _place_option_protective_stop(
+                                ticker, dict(guard.get("contract") or {}), filled,
+                                float(guard.get("stop") or 0),
+                            )
+                        else:
+                            stop_info = await _place_protective_stop(
+                                ticker, str(guard.get("action") or "BUY"), filled,
+                                float(guard.get("stop") or 0),
+                            )
+                        guard = await state.update_guard(
+                            ticker,
+                            guarded_qty=filled,
+                            stop_order_id=stop_info["order_id"],
+                            stop_client_id=stop_info["client_id"],
+                        ) or guard
+                        pos = await state.get_position(ticker)
+                        if pos:
+                            pos["stop_order_id"] = stop_info["order_id"]
+                            pos["filled_qty"] = filled
+                            await state.set_position(ticker, pos)
+                        guarded = filled
+                    except Exception as e:
+                        logger.error(f"[STOP GUARD] {ticker} stop placement FAILED (will retry): {e}")
+                        await alerts.send(
+                            "critical", "stop_placement_failed",
+                            f"{ticker}: protective stop placement failed (guard will retry): {e}",
+                            dedupe_key=f"guard_fail:{ticker}",
+                        )
+
+            guard = await state.update_guard(ticker, last_filled=filled, last_status=status) or guard
+
+            # STOP PLACEMENT TIMEOUT CIRCUIT BREAKER — the bracket must be
+            # complete (a protective stop RESTING at the broker) within
+            # STOP_PLACEMENT_TIMEOUT_SECONDS. The clock starts at entry
+            # placement and RE-ANCHORS to the first detected fill (above), so a
+            # fill always gets the full window. Past the deadline with NO stop:
+            #   • unfilled entry → cancel the entry order immediately
+            #   • filled entry   → cancel any live remainder immediately, then
+            #                      emergency market-flatten (a fill cannot be
+            #                      cancelled — flattening is the equivalent).
+            # The stop-placement attempt above always runs FIRST, so this only
+            # fires when protection genuinely failed to stick in time.
+            stop_deadline = float(guard.get("stop_deadline_ts") or 0)
+            if stop_deadline and not guard.get("stop_order_id") and time.time() >= stop_deadline:
+                if filled > 0:
+                    if status not in _TERMINAL_ORDER_STATUSES:
+                        await _cancel_order_safe(guard.get("entry_order_id"))
+                    try:
+                        flatten_id = await _emergency_flatten(ticker, guard, filled)
+                        await _record_close(ticker, None, {"ticker": ticker, "action": guard.get("action") or "BUY"})
+                        await _finish_guard(ticker, "stop_timeout_flattened")
+                        await trade_ledger.record("stop_timeout_flattened", {
+                            "ticker": ticker, "qty": filled, "flatten_order_id": flatten_id,
+                            "timeout_seconds": STOP_PLACEMENT_TIMEOUT_SECONDS,
+                        })
+                        await alerts.send(
+                            "critical", "stop_timeout_flattened",
+                            f"{ticker}: no protective stop resting {STOP_PLACEMENT_TIMEOUT_SECONDS}s after entry "
+                            f"— position flattened at market (qty={filled}, order={flatten_id})",
+                            dedupe_key=f"stop_timeout:{ticker}",
+                        )
+                        return
+                    except Exception as e:
+                        logger.error(f"[STOP GUARD] {ticker} emergency flatten FAILED (will retry): {e}")
+                        await alerts.send(
+                            "critical", "stop_timeout_flatten_failed",
+                            f"{ticker}: UNPROTECTED past the {STOP_PLACEMENT_TIMEOUT_SECONDS}s stop deadline and "
+                            f"the emergency flatten failed (guard keeps retrying): {e}",
+                            dedupe_key=f"stop_timeout_fail:{ticker}",
+                        )
+                        # Fall through — next poll retries the stop placement
+                        # first, then this flatten again if it still won't stick.
+                else:
+                    await _cancel_order_safe(guard.get("entry_order_id"))
+                    # Re-poll after the cancel: a fill may have raced it. If it
+                    # did, keep looping — the stop gets placed next iteration
+                    # (or the flatten branch above fires).
+                    late_filled = 0
+                    try:
+                        _s2, late_filled = await _order_state(guard.get("entry_order_id"), guard.get("entry_client_id"))
+                    except Exception as e:
+                        logger.warning(f"[STOP GUARD] {ticker} post-cancel poll failed: {e}")
+                    if late_filled > 0:
+                        logger.warning(f"[STOP GUARD] {ticker} filled during timeout cancel (qty={late_filled}) — continuing guard")
+                    else:
+                        await _finish_guard(ticker, "stop_timeout_entry_cancelled")
+                        await state.delete_position(ticker)
+                        await trade_ledger.record("stop_timeout_entry_cancelled", {
+                            "ticker": ticker, "entry_order_id": guard.get("entry_order_id"),
+                            "timeout_seconds": STOP_PLACEMENT_TIMEOUT_SECONDS,
+                        })
+                        await alerts.send(
+                            "warning", "stop_timeout_entry_cancelled",
+                            f"{ticker}: entry unfilled and no protective stop within "
+                            f"{STOP_PLACEMENT_TIMEOUT_SECONDS}s — entry auto-cancelled",
+                            dedupe_key=f"stop_timeout:{ticker}",
+                        )
+                        return
+
+            if status == "EXECUTED" and filled > 0 and guarded >= filled:
+                await _finish_guard(ticker, "filled_and_protected")
                 return
-            # Filled but stop never stuck — keep trying rather than walk away.
-            logger.error(f"[STOP GUARD] {ticker} UNPROTECTED at deadline — extending guard")
-            g = _stop_guards.get(ticker)
-            if g:
-                g["deadline_ts"] = time.time() + ENTRY_FILL_TIMEOUT_MIN * 60
-                _save_state()
-        await asyncio.sleep(STOP_GUARD_POLL_SECONDS)
+            if status in _TERMINAL_ORDER_STATUSES and status != "EXECUTED" and filled == 0:
+                await _finish_guard(ticker, f"entry_{status.lower()}_unfilled")
+                await state.delete_position(ticker)
+                return
+            if time.time() >= float(guard.get("deadline_ts") or 0):
+                if filled == 0:
+                    await _cancel_order_safe(guard.get("entry_order_id"))
+                    await _finish_guard(ticker, "entry_timeout_cancelled")
+                    await state.delete_position(ticker)
+                    return
+                if guarded >= filled:
+                    await _finish_guard(ticker, "partial_fill_protected")
+                    return
+                # Filled but stop never stuck — keep trying rather than walk away.
+                logger.error(f"[STOP GUARD] {ticker} UNPROTECTED at deadline — extending guard")
+                await alerts.send(
+                    "critical", "position_unprotected",
+                    f"{ticker}: filled entry still has NO resting stop at the guard deadline — guard extended, retrying",
+                    dedupe_key=f"unprotected:{ticker}",
+                )
+                await state.update_guard(ticker, deadline_ts=time.time() + ENTRY_FILL_TIMEOUT_MIN * 60)
+            # Poll faster while the stop deadline is live and unmet so the 60s
+            # rule is enforced with tight granularity, not at the next 10s tick.
+            sleep_s = float(STOP_GUARD_POLL_SECONDS)
+            if stop_deadline and not guard.get("stop_order_id"):
+                sleep_s = max(1.0, min(sleep_s, stop_deadline - time.time()))
+            await asyncio.sleep(sleep_s)
+    finally:
+        await lock.release()
 
 
 def _spawn_guard(ticker: str) -> None:
     asyncio.create_task(_stop_guard_worker(ticker))
 
 
-def _arm_stop_guard(ticker: str, action: str, stop_price: float, entry_order_id: Optional[str], entry_client_id: str) -> None:
-    _stop_guards[ticker] = {
+async def _arm_stop_guard(ticker: str, action: str, stop_price: float,
+                          entry_order_id: Optional[str], entry_client_id: str,
+                          kind: str = "equity", contract: Optional[dict] = None) -> None:
+    """Persist guard state to Redis (restart-safe) and spawn the watcher task.
+    kind='option' guards rest a SELL_CLOSE STOP on the same OCC contract;
+    `stop_price` is then the protective PREMIUM trigger."""
+    await state.set_guard(ticker, {
         "ticker": ticker,
+        "kind": kind,
         "action": action,
         "stop": round(float(stop_price), 2),
+        "contract": contract,
         "entry_order_id": entry_order_id,
         "entry_client_id": entry_client_id,
         "guarded_qty": 0,
@@ -1122,51 +1651,69 @@ def _arm_stop_guard(ticker: str, action: str, stop_price: float, entry_order_id:
         "last_status": "OPEN",
         "stop_order_id": None,
         "stop_client_id": None,
+        "armed_ts": time.time(),
         "deadline_ts": time.time() + ENTRY_FILL_TIMEOUT_MIN * 60,
+        # STOP PLACEMENT TIMEOUT deadline — initially anchored at entry
+        # placement; the guard worker re-anchors it to the first detected fill
+        # so protection always gets the full window after the fill.
+        "stop_deadline_ts": (time.time() + STOP_PLACEMENT_TIMEOUT_SECONDS) if STOP_PLACEMENT_TIMEOUT_SECONDS > 0 else 0,
+        "fill_detected_ts": None,
         "done": False,
         "result": None,
-    }
-    _save_state()
+    })
     _spawn_guard(ticker)
 
 
-def _resume_guards() -> None:
-    """Respawn watcher tasks for guards interrupted by a restart."""
-    pending = [t for t, g in _stop_guards.items() if not g.get("done")]
+async def _resume_guards() -> None:
+    """Respawn watcher tasks for guards interrupted by a restart. The guard
+    lock makes this safe when several workers boot at once — only one wins."""
+    pending = await state.pending_guards()
     for t in pending:
         logger.info(f"[STOP GUARD] resuming guard for {t} after restart")
         _spawn_guard(t)
 
 
-# ==================== POSITION LEDGER ====================
-def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Optional[float],
-                 target: Optional[float], contract: Optional[dict]) -> None:
-    global _trades_today
-    _reset_daily()
-    _open_positions[ticker] = {
+# ==================== POSITION LEDGER (Redis-backed) ====================
+async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Optional[float],
+                       target: Optional[float], contract: Optional[dict],
+                       action: str = "BUY") -> None:
+    await state.set_position(ticker, {
         "qty": int(qty),
+        "action": str(action or "BUY").upper(),
         "entry": float(entry) if entry else None,
         "stop": float(stop) if stop else None,
         "target": float(target) if target else None,
         "ts": _utcnow().isoformat(),
         "contract": contract,
-    }
-    _trades_today += 1
-    _save_state()
+    })
+    await state.incr_trades_today()
+    await trade_ledger.record("position_opened", {
+        "ticker": ticker, "qty": int(qty), "action": str(action or "BUY").upper(),
+        "entry": float(entry) if entry else None,
+        "stop": float(stop) if stop else None,
+        "target": float(target) if target else None,
+        "contract": contract,
+    })
 
 
-def _record_close(ticker: str, exit_price: Optional[float], payload: dict) -> None:
+async def _record_close(ticker: str, exit_price: Optional[float], payload: dict) -> None:
     """Pop the position and feed realized pnl (underlying move, signed by
     direction) into the daily loss-limit accounting."""
-    global _realized_pnl_today_pct
-    pos = _open_positions.pop(ticker, None)
-    _reset_daily()
+    pos = await state.delete_position(ticker)
     entry = float((pos or {}).get("entry") or payload.get("entry") or 0)
     exit_px = float(exit_price or payload.get("exit_price") or payload.get("limit_price") or entry or 0)
     direction = 1.0 if str(payload.get("action") or "BUY").upper() == "BUY" else -1.0
+    pnl_pct: Optional[float] = None
     if entry > 0 and exit_px > 0:
-        _realized_pnl_today_pct += direction * ((exit_px - entry) / entry * 100.0)
-    _save_state()
+        pnl_pct = direction * ((exit_px - entry) / entry * 100.0)
+        await state.add_realized_pnl(pnl_pct)
+    await trade_ledger.record("position_closed", {
+        "ticker": ticker,
+        "entry": entry or None,
+        "exit": exit_px or None,
+        "realized_pnl_pct": round(pnl_pct, 4) if pnl_pct is not None else None,
+        "qty": int((pos or {}).get("filled_qty") or (pos or {}).get("qty") or 0) or None,
+    })
 
 
 async def _live_equity() -> Optional[float]:
@@ -1182,19 +1729,20 @@ async def _live_equity() -> Optional[float]:
             tokens["oauth_token"], tokens["oauth_token_secret"],
             dev=is_sandbox,
         )
-        lst = await asyncio.to_thread(accounts.list_accounts, resp_format="json")
+        lst = await _etrade_call(accounts.list_accounts, resp_format="json", source="equity_accounts")
         acct_list = (((lst or {}).get("AccountListResponse") or {}).get("Accounts") or {}).get("Account") or []
         if isinstance(acct_list, dict):
             acct_list = [acct_list]
         if not acct_list:
             return None
         acct = acct_list[0]
-        bal = await asyncio.to_thread(
+        bal = await _etrade_call(
             accounts.get_account_balance,
             acct["accountIdKey"],
             account_type=acct.get("accountType"),
             institution_type=acct.get("institutionType", "BROKERAGE"),
             resp_format="json",
+            source="balance",
         )
         val = (
             (bal or {}).get("BalanceResponse", {})
@@ -1279,7 +1827,7 @@ def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_
     today = datetime.utcnow().date()
 
     try:
-        resp = market.get_option_expire_date(symbol, resp_format="json")
+        resp = _sync_etrade_call(market.get_option_expire_date, symbol, resp_format="json", source="option_expiry")
         raw_dates = (((resp or {}).get("OptionExpireDateResponse") or {}).get("ExpirationDate")) or []
         if isinstance(raw_dates, dict):
             raw_dates = [raw_dates]
@@ -1303,13 +1851,15 @@ def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_
         return snapped_expiry, snapped_strike, real_bid, real_ask
 
     try:
-        chains = market.get_option_chains(
+        chains = _sync_etrade_call(
+            market.get_option_chains,
             symbol,
             expiry_date=requested,
             chain_type=("CALL" if str(call_put).upper() == "CALL" else "PUT"),
             strike_price_near=int(round(snapped_strike)),
             no_of_strikes=10,
             resp_format="json",
+            source="option_chain",
         )
         pairs = (((chains or {}).get("OptionChainResponse") or {}).get("OptionPair")) or []
         if isinstance(pairs, dict):
@@ -1348,8 +1898,6 @@ def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_
 
 # ==================== LIVE TRADING ====================
 async def execute_live_order(payload: dict):
-    global consecutive_failures, circuit_breaker_open
-
     mode = payload.get("mode", "paper").lower()
     instrument = payload.get("instrument", "stock").lower()
     ticker = payload.get("ticker", "UNKNOWN")
@@ -1372,7 +1920,7 @@ async def execute_live_order(payload: dict):
     # gates for ENTRIES here too (closes always pass: they reduce risk).
     is_close = _is_close_payload(payload)
     if not is_close:
-        if _killed:
+        if await state.is_killed():
             raise Exception("kill switch active — entry refused")
         if not _is_market_open() and not bool(payload.get("force_execute")):
             raise Exception("market closed — entry refused (exchange-aware calendar)")
@@ -1386,13 +1934,15 @@ async def execute_live_order(payload: dict):
     # accountIdKey from /accounts/list (Error 102 otherwise).
     account_id_key = await _resolve_account_id_key(tokens)
 
-    orders = pyetrade.ETradeOrder(
-        CONSUMER_KEY, CONSUMER_SECRET,
-        tokens["oauth_token"], tokens["oauth_token_secret"],
-        dev=is_sandbox,
-    )
-
     client_order_id = str(uuid.uuid4().int)[:18]
+
+    # DISTRIBUTED CRITICAL SECTION — one worker at a time may place/close
+    # orders for this ticker (prevents double-placement across instances).
+    order_lock = state.lock(f"order:{str(ticker).upper()}", ttl_ms=120_000, wait_timeout=30.0)
+    try:
+        await order_lock.acquire()
+    except LockNotAcquired:
+        raise Exception(f"order lock busy for {ticker} — another worker is placing/closing this ticker")
 
     try:
         if instrument == "option":
@@ -1452,6 +2002,33 @@ async def execute_live_order(payload: dict):
             )
 
             if is_exit:
+                # CLOSE FLOW: cancel the broker-resting protective option stop
+                # FIRST (same discipline as equity) so the close can never
+                # double-sell against it.
+                sym_u = str(symbol).upper()
+                pos = await state.get_position(sym_u) or {}
+                opt_guard = await state.get_guard(sym_u) or {}
+                resting_stop_id = pos.get("stop_order_id") or opt_guard.get("stop_order_id")
+                if resting_stop_id and not await _cancel_order_safe(resting_stop_id):
+                    try:
+                        stop_status, _sf = await _order_state(resting_stop_id, None)
+                    except Exception as e:
+                        stop_status = "UNKNOWN"
+                        logger.warning(f"option stop status check failed for {sym_u}: {e}")
+                    if stop_status == "EXECUTED":
+                        await _finish_guard(sym_u, "closed_by_stop")
+                        await _record_close(sym_u, None, payload)
+                        logger.info(f"[LIVE option CLOSE] {sym_u} already closed by resting stop {resting_stop_id}")
+                        return {
+                            "status": "success",
+                            "response": {"note": "resting protective stop already executed at broker", "stop_order_id": resting_stop_id},
+                        }
+                    if stop_status not in {"CANCELLED", "REJECTED", "EXPIRED", "NOT_FOUND"}:
+                        raise Exception(
+                            f"could not cancel resting option stop {resting_stop_id} — refusing to double-sell {sym_u}"
+                        )
+                await _finish_guard(sym_u, "closed_by_app")
+
                 # EXIT (SELL_CLOSE): protective exits must FILL. Default to
                 # MARKET. An explicit `exit_limit_price` overrides; a resting
                 # broker-side STOP is placed only when the app explicitly asks
@@ -1511,38 +2088,72 @@ async def execute_live_order(payload: dict):
                         f"trail_stop={payload.get('trail_stop')} trail_amount={payload.get('trail_amount') or payload.get('trailing_stop_amount')}"
                     )
 
-            logger.info(f"📤 Placing OPTION (flat kwargs): {json.dumps(common)}")
-            final = await asyncio.to_thread(orders.place_option_order, **common)
-            logger.info(f"✅ LIVE OPTION TRADE SUCCESS: {symbol} {call_put} {strike} {expiry}")
-            consecutive_failures = 0
+            logger.info(f"📤 Placing OPTION: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
             if is_exit:
-                _record_close(str(symbol).upper(), None, payload)
+                # Closes must always cover the full tracked position — never clamp.
+                final = await _place_order_smart("option", common, tokens)
             else:
-                _record_open(
+                final, quantity = await _place_entry_with_funds_clamp("option", common, tokens)
+            logger.info(f"✅ LIVE OPTION TRADE SUCCESS: {symbol} {call_put} {strike} {expiry}")
+            await _record_api_success()
+            if is_exit:
+                await _record_close(str(symbol).upper(), None, payload)
+            else:
+                contract = {
+                    "occ_symbol": _occ_symbol(symbol, expiry, call_put, float(strike)),
+                    "right": call_put,
+                    "strike": float(strike),
+                    "expiration": expiry,
+                }
+                await _record_open(
                     str(symbol).upper(), quantity,
                     payload.get("entry"), payload.get("stop") or payload.get("stop_price"),
-                    payload.get("target"),
-                    {
-                        "occ_symbol": _occ_symbol(symbol, expiry, call_put, float(strike)),
-                        "right": call_put,
-                        "strike": float(strike),
-                        "expiration": expiry,
-                    },
-                    action,
+                    payload.get("target"), contract, action,
                 )
+                # OPTION STOP PROTECTION — async guard task (state in Redis,
+                # survives restarts): poll the fill, then rest a SELL_CLOSE
+                # STOP on the same OCC contract.
+                entry_order_id = _order_id_from_place(final)
+                stop_premium: Optional[float] = None
+                explicit = payload.get("option_stop_price")
+                try:
+                    if explicit is not None and float(explicit) > 0:
+                        stop_premium = float(explicit)
+                except (TypeError, ValueError):
+                    stop_premium = None
+                fill_ref = float(common.get("limitPrice") or 0)
+                if stop_premium is None and fill_ref > 0 and OPTION_STOP_LOSS_PCT > 0:
+                    stop_premium = fill_ref * (1.0 - OPTION_STOP_LOSS_PCT / 100.0)
+                if stop_premium and stop_premium > 0:
+                    stop_premium = _round_to_option_tick(stop_premium, "down")
+                    await _arm_stop_guard(
+                        str(symbol).upper(), "BUY", stop_premium, entry_order_id, client_order_id,
+                        kind="option", contract=contract,
+                    )
+                    pos_rec = await state.get_position(str(symbol).upper())
+                    if pos_rec is not None:
+                        pos_rec["stop_premium"] = stop_premium
+                        await state.set_position(str(symbol).upper(), pos_rec)
+                    logger.info(
+                        f"[STOP GUARD] option guard armed for {symbol} at premium {stop_premium:.2f} "
+                        f"(entry order={entry_order_id})"
+                    )
+                else:
+                    logger.warning(f"⚠️ {symbol} option entry has no derivable stop premium — no broker-side stop armed")
             return {"status": "success", "response": final}
 
         else:
             # EQUITY ORDER
             symbol = str(ticker).upper()
             limit_price = payload.get("limit_price")
-            is_equity_exit = is_close or action in {"EXIT", "CLOSE"} or (action != "BUY" and symbol in _open_positions)
+            tracked_pos = await state.get_position(symbol)
+            is_equity_exit = is_close or action in {"EXIT", "CLOSE"} or (action != "BUY" and tracked_pos is not None)
 
             if is_equity_exit:
                 # LIVE EQUITY CLOSE — cancel the broker-resting protective stop
                 # FIRST so the close can never double-sell against it.
-                pos = _open_positions.get(symbol) or {}
-                guard = _stop_guards.get(symbol) or {}
+                pos = tracked_pos or {}
+                guard = await state.get_guard(symbol) or {}
                 stop_order_id = pos.get("stop_order_id") or guard.get("stop_order_id")
                 already_closed_by_stop = False
                 if stop_order_id and not await _cancel_order_safe(stop_order_id):
@@ -1557,9 +2168,9 @@ async def execute_live_order(payload: dict):
                         raise Exception(
                             f"could not cancel resting stop {stop_order_id} — refusing to double-sell {symbol}"
                         )
-                _finish_guard(symbol, "closed_by_app")
+                await _finish_guard(symbol, "closed_by_app")
                 if already_closed_by_stop:
-                    _record_close(symbol, None, payload)
+                    await _record_close(symbol, None, payload)
                     logger.info(f"[LIVE equity CLOSE] {symbol} already closed by resting stop {stop_order_id}")
                     return {
                         "status": "success",
@@ -1585,11 +2196,11 @@ async def execute_live_order(payload: dict):
                     allOrNone=False,
                     priceType="MARKET",  # protective closes prioritize certainty of fill
                 )
-                logger.info(f"📤 Placing EQUITY CLOSE (flat kwargs): {json.dumps(common)}")
-                final = await asyncio.to_thread(orders.place_equity_order, **common)
-                _record_close(symbol, None, payload)
+                logger.info(f"📤 Placing EQUITY CLOSE: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
+                final = await _place_order_smart("equity", common, tokens)
+                await _record_close(symbol, None, payload)
                 logger.info(f"✅ LIVE EQUITY CLOSE SUCCESS: {exit_side} {qty} {symbol}")
-                consecutive_failures = 0
+                await _record_api_success()
                 return {"status": "success", "response": final}
 
             # LIVE EQUITY ENTRY — FAIL-CLOSED sizing: never default to 1 share.
@@ -1630,35 +2241,75 @@ async def execute_live_order(payload: dict):
             else:
                 common["priceType"] = "MARKET"
 
-            logger.info(f"📤 Placing EQUITY (flat kwargs): {json.dumps(common)}")
-            final = await asyncio.to_thread(orders.place_equity_order, **common)
-            logger.info(f"✅ LIVE EQUITY TRADE SUCCESS: {action} {quantity} {symbol}")
-            consecutive_failures = 0
+            # ATOMIC OTOCO BEST-EFFORT — one linked Entry + Protective Stop
+            # request via the raw Order API. E*TRADE's public API doesn't
+            # officially support OCO/OTOCO, so rejection falls back to the
+            # proven sequential path (entry + stop guard) and is remembered.
+            if (
+                ENABLE_RAW_OTOCO and USE_RAW_ORDER_API and stop_px > 0
+                and not await state.exists("otoco:unsupported")
+            ):
+                try:
+                    raw = _raw_client(tokens)
+                    entry_detail = raw.order_detail(
+                        [raw.equity_instrument(symbol, order_action, quantity)],
+                        str(common.get("priceType") or "MARKET"),
+                        limit_price=common.get("limitPrice"),
+                    )
+                    otoco_exit_side = "SELL" if order_action == "BUY" else "BUY_TO_COVER"
+                    stop_detail = raw.order_detail(
+                        [raw.equity_instrument(symbol, otoco_exit_side, quantity)],
+                        "STOP", stop_price=round(stop_px, 2),
+                    )
+                    final = await raw.place_otoco_best_effort(
+                        account_id_key, client_order_id, "EQ", entry_detail, stop_detail,
+                    )
+                    logger.info(f"✅ ATOMIC OTOCO accepted for {symbol} — entry + protective stop in ONE request")
+                    await _record_api_success()
+                    await _record_open(symbol, quantity, entry_px or None, stop_px or None,
+                                       payload.get("target"), None, action)
+                    return {"status": "success", "response": final, "otoco": True}
+                except OTOCOUnsupported as e:
+                    logger.warning(
+                        f"OTOCO not accepted by E*TRADE ({e.message}) — falling back to entry + stop guard "
+                        f"(skipping OTOCO attempts for {OTOCO_UNSUPPORTED_TTL // 3600}h)"
+                    )
+                    await state.set("otoco:unsupported", "1", ex=OTOCO_UNSUPPORTED_TTL)
+                except ETradeAPIError as e:
+                    logger.warning(f"OTOCO attempt failed ({e}) — falling back to entry + stop guard")
 
-            _record_open(symbol, quantity, entry_px or None, stop_px or None, payload.get("target"), None, action)
+            logger.info(f"📤 Placing EQUITY: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
+            final, quantity = await _place_entry_with_funds_clamp("equity", common, tokens)
+            logger.info(f"✅ LIVE EQUITY TRADE SUCCESS: {action} {quantity} {symbol}")
+            await _record_api_success()
+
+            await _record_open(symbol, quantity, entry_px or None, stop_px or None, payload.get("target"), None, action)
             entry_order_id = _order_id_from_place(final)
             if stop_px > 0:
                 # Arm the stop guard: poll the entry fill, then rest a real STOP
                 # at E*TRADE so the position stays protected even if the app
                 # goes offline.
-                _arm_stop_guard(symbol, action, stop_px, entry_order_id, client_order_id)
+                await _arm_stop_guard(symbol, action, stop_px, entry_order_id, client_order_id)
                 logger.info(f"[STOP GUARD] armed for {symbol} at {stop_px:.2f} (entry order={entry_order_id})")
             else:
                 logger.warning(f"⚠️ {symbol} live entry has NO stop level — no broker-side protective stop armed")
             return {"status": "success", "response": final}
 
     except Exception as e:
-        global circuit_breaker_opened_at
-        consecutive_failures += 1
-        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES and not circuit_breaker_open:
-            circuit_breaker_open = True
-            circuit_breaker_opened_at = datetime.utcnow()
-            logger.error(
-                f"⛔ Circuit breaker OPEN after {consecutive_failures} consecutive failures "
-                f"— auto-resets in {CIRCUIT_BREAKER_COOLDOWN_SECONDS // 60} minutes"
-            )
+        await _record_api_failure("order_placement", str(e))
+        await trade_ledger.record("order_failed", {
+            "ticker": ticker, "action": action, "instrument": instrument,
+            "error": str(e)[:300],
+        })
+        await alerts.send(
+            "error", "order_failed",
+            f"{ticker} {action} ({instrument}) failed: {e}",
+            dedupe_key=f"order_failed:{ticker}",
+        )
         logger.error(f"❌ LIVE TRADE FAILED: {e}")
         raise
+    finally:
+        await order_lock.release()
 
 
 # ==================== WORKER ====================
@@ -1680,20 +2331,25 @@ async def token_keepalive_worker():
                 CONSUMER_KEY, CONSUMER_SECRET,
                 tokens["oauth_token"], tokens["oauth_token_secret"],
             )
-            await asyncio.to_thread(auth_manager.renew_access_token)
+            await _etrade_call(auth_manager.renew_access_token, source="keepalive_renew")
             logger.info("🔄 Keepalive: E*TRADE access token renewed")
         except Exception as e:
             # Renewal fails after the midnight-ET hard expiry — that requires a
             # full relink from the app, so just log it (orders will 401 and the
             # app surfaces the relink prompt).
             logger.warning(f"Keepalive renewal failed (relink may be required): {e}")
+            await alerts.send(
+                "warning", "token_keepalive_failed",
+                f"E*TRADE access token renewal failed — a relink may be required: {e}",
+                dedupe_key="keepalive",
+            )
 
 
 async def placement_worker():
     while not _worker_stop:
         try:
-            if redis:
-                job = await redis.lpop(QUEUE_KEY)
+            if state.is_distributed:
+                job = await state.queue_pop(QUEUE_KEY)
                 if job:
                     await execute_live_order(json.loads(job)["payload"])
                 else:
@@ -1705,6 +2361,135 @@ async def placement_worker():
             await asyncio.sleep(2)
 
 
+# ==================== RECONCILIATION ENGINE WIRING ====================
+# Dependency-injected so reconciliation.py never imports main_bot. The engine
+# runs under the distributed `lock:reconcile` — one instance at a time.
+def _reconcile_has_tokens() -> bool:
+    return load_tokens() is not None
+
+
+async def _reconcile_fetch_portfolio() -> Dict[str, Any]:
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("E*TRADE not linked")
+    acct_key = await _resolve_account_id_key(tokens)
+    return await _raw_client(tokens).get_portfolio(acct_key)
+
+
+async def _reconcile_fetch_orders() -> Dict[str, Any]:
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("E*TRADE not linked")
+    acct_key = await _resolve_account_id_key(tokens)
+    return await _raw_client(tokens).list_orders(acct_key)
+
+
+async def _reconcile_cancel(order_id: str) -> bool:
+    return await _cancel_order_safe(order_id)
+
+
+async def _reconcile_rearm_guard(ticker: str, pos: dict) -> None:
+    """Re-arm a protective stop for a position the reconciler found
+    UNPROTECTED (filled at broker, no live stop, no active guard)."""
+    qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
+    if qty < 1:
+        return
+    contract = pos.get("contract")
+    if contract and contract.get("right"):
+        premium = float(pos.get("stop_premium") or 0)
+        if premium <= 0:
+            logger.warning(f"[RECONCILE] cannot re-arm option stop for {ticker} — no stop premium recorded")
+            return
+        stop_info = await _place_option_protective_stop(ticker, dict(contract), qty, premium)
+    else:
+        stop = float(pos.get("stop") or 0)
+        if stop <= 0:
+            return
+        stop_info = await _place_protective_stop(ticker, str(pos.get("action") or "BUY"), qty, stop)
+    pos["stop_order_id"] = stop_info["order_id"]
+    pos["filled_qty"] = qty
+    await state.set_position(ticker, pos)
+    logger.warning(f"[RECONCILE] 🛡️ re-armed protective stop for {ticker} (order={stop_info['order_id']})")
+
+
+def _start_reconciler() -> None:
+    asyncio.create_task(reconciliation.reconciliation_loop(
+        state,
+        _reconcile_fetch_portfolio,
+        _reconcile_fetch_orders,
+        _reconcile_cancel,
+        _is_market_open,
+        _reconcile_has_tokens,
+        rearm_guard=_reconcile_rearm_guard,
+        interval_seconds=RECONCILE_INTERVAL_SECONDS,
+        offhours_interval_seconds=RECONCILE_OFFHOURS_SECONDS,
+        auto_heal=RECONCILE_AUTO_HEAL,
+        stop_flag=lambda: _worker_stop,
+        alert=alerts.send,
+    ))
+
+
+async def _startup_reconcile() -> None:
+    """BLOCKING broker reconciliation at boot — sync Redis truth with E*TRADE
+    BEFORE the placement worker accepts any job. Closes the biggest cold-start
+    gap: acting on stale positions/guards after a restart. Best-effort: a
+    broker failure or timeout never blocks boot (the background engine
+    retries), but it is alerted."""
+    if not load_tokens():
+        logger.info("[RECONCILE] startup pass skipped — E*TRADE not linked yet")
+        return
+    lock = state.lock(reconciliation.RECONCILE_LOCK, ttl_ms=STARTUP_RECONCILE_TIMEOUT_SECONDS * 2000)
+    if not await lock.try_acquire():
+        logger.info("[RECONCILE] startup pass skipped — another worker is reconciling")
+        return
+    try:
+        logger.info("[RECONCILE] 🚀 startup pass — syncing state with broker before accepting orders")
+        report = await asyncio.wait_for(
+            reconciliation.reconcile_once(
+                state, _reconcile_fetch_portfolio, _reconcile_fetch_orders,
+                _reconcile_cancel, rearm_guard=_reconcile_rearm_guard,
+                auto_heal=RECONCILE_AUTO_HEAL, alert=alerts.send,
+            ),
+            timeout=STARTUP_RECONCILE_TIMEOUT_SECONDS,
+        )
+        summary = {
+            "ok": report.get("ok"),
+            "tracked_positions": report.get("tracked_positions"),
+            "broker_positions": report.get("broker_positions"),
+            "live_orders": report.get("live_orders"),
+            "healed": report.get("healed", []),
+            "warnings": report.get("warnings", []),
+        }
+        logger.info(
+            f"[RECONCILE] ✅ startup pass done — tracked={summary['tracked_positions']} "
+            f"broker={summary['broker_positions']} orders={summary['live_orders']} "
+            f"healed={len(summary['healed'])} warnings={len(summary['warnings'])}"
+        )
+        await trade_ledger.record("startup_reconcile", summary)
+        if summary["warnings"]:
+            await alerts.send(
+                "warning", "startup_reconcile_warnings",
+                "; ".join(str(w) for w in summary["warnings"][:5]),
+                dedupe_key="startup_reconcile",
+            )
+    except asyncio.TimeoutError:
+        logger.error(f"[RECONCILE] startup pass timed out ({STARTUP_RECONCILE_TIMEOUT_SECONDS}s) — background engine will retry")
+        await alerts.send(
+            "error", "startup_reconcile_timeout",
+            f"Startup reconciliation timed out after {STARTUP_RECONCILE_TIMEOUT_SECONDS}s — background engine will retry",
+            dedupe_key="startup_reconcile",
+        )
+    except Exception as e:
+        logger.error(f"[RECONCILE] startup pass failed: {e}")
+        await alerts.send(
+            "error", "startup_reconcile_failed",
+            f"Startup reconciliation failed: {e} — background engine will retry",
+            dedupe_key="startup_reconcile",
+        )
+    finally:
+        await lock.release()
+
+
 async def start_worker():
     global _worker_task
     _worker_task = asyncio.create_task(placement_worker())
@@ -1714,34 +2499,35 @@ async def start_worker():
 # ==================== STARTUP ====================
 @app.on_event("startup")
 async def on_startup():
-    global redis
+    global state
     logger.info(f"Starting → {'SANDBOX' if is_sandbox else 'PRODUCTION'} | LIVE={LIVE_TRADING} | VERSION={BOT_VERSION}")
-    if REDIS_URL:
-        try:
-            redis = await redis_from_url(REDIS_URL, decode_responses=True)
-            logger.info("✅ Redis connected")
-        except Exception as e:
-            logger.warning(f"Redis not available (running without queue): {e}")
-            redis = None
-    else:
-        logger.warning("No REDIS_URL set — running without Redis queue")
-        redis = None
+    # Distributed state first — everything else reads through it.
+    state = await StateStore.create(REDIS_URL)
+    # Alerting + immutable ledger come up right after state — everything
+    # downstream (breaker, guards, reconciler) reports through them.
+    alerts.init(state, ALERT_WEBHOOK_URL, dedupe_seconds=ALERT_DEDUPE_SECONDS)
+    trade_ledger.init(TRADE_LEDGER_FILE)
     await init_db()
     await preload_tokens()
-    # Restore persisted safety state (positions, guards, counters, kill switch)
-    # and resume any stop-guards interrupted by the restart.
-    _load_state()
-    _resume_guards()
+    # One-time migration of the legacy JSON STATE_FILE into Redis (skipped when
+    # Redis already holds state; the file is renamed *.migrated afterwards).
+    await state.migrate_from_file(STATE_FILE)
+    # STARTUP RECONCILIATION — blocking broker→Redis sync BEFORE the placement
+    # worker starts, so no order is ever placed against stale cold-start state.
+    await _startup_reconcile()
+    # Resume stop-guards interrupted by the restart (guard lock makes this
+    # multi-worker safe) and start the background reconciliation engine.
+    await _resume_guards()
+    _start_reconciler()
     await start_worker()
-    logger.info("✅ Bot ready")
+    logger.info(f"✅ Bot ready (state backend: {state.backend_name})")
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
     global _worker_stop
     _worker_stop = True
-    if redis:
-        await redis.close()
+    await state.close()
 
 
 # ==================== ENDPOINTS ====================
@@ -1774,40 +2560,46 @@ async def webhook(
     mode = str(pd.get("mode") or "paper").lower()
     live_intent = mode == "live" and LIVE_TRADING and not is_sandbox
 
-    # Atomic idempotency — a network retry can never double-place an order.
-    if not store.set(sig_key, "processing", ex=86400, nx=True):
-        return {"status": "duplicate", "existing_status": store.get(sig_key), "signal_id": sig_key}
+    # Atomic idempotency in Redis (SET NX + TTL) — a network retry or a second
+    # worker can never double-place an order.
+    if not await state.set(sig_key, "processing", ex=86400, nx=True):
+        return {"status": "duplicate", "existing_status": await state.get(sig_key), "signal_id": sig_key}
 
     # Server-side gates for LIVE ENTRIES. Closes always pass — a protective
     # exit must never be blocked by entry gating.
     if live_intent and not is_close:
         if not _is_market_open() and not bool(pd.get("force_execute")):
-            store.set(sig_key, "rejected", ex=86400)
+            await state.set(sig_key, "rejected", ex=86400)
             return {"status": "rejected", "reason": "market_closed", "signal_id": sig_key}
-        ok, blocked = _passes_entry_filters(pd)
+        ok, blocked = await _passes_entry_filters(pd)
         if not ok:
-            store.set(sig_key, "rejected", ex=86400)
+            await state.set(sig_key, "rejected", ex=86400)
+            await trade_ledger.record("entry_rejected", {
+                "ticker": str(pd.get("ticker") or "").upper(),
+                "action": pd.get("action"),
+                "blocked_by": blocked,
+            })
             return {"status": "rejected", "reason": "; ".join(blocked), "signal_id": sig_key}
         cooldown_key = f"cooldown:{str(pd.get('ticker') or '').upper()}"
-        if store.exists(cooldown_key):
-            store.set(sig_key, "cooldown", ex=86400)
+        # NX write doubles as the existence check — atomic even across workers.
+        if not await state.set(cooldown_key, "1", ex=TICKER_COOLDOWN_MINUTES * 60, nx=True):
+            await state.set(sig_key, "cooldown", ex=86400)
             return {"status": "cooldown", "reason": "ticker_in_cooldown", "signal_id": sig_key}
-        store.set(cooldown_key, "1", ex=TICKER_COOLDOWN_MINUTES * 60)
 
     job = {"payload": pd}
-    if redis:
+    if state.is_distributed:
         try:
-            await redis.rpush(QUEUE_KEY, json.dumps(job))
-            store.set(sig_key, "queued", ex=86400)
+            await state.queue_push(QUEUE_KEY, json.dumps(job))
+            await state.set(sig_key, "queued", ex=86400)
             return {"status": "queued", "signal_id": sig_key}
         except Exception as e:
             logger.warning(f"Redis push failed, processing directly: {e}")
     try:
         result = await execute_live_order(pd)
-        store.set(sig_key, str(result.get("status") or "processed"), ex=86400)
+        await state.set(sig_key, str(result.get("status") or "processed"), ex=86400)
         return {"status": "processed_directly", "result": result, "signal_id": sig_key}
     except Exception as e:
-        store.set(sig_key, "failed", ex=86400)
+        await state.set(sig_key, "failed", ex=86400)
         logger.error(f"Direct processing failed: {e}")
         return {"status": "error", "message": str(e), "signal_id": sig_key}
 
@@ -1823,8 +2615,11 @@ async def health():
         "version": BOT_VERSION,
         "target_account_set": bool(TARGET_ACCOUNT_ID),
         "resolved_account_key": bool(_resolved_account_id_key),
-        "circuit_breaker_open": circuit_breaker_open,
-        "killed": _killed,
+        "circuit_breaker_open": await _breaker_is_open(),
+        "killed": await state.is_killed(),
+        "state_backend": state.backend_name,
+        "alert_webhook_configured": alerts.webhook_configured(),
+        "reconcile_interval_seconds": RECONCILE_INTERVAL_SECONDS,
     }
 
 
@@ -1838,20 +2633,31 @@ async def healthz():
 async def status():
     """Broker-state snapshot polled by the app's Reconciliation engine. The
     shape matches etrade_bot_handler's /status (open_positions keyed by ticker
-    with qty/entry/stop/target/ts/contract)."""
-    _reset_daily()
+    with qty/entry/stop/target/ts/contract), now read from reconciled Redis
+    state and enriched with the last reconciliation report."""
+    daily = await state.get_daily()
+    last_reconcile = None
+    raw_report = await state.get("reconcile:last")
+    if raw_report:
+        try:
+            last_reconcile = json.loads(raw_report)
+        except json.JSONDecodeError:
+            last_reconcile = None
     return {
-        "killed": _killed,
+        "killed": await state.is_killed(),
         "env": ENV,
         "live_trading": LIVE_TRADING,
         "version": BOT_VERSION,
         "market_open": _is_market_open(),
-        "open_positions": _open_positions,
-        "stop_guards": _stop_guards,
-        "trades_today": _trades_today,
-        "realized_pnl_today_pct": _realized_pnl_today_pct,
-        "circuit_breaker_open": circuit_breaker_open,
-        "state_file": str(STATE_FILE),
+        "open_positions": await state.all_positions(),
+        "stop_guards": await state.all_guards(),
+        "trades_today": daily["trades_today"],
+        "realized_pnl_today_pct": daily["realized_pnl_today_pct"],
+        "circuit_breaker_open": await _breaker_is_open(),
+        "state_backend": state.backend_name,
+        "last_reconcile": last_reconcile,
+        "reconcile_interval_seconds": RECONCILE_INTERVAL_SECONDS,
+        "alert_webhook_configured": alerts.webhook_configured(),
         "filters": {
             "min_score": MIN_SCORE,
             "min_score_trending": MIN_SCORE_TRENDING,
@@ -1862,25 +2668,54 @@ async def status():
     }
 
 
+@app.get("/alerts")
+async def recent_alerts(count: int = Query(50, ge=1, le=200)):
+    """Recent real-time alerts (newest first) — kill switch, failed guards,
+    unprotected positions, circuit breaker trips, API problems."""
+    return {
+        "alerts": await alerts.recent(count),
+        "webhook_configured": alerts.webhook_configured(),
+    }
+
+
+@app.get("/ledger")
+async def ledger_tail(count: int = Query(100, ge=1, le=500), verify: bool = Query(False)):
+    """Tail of the immutable trade ledger (newest first). Pass ?verify=true to
+    walk the FULL hash chain and prove no record was altered or removed."""
+    out: Dict[str, Any] = {"records": trade_ledger.tail(count)}
+    if verify:
+        ok, checked, err = trade_ledger.verify()
+        out["chain_ok"] = ok
+        out["chain_records_checked"] = checked
+        out["chain_error"] = err
+    return out
+
+
 @app.post("/kill")
 async def kill(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret")):
     if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
         raise HTTPException(401, "invalid secret")
-    global _killed
-    _killed = True
-    _save_state()
-    logger.warning("KILL SWITCH activated")
-    return {"status": "killed", "open_positions": list(_open_positions.keys())}
+    await state.set_killed(True)
+    logger.warning("KILL SWITCH activated (distributed — all workers respect it)")
+    open_tickers = await state.position_tickers()
+    await trade_ledger.record("kill_switch_engaged", {"open_positions": open_tickers})
+    await alerts.send(
+        "critical", "kill_switch_engaged",
+        f"KILL SWITCH engaged — all entries halted. Open positions: {', '.join(open_tickers) or 'none'}",
+        dedupe_key="kill_switch",
+    )
+    return {"status": "killed", "open_positions": open_tickers}
 
 
 @app.post("/resume")
 async def resume(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret")):
     if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
         raise HTTPException(401, "invalid secret")
-    global _killed
-    _killed = False
-    _save_state()
+    await state.set_killed(False)
     logger.info("Kill switch released — trading resumed")
+    await trade_ledger.record("kill_switch_released", {})
+    await alerts.send("info", "kill_switch_released", "Kill switch released — trading resumed",
+                      dedupe_key="kill_switch_release")
     return {"status": "resumed"}
 
 
