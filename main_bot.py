@@ -2296,9 +2296,46 @@ class WebhookPayload(BaseModel):
 
 
 # ==================== TOKEN PERSISTENCE ====================
+# Broker SESSION HEALTH — tokens on disk are not the same thing as a live
+# session (E*TRADE access tokens hard-expire at midnight ET). The app polls
+# /etrade/account and /status; `token_valid` lets it distinguish "linked with
+# a working session" from "linked but the session is DEAD — relink required",
+# so a token-expired weekend can never look armed in the app again.
+_token_session: Dict[str, Any] = {"valid": None, "reason": None, "checked_at": None}
+
+
+def _mark_token_session(valid: bool, reason: str = "") -> None:
+    prev = _token_session["valid"]
+    _token_session["valid"] = valid
+    _token_session["reason"] = reason or None
+    _token_session["checked_at"] = _utcnow().isoformat()
+    if prev is not False and valid is False:
+        logger.warning(f"Broker session marked EXPIRED — {reason}")
+    elif prev is not True and valid is True:
+        logger.info("Broker session marked ACTIVE")
+
+
+def _looks_like_auth_failure(err: Exception) -> bool:
+    text = str(err)
+    return "401" in text or "oauth_problem" in text or "Unauthorized" in text
+
+
+def _token_session_fields() -> Dict[str, Any]:
+    valid = _token_session["valid"]
+    return {
+        "token_valid": valid,
+        "session_state": "expired" if valid is False else ("active" if valid is True else "unknown"),
+        "session_checked_at": _token_session["checked_at"],
+        "session_reason": _token_session["reason"],
+    }
+
+
 def save_tokens(token: str, token_secret: str):
     global _current_tokens, _resolved_account_id_key
     logger.info("=== NEW TOKENS RECEIVED ===")
+    # Fresh tokens are validated by the auth flow before they get here — the
+    # session starts ACTIVE.
+    _mark_token_session(True, "new tokens adopted")
     _current_tokens = {"oauth_token": token, "oauth_token_secret": token_secret}
     _resolved_account_id_key = None  # re-resolve accountIdKey for the new session
     # A fresh link is an explicit user action — clear any tripped breaker so
@@ -2551,8 +2588,12 @@ async def get_etrade_account():
                 "accountType": a.get("accountType"),
                 "accountStatus": a.get("accountStatus"),
             })
+        # A successful authenticated call proves the session is alive.
+        _mark_token_session(True, "account enumeration ok")
     except Exception as e:
         logger.warning(f"Account enumeration failed (still linked): {e}")
+        if _looks_like_auth_failure(e):
+            _mark_token_session(False, "E*TRADE rejected the session (token expired at midnight ET or revoked) — relink required")
     # Real balances so the app can size positions off the TRUE account value
     # instead of a stale default. Best-effort — never fail the linked check.
     balances = await _fetch_broker_balance() or {}
@@ -2562,6 +2603,9 @@ async def get_etrade_account():
         "accounts": accounts_out,
         "equity": balances.get("total"),
         "cash_buying_power": balances.get("available"),
+        # Session health — `linked` means "tokens on file", these fields say
+        # whether those tokens can actually place orders RIGHT NOW.
+        **_token_session_fields(),
     }
 
 
@@ -2581,6 +2625,7 @@ async def etrade_auth_renew(data: dict = Body(...)):
         try:
             accounts = pyetrade.ETradeAccounts(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret, dev=is_sandbox)
             await asyncio.to_thread(accounts.list_accounts, resp_format="json")
+            _mark_token_session(True, "renew check: tokens still valid")
             return {"status": "success", "message": "Tokens are still valid", "renewed": False}
         except Exception:
             logger.info("Current tokens appear invalid. Attempting renewal...")
@@ -2594,6 +2639,8 @@ async def etrade_auth_renew(data: dict = Body(...)):
         raise
     except Exception as e:
         logger.error(f"Renew failed: {e}")
+        if _looks_like_auth_failure(e):
+            _mark_token_session(False, "token renewal rejected — hard-expired at midnight ET, relink required")
         raise HTTPException(500, detail="Renewal failed")
 
 
@@ -4358,11 +4405,14 @@ async def token_keepalive_worker():
             )
             await _etrade_call(auth_manager.renew_access_token, source="keepalive_renew")
             logger.info("🔄 Keepalive: E*TRADE access token renewed")
+            _mark_token_session(True, "keepalive renew ok")
         except Exception as e:
             # Renewal fails after the midnight-ET hard expiry — that requires a
             # full relink from the app, so just log it (orders will 401 and the
             # app surfaces the relink prompt).
             logger.warning(f"Keepalive renewal failed (relink may be required): {e}")
+            if _looks_like_auth_failure(e):
+                _mark_token_session(False, "token renewal rejected — hard-expired at midnight ET, relink required")
             await alerts.send(
                 "warning", "token_keepalive_failed",
                 f"E*TRADE access token renewal failed — a relink may be required: {e}",
@@ -4397,16 +4447,32 @@ async def _reconcile_fetch_portfolio() -> Dict[str, Any]:
     tokens = load_tokens()
     if not tokens:
         raise Exception("E*TRADE not linked")
-    acct_key = await _resolve_account_id_key(tokens)
-    return await _raw_client(tokens).get_portfolio(acct_key)
+    try:
+        acct_key = await _resolve_account_id_key(tokens)
+        result = await _raw_client(tokens).get_portfolio(acct_key)
+    except Exception as e:
+        # The reconciler runs every 15 min even with the app closed — it is
+        # the earliest detector of a midnight-ET token expiry.
+        if _looks_like_auth_failure(e):
+            _mark_token_session(False, "reconcile broker fetch rejected — token expired, relink required")
+        raise
+    _mark_token_session(True, "reconcile broker fetch ok")
+    return result
 
 
 async def _reconcile_fetch_orders() -> Dict[str, Any]:
     tokens = load_tokens()
     if not tokens:
         raise Exception("E*TRADE not linked")
-    acct_key = await _resolve_account_id_key(tokens)
-    return await _raw_client(tokens).list_orders(acct_key)
+    try:
+        acct_key = await _resolve_account_id_key(tokens)
+        result = await _raw_client(tokens).list_orders(acct_key)
+    except Exception as e:
+        if _looks_like_auth_failure(e):
+            _mark_token_session(False, "reconcile broker fetch rejected — token expired, relink required")
+        raise
+    _mark_token_session(True, "reconcile broker fetch ok")
+    return result
 
 
 async def _reconcile_cancel(order_id: str) -> bool:
@@ -4696,6 +4762,8 @@ async def status():
         "last_reconcile": last_reconcile,
         "reconcile_interval_seconds": RECONCILE_INTERVAL_SECONDS,
         "alert_webhook_configured": alerts.webhook_configured(),
+        "broker_linked": load_tokens() is not None,
+        **_token_session_fields(),
         "filters": {
             "min_score": MIN_SCORE,
             "min_score_trending": MIN_SCORE_TRENDING,
