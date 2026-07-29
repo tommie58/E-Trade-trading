@@ -1721,6 +1721,228 @@ async def reconciliation_loop(
 
 ''')
 
+_bundle_load('trailing_engine', r'''
+"""
+Server-side Trailing-Stop Engine — pure math, no I/O.
+=====================================================
+
+Python port of the app's `trailingEngine.ts` so the SAME tiered, real-money
+trail runs at the broker even when the phone is locked or the app is killed.
+
+The ladder mirrors how a disciplined day trader manages a live position:
+
+1. BREAKEVEN LOCK — once the trade has shown +0.75R of open profit, the stop
+   can never sit below entry again. A winner never round-trips to a full loss.
+2. TIERED TIGHTENING — the trail distance shrinks as profit grows:
+     • < 1R open profit → trail 1.00R behind the high-water mark ("initial")
+     • ≥ 1R             → trail 0.75R ("protect")
+     • ≥ 2R             → trail 0.50R ("locked")
+     • ≥ 3R             → trail 0.35R ("runner")
+3. ATR NOISE FLOOR — never tighter than 0.45 × ATR (capped at the initial 1R)
+   so intraday noise can't shake out a healthy runner.
+4. MONOTONIC RATCHET — the stop only ever moves in the trade's favor.
+
+`plan_ratchet` adds the broker-aware layer: given a tracked position record
+and a live mark, it returns the watermark updates plus whether the resting
+stop order should be cancel/replaced (only when the improvement clears a
+minimum step, so broker API quota isn't burned on penny moves).
+
+Pure functions only — the caller owns quotes, order placement, and state.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+# MFE (in R) at which the stop locks to breakeven.
+BREAKEVEN_TRIGGER_R = 0.75
+# Fraction of ATR the trail must always leave for normal noise.
+ATR_NOISE_FLOOR = 0.45
+
+# Profit-tier ladder: (minimum MFE in R, trail distance as fraction of R, tier).
+TIER_LADDER = (
+    (3.0, 0.35, "runner"),
+    (2.0, 0.50, "locked"),
+    (1.0, 0.75, "protect"),
+)
+
+TRAIL_TIER_LABEL = {
+    "initial": "Initial 1R trail",
+    "breakeven": "Breakeven locked",
+    "protect": "+1R — trailing 0.75R",
+    "locked": "+2R — trailing 0.50R",
+    "runner": "+3R runner — trailing 0.35R",
+}
+
+
+def _round2(n: float) -> float:
+    return round(n * 100) / 100.0
+
+
+def _finite(value: Any) -> Optional[float]:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
+
+
+def trail_tier_for(r_multiple: float) -> Dict[str, Any]:
+    """Resolve the tier + trail fraction for a given MFE in R multiples."""
+    for min_r, frac, tier in TIER_LADDER:
+        if r_multiple >= min_r:
+            return {"tier": tier, "frac": frac}
+    if r_multiple >= BREAKEVEN_TRIGGER_R:
+        return {"tier": "breakeven", "frac": 1.0}
+    return {"tier": "initial", "frac": 1.0}
+
+
+def compute_trail_level(
+    side: str,
+    entry_price: float,
+    stop_loss: float,
+    high_since: float,
+    low_since: float,
+    atr: Optional[float] = None,
+    prev_trail: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Compute the current trailing-stop level for a position.
+
+    side: "BUY" (long) or "SELL" (short). Degenerate inputs fall back to the
+    hard stop with the initial tier — a protective level is always returned.
+    """
+    is_buy = str(side or "BUY").upper() != "SELL"
+    entry = _finite(entry_price) or 0.0
+    stop = _finite(stop_loss) or 0.0
+    risk = abs(entry - stop)
+
+    fallback = {
+        "trail_price": _round2(stop),
+        "trail_distance": _round2(risk),
+        "tier": "initial",
+        "r_multiple": 0.0,
+        "breakeven_locked": False,
+    }
+    if entry <= 0 or risk <= 0:
+        return fallback
+
+    high = _finite(high_since)
+    low = _finite(low_since)
+    water_mark = (
+        max(entry, high) if (is_buy and high is not None)
+        else min(entry, low) if (not is_buy and low is not None)
+        else entry
+    )
+    if water_mark <= 0:
+        return fallback
+
+    mfe = (water_mark - entry) if is_buy else (entry - water_mark)
+    r_multiple = mfe / risk
+
+    rung = trail_tier_for(r_multiple)
+    distance = rung["frac"] * risk
+    atr_f = _finite(atr)
+    if atr_f is not None and atr_f > 0:
+        distance = max(distance, min(risk, ATR_NOISE_FLOOR * atr_f))
+
+    raw = (water_mark - distance) if is_buy else (water_mark + distance)
+
+    if r_multiple >= BREAKEVEN_TRIGGER_R:
+        raw = max(raw, entry) if is_buy else min(raw, entry)
+
+    trail = max(stop, raw) if is_buy else min(stop, raw)
+    prev = _finite(prev_trail)
+    if prev is not None and prev > 0:
+        trail = max(trail, prev) if is_buy else min(trail, prev)
+    trail = _round2(trail)
+
+    return {
+        "trail_price": trail,
+        "trail_distance": _round2(distance),
+        "tier": rung["tier"],
+        "r_multiple": round(r_multiple * 100) / 100.0,
+        "breakeven_locked": (trail >= entry) if is_buy else (trail <= entry),
+    }
+
+
+def plan_ratchet(
+    position: Dict[str, Any],
+    mark: float,
+    min_step_frac: float = 0.10,
+    min_step_abs: float = 0.02,
+) -> Optional[Dict[str, Any]]:
+    """Decide whether a position's resting stop should be ratcheted.
+
+    `position` is a bot position record. For options the caller must pass the
+    option PREMIUM as `mark` and premium-basis entry/stop via the
+    `entry_premium` / `stop_premium` fields. Returns None when the position
+    can't be trailed (missing basis), otherwise a plan dict:
+
+      {
+        "entry", "initial_stop", "current_stop",   # basis used
+        "high_since", "low_since",                  # updated watermarks
+        "trail": {...compute_trail_level result},
+        "should_replace": bool,                     # cancel/replace at broker?
+        "new_stop": float,                          # level to rest if so
+      }
+
+    A replace is only proposed when the improvement over the currently resting
+    level clears max(min_step_abs, min_step_frac × initial risk) — small
+    ratchets aren't worth a cancel/replace round-trip at the broker.
+    """
+    is_option = bool((position.get("contract") or {}).get("right"))
+    side = str(position.get("action") or "BUY").upper()
+    if is_option:
+        side = "BUY"  # options are held long here; exits are SELL_CLOSE
+        entry = _finite(position.get("entry_premium"))
+        initial = _finite(position.get("initial_stop") or position.get("stop_premium"))
+    else:
+        entry = _finite(position.get("entry"))
+        initial = _finite(position.get("initial_stop") or position.get("stop"))
+
+    mark_f = _finite(mark)
+    if entry is None or entry <= 0 or initial is None or initial <= 0 \
+            or mark_f is None or mark_f <= 0:
+        return None
+    risk = abs(entry - initial)
+    if risk <= 0:
+        return None
+
+    is_buy = side != "SELL"
+    high = _finite(position.get("trail_high")) or entry
+    low = _finite(position.get("trail_low")) or entry
+    high = max(high, mark_f)
+    low = min(low, mark_f)
+
+    prev_trail = _finite(position.get("trail"))
+    current_stop = prev_trail if (prev_trail is not None and prev_trail > 0) else initial
+
+    trail = compute_trail_level(
+        side=side,
+        entry_price=entry,
+        stop_loss=initial,
+        high_since=high,
+        low_since=low,
+        atr=position.get("atr"),
+        prev_trail=current_stop,
+    )
+
+    step = max(float(min_step_abs), float(min_step_frac) * risk)
+    improvement = (trail["trail_price"] - current_stop) if is_buy else (current_stop - trail["trail_price"])
+    return {
+        "entry": entry,
+        "initial_stop": initial,
+        "current_stop": current_stop,
+        "high_since": _round2(high),
+        "low_since": _round2(low),
+        "trail": trail,
+        "should_replace": improvement >= step,
+        "new_stop": trail["trail_price"],
+    }
+
+''')
+
 # =========================================================================
 # main_bot.py source follows (its `from x import y` calls resolve to the
 # embedded modules registered in sys.modules above).
@@ -1858,12 +2080,14 @@ try:  # package-style import (python -m bot.main_bot) or flat (uvicorn main_bot:
     from . import reconciliation
     from . import alerts
     from . import trade_ledger
+    from . import trailing_engine
 except ImportError:
     from state_store import StateStore, LockNotAcquired
     from etrade_async import ETradeAsyncClient, ETradeAPIError, OTOCOUnsupported
     import reconciliation
     import alerts
     import trade_ledger
+    import trailing_engine
 
 load_dotenv()
 
@@ -1883,7 +2107,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.6.0-balance-compat-park-replay"
+BOT_VERSION = "5.7.0-server-trail"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 85 / trending 80).
@@ -1932,6 +2156,14 @@ RECONCILE_INTERVAL_SECONDS = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "300"))
 RECONCILE_OFFHOURS_SECONDS = int(os.getenv("RECONCILE_OFFHOURS_SECONDS", "900"))
 RECONCILE_AUTO_HEAL = os.getenv("RECONCILE_AUTO_HEAL", "true").lower() == "true"
 STARTUP_RECONCILE_TIMEOUT_SECONDS = int(os.getenv("STARTUP_RECONCILE_TIMEOUT_SECONDS", "90"))
+# Server-side trailing-stop engine — ratchets the RESTING protective stop at
+# the broker using the same tiered ladder as the app (breakeven at +0.75R,
+# 0.75R/0.50R/0.35R tiers), so the trail keeps working with the app closed.
+# A cancel/replace only fires when the improvement clears the min step
+# (fraction of initial risk), keeping broker API usage sane.
+TRAIL_ENGINE_ENABLED = os.getenv("TRAIL_ENGINE_ENABLED", "true").lower() == "true"
+TRAIL_INTERVAL_SECONDS = int(os.getenv("TRAIL_INTERVAL_SECONDS", "30"))
+TRAIL_MIN_STEP_FRAC = float(os.getenv("TRAIL_MIN_STEP_FRAC", "0.10"))
 # Real-time alerting: Slack/Discord/generic JSON webhook. Alerts always land
 # in the log and GET /alerts even without a webhook.
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
@@ -4199,6 +4431,10 @@ async def execute_live_order(payload: dict):
                     pos_rec = await state.get_position(str(symbol).upper())
                     if pos_rec is not None:
                         pos_rec["stop_premium"] = stop_premium
+                        # Premium basis for the server-side trailing engine —
+                        # without it an option position cannot be trailed.
+                        if fill_ref > 0:
+                            pos_rec["entry_premium"] = round(fill_ref, 2)
                         await state.set_position(str(symbol).upper(), pos_rec)
                     logger.info(
                         f"[STOP GUARD] option guard armed for {symbol} at premium {stop_premium:.2f} "
@@ -4481,19 +4717,27 @@ async def _reconcile_cancel(order_id: str) -> bool:
 
 async def _reconcile_rearm_guard(ticker: str, pos: dict) -> None:
     """Re-arm a protective stop for a position the reconciler found
-    UNPROTECTED (filled at broker, no live stop, no active guard)."""
+    UNPROTECTED (filled at broker, no live stop, no active guard). Re-arms at
+    the EFFECTIVE level — the trailing engine's ratcheted trail when one is
+    recorded — never back at the looser original stop."""
     qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
     if qty < 1:
         return
+    is_buy = str(pos.get("action") or "BUY").upper() != "SELL"
+    trail = float(pos.get("trail") or 0)
     contract = pos.get("contract")
     if contract and contract.get("right"):
         premium = float(pos.get("stop_premium") or 0)
+        if trail > 0:
+            premium = max(premium, trail)
         if premium <= 0:
             logger.warning(f"[RECONCILE] cannot re-arm option stop for {ticker} — no stop premium recorded")
             return
         stop_info = await _place_option_protective_stop(ticker, dict(contract), qty, premium)
     else:
         stop = float(pos.get("stop") or 0)
+        if trail > 0:
+            stop = max(stop, trail) if is_buy else (min(stop, trail) if stop > 0 else trail)
         if stop <= 0:
             return
         stop_info = await _place_protective_stop(ticker, str(pos.get("action") or "BUY"), qty, stop)
@@ -4518,6 +4762,162 @@ def _start_reconciler() -> None:
         stop_flag=lambda: _worker_stop,
         alert=alerts.send,
     ))
+
+
+# ==================== SERVER-SIDE TRAILING-STOP ENGINE ====================
+# The app's tiered trail (breakeven lock at +0.75R, then 0.75R/0.50R/0.35R
+# tiers) previously only ran while the phone had the app open. This worker
+# runs the SAME ladder at the broker: every TRAIL_INTERVAL_SECONDS during
+# market hours it marks each tracked position, ratchets the watermark, and
+# cancel/replaces the RESTING protective stop when the trail improves enough.
+# It keeps running when the kill switch is engaged — tightening protection is
+# a defensive action, never an entry.
+
+async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
+    """Mark one position, ratchet its watermark, and cancel/replace the
+    resting stop when the tiered trail has improved past the min step."""
+    contract = pos.get("contract")
+    is_option = bool(contract and contract.get("right"))
+    qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
+    stop_order_id = pos.get("stop_order_id")
+    if qty < 1 or not stop_order_id:
+        return
+
+    bid, ask = await _current_bid_ask(ticker, dict(contract) if is_option else None)
+    is_buy = str(pos.get("action") or "BUY").upper() != "SELL"
+    # Conservative mark: longs (and long options) trail off the BID, shorts
+    # off the ASK — the trail only ratchets on prices we could actually exit at.
+    mark = bid if (is_buy or is_option) else ask
+    if mark <= 0:
+        return
+
+    plan = trailing_engine.plan_ratchet(pos, mark, min_step_frac=TRAIL_MIN_STEP_FRAC)
+    if plan is None:
+        return
+
+    prev_tier = pos.get("trail_tier")
+    pos["initial_stop"] = plan["initial_stop"]
+    pos["trail_high"] = plan["high_since"]
+    pos["trail_low"] = plan["low_since"]
+    pos["trail_tier"] = plan["trail"]["tier"]
+    pos["trail_r"] = plan["trail"]["r_multiple"]
+    pos["breakeven_locked"] = plan["trail"]["breakeven_locked"]
+    pos["trail_checked_at"] = _utcnow().isoformat()
+
+    new_stop = plan["new_stop"]
+    if is_option:
+        new_stop = _round_to_option_tick(new_stop, "down")
+    replace = plan["should_replace"] and new_stop > float(plan["current_stop"]) if is_buy \
+        else plan["should_replace"] and new_stop < float(plan["current_stop"])
+    if not replace:
+        await state.set_position(ticker, pos)
+        return
+
+    # Cancel/replace: never leave two live stops, and only place after the
+    # cancel is confirmed (same discipline as the stop guard's replace flow).
+    cancelled = await _cancel_order_safe(stop_order_id)
+    if not cancelled:
+        logger.warning(f"[TRAIL] {ticker} could not cancel resting stop {stop_order_id} — ratchet skipped this pass")
+        await state.set_position(ticker, pos)
+        return
+
+    stop_info = None
+    last_err: Optional[Exception] = None
+    for attempt in (1, 2):
+        try:
+            if is_option:
+                stop_info = await _place_option_protective_stop(ticker, dict(contract), qty, new_stop)
+            else:
+                stop_info = await _place_protective_stop(ticker, str(pos.get("action") or "BUY"), qty, new_stop)
+            break
+        except Exception as e:
+            last_err = e
+            logger.error(f"[TRAIL] {ticker} ratchet placement failed (attempt {attempt}/2): {e}")
+
+    if stop_info is None:
+        # Old stop is cancelled and the new one didn't stick — the position is
+        # UNPROTECTED. Record the trail level so the reconciler re-arms at the
+        # ratcheted price, and scream.
+        pos["stop_order_id"] = None
+        pos["trail"] = new_stop
+        await state.set_position(ticker, pos)
+        await trade_ledger.record("trail_ratchet_failed", {
+            "ticker": ticker, "new_stop": new_stop, "error": str(last_err),
+        })
+        await alerts.send(
+            "critical", "trail_ratchet_failed",
+            f"{ticker}: trailing ratchet cancelled the old stop but the new stop at {new_stop:.2f} "
+            f"failed to rest — position unprotected until the reconciler re-arms: {last_err}",
+            dedupe_key=f"trail_fail:{ticker}",
+        )
+        return
+
+    pos["stop_order_id"] = stop_info["order_id"]
+    pos["trail"] = float(stop_info["stop"])
+    if is_option:
+        pos["stop_premium"] = float(stop_info["stop"])
+    await state.set_position(ticker, pos)
+    tier = str(plan["trail"]["tier"])
+    logger.info(
+        f"[TRAIL] ⤴ {ticker} stop ratcheted {plan['current_stop']:.2f} → {float(stop_info['stop']):.2f} "
+        f"({tier}, {plan['trail']['r_multiple']:+.2f}R, order={stop_info['order_id']})"
+    )
+    await trade_ledger.record("trail_ratcheted", {
+        "ticker": ticker, "kind": "option" if is_option else "equity",
+        "from": plan["current_stop"], "to": float(stop_info["stop"]),
+        "tier": tier, "r_multiple": plan["trail"]["r_multiple"],
+        "breakeven_locked": plan["trail"]["breakeven_locked"],
+        "order_id": stop_info["order_id"],
+    })
+    if tier != prev_tier:
+        await alerts.send(
+            "info", "trail_tier_advanced",
+            f"{ticker}: {trailing_engine.TRAIL_TIER_LABEL.get(tier, tier)} — stop now {float(stop_info['stop']):.2f} "
+            f"(+{plan['trail']['r_multiple']:.2f}R shown)",
+            dedupe_key=f"trail_tier:{ticker}:{tier}",
+        )
+
+
+async def _trail_pass() -> None:
+    """One trailing pass over every tracked position with a resting stop.
+    Positions whose entry guard is still active are skipped — the guard owns
+    the stop until it finishes."""
+    positions = await state.all_positions()
+    if not positions:
+        return
+    guards = await state.all_guards()
+    for ticker, pos in positions.items():
+        guard = guards.get(ticker)
+        if guard and not guard.get("done"):
+            continue
+        try:
+            await _trail_ratchet_one(ticker, pos)
+        except Exception as e:
+            logger.warning(f"[TRAIL] {ticker} pass failed: {e}")
+
+
+async def trailing_worker():
+    """Continuous server-side trail. Runs each pass under the distributed
+    `lock:trail_engine` so exactly one worker trails at a time."""
+    if not TRAIL_ENGINE_ENABLED:
+        logger.info("[TRAIL] server-side trailing engine DISABLED (TRAIL_ENGINE_ENABLED=false)")
+        return
+    logger.info(
+        f"[TRAIL] server-side trailing engine started — every {TRAIL_INTERVAL_SECONDS}s in-session, "
+        f"min step {TRAIL_MIN_STEP_FRAC:.0%} of initial risk"
+    )
+    while not _worker_stop:
+        try:
+            if _is_market_open() and load_tokens() is not None:
+                lock = state.lock("trail_engine", ttl_ms=max(60_000, TRAIL_INTERVAL_SECONDS * 2000))
+                if await lock.try_acquire():
+                    try:
+                        await _trail_pass()
+                    finally:
+                        await lock.release()
+        except Exception as e:
+            logger.error(f"[TRAIL] loop error: {e}")
+        await asyncio.sleep(TRAIL_INTERVAL_SECONDS)
 
 
 async def _startup_reconcile() -> None:
@@ -4585,6 +4985,7 @@ async def start_worker():
     global _worker_task
     _worker_task = asyncio.create_task(placement_worker())
     asyncio.create_task(token_keepalive_worker())
+    asyncio.create_task(trailing_worker())
 
 
 # ==================== STARTUP ====================
@@ -4761,6 +5162,11 @@ async def status():
         "state_backend": state.backend_name,
         "last_reconcile": last_reconcile,
         "reconcile_interval_seconds": RECONCILE_INTERVAL_SECONDS,
+        "trail_engine": {
+            "enabled": TRAIL_ENGINE_ENABLED,
+            "interval_seconds": TRAIL_INTERVAL_SECONDS,
+            "min_step_frac": TRAIL_MIN_STEP_FRAC,
+        },
         "alert_webhook_configured": alerts.webhook_configured(),
         "broker_linked": load_tokens() is not None,
         **_token_session_fields(),
