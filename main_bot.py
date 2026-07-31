@@ -1085,12 +1085,31 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("etrade-bot.alerts")
 
 ALERTS_RECENT_KEY = "alerts:recent"
+ALERTS_CONFIG_KEY = "alerts:config"
+ALERTS_LAST_DELIVERY_KEY = "alerts:last_delivery"
 ALERTS_RECENT_MAX = 200
 _VALID_SEVERITIES = {"info", "warning", "error", "critical"}
+_SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2, "critical": 3}
+DEFAULT_MIN_SEVERITY = "warning"
 
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def mask_webhook_url(url: Optional[str]) -> Optional[str]:
+    """Keep scheme + host + first path segment; hide the secret tail.
+    e.g. https://discord.com/api/webhooks/123…/abc… → https://discord.com/api/…9xYz
+    """
+    if not url:
+        return None
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        tail = url[-4:] if len(url) > 24 else ""
+        return f"{p.scheme}://{p.netloc}/…{tail}"
+    except Exception:
+        return "…" + url[-4:]
 
 
 class AlertManager:
@@ -1098,11 +1117,90 @@ class AlertManager:
                  dedupe_seconds: int = 300) -> None:
         self._state = state
         self._webhook_url = (webhook_url or "").strip() or None
+        self._min_severity = DEFAULT_MIN_SEVERITY
         self._dedupe_seconds = max(10, int(dedupe_seconds))
 
     @property
     def webhook_configured(self) -> bool:
         return self._webhook_url is not None
+
+    async def load_persisted(self) -> None:
+        """Apply a webhook config saved via POST /alerts/config (survives
+        restarts; overrides the env default when present)."""
+        try:
+            raw = await self._state.get(ALERTS_CONFIG_KEY)
+            if not raw:
+                return
+            cfg = json.loads(raw)
+            url = (cfg.get("webhook_url") or "").strip()
+            self._webhook_url = url or None
+            sev = str(cfg.get("min_severity", "")).lower()
+            if sev in _VALID_SEVERITIES:
+                self._min_severity = sev
+            logger.info(
+                f"alerting: loaded persisted config — webhook={'configured' if self._webhook_url else 'cleared'}, "
+                f"min_severity={self._min_severity}"
+            )
+        except Exception as e:
+            logger.warning(f"alert config load failed (using env default): {e}")
+
+    async def set_config(self, webhook_url: Optional[str],
+                         min_severity: Optional[str]) -> Dict[str, Any]:
+        """Apply + persist a new delivery config. Empty/None URL clears delivery."""
+        if webhook_url is not None:
+            url = webhook_url.strip()
+            if url and not (url.startswith("https://") or url.startswith("http://")):
+                raise ValueError("webhook_url must start with http(s)://")
+            self._webhook_url = url or None
+        if min_severity is not None:
+            sev = min_severity.lower()
+            if sev not in _VALID_SEVERITIES:
+                raise ValueError(f"min_severity must be one of {sorted(_VALID_SEVERITIES)}")
+            self._min_severity = sev
+        payload = {"webhook_url": self._webhook_url or "", "min_severity": self._min_severity}
+        try:
+            await self._state.set(ALERTS_CONFIG_KEY, json.dumps(payload))
+        except Exception as e:
+            logger.warning(f"alert config persist failed (applied in-memory only): {e}")
+        return await self.get_config()
+
+    async def get_config(self) -> Dict[str, Any]:
+        last: Optional[Dict[str, Any]] = None
+        try:
+            raw = await self._state.get(ALERTS_LAST_DELIVERY_KEY)
+            if raw:
+                last = json.loads(raw)
+        except Exception:
+            last = None
+        return {
+            "webhook_configured": self.webhook_configured,
+            "webhook_url_masked": mask_webhook_url(self._webhook_url),
+            "min_severity": self._min_severity,
+            "last_delivery": last,
+        }
+
+    async def test_fire(self) -> Dict[str, Any]:
+        """Send a test alert through the FULL delivery chain (log + recent list +
+        webhook), bypassing dedupe and the min-severity filter, and return the
+        webhook delivery result so the app can show it immediately."""
+        record: Dict[str, Any] = {
+            "ts": _utcnow_iso(),
+            "severity": "info",
+            "event": "alert_delivery_test",
+            "message": "Test alert from TSIT Trading — delivery chain is working. "
+                       "Critical bot alerts (kill switch, unprotected positions, loss limits) will arrive here.",
+        }
+        logger.info(f"[ALERT][TEST] {record['message']}")
+        try:
+            await self._state.list_push_capped(
+                ALERTS_RECENT_KEY, json.dumps(record, default=str), ALERTS_RECENT_MAX,
+            )
+        except Exception as e:
+            logger.warning(f"test alert store failed: {e}")
+        if not self._webhook_url:
+            return {"delivered": False, "detail": "No webhook URL configured"}
+        ok, detail = await self._post_webhook(record)
+        return {"delivered": ok, "detail": detail}
 
     async def send(self, severity: str, event: str, message: str,
                    dedupe_key: Optional[str] = None,
@@ -1131,9 +1229,11 @@ class AlertManager:
         except Exception as e:
             logger.warning(f"alert store failed: {e}")
 
-        # 3) Webhook — deduped, best-effort.
+        # 3) Webhook — severity-filtered, deduped, best-effort.
         if not self._webhook_url:
             return
+        if _SEVERITY_RANK.get(severity, 1) < _SEVERITY_RANK.get(self._min_severity, 1):
+            return  # below the configured delivery floor — log + /alerts only
         if dedupe_key:
             try:
                 fresh = await self._state.set(
@@ -1146,17 +1246,35 @@ class AlertManager:
                 logger.warning(f"alert dedupe check failed (sending anyway): {e}")
         await self._post_webhook(record)
 
-    async def _post_webhook(self, record: Dict[str, Any]) -> None:
+    async def _post_webhook(self, record: Dict[str, Any]) -> tuple:
+        """POST to the webhook; returns (ok, detail) and records the outcome so
+        GET /alerts/config can show whether real delivery is actually working."""
+        ok = False
+        detail = ""
         try:
             import httpx  # lazy import — alerting must not hard-require httpx
             text = f"[{record['severity'].upper()}] {record['event']}: {record['message']}"
             payload = {"text": text, "content": text, **record}
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=8.0) as client:
                 resp = await client.post(self._webhook_url, json=payload)
-                if resp.status_code >= 400:
+                ok = resp.status_code < 400
+                detail = f"HTTP {resp.status_code}"
+                if not ok:
                     logger.warning(f"alert webhook returned {resp.status_code}")
         except Exception as e:
+            detail = str(e)[:200]
             logger.warning(f"alert webhook delivery failed: {e}")
+        try:
+            await self._state.set(ALERTS_LAST_DELIVERY_KEY, json.dumps({
+                "ts": _utcnow_iso(),
+                "ok": ok,
+                "detail": detail,
+                "event": record.get("event", ""),
+                "severity": record.get("severity", ""),
+            }))
+        except Exception:
+            pass
+        return ok, detail
 
     async def recent(self, count: int = 50) -> List[Dict[str, Any]]:
         try:
@@ -1187,6 +1305,32 @@ def init(state: Any, webhook_url: Optional[str], dedupe_seconds: int = 300) -> N
 
 def webhook_configured() -> bool:
     return _manager is not None and _manager.webhook_configured
+
+
+async def load_persisted() -> None:
+    """Load a previously saved webhook config from the state store (startup)."""
+    if _manager is not None:
+        await _manager.load_persisted()
+
+
+async def get_config() -> Dict[str, Any]:
+    if _manager is None:
+        return {"webhook_configured": False, "webhook_url_masked": None,
+                "min_severity": DEFAULT_MIN_SEVERITY, "last_delivery": None}
+    return await _manager.get_config()
+
+
+async def set_config(webhook_url: Optional[str], min_severity: Optional[str]) -> Dict[str, Any]:
+    """Apply + persist delivery config. Raises ValueError on bad input."""
+    if _manager is None:
+        raise RuntimeError("alerting not initialised")
+    return await _manager.set_config(webhook_url, min_severity)
+
+
+async def test_fire() -> Dict[str, Any]:
+    if _manager is None:
+        return {"delivered": False, "detail": "alerting not initialised"}
+    return await _manager.test_fire()
 
 
 async def send(severity: str, event: str, message: str,
@@ -2107,7 +2251,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.7.0-server-trail"
+BOT_VERSION = "5.8.1-root-webhook-alias"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 85 / trending 80).
@@ -4998,6 +5142,9 @@ async def on_startup():
     # Alerting + immutable ledger come up right after state — everything
     # downstream (breaker, guards, reconciler) reports through them.
     alerts.init(state, ALERT_WEBHOOK_URL, dedupe_seconds=ALERT_DEDUPE_SECONDS)
+    # A webhook saved live via POST /alerts/config overrides the env default
+    # and survives restarts — no redeploy needed to change alert delivery.
+    await alerts.load_persisted()
     trade_ledger.init(TRADE_LEDGER_FILE)
     await init_db()
     await preload_tokens()
@@ -5022,7 +5169,61 @@ async def on_shutdown():
     await state.close()
 
 
+# ==================== DISPATCH VERDICT LOG ====================
+# Every /webhook exit path used to answer 200 OK with the verdict buried in
+# the JSON body — rejected/cooldown/duplicate/skip dispatches left ZERO trace
+# in the server log. One INFO line per verdict + a capped state list surfaced
+# via /status.recent_dispatches makes every dispatch outcome observable.
+DISPATCH_LOG_KEY = "dispatch:recent"
+DISPATCH_LOG_MAX = 50
+
+
+async def _record_dispatch_verdict(pd: dict, verdict: str, reason: str = "") -> None:
+    ticker = str(pd.get("ticker") or "?").upper()
+    action = str(pd.get("action") or "?").upper()
+    mode = str(pd.get("mode") or "paper").lower()
+    line = f"📨 Dispatch verdict: {verdict.upper()} — {ticker} {action} mode={mode}"
+    if reason:
+        line += f" — {reason}"
+    if verdict in ("rejected", "failed", "error", "parked"):
+        logger.warning(line)
+    else:
+        logger.info(line)
+    entry = {
+        "ts": _utcnow().isoformat(),
+        "ticker": ticker,
+        "action": action,
+        "mode": mode,
+        "verdict": verdict,
+        "reason": reason or None,
+    }
+    try:
+        await state.list_push_capped(DISPATCH_LOG_KEY, json.dumps(entry), max_len=DISPATCH_LOG_MAX)
+    except Exception as e:
+        logger.warning(f"dispatch verdict record failed: {e}")
+
+
+async def _recent_dispatch_verdicts(count: int = 20) -> List[dict]:
+    out: List[dict] = []
+    try:
+        for raw in await state.list_range(DISPATCH_LOG_KEY, count):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    out.append(parsed)
+            except json.JSONDecodeError:
+                continue
+    except Exception as e:
+        logger.warning(f"dispatch verdict read failed: {e}")
+    return out
+
+
 # ==================== ENDPOINTS ====================
+# NOTE: "/" is a deliberate alias — apps configured with the bare bot host as
+# their webhook URL used to hit `POST /` and 404, silently losing the order
+# (observed live 2026-07-30 19:02 UTC). Root posts now land in the same
+# authenticated webhook handler.
+@app.post("/")
 @app.post("/webhook")
 async def webhook(
     request: Request,
@@ -5055,13 +5256,16 @@ async def webhook(
     # Atomic idempotency in Redis (SET NX + TTL) — a network retry or a second
     # worker can never double-place an order.
     if not await state.set(sig_key, "processing", ex=86400, nx=True):
-        return {"status": "duplicate", "existing_status": await state.get(sig_key), "signal_id": sig_key}
+        existing = await state.get(sig_key)
+        await _record_dispatch_verdict(pd, "duplicate", f"existing_status={existing}")
+        return {"status": "duplicate", "existing_status": existing, "signal_id": sig_key}
 
     # Server-side gates for LIVE ENTRIES. Closes always pass — a protective
     # exit must never be blocked by entry gating.
     if live_intent and not is_close:
         if not _is_market_open() and not bool(pd.get("force_execute")):
             await state.set(sig_key, "rejected", ex=86400)
+            await _record_dispatch_verdict(pd, "rejected", "market_closed")
             return {"status": "rejected", "reason": "market_closed", "signal_id": sig_key}
         ok, blocked = await _passes_entry_filters(pd)
         if not ok:
@@ -5071,11 +5275,13 @@ async def webhook(
                 "action": pd.get("action"),
                 "blocked_by": blocked,
             })
+            await _record_dispatch_verdict(pd, "rejected", "; ".join(blocked))
             return {"status": "rejected", "reason": "; ".join(blocked), "signal_id": sig_key}
         cooldown_key = f"cooldown:{str(pd.get('ticker') or '').upper()}"
         # NX write doubles as the existence check — atomic even across workers.
         if not await state.set(cooldown_key, "1", ex=TICKER_COOLDOWN_MINUTES * 60, nx=True):
             await state.set(sig_key, "cooldown", ex=86400)
+            await _record_dispatch_verdict(pd, "cooldown", "ticker_in_cooldown")
             return {"status": "cooldown", "reason": "ticker_in_cooldown", "signal_id": sig_key}
 
     job = {"payload": pd}
@@ -5083,12 +5289,20 @@ async def webhook(
         try:
             await state.queue_push(QUEUE_KEY, json.dumps(job))
             await state.set(sig_key, "queued", ex=86400)
+            await _record_dispatch_verdict(pd, "queued", "live" if live_intent else "non-live payload")
             return {"status": "queued", "signal_id": sig_key}
         except Exception as e:
             logger.warning(f"Redis push failed, processing directly: {e}")
     try:
         result = await execute_live_order(pd)
         await state.set(sig_key, str(result.get("status") or "processed"), ex=86400)
+        inner_status = str(result.get("status") or "processed")
+        inner_reason = str(result.get("reason") or "") if inner_status != "success" else ""
+        await _record_dispatch_verdict(
+            pd,
+            "placed" if inner_status == "success" else inner_status,
+            inner_reason,
+        )
         return {"status": "processed_directly", "result": result, "signal_id": sig_key}
     except Exception as e:
         err = str(e)
@@ -5098,6 +5312,7 @@ async def webhook(
         if live_intent and _is_auth_error(err):
             _park_signal(pd)
             await state.set(sig_key, "parked", ex=86400)
+            await _record_dispatch_verdict(pd, "parked", f"auth error — replays after relink: {err[:120]}")
             return {
                 "status": "error",
                 "message": f"{err} — signal parked; auto-replays after relink",
@@ -5106,6 +5321,7 @@ async def webhook(
             }
         await state.set(sig_key, "failed", ex=86400)
         logger.error(f"Direct processing failed: {e}")
+        await _record_dispatch_verdict(pd, "failed", err[:200])
         return {"status": "error", "message": str(e), "signal_id": sig_key}
 
 
@@ -5168,6 +5384,7 @@ async def status():
             "min_step_frac": TRAIL_MIN_STEP_FRAC,
         },
         "alert_webhook_configured": alerts.webhook_configured(),
+        "recent_dispatches": await _recent_dispatch_verdicts(20),
         "broker_linked": load_tokens() is not None,
         **_token_session_fields(),
         "filters": {
@@ -5188,6 +5405,53 @@ async def recent_alerts(count: int = Query(50, ge=1, le=200)):
         "alerts": await alerts.recent(count),
         "webhook_configured": alerts.webhook_configured(),
     }
+
+
+@app.get("/alerts/config")
+async def alerts_config():
+    """Current alert delivery config — masked webhook URL, severity floor, and
+    the outcome of the most recent webhook delivery attempt."""
+    return await alerts.get_config()
+
+
+@app.post("/alerts/config")
+async def alerts_config_set(
+    body: dict = Body(...),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Set (or clear) the alert delivery webhook live — no redeploy needed.
+    Body: { "webhook_url": "https://…" | "" , "min_severity": "warning" }.
+    Accepts Slack, Discord, ntfy, or any generic JSON receiver URL."""
+    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
+        raise HTTPException(401, "invalid secret")
+    url = body.get("webhook_url")
+    sev = body.get("min_severity")
+    if url is not None and not isinstance(url, str):
+        raise HTTPException(422, "webhook_url must be a string")
+    if sev is not None and not isinstance(sev, str):
+        raise HTTPException(422, "min_severity must be a string")
+    try:
+        cfg = await alerts.set_config(url, sev)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    logger.info(
+        f"Alert delivery config updated — webhook={'configured' if cfg['webhook_configured'] else 'CLEARED'}, "
+        f"min_severity={cfg['min_severity']}"
+    )
+    return cfg
+
+
+@app.post("/alerts/test")
+async def alerts_test(
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Fire a test alert through the FULL delivery chain and report whether the
+    webhook accepted it — lets the user prove delivery works BEFORE relying on
+    it for kill-switch / unprotected-position alerts."""
+    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
+        raise HTTPException(401, "invalid secret")
+    result = await alerts.test_fire()
+    return {**result, "config": await alerts.get_config()}
 
 
 @app.get("/ledger")
