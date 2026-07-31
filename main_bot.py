@@ -2087,6 +2087,681 @@ def plan_ratchet(
 
 ''')
 
+_bundle_load('scanner', r'''
+"""
+Server-Side Market Scanner — the bot's own eyes.
+================================================
+
+WHY THIS EXISTS
+---------------
+Every signal this bot ever executed was born in the phone app: the app polled
+quotes, scored setups and POSTed them to /webhook. The bot was a hands-only
+service — it could place, protect, trail and reconcile orders, but it could
+not SEE the market. Close the app (phone locked, backgrounded, killed) and the
+pipeline went blind: observed live on 2026-07-31, quote polling stopped at
+20:11 UTC and nothing but the 15-minute reconcile ticked for the rest of the
+session.
+
+This module gives the bot its own perception loop. It samples real E*TRADE
+quotes for a configurable universe on a fixed cadence, keeps a rolling
+intraday series in the shared state store, measures relative volume from the
+broker's own numbers, detects a small set of well-defined setups, scores them
+from those measurements, and dispatches qualifying candidates through the
+EXACT same path a webhook signal takes (so every server-side risk gate,
+cooldown, cap, kill switch and stop-guard still applies).
+
+DATA-TRUST RULES (non-negotiable)
+---------------------------------
+* RVOL is computed ONLY from broker-reported `totalVolume` and the 10-day
+  average daily volume, prorated by how much of the session has elapsed. If
+  either input is missing, rvol is None — the candidate can never be sent
+  live (the entry filter refuses unmeasured RVOL).
+* Scores are a weighted blend of MEASURED factors (rvol, momentum vs. open,
+  position vs. sampled VWAP, spread). Nothing is invented to clear a gate.
+* A candidate needs at least MIN_SAMPLES observations of its own before any
+  setup can be claimed — the scanner never judges a ticker it just met.
+
+MODES
+-----
+    off     — loop idles; nothing is measured or emitted.
+    shadow  — full measurement + scoring; candidates are recorded and visible
+              via /scanner/status, but NOTHING is dispatched. (default)
+    live    — qualifying candidates are dispatched as real signals.
+
+Everything (mode, universe, cadence, thresholds) is stored in the state store
+and changeable at runtime via POST /scanner/config — no redeploy.
+
+All broker/dispatch access is dependency-injected so this module never imports
+main_bot (no circular imports) and its helpers stay unit-testable.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+from datetime import datetime, time as dtime, timezone
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+
+try:  # package-style import (python -m bot...) or flat (uvicorn main_bot:app)
+    from .state_store import StateStore
+except ImportError:
+    from state_store import StateStore
+
+logger = logging.getLogger("etrade-bot.scanner")
+
+SCANNER_LOCK = "scanner"
+CONFIG_KEY = "scanner:config"
+REPORT_KEY = "scanner:last"
+SERIES_KEY_FMT = "scanner:series:{}"
+EMIT_KEY_FMT = "scanner:emits:{}"
+
+# A ticker must have this many of its own samples before a setup may be
+# claimed — no judging a symbol the scanner just started watching.
+MIN_SAMPLES = 4
+# Rolling samples kept per ticker (60s cadence → ~2h of session memory).
+MAX_SAMPLES = 120
+# E*TRADE accepts batched quote symbols; keep chunks conservative.
+QUOTE_CHUNK = 20
+
+MODES = ("off", "shadow", "live")
+
+DEFAULT_UNIVERSE = [
+    "AAPL", "NVDA", "TSLA", "MSFT", "META", "AMZN", "AMD", "GOOGL",
+    "PLTR", "NFLX", "AVGO", "MU", "COIN", "SMCI", "SPY", "QQQ",
+]
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "mode": "shadow",
+    "universe": list(DEFAULT_UNIVERSE),
+    "interval_seconds": 60,
+    "min_score": 85,
+    "min_rvol": 1.5,
+    "max_spread_pct": 0.35,
+    "min_price": 5.0,
+    "max_signals_per_day": 3,
+    "risk_pct": 0.5,
+}
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (no I/O — unit-testable)
+# ---------------------------------------------------------------------------
+def normalize_config(raw: Any) -> Dict[str, Any]:
+    """Coerce a stored/posted config blob into a complete, sane config."""
+    cfg = dict(DEFAULT_CONFIG)
+    if isinstance(raw, dict):
+        mode = str(raw.get("mode") or "").lower().strip()
+        if mode in MODES:
+            cfg["mode"] = mode
+        universe = raw.get("universe")
+        if isinstance(universe, str):
+            universe = universe.split(",")
+        if isinstance(universe, list):
+            cleaned: List[str] = []
+            for sym in universe:
+                s = str(sym or "").strip().upper()
+                if s and s.isalpha() and len(s) <= 6 and s not in cleaned:
+                    cleaned.append(s)
+            if cleaned:
+                cfg["universe"] = cleaned[:40]
+        for key, lo, hi, cast in (
+            ("interval_seconds", 20, 600, int),
+            ("min_score", 50, 100, int),
+            ("min_rvol", 1.0, 10.0, float),
+            ("max_spread_pct", 0.01, 5.0, float),
+            ("min_price", 0.0, 10_000.0, float),
+            ("max_signals_per_day", 0, 20, int),
+            ("risk_pct", 0.05, 5.0, float),
+        ):
+            if raw.get(key) is None:
+                continue
+            try:
+                cfg[key] = max(lo, min(hi, cast(raw[key])))
+            except (TypeError, ValueError):
+                continue
+    return cfg
+
+
+def session_progress(now_et: datetime) -> float:
+    """Fraction of the 9:30–16:00 ET regular session elapsed, clamped to
+    [0.05, 1.0]. The floor stops a 9:31 reading from dividing by ~0 and
+    manufacturing an absurd RVOL."""
+    open_m = 9 * 60 + 30
+    close_m = 16 * 60
+    minutes = now_et.hour * 60 + now_et.minute + now_et.second / 60.0
+    frac = (minutes - open_m) / float(close_m - open_m)
+    return max(0.05, min(1.0, frac))
+
+
+def compute_rvol(
+    total_volume: Optional[float],
+    avg_daily_volume: Optional[float],
+    progress: float,
+) -> Optional[float]:
+    """Relative volume from BROKER numbers only.
+
+    total_volume  — shares traded so far today (E*TRADE `totalVolume`)
+    avg_daily_volume — 10-day average daily volume (E*TRADE `volume10Day`)
+    progress      — fraction of the session elapsed (see session_progress)
+
+    Returns None when either input is missing/zero: an unmeasurable RVOL must
+    stay unmeasured rather than be guessed."""
+    try:
+        tv = float(total_volume or 0)
+        adv = float(avg_daily_volume or 0)
+    except (TypeError, ValueError):
+        return None
+    if tv <= 0 or adv <= 0 or progress <= 0:
+        return None
+    expected = adv * progress
+    if expected <= 0:
+        return None
+    return round(tv / expected, 2)
+
+
+def spread_pct(bid: Optional[float], ask: Optional[float]) -> Optional[float]:
+    """Bid/ask spread as a percent of the mid price (None when unquotable)."""
+    try:
+        b = float(bid or 0)
+        a = float(ask or 0)
+    except (TypeError, ValueError):
+        return None
+    if b <= 0 or a <= 0 or a < b:
+        return None
+    mid = (a + b) / 2.0
+    if mid <= 0:
+        return None
+    return round((a - b) / mid * 100.0, 3)
+
+
+def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Flatten an E*TRADE QuoteResponse into measured per-symbol readings.
+    Only fields the broker actually returned are populated — absent numbers
+    stay None so downstream logic can refuse to guess."""
+    out: List[Dict[str, Any]] = []
+    data = ((resp or {}).get("QuoteResponse") or {}).get("QuoteData")
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return out
+
+    def num(node: Dict[str, Any], key: str) -> Optional[float]:
+        val = node.get(key)
+        if val is None or val == "":
+            return None
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return None
+        return f if math.isfinite(f) else None
+
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        all_q = entry.get("All") or {}
+        product = entry.get("Product") or {}
+        symbol = str(product.get("symbol") or entry.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        last = num(all_q, "lastTrade")
+        if last is None or last <= 0:
+            continue
+        out.append({
+            "symbol": symbol,
+            "last": last,
+            "bid": num(all_q, "bid"),
+            "ask": num(all_q, "ask"),
+            "open": num(all_q, "open"),
+            "high": num(all_q, "high"),
+            "low": num(all_q, "low"),
+            "previous_close": num(all_q, "previousClose"),
+            "total_volume": num(all_q, "totalVolume"),
+            "avg_daily_volume": num(all_q, "volume10Day"),
+        })
+    return out
+
+
+def sampled_vwap(series: List[Dict[str, Any]]) -> Optional[float]:
+    """Volume-weighted average price built from the scanner's OWN samples,
+    weighting each observation by the volume traded since the previous one.
+    Returns None until at least two samples with a positive volume delta."""
+    num = 0.0
+    den = 0.0
+    prev_vol: Optional[float] = None
+    for sample in series:
+        price = sample.get("last")
+        vol = sample.get("total_volume")
+        if price is None:
+            continue
+        if vol is None:
+            prev_vol = None
+            continue
+        if prev_vol is not None and vol > prev_vol:
+            delta = vol - prev_vol
+            num += float(price) * delta
+            den += delta
+        prev_vol = float(vol)
+    if den <= 0:
+        return None
+    return round(num / den, 4)
+
+
+def pct_change(now: Optional[float], base: Optional[float]) -> Optional[float]:
+    try:
+        n = float(now or 0)
+        b = float(base or 0)
+    except (TypeError, ValueError):
+        return None
+    if b <= 0:
+        return None
+    return round((n - b) / b * 100.0, 3)
+
+
+def detect_setup(
+    series: List[Dict[str, Any]],
+    quote: Dict[str, Any],
+    vwap: Optional[float],
+) -> Optional[str]:
+    """Name the setup a reading satisfies, or None.
+
+    Setup names deliberately match the bot's ALLOWED_SETUPS vocabulary so a
+    scanner signal is judged by the exact same allowlist as an app signal.
+    Long-side only — the scanner never initiates a short."""
+    if len(series) < MIN_SAMPLES:
+        return None
+    last = quote.get("last")
+    if last is None:
+        return None
+    prior = [s.get("last") for s in series[:-1] if s.get("last") is not None]
+    if len(prior) < MIN_SAMPLES - 1:
+        return None
+    prior_high = max(prior)
+    prev_price = prior[-1]
+    open_px = quote.get("open")
+    prev_close = quote.get("previous_close")
+
+    # VWAP reclaim: was below the sampled VWAP on the previous observation and
+    # is now above it, with the session still positive on the day.
+    if vwap is not None and prev_price is not None:
+        if prev_price < vwap <= float(last) and (pct_change(last, open_px) or 0) > 0:
+            return "vwap reclaim"
+
+    # Breakout: new session high across the sampled window AND above the prior
+    # close by a real margin.
+    if float(last) > prior_high and (pct_change(last, prev_close) or 0) >= 0.5:
+        return "breakout"
+
+    # Momentum: sustained push off the open with price leading the VWAP.
+    change_open = pct_change(last, open_px)
+    if change_open is not None and change_open >= 0.3 and (vwap is None or float(last) >= vwap):
+        if float(last) >= prior_high:
+            return "momentum"
+    return None
+
+
+def score_candidate(
+    rvol: Optional[float],
+    change_from_open_pct: Optional[float],
+    vwap_distance_pct: Optional[float],
+    spread: Optional[float],
+    max_spread_pct: float,
+) -> int:
+    """Composite 55–100 score from MEASURED factors only.
+
+    Each factor is normalized to 0–1 and blended by weight; the result is
+    mapped onto 55..100. A candidate strong on every measured dimension lands
+    in the low 90s — nothing is padded to clear a threshold, and a missing
+    factor contributes 0 rather than an assumed value."""
+    def clamp01(x: float) -> float:
+        return max(0.0, min(1.0, x))
+
+    f_rvol = clamp01(((rvol or 0.0) - 1.0) / 2.0)
+    f_mom = clamp01(abs(change_from_open_pct or 0.0) / 1.5)
+    f_vwap = clamp01((vwap_distance_pct or 0.0) / 0.5)
+    f_liq = clamp01(1.0 - (spread if spread is not None else max_spread_pct) / max(max_spread_pct, 0.01))
+    blended = 0.40 * f_rvol + 0.25 * f_mom + 0.20 * f_vwap + 0.15 * f_liq
+    return int(round(55 + 45 * blended))
+
+
+def risk_levels(entry: float, series: List[Dict[str, Any]]) -> Tuple[float, float]:
+    """(stop, target) from the observed intraday range.
+
+    Stop = entry − max(observed swing, 0.4% floor); target = 2R. The swing is
+    the scanner's own sampled high−low, so the stop reflects real volatility
+    rather than a fixed guess."""
+    prices = [float(s["last"]) for s in series if s.get("last") is not None]
+    swing = (max(prices) - min(prices)) if len(prices) >= 2 else 0.0
+    distance = max(swing, entry * 0.004)
+    stop = round(max(0.01, entry - distance), 2)
+    target = round(entry + 2 * (entry - stop), 2)
+    return stop, target
+
+
+def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    """Webhook-shaped payload for a qualifying candidate.
+
+    `position_size_shares` is deliberately omitted — the bot sizes equity
+    entries from live account equity, the configured risk percent and the stop
+    distance, which is strictly safer than a scanner-side guess."""
+    return {
+        "ticker": candidate["ticker"],
+        "action": "BUY",
+        "mode": mode,
+        "instrument": "stock",
+        "entry": candidate["entry"],
+        "stop": candidate["stop"],
+        "target": candidate["target"],
+        "score": candidate["score"],
+        "rvol": candidate["rvol"],
+        "setup": candidate["setup"],
+        "source": "bot_scanner",
+        "timestamp": candidate["ts"],
+    }
+
+
+def evaluate_quote(
+    quote: Dict[str, Any],
+    series: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+    progress: float,
+) -> Dict[str, Any]:
+    """Turn one broker reading + its rolling series into a scored candidate.
+
+    Always returns a record (so /scanner/status can show WHY a ticker didn't
+    qualify); `qualifies` is only true when every measured requirement is met."""
+    last = float(quote["last"])
+    rvol = compute_rvol(quote.get("total_volume"), quote.get("avg_daily_volume"), progress)
+    spread = spread_pct(quote.get("bid"), quote.get("ask"))
+    vwap = sampled_vwap(series)
+    change_open = pct_change(last, quote.get("open"))
+    vwap_dist = pct_change(last, vwap) if vwap else None
+    setup = detect_setup(series, quote, vwap)
+    score = score_candidate(rvol, change_open, vwap_dist, spread, float(cfg["max_spread_pct"]))
+
+    reasons: List[str] = []
+    if len(series) < MIN_SAMPLES:
+        reasons.append(f"warming up ({len(series)}/{MIN_SAMPLES} samples)")
+    if rvol is None:
+        reasons.append("rvol not measurable (broker volume fields missing)")
+    elif rvol < float(cfg["min_rvol"]):
+        reasons.append(f"rvol {rvol} < {cfg['min_rvol']}")
+    if last < float(cfg["min_price"]):
+        reasons.append(f"price {last} < {cfg['min_price']}")
+    if spread is None:
+        reasons.append("no two-sided quote")
+    elif spread > float(cfg["max_spread_pct"]):
+        reasons.append(f"spread {spread}% > {cfg['max_spread_pct']}%")
+    if setup is None:
+        reasons.append("no setup")
+    if score < int(cfg["min_score"]):
+        reasons.append(f"score {score} < {cfg['min_score']}")
+
+    stop, target = risk_levels(last, series + [quote])
+    return {
+        "ticker": quote["symbol"],
+        "entry": round(last, 2),
+        "stop": stop,
+        "target": target,
+        "rvol": rvol,
+        "spread_pct": spread,
+        "change_from_open_pct": change_open,
+        "vwap": vwap,
+        "setup": setup,
+        "score": score,
+        "samples": len(series),
+        "qualifies": not reasons,
+        "blocked_by": reasons,
+        "ts": _utcnow().isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stateful engine
+# ---------------------------------------------------------------------------
+class Scanner:
+    """Perception loop. Broker + dispatch access is injected."""
+
+    def __init__(
+        self,
+        state: StateStore,
+        fetch_quotes: Callable[[List[str]], Awaitable[Dict[str, Any]]],
+        dispatch: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]],
+        is_market_open: Callable[[], bool],
+        has_tokens: Callable[[], bool],
+        now_et: Callable[[], datetime],
+        alert: Optional[Callable[..., Awaitable[None]]] = None,
+        stop_flag: Callable[[], bool] = lambda: False,
+    ) -> None:
+        self.state = state
+        self.fetch_quotes = fetch_quotes
+        self.dispatch = dispatch
+        self.is_market_open = is_market_open
+        self.has_tokens = has_tokens
+        self.now_et = now_et
+        self.alert = alert
+        self.stop_flag = stop_flag
+        self._config: Dict[str, Any] = dict(DEFAULT_CONFIG)
+
+    # ---- config -----------------------------------------------------------
+    async def load_config(self) -> Dict[str, Any]:
+        raw = await self.state.get(CONFIG_KEY)
+        if raw:
+            try:
+                self._config = normalize_config(json.loads(raw))
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("scanner config unreadable — using defaults")
+                self._config = dict(DEFAULT_CONFIG)
+        return dict(self._config)
+
+    async def set_config(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        merged = {**self._config, **(patch or {})}
+        self._config = normalize_config(merged)
+        await self.state.set(CONFIG_KEY, json.dumps(self._config))
+        logger.info(
+            f"🔭 Scanner config updated — mode={self._config['mode']} "
+            f"universe={len(self._config['universe'])} symbols "
+            f"every {self._config['interval_seconds']}s, min_score={self._config['min_score']}"
+        )
+        return dict(self._config)
+
+    @property
+    def config(self) -> Dict[str, Any]:
+        return dict(self._config)
+
+    # ---- rolling series ---------------------------------------------------
+    async def _series(self, ticker: str) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        try:
+            raw_items = await self.state.list_range(SERIES_KEY_FMT.format(ticker), MAX_SAMPLES)
+        except Exception as e:
+            logger.warning(f"series read failed for {ticker}: {e}")
+            return out
+        for raw in raw_items:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                out.append(parsed)
+        # list_range returns newest-first; the analytics want chronological.
+        out.reverse()
+        return out
+
+    async def _append_sample(self, quote: Dict[str, Any]) -> None:
+        sample = {
+            "ts": _utcnow().isoformat(),
+            "last": quote.get("last"),
+            "total_volume": quote.get("total_volume"),
+        }
+        try:
+            await self.state.list_push_capped(
+                SERIES_KEY_FMT.format(quote["symbol"]), json.dumps(sample), max_len=MAX_SAMPLES,
+            )
+        except Exception as e:
+            logger.warning(f"series write failed for {quote.get('symbol')}: {e}")
+
+    # ---- emission budget --------------------------------------------------
+    def _emit_key(self) -> str:
+        return EMIT_KEY_FMT.format(self.now_et().date().isoformat())
+
+    async def emits_today(self) -> int:
+        try:
+            raw = await self.state.get(self._emit_key())
+            return int(raw or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    async def _note_emit(self) -> int:
+        try:
+            return await self.state.incr(self._emit_key(), ex=36 * 3600)
+        except Exception as e:
+            logger.warning(f"emit counter failed: {e}")
+            return 0
+
+    # ---- one pass ---------------------------------------------------------
+    async def scan_once(self) -> Dict[str, Any]:
+        cfg = self._config
+        universe: List[str] = list(cfg["universe"])
+        quotes: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        for i in range(0, len(universe), QUOTE_CHUNK):
+            chunk = universe[i:i + QUOTE_CHUNK]
+            try:
+                quotes.extend(parse_quotes(await self.fetch_quotes(chunk)))
+            except Exception as e:
+                errors.append(f"{chunk[0]}…: {str(e)[:120]}")
+                logger.warning(f"scanner quote fetch failed for {len(chunk)} symbols: {e}")
+
+        progress = session_progress(self.now_et())
+        candidates: List[Dict[str, Any]] = []
+        for quote in quotes:
+            series = await self._series(quote["symbol"])
+            candidates.append(evaluate_quote(quote, series, cfg, progress))
+            await self._append_sample(quote)
+
+        candidates.sort(key=lambda c: (c["qualifies"], c["score"]), reverse=True)
+        emitted: List[Dict[str, Any]] = []
+        budget = int(cfg["max_signals_per_day"])
+        used = await self.emits_today()
+
+        for cand in candidates:
+            if not cand["qualifies"]:
+                continue
+            if cfg["mode"] != "live":
+                cand["dispatch"] = "shadow (not sent)"
+                continue
+            if used >= budget:
+                cand["dispatch"] = f"daily scanner budget reached ({budget})"
+                continue
+            quote = next((q for q in quotes if q["symbol"] == cand["ticker"]), None)
+            if quote is None:
+                continue
+            payload = build_signal(quote, cand, "live")
+            try:
+                result = await self.dispatch(payload)
+                verdict = str((result or {}).get("status") or "unknown")
+            except Exception as e:
+                verdict = f"error: {str(e)[:120]}"
+                logger.error(f"scanner dispatch failed for {cand['ticker']}: {e}")
+            cand["dispatch"] = verdict
+            used = await self._note_emit()
+            emitted.append({"ticker": cand["ticker"], "setup": cand["setup"],
+                            "score": cand["score"], "rvol": cand["rvol"], "verdict": verdict})
+            logger.info(
+                f"🔭 Scanner signal → {cand['ticker']} {cand['setup']} score={cand['score']} "
+                f"rvol={cand['rvol']} entry={cand['entry']} stop={cand['stop']} → {verdict}"
+            )
+            if self.alert is not None:
+                try:
+                    await self.alert(
+                        "info", "scanner_signal",
+                        f"Scanner dispatched {cand['ticker']} {cand['setup']} "
+                        f"(score {cand['score']}, rvol {cand['rvol']}) → {verdict}",
+                        dedupe_key=f"scanner:{cand['ticker']}",
+                    )
+                except Exception:
+                    logger.debug("scanner alert failed", exc_info=True)
+
+        report = {
+            "ts": _utcnow().isoformat(),
+            "mode": cfg["mode"],
+            "universe_size": len(universe),
+            "quotes_read": len(quotes),
+            "session_progress": round(progress, 3),
+            "qualifying": sum(1 for c in candidates if c["qualifies"]),
+            "emitted": emitted,
+            "emits_today": used,
+            "max_signals_per_day": budget,
+            "errors": errors[:5],
+            "candidates": candidates[:12],
+        }
+        try:
+            await self.state.set(REPORT_KEY, json.dumps(report), ex=36 * 3600)
+        except Exception as e:
+            logger.warning(f"scanner report write failed: {e}")
+        return report
+
+    async def last_report(self) -> Optional[Dict[str, Any]]:
+        raw = await self.state.get(REPORT_KEY)
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    async def status(self) -> Dict[str, Any]:
+        return {
+            "config": self.config,
+            "market_open": self.is_market_open(),
+            "broker_linked": self.has_tokens(),
+            "emits_today": await self.emits_today(),
+            "last_scan": await self.last_report(),
+        }
+
+    # ---- loop -------------------------------------------------------------
+    async def run(self) -> None:
+        await self.load_config()
+        logger.info(
+            f"🔭 Scanner engine started — mode={self._config['mode']}, "
+            f"{len(self._config['universe'])} symbols every {self._config['interval_seconds']}s"
+        )
+        while not self.stop_flag():
+            cfg = await self.load_config()  # picks up live config changes
+            delay = int(cfg["interval_seconds"])
+            try:
+                if cfg["mode"] == "off":
+                    delay = 60
+                elif not self.has_tokens():
+                    delay = 120
+                elif not self.is_market_open():
+                    delay = 300
+                else:
+                    lock = self.state.lock(SCANNER_LOCK, ttl_ms=max(30_000, delay * 2000))
+                    if await lock.try_acquire():
+                        try:
+                            await self.scan_once()
+                        finally:
+                            await lock.release()
+                    # else: another instance owns this pass.
+            except Exception as e:
+                logger.error(f"scanner loop error: {e}")
+                if self.alert is not None:
+                    try:
+                        await self.alert("error", "scanner_loop_error", str(e)[:200],
+                                         dedupe_key="scanner_loop")
+                    except Exception:
+                        logger.debug("scanner loop alert failed", exc_info=True)
+            await asyncio.sleep(max(5, delay))
+
+''')
+
 # =========================================================================
 # main_bot.py source follows (its `from x import y` calls resolve to the
 # embedded modules registered in sys.modules above).
@@ -2225,6 +2900,7 @@ try:  # package-style import (python -m bot.main_bot) or flat (uvicorn main_bot:
     from . import alerts
     from . import trade_ledger
     from . import trailing_engine
+    from . import scanner as scanner_mod
 except ImportError:
     from state_store import StateStore, LockNotAcquired
     from etrade_async import ETradeAsyncClient, ETradeAPIError, OTOCOUnsupported
@@ -2232,6 +2908,7 @@ except ImportError:
     import alerts
     import trade_ledger
     import trailing_engine
+    import scanner as scanner_mod
 
 load_dotenv()
 
@@ -2251,7 +2928,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.8.1-root-webhook-alias"
+BOT_VERSION = "5.10.0-server-scanner"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 85 / trending 80).
@@ -2308,6 +2985,20 @@ STARTUP_RECONCILE_TIMEOUT_SECONDS = int(os.getenv("STARTUP_RECONCILE_TIMEOUT_SEC
 TRAIL_ENGINE_ENABLED = os.getenv("TRAIL_ENGINE_ENABLED", "true").lower() == "true"
 TRAIL_INTERVAL_SECONDS = int(os.getenv("TRAIL_INTERVAL_SECONDS", "30"))
 TRAIL_MIN_STEP_FRAC = float(os.getenv("TRAIL_MIN_STEP_FRAC", "0.10"))
+# ---- V5.10 server-side scanner ----
+# The bot's own eyes: samples E*TRADE quotes for a universe on a fixed cadence,
+# measures RVOL from broker volume, detects setups and dispatches qualifying
+# candidates through the SAME gated path a webhook signal takes — so signals
+# keep being found with the phone app closed. Runtime config (mode/universe/
+# cadence/thresholds) lives in the state store and is changed via
+# POST /scanner/config; these env vars only seed the very first boot.
+# Default mode is "shadow": it measures and reports but dispatches nothing
+# until the user explicitly promotes it to "live".
+SCANNER_ENABLED = os.getenv("SCANNER_ENABLED", "true").lower() == "true"
+SCANNER_MODE = os.getenv("SCANNER_MODE", "shadow").lower()
+SCANNER_UNIVERSE = os.getenv("SCANNER_UNIVERSE", "")
+SCANNER_INTERVAL_SECONDS = int(os.getenv("SCANNER_INTERVAL_SECONDS", "60"))
+SCANNER_MAX_SIGNALS_PER_DAY = int(os.getenv("SCANNER_MAX_SIGNALS_PER_DAY", "3"))
 # Real-time alerting: Slack/Discord/generic JSON webhook. Alerts always land
 # in the log and GET /alerts even without a webhook.
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
@@ -2380,6 +3071,13 @@ _MAX_PARKED_SIGNALS = 10
 # "Code: 102, Please enter valid Account Key". We resolve the real key once
 # per session and cache it here (cleared on relink/disconnect).
 _resolved_account_id_key: Optional[str] = None
+
+# Account-binding provenance for the resolved key: which account real orders
+# actually route to, whether it matched the configured ETRADE_ACCOUNT_ID, and
+# whether the pick was an ambiguous fallback. Surfaced via /status so the app
+# can refuse to call the live path "trusted" while orders would land in an
+# account the user never named. Reset alongside the key on relink/disconnect.
+_account_binding: Optional[Dict[str, Any]] = None
 
 # Pending OAuth request tokens (token -> secret). E*TRADE request tokens are
 # single-use and expire ~5 minutes after issue. Memory is the PRIMARY store —
@@ -2537,35 +3235,58 @@ def _is_close_payload(p: dict) -> bool:
 
 
 # ==================== ENTRY FILTERS (live entries only) ====================
+def _is_connectivity_test(p: dict) -> bool:
+    """A `test: true` payload is a one-contract end-to-end connectivity probe,
+    not a strategy signal. It carries no real market measurements."""
+    return bool(p.get("test")) is True
+
+
 async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     """Server-side re-filter mirroring the Rork app's gating, evaluated against
     the reconciled Redis state (single source of truth). Quality checks apply
     only when the payload carries the field (score/rvol/mtf/setup); risk
     limits (kill switch, daily loss, trade count, positions, heat, duplicate
-    ticker) always apply."""
+    ticker) always apply.
+
+    CONNECTIVITY TESTS (`test: true`) skip the QUALITY gates only. A probe
+    ships placeholder quality fields by definition, so the old behaviour made
+    it structurally impossible to pass: observed live 2026-07-31 18:30 UTC as
+    `REJECTED - rvol 1 < 1.5; setup 'Connectivity Test' not allowlisted`,
+    leaving the user with no way to prove the real-money path works. Every
+    RISK gate below still applies to a probe — kill switch, daily loss, trade
+    count, position cap, portfolio heat and duplicate ticker are absolute."""
     blocked: List[str] = []
     if await state.is_killed():
         blocked.append("kill switch active")
 
-    regime = str(p.get("regime") or "").lower()
-    score = p.get("score")
-    if isinstance(score, (int, float)):
-        required = MIN_SCORE_TRENDING if "trending" in regime else MIN_SCORE
-        if score < required:
-            blocked.append(f"score {score} < {required}")
-    rvol = p.get("rvol")
-    if isinstance(rvol, (int, float)) and rvol < MIN_RVOL:
-        blocked.append(f"rvol {rvol} < {MIN_RVOL}")
-    mtf = p.get("mtf_alignment")
-    if isinstance(mtf, str) and mtf.strip():
-        try:
-            if int(mtf.split("/")[0]) < MIN_MTF:
-                blocked.append(f"mtf {mtf} < {MIN_MTF}/5")
-        except (ValueError, IndexError):
-            blocked.append("mtf_alignment unparseable")
-    setup = p.get("setup")
-    if isinstance(setup, str) and setup.strip() and ALLOWED_SETUPS and setup.lower().strip() not in ALLOWED_SETUPS:
-        blocked.append(f"setup '{setup}' not allowlisted")
+    is_probe = _is_connectivity_test(p)
+    if not is_probe:
+        regime = str(p.get("regime") or "").lower()
+        score = p.get("score")
+        if isinstance(score, (int, float)):
+            required = MIN_SCORE_TRENDING if "trending" in regime else MIN_SCORE
+            if score < required:
+                blocked.append(f"score {score} < {required}")
+        rvol = p.get("rvol")
+        if rvol is None:
+            # An absent RVOL means the app never MEASURED relative volume.
+            # Silently waving that through would place real money on an
+            # unverified decision input, so a live entry is refused outright.
+            blocked.append("rvol not measured (volume feed gap) — live entry needs a real reading")
+        elif isinstance(rvol, (int, float)) and rvol < MIN_RVOL:
+            blocked.append(f"rvol {rvol} < {MIN_RVOL}")
+        mtf = p.get("mtf_alignment")
+        if isinstance(mtf, str) and mtf.strip():
+            try:
+                if int(mtf.split("/")[0]) < MIN_MTF:
+                    blocked.append(f"mtf {mtf} < {MIN_MTF}/5")
+            except (ValueError, IndexError):
+                blocked.append("mtf_alignment unparseable")
+        setup = p.get("setup")
+        if isinstance(setup, str) and setup.strip() and ALLOWED_SETUPS and setup.lower().strip() not in ALLOWED_SETUPS:
+            blocked.append(f"setup '{setup}' not allowlisted")
+    else:
+        logger.info("🧪 Connectivity test payload — quality gates skipped, risk gates still enforced")
 
     daily = await state.get_daily()
     open_positions = await state.all_positions()
@@ -2707,13 +3428,14 @@ def _token_session_fields() -> Dict[str, Any]:
 
 
 def save_tokens(token: str, token_secret: str):
-    global _current_tokens, _resolved_account_id_key
+    global _current_tokens, _resolved_account_id_key, _account_binding
     logger.info("=== NEW TOKENS RECEIVED ===")
     # Fresh tokens are validated by the auth flow before they get here — the
     # session starts ACTIVE.
     _mark_token_session(True, "new tokens adopted")
     _current_tokens = {"oauth_token": token, "oauth_token_secret": token_secret}
     _resolved_account_id_key = None  # re-resolve accountIdKey for the new session
+    _account_binding = None
     # A fresh link is an explicit user action — clear any tripped breaker so
     # the relinked session starts clean instead of rejecting with 503.
     try:
@@ -3022,7 +3744,7 @@ async def etrade_auth_renew(data: dict = Body(...)):
 
 @app.post("/etrade/disconnect")
 async def etrade_disconnect():
-    global _current_tokens, _resolved_account_id_key
+    global _current_tokens, _resolved_account_id_key, _account_binding
     _current_tokens = None
     _resolved_account_id_key = None
     logger.info("User requested account disconnect")
@@ -3176,10 +3898,12 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
 
     target = (TARGET_ACCOUNT_ID or "").strip()
     chosen = None
+    matched = False
     if target:
         for acct in account_list:
             if target in {str(acct.get("accountId", "")), str(acct.get("accountIdKey", ""))}:
                 chosen = acct
+                matched = True
                 break
         if not chosen:
             logger.warning(
@@ -3198,6 +3922,39 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
     _resolved_account_id_key = str(key)
     acct_id = str(chosen.get("accountId", ""))
     logger.info(f"✅ Resolved accountIdKey for account ****{acct_id[-4:]} (desc={chosen.get('accountDesc', 'n/a')})")
+
+    # Account-binding transparency. Real orders route to whichever account was
+    # resolved here — if that was a FALLBACK pick (configured id matched
+    # nothing, or no id configured at all among several accounts), the user is
+    # trading an account they never named. Record it so /status can surface it
+    # and fire a one-shot alert instead of leaving it buried in a log line.
+    global _account_binding
+    _account_binding = {
+        "configured": target or None,
+        "resolved_account_id": acct_id or None,
+        "resolved_last4": acct_id[-4:] if acct_id else None,
+        "resolved_description": chosen.get("accountDesc") or None,
+        "account_count": len(account_list),
+        "matched_configured": matched,
+        "fallback": (not matched),
+        "ambiguous": (not matched) and len(account_list) > 1,
+    }
+    if target and not matched:
+        await alerts.send(
+            "warning", "account_binding_mismatch",
+            f"ETRADE_ACCOUNT_ID ({target}) matched none of {len(account_list)} linked accounts — "
+            f"orders will route to ****{acct_id[-4:] or '????'} ({chosen.get('accountDesc', 'n/a')}). "
+            f"Fix ETRADE_ACCOUNT_ID or clear it to silence this.",
+            dedupe_key=f"acctbind:{target}:{acct_id}",
+        )
+    elif not target and len(account_list) > 1:
+        await alerts.send(
+            "warning", "account_binding_unset",
+            f"ETRADE_ACCOUNT_ID is not set and {len(account_list)} accounts are linked — "
+            f"orders route to the first ACTIVE one (****{acct_id[-4:] or '????'}, "
+            f"{chosen.get('accountDesc', 'n/a')}). Set ETRADE_ACCOUNT_ID to pin it.",
+            dedupe_key=f"acctbind:unset:{acct_id}",
+        )
     return _resolved_account_id_key
 
 
@@ -5125,11 +5882,78 @@ async def _startup_reconcile() -> None:
         await lock.release()
 
 
+# ==================== SERVER-SIDE SCANNER WIRING ====================
+# Dependency-injected so scanner.py never imports main_bot. The loop runs
+# under the distributed `lock:scanner` — one instance scans at a time.
+scanner: Optional[scanner_mod.Scanner] = None
+
+
+async def _scanner_fetch_quotes(symbols: List[str]) -> Dict[str, Any]:
+    """Batched E*TRADE quote read for the scanner (same client/backoff path as
+    the app-facing /etrade/quote endpoint)."""
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("E*TRADE not linked")
+    market = pyetrade.ETradeMarket(
+        CONSUMER_KEY, CONSUMER_SECRET,
+        tokens["oauth_token"], tokens["oauth_token_secret"], dev=is_sandbox,
+    )
+    return await _etrade_call(market.get_quote, list(symbols), resp_format="json", source="scanner_quote")
+
+
+async def _scanner_dispatch(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Send a scanner candidate down the SAME pipeline as a webhook signal.
+    The payload is validated with the identical model first, so a malformed
+    scanner signal fails here instead of reaching the broker."""
+    try:
+        pd = WebhookPayload(**payload).dict()
+    except ValidationError as e:
+        return {"status": "invalid", "reason": str(e.errors()[:2])}
+    pd.pop("secret", None)
+    return await process_signal(pd)
+
+
+def _scanner_now_et() -> datetime:
+    return _utcnow().astimezone(_ET_ZONE)
+
+
+async def _start_scanner() -> None:
+    global scanner
+    scanner = scanner_mod.Scanner(
+        state,
+        _scanner_fetch_quotes,
+        _scanner_dispatch,
+        _is_market_open,
+        lambda: load_tokens() is not None,
+        _scanner_now_et,
+        alert=alerts.send,
+        stop_flag=lambda: _worker_stop,
+    )
+    # Stored config wins (survives restarts, changed live from the app); env
+    # vars only seed the very first boot.
+    stored = await scanner.load_config()
+    if not await state.get(scanner_mod.CONFIG_KEY):
+        seed: Dict[str, Any] = {
+            "mode": SCANNER_MODE if SCANNER_ENABLED else "off",
+            "interval_seconds": SCANNER_INTERVAL_SECONDS,
+            "max_signals_per_day": SCANNER_MAX_SIGNALS_PER_DAY,
+        }
+        if SCANNER_UNIVERSE.strip():
+            seed["universe"] = SCANNER_UNIVERSE
+        stored = await scanner.set_config(seed)
+    logger.info(
+        f"🔭 Scanner wired — mode={stored['mode']}, {len(stored['universe'])} symbols, "
+        f"every {stored['interval_seconds']}s, budget {stored['max_signals_per_day']}/day"
+    )
+    asyncio.create_task(scanner.run())
+
+
 async def start_worker():
     global _worker_task
     _worker_task = asyncio.create_task(placement_worker())
     asyncio.create_task(token_keepalive_worker())
     asyncio.create_task(trailing_worker())
+    await _start_scanner()
 
 
 # ==================== STARTUP ====================
@@ -5248,6 +6072,17 @@ async def webhook(
 
     pd = payload.dict()
     pd.pop("secret", None)  # never persist/queue the shared secret
+    return await process_signal(pd)
+
+
+async def process_signal(pd: dict) -> dict:
+    """Idempotency → gates → queue/execute for ONE signal.
+
+    Extracted from the /webhook handler so the server-side scanner dispatches
+    through the byte-identical path an app signal takes: same duplicate key,
+    same market-hours check, same entry filters, same ticker cooldown, same
+    queueing and the same parked-signal recovery. A scanner signal can never
+    take a shortcut around a risk gate."""
     sig_key = _signal_key(pd)
     is_close = _is_close_payload(pd)
     mode = str(pd.get("mode") or "paper").lower()
@@ -5334,6 +6169,7 @@ async def health():
         "live_trading": LIVE_TRADING,
         "linked": bool(tokens),
         "version": BOT_VERSION,
+        "scanner_mode": scanner.config["mode"] if scanner else "unavailable",
         "target_account_set": bool(TARGET_ACCOUNT_ID),
         "resolved_account_key": bool(_resolved_account_id_key),
         "circuit_breaker_open": await _breaker_is_open(),
@@ -5384,9 +6220,11 @@ async def status():
             "min_step_frac": TRAIL_MIN_STEP_FRAC,
         },
         "alert_webhook_configured": alerts.webhook_configured(),
+        "account_binding": _account_binding,
         "recent_dispatches": await _recent_dispatch_verdicts(20),
         "broker_linked": load_tokens() is not None,
         **_token_session_fields(),
+        "scanner": await scanner.status() if scanner else None,
         "filters": {
             "min_score": MIN_SCORE,
             "min_score_trending": MIN_SCORE_TRENDING,
@@ -5452,6 +6290,58 @@ async def alerts_test(
         raise HTTPException(401, "invalid secret")
     result = await alerts.test_fire()
     return {**result, "config": await alerts.get_config()}
+
+
+@app.get("/scanner/status")
+async def scanner_status():
+    """What the bot's own eyes currently see: config, last scan pass, the
+    scored candidates and — for every one that did NOT qualify — the exact
+    measured reason it was skipped."""
+    if scanner is None:
+        raise HTTPException(503, "scanner not initialized")
+    return await scanner.status()
+
+
+@app.post("/scanner/config")
+async def scanner_config_set(
+    body: dict = Body(...),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Change the scanner live — no redeploy.
+    Body: { "mode": "off"|"shadow"|"live", "universe": ["AAPL", ...],
+            "interval_seconds": 60, "min_score": 85, "min_rvol": 1.5,
+            "max_spread_pct": 0.35, "max_signals_per_day": 3 }"""
+    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
+        raise HTTPException(401, "invalid secret")
+    if scanner is None:
+        raise HTTPException(503, "scanner not initialized")
+    before = scanner.config["mode"]
+    cfg = await scanner.set_config(body or {})
+    if cfg["mode"] != before:
+        await trade_ledger.record("scanner_mode_changed", {"from": before, "to": cfg["mode"]})
+        await alerts.send(
+            "warning" if cfg["mode"] == "live" else "info",
+            "scanner_mode_changed",
+            f"Scanner mode {before} → {cfg['mode']} "
+            f"({len(cfg['universe'])} symbols, budget {cfg['max_signals_per_day']}/day)",
+            dedupe_key="scanner_mode",
+        )
+    return await scanner.status()
+
+
+@app.post("/scanner/scan")
+async def scanner_scan_now(
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Force one scan pass immediately and return the full report — lets the
+    user prove the scanner sees the market without waiting for the cadence."""
+    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
+        raise HTTPException(401, "invalid secret")
+    if scanner is None:
+        raise HTTPException(503, "scanner not initialized")
+    if load_tokens() is None:
+        raise HTTPException(409, "E*TRADE not linked — the scanner cannot read quotes")
+    return await scanner.scan_once()
 
 
 @app.get("/ledger")
