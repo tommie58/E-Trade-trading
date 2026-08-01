@@ -3824,6 +3824,9 @@ async def get_etrade_account():
                 "accountId": a.get("accountId"),
                 "accountType": a.get("accountType"),
                 "accountStatus": a.get("accountStatus"),
+                "accountDesc": a.get("accountDesc"),
+                "accountName": a.get("accountName"),
+                "institutionType": a.get("institutionType"),
             })
         # A successful authenticated call proves the session is alive.
         _mark_token_session(True, "account enumeration ok")
@@ -3834,10 +3837,44 @@ async def get_etrade_account():
     # Real balances so the app can size positions off the TRUE account value
     # instead of a stale default. Best-effort — never fail the linked check.
     balances = await _fetch_broker_balance() or {}
+
+    # IDENTITY OF THE ROUTED ACCOUNT, flat at the response root.
+    # The app reads snake_case scalars (`account_id`, `account_type`, …) — it
+    # does NOT walk the `accounts` array. Returning only the array meant the
+    # app showed "Account —" forever even with a perfectly healthy link.
+    # These name the ONE account orders actually route to, using the exact
+    # same precedence as order placement (resolved key → first ACTIVE → first).
+    routed: Dict[str, Any] = {}
+    if raw:
+        resolved_key = _resolved_account_id_key
+        if not resolved_key:
+            try:
+                resolved_key = await _resolve_account_id_key(tokens)
+            except Exception as e:
+                logger.warning(f"Account key resolution failed during /etrade/account: {e}")
+        try:
+            chosen = _account_for_balance(raw, resolved_key)
+        except Exception:
+            chosen = raw[0]
+        acct_id = str(chosen.get("accountId") or "").strip()
+        routed = {
+            "account_id": acct_id or None,
+            "account_id_key": str(chosen.get("accountIdKey") or "").strip() or None,
+            "account_type": chosen.get("accountType") or None,
+            "account_status": chosen.get("accountStatus") or None,
+            "account_desc": chosen.get("accountDesc") or chosen.get("accountName") or None,
+            "account_last4": acct_id[-4:] if acct_id else None,
+            "institution_type": chosen.get("institutionType") or None,
+        }
+
     return {
         "status": "linked",
         "linked": True,
         "accounts": accounts_out,
+        **routed,
+        # Provenance for the pick above — lets the app say "pinned" vs
+        # "fell back to this one" without a second /status round-trip.
+        "account_binding": _account_binding,
         "equity": balances.get("total"),
         "cash_buying_power": balances.get("available"),
         # Session health — `linked` means "tokens on file", these fields say
