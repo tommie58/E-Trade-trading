@@ -1453,6 +1453,16 @@ class TradeLedger:
 
     def tail(self, count: int = 100) -> List[Dict[str, Any]]:
         """Last `count` records, newest first."""
+        out = self.recent(count)
+        out.reverse()
+        return out
+
+    def recent(self, count: int = 100) -> List[Dict[str, Any]]:
+        """Last `count` records in CHRONOLOGICAL order (oldest first).
+
+        Replaying history (e.g. recomputing a day's realized P&L) needs events
+        in the order they happened, so opens are seen before the closes that
+        reference them."""
         out: List[Dict[str, Any]] = []
         try:
             if not self.path.exists():
@@ -1465,8 +1475,7 @@ class TradeLedger:
                 except json.JSONDecodeError:
                     continue
         except OSError as e:
-            logger.warning(f"ledger tail read failed: {e}")
-        out.reverse()
+            logger.warning(f"ledger read failed: {e}")
         return out
 
     def verify_chain(self) -> Tuple[bool, int, Optional[str]]:
@@ -1895,6 +1904,7 @@ Pure functions only — the caller owns quotes, order placement, and state.
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Optional
 
 # MFE (in R) at which the stop locks to breakeven.
@@ -1919,7 +1929,13 @@ TRAIL_TIER_LABEL = {
 
 
 def _round2(n: float) -> float:
-    return round(n * 100) / 100.0
+    """Round to 2dp with JS `Math.round` semantics (half away from -inf).
+
+    Python's built-in `round` is banker's rounding, so `round(10012.5)` is
+    10012 while JavaScript's `Math.round` gives 10013. The app and the bot
+    must agree on the cent, or the same trade shows two different stops.
+    """
+    return math.floor(n * 100 + 0.5) / 100.0
 
 
 def _finite(value: Any) -> Optional[float]:
@@ -1971,13 +1987,12 @@ def compute_trail_level(
     if entry <= 0 or risk <= 0:
         return fallback
 
-    high = _finite(high_since)
-    low = _finite(low_since)
-    water_mark = (
-        max(entry, high) if (is_buy and high is not None)
-        else min(entry, low) if (not is_buy and low is not None)
-        else entry
-    )
+    # Only the side-relevant watermark matters; a missing one is a degenerate
+    # input and falls back to the hard stop (mirrors the TypeScript engine).
+    mark = _finite(high_since) if is_buy else _finite(low_since)
+    if mark is None:
+        return fallback
+    water_mark = max(entry, mark) if is_buy else min(entry, mark)
     if water_mark <= 0:
         return fallback
 
@@ -2140,6 +2155,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 from datetime import datetime, time as dtime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -2175,13 +2191,40 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "mode": "shadow",
     "universe": list(DEFAULT_UNIVERSE),
     "interval_seconds": 60,
-    "min_score": 85,
+    "min_score": 75,
     "min_rvol": 1.5,
     "max_spread_pct": 0.35,
     "min_price": 5.0,
     "max_signals_per_day": 3,
     "risk_pct": 0.5,
 }
+
+# Symbols may never exceed this — one pasted watchlist must not blow the
+# broker's quote budget. Mirrored by the app's parseUniverse().
+UNIVERSE_LIMIT = 40
+# A watchlist may be typed with commas, spaces or semicolons; the app splits
+# on all three, so the bot must too or "AAPL NVDA TSLA" silently collapses.
+_SYMBOL_SPLIT = re.compile(r"[\s,;]+")
+_SYMBOL_RE = re.compile(r"^[A-Z]{1,6}$")
+
+# The scanner is UPSTREAM of the bot's live entry filter: everything it
+# dispatches is re-judged by _passes_entry_filters(). A scanner floor looser
+# than that filter can only ever produce candidates that are guaranteed to be
+# rejected server-side — noise in the log, no trade, and a user staring at a
+# threshold the bot silently overrides. main_bot injects its REAL (env-aware)
+# gate here at wiring time; the defaults mirror main_bot's own defaults.
+ENTRY_GATE_FLOORS: Dict[str, float] = {"min_score": 75.0, "min_rvol": 1.5}
+
+
+def set_entry_gate_floors(min_score: float, min_rvol: float) -> Dict[str, float]:
+    """Bind the scanner's configurable floors to the bot's live entry gate.
+    Called once from main_bot so the two can never drift apart."""
+    ENTRY_GATE_FLOORS["min_score"] = float(min_score)
+    ENTRY_GATE_FLOORS["min_rvol"] = float(min_rvol)
+    for key in ("min_score", "min_rvol"):
+        if DEFAULT_CONFIG[key] < ENTRY_GATE_FLOORS[key]:
+            DEFAULT_CONFIG[key] = type(DEFAULT_CONFIG[key])(ENTRY_GATE_FLOORS[key])
+    return dict(ENTRY_GATE_FLOORS)
 
 
 def _utcnow() -> datetime:
@@ -2191,28 +2234,45 @@ def _utcnow() -> datetime:
 # ---------------------------------------------------------------------------
 # Pure helpers (no I/O — unit-testable)
 # ---------------------------------------------------------------------------
+def parse_universe(raw: Any) -> List[str]:
+    """Free-text or list watchlist → clean symbols.
+
+    Byte-for-byte the same rules as the app's parseUniverse(): split on
+    whitespace/comma/semicolon, uppercase, ASCII A–Z only, 1–6 chars,
+    de-duplicated, capped at UNIVERSE_LIMIT."""
+    tokens: List[str] = []
+    if isinstance(raw, str):
+        tokens = _SYMBOL_SPLIT.split(raw)
+    elif isinstance(raw, list):
+        for item in raw:
+            tokens.extend(_SYMBOL_SPLIT.split(str(item or "")))
+    out: List[str] = []
+    for token in tokens:
+        sym = token.strip().upper()
+        if not sym or not _SYMBOL_RE.match(sym) or sym in out:
+            continue
+        out.append(sym)
+    return out[:UNIVERSE_LIMIT]
+
+
 def normalize_config(raw: Any) -> Dict[str, Any]:
-    """Coerce a stored/posted config blob into a complete, sane config."""
+    """Coerce a stored/posted config blob into a complete, sane config.
+
+    `min_score` / `min_rvol` can be tightened but never loosened past the
+    bot's live entry gate — see ENTRY_GATE_FLOORS."""
     cfg = dict(DEFAULT_CONFIG)
     if isinstance(raw, dict):
         mode = str(raw.get("mode") or "").lower().strip()
         if mode in MODES:
             cfg["mode"] = mode
-        universe = raw.get("universe")
-        if isinstance(universe, str):
-            universe = universe.split(",")
-        if isinstance(universe, list):
-            cleaned: List[str] = []
-            for sym in universe:
-                s = str(sym or "").strip().upper()
-                if s and s.isalpha() and len(s) <= 6 and s not in cleaned:
-                    cleaned.append(s)
+        if raw.get("universe") is not None:
+            cleaned = parse_universe(raw["universe"])
             if cleaned:
-                cfg["universe"] = cleaned[:40]
+                cfg["universe"] = cleaned
         for key, lo, hi, cast in (
             ("interval_seconds", 20, 600, int),
-            ("min_score", 50, 100, int),
-            ("min_rvol", 1.0, 10.0, float),
+            ("min_score", ENTRY_GATE_FLOORS["min_score"], 100, int),
+            ("min_rvol", ENTRY_GATE_FLOORS["min_rvol"], 10.0, float),
             ("max_spread_pct", 0.01, 5.0, float),
             ("min_price", 0.0, 10_000.0, float),
             ("max_signals_per_day", 0, 20, int),
@@ -2221,9 +2281,12 @@ def normalize_config(raw: Any) -> Dict[str, Any]:
             if raw.get(key) is None:
                 continue
             try:
-                cfg[key] = max(lo, min(hi, cast(raw[key])))
+                cfg[key] = cast(max(lo, min(hi, cast(raw[key]))))
             except (TypeError, ValueError):
                 continue
+    # A stored config written before a gate change must still be re-floored.
+    cfg["min_score"] = int(max(cfg["min_score"], ENTRY_GATE_FLOORS["min_score"]))
+    cfg["min_rvol"] = float(max(cfg["min_rvol"], ENTRY_GATE_FLOORS["min_rvol"]))
     return cfg
 
 
@@ -2404,6 +2467,67 @@ def detect_setup(
     return None
 
 
+# Score anatomy. A score is BASE plus a weighted share of SPAN, so the worst
+# readable candidate scores SCORE_BASE and a perfect one scores 100. Kept as
+# named constants because the app renders the same arithmetic back to the user
+# (see expo/services/botScanner.ts — asserted equal by scannerParity.test.ts).
+SCORE_BASE = 55
+SCORE_SPAN = 45
+# weight, and the measured reading at which the factor is fully earned.
+SCORE_WEIGHTS: Dict[str, float] = {"rvol": 0.40, "momentum": 0.25, "vwap": 0.20, "liquidity": 0.15}
+# rvol is credited from 1.0x (market-average) up to FULL_RVOL.
+FULL_RVOL = 3.0
+FULL_MOVE_PCT = 1.5
+FULL_VWAP_PCT = 0.5
+
+
+def score_factors(
+    rvol: Optional[float],
+    change_from_open_pct: Optional[float],
+    vwap_distance_pct: Optional[float],
+    spread: Optional[float],
+    max_spread_pct: float,
+) -> List[Dict[str, Any]]:
+    """Per-factor attribution of a candidate's score.
+
+    Returns one record per factor with the MEASURED reading, the reading that
+    would fully earn it, how much of it is earned (0–1), and the points that
+    contributes. Summing `points` and adding SCORE_BASE reproduces the score
+    exactly, so a user can see which single measurement is holding a candidate
+    below the gate instead of staring at an unexplained number.
+
+    A missing measurement earns 0 — never an assumed midpoint."""
+    def clamp01(x: float) -> float:
+        return max(0.0, min(1.0, x))
+
+    ceiling = max(max_spread_pct, 0.01)
+    readings: List[Tuple[str, str, Optional[float], float, str, float]] = [
+        ("rvol", "Relative volume", rvol, FULL_RVOL,
+         "x", clamp01(((rvol or 0.0) - 1.0) / (FULL_RVOL - 1.0))),
+        ("momentum", "Move off the open", change_from_open_pct, FULL_MOVE_PCT,
+         "%", clamp01(abs(change_from_open_pct or 0.0) / FULL_MOVE_PCT)),
+        ("vwap", "Lead over VWAP", vwap_distance_pct, FULL_VWAP_PCT,
+         "%", clamp01((vwap_distance_pct or 0.0) / FULL_VWAP_PCT)),
+        ("liquidity", "Spread", spread, ceiling,
+         "%", clamp01(1.0 - (spread if spread is not None else ceiling) / ceiling)),
+    ]
+    out: List[Dict[str, Any]] = []
+    for key, label, value, target, unit, fill in readings:
+        weight = SCORE_WEIGHTS[key]
+        out.append({
+            "key": key,
+            "label": label,
+            "value": None if value is None else round(float(value), 3),
+            "target": round(float(target), 3),
+            "unit": unit,
+            "fill": round(fill, 4),
+            "points": round(SCORE_SPAN * weight * fill, 2),
+            "max_points": round(SCORE_SPAN * weight, 2),
+            "measured": value is not None,
+        })
+    return out
+
+
 def score_candidate(
     rvol: Optional[float],
     change_from_open_pct: Optional[float],
@@ -2417,15 +2541,9 @@ def score_candidate(
     mapped onto 55..100. A candidate strong on every measured dimension lands
     in the low 90s — nothing is padded to clear a threshold, and a missing
     factor contributes 0 rather than an assumed value."""
-    def clamp01(x: float) -> float:
-        return max(0.0, min(1.0, x))
-
-    f_rvol = clamp01(((rvol or 0.0) - 1.0) / 2.0)
-    f_mom = clamp01(abs(change_from_open_pct or 0.0) / 1.5)
-    f_vwap = clamp01((vwap_distance_pct or 0.0) / 0.5)
-    f_liq = clamp01(1.0 - (spread if spread is not None else max_spread_pct) / max(max_spread_pct, 0.01))
-    blended = 0.40 * f_rvol + 0.25 * f_mom + 0.20 * f_vwap + 0.15 * f_liq
-    return int(round(55 + 45 * blended))
+    factors = score_factors(rvol, change_from_open_pct, vwap_distance_pct, spread, max_spread_pct)
+    blended = sum(SCORE_WEIGHTS[f["key"]] * f["fill"] for f in factors)
+    return int(round(SCORE_BASE + SCORE_SPAN * blended))
 
 
 def risk_levels(entry: float, series: List[Dict[str, Any]]) -> Tuple[float, float]:
@@ -2481,6 +2599,7 @@ def evaluate_quote(
     change_open = pct_change(last, quote.get("open"))
     vwap_dist = pct_change(last, vwap) if vwap else None
     setup = detect_setup(series, quote, vwap)
+    factors = score_factors(rvol, change_open, vwap_dist, spread, float(cfg["max_spread_pct"]))
     score = score_candidate(rvol, change_open, vwap_dist, spread, float(cfg["max_spread_pct"]))
 
     reasons: List[str] = []
@@ -2513,6 +2632,9 @@ def evaluate_quote(
         "vwap": vwap,
         "setup": setup,
         "score": score,
+        "score_base": SCORE_BASE,
+        "score_factors": factors,
+        "points_to_gate": max(0, int(cfg["min_score"]) - score),
         "samples": len(series),
         "qualifies": not reasons,
         "blocked_by": reasons,
@@ -2616,12 +2738,20 @@ class Scanner:
         except (TypeError, ValueError):
             return 0
 
-    async def _note_emit(self) -> int:
+    async def _note_emit(self, used: int) -> int:
+        """Consume one unit of the daily signal budget.
+
+        `used` is the caller's running count. A failed increment must still
+        consume the slot: returning 0 here reset the caller's counter, so the
+        `used >= budget` check could never fire again and the scanner would
+        dispatch EVERY qualifying candidate — real live orders, unbounded — for
+        the rest of the pass. Budget accounting fails CLOSED.
+        """
         try:
-            return await self.state.incr(self._emit_key(), ex=36 * 3600)
+            return int(await self.state.incr(self._emit_key(), ex=36 * 3600))
         except Exception as e:
-            logger.warning(f"emit counter failed: {e}")
-            return 0
+            logger.warning(f"emit counter failed ({e}) — counting the signal locally to preserve the daily budget")
+            return used + 1
 
     # ---- one pass ---------------------------------------------------------
     async def scan_once(self) -> Dict[str, Any]:
@@ -2647,7 +2777,13 @@ class Scanner:
         candidates.sort(key=lambda c: (c["qualifies"], c["score"]), reverse=True)
         emitted: List[Dict[str, Any]] = []
         budget = int(cfg["max_signals_per_day"])
-        used = await self.emits_today()
+        try:
+            used = await self.emits_today()
+        except Exception as e:
+            # Unknown usage must not read as "zero used" — that would hand the
+            # scanner a fresh budget on every storage hiccup. Assume spent.
+            logger.warning(f"emit counter unreadable ({e}) — treating the daily budget as spent this pass")
+            used = budget
 
         for cand in candidates:
             if not cand["qualifies"]:
@@ -2669,7 +2805,7 @@ class Scanner:
                 verdict = f"error: {str(e)[:120]}"
                 logger.error(f"scanner dispatch failed for {cand['ticker']}: {e}")
             cand["dispatch"] = verdict
-            used = await self._note_emit()
+            used = await self._note_emit(used)
             emitted.append({"ticker": cand["ticker"], "setup": cand["setup"],
                             "score": cand["score"], "rvol": cand["rvol"], "verdict": verdict})
             logger.info(
@@ -2719,6 +2855,7 @@ class Scanner:
     async def status(self) -> Dict[str, Any]:
         return {
             "config": self.config,
+            "entry_gate": dict(ENTRY_GATE_FLOORS),
             "market_open": self.is_market_open(),
             "broker_linked": self.has_tokens(),
             "emits_today": await self.emits_today(),
@@ -2928,14 +3065,14 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.10.0-server-scanner"
+BOT_VERSION = "5.12.1-pnl-repair"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
-# Gate parity with the Rork app (app defaults: minScore 85 / trending 80).
+# Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
 # A stricter bot default silently rejects every score the app clears — the
 # thresholds MUST match unless deliberately overridden via env.
-MIN_SCORE = int(os.getenv("MIN_SCORE", "85"))
-MIN_SCORE_TRENDING = int(os.getenv("MIN_SCORE_TRENDING", "80"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "75"))
+MIN_SCORE_TRENDING = int(os.getenv("MIN_SCORE_TRENDING", "70"))
 MIN_RVOL = float(os.getenv("MIN_RVOL", "1.5"))
 MIN_MTF = int(os.getenv("MIN_MTF", "3"))
 ALLOWED_SETUPS = {
@@ -3053,6 +3190,8 @@ BREAKER_FAILURES_KEY = "breaker:failures"
 QUEUE_KEY = "etrade:placement_queue"
 _worker_task = None
 _worker_stop = False
+# Outcome of the last daily-P&L-vs-ledger verification (surfaced via /status).
+_last_pnl_repair: Optional[Dict[str, Any]] = None
 
 # In-memory token cache
 _current_tokens: Optional[Dict[str, str]] = None
@@ -3742,13 +3881,46 @@ async def etrade_auth_renew(data: dict = Body(...)):
         raise HTTPException(500, detail="Renewal failed")
 
 
+async def _forget_persisted_tokens() -> bool:
+    """Delete the persisted access-token row so a disconnect survives a restart."""
+    if not async_session:
+        return False
+    try:
+        async with async_session() as session:
+            async with session.begin():
+                row = await session.get(ETradeSessionState, "active_tokens")
+                if row is not None:
+                    await session.delete(row)
+        return True
+    except Exception as e:
+        logger.warning(f"could not delete persisted tokens on disconnect: {e}")
+        return False
+
+
 @app.post("/etrade/disconnect")
 async def etrade_disconnect():
+    """Fully unlink the broker session.
+
+    Clearing only the in-memory token left three things behind: the persisted
+    DB row (so `preload_tokens()` silently RE-LINKED the account on the next
+    restart/redeploy), the resolved account binding still shown by /status, and
+    a `token_valid: true` session flag — i.e. the app could keep reporting a
+    trusted live session for an account the user had just disconnected.
+    """
     global _current_tokens, _resolved_account_id_key, _account_binding
     _current_tokens = None
     _resolved_account_id_key = None
-    logger.info("User requested account disconnect")
-    return {"status": "success", "message": "Disconnect request received"}
+    _account_binding = None
+    _mark_token_session(False, "account disconnected by user")
+    _parked_signals.clear()
+    purged = await _forget_persisted_tokens()
+    logger.info(f"User requested account disconnect (persisted tokens purged={purged})")
+    return {
+        "status": "success",
+        "message": "Disconnect request received",
+        "linked": False,
+        "persisted_tokens_cleared": purged,
+    }
 
 
 # ==================== RESTORE ====================
@@ -4006,7 +4178,39 @@ async def _record_api_failure(source: str, error: str) -> None:
         )
 
 
-async def check_risk_limits():
+# Failures that are the BOT'S OWN verdict, not the broker's. These must never
+# count toward the API circuit breaker: five benign rejections in a row (five
+# signals arriving after hours, five duplicate tickers, five fail-closed sizing
+# refusals) used to trip the breaker and halt ALL placement — including
+# protective exits — for the full cooldown.
+_LOCAL_REFUSAL_MARKERS = (
+    "kill switch active",
+    "market closed",
+    "order lock busy",
+    "fail-closed sizing",
+    "close refused",
+    "insufficient funds:",  # our own pre-flight refusal (broker's 8400 has no colon)
+    "tokens not set",
+    "missing strike or expiration",
+    "refusing to double-sell",
+)
+
+
+def _is_local_refusal(err: str) -> bool:
+    """True when a failure came from this bot's own gating rather than from a
+    broker API call — it says nothing about broker health."""
+    low = str(err).lower()
+    return any(marker in low for marker in _LOCAL_REFUSAL_MARKERS)
+
+
+async def check_risk_limits(is_close: bool = False) -> None:
+    """Refuse new work while the broker-API breaker is open.
+
+    A CLOSE is exempt: exits REDUCE risk, and a breaker tripped by flaky reads
+    must never be the reason a protective exit can't be sent. Entries still
+    wait for the cooldown."""
+    if is_close:
+        return
     if await _breaker_is_open():
         raise HTTPException(
             503,
@@ -4804,15 +5008,39 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
     })
 
 
+def _entry_direction(pos: Optional[dict], payload: dict) -> float:
+    """+1 for a long position, -1 for a short — always from the ENTRY side.
+
+    P&L direction is a property of how the position was OPENED, never of the
+    order that closes it. A close payload carries the EXIT action
+    (SELL / EXIT / CLOSE / SELL_CLOSE), so reading direction off the payload
+    inverted the sign of every app-initiated exit: a long closed for a profit
+    was booked as a LOSS into `realized_pnl_today_pct`, pushing the bot toward
+    its daily loss limit on winners and relieving it on losers.
+
+    The tracked position's own `action` is therefore authoritative. The payload
+    is only consulted when no position is tracked, and an exit verb there is
+    treated as closing a LONG (the overwhelmingly common case, and the same
+    assumption the equity close path already makes when picking its exit side).
+    """
+    tracked = str((pos or {}).get("action") or "").upper()
+    if tracked in {"BUY", "SELL"}:
+        return 1.0 if tracked == "BUY" else -1.0
+    action = str(payload.get("action") or "BUY").upper()
+    if action in {"EXIT", "CLOSE", "SELL"} or str(payload.get("intent") or "").lower() == "close":
+        return 1.0  # closing an untracked position — assume it was long
+    return 1.0 if action == "BUY" else -1.0
+
+
 async def _record_close(ticker: str, exit_price: Optional[float], payload: dict) -> None:
-    """Pop the position and feed realized pnl (underlying move, signed by
-    direction) into the daily loss-limit accounting — plus credit equity
+    """Pop the position and feed realized pnl (underlying move, signed by the
+    ENTRY direction) into the daily loss-limit accounting — plus credit equity
     proceeds back into the tracked balance so wins/losses immediately update
     the funds available for the next entry."""
     pos = await state.delete_position(ticker)
     entry = float((pos or {}).get("entry") or payload.get("entry") or 0)
     exit_px = float(exit_price or payload.get("exit_price") or payload.get("limit_price") or entry or 0)
-    direction = 1.0 if str(payload.get("action") or "BUY").upper() == "BUY" else -1.0
+    direction = _entry_direction(pos, payload)
     qty = int((pos or {}).get("filled_qty") or (pos or {}).get("qty") or 0)
     is_option = bool((pos or {}).get("contract"))
     pnl_pct: Optional[float] = None
@@ -4835,10 +5063,201 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict)
         "ticker": ticker,
         "entry": entry or None,
         "exit": exit_px or None,
+        # The ENTRY side is recorded explicitly so a later replay of the ledger
+        # can verify the P&L sign without having to hunt for the matching open.
+        "entry_action": "BUY" if direction > 0 else "SELL",
         "realized_pnl_pct": round(pnl_pct, 4) if pnl_pct is not None else None,
         "realized_pnl_usd": round(realized_usd, 2) if realized_usd is not None else None,
         "qty": qty or None,
     })
+
+
+# ==================== DAILY P&L REPAIR (ledger replay) ====================
+# Before the entry-direction fix, `_record_close` signed realized P&L off the
+# CLOSE payload's action, so every app-initiated exit landed in
+# `realized_pnl_today_pct` with the wrong sign. That figure drives the daily
+# loss limit, so a day's stored value can still be inverted after redeploy —
+# winners pushing the bot toward a halt, losers relieving it.
+#
+# The immutable ledger holds each close's entry, exit and (as-written) pct, so
+# the true figure can be recomputed and the Redis counter corrected. The repair
+# is deliberately FAIL-CLOSED: it only writes when the ledger fully accounts for
+# the stored number, so a lost/partial ledger can never erase a real loss and
+# hand the bot a fresh risk budget.
+PNL_REPAIR_EPSILON = 0.0001
+PNL_REPAIR_LEDGER_SCAN = 5000
+
+
+def _ledger_close_direction(rec_data: dict, opens: Dict[str, str]) -> Optional[float]:
+    """Entry direction for a ledger close: the close's own `entry_action` when
+    present (written since the fix), else the last `position_opened` seen for
+    that ticker. None when neither is known — such a close is left untouched."""
+    explicit = str(rec_data.get("entry_action") or "").upper()
+    if explicit in {"BUY", "SELL"}:
+        return 1.0 if explicit == "BUY" else -1.0
+    opened = opens.get(str(rec_data.get("ticker") or "").upper())
+    if opened in {"BUY", "SELL"}:
+        return 1.0 if opened == "BUY" else -1.0
+    return None
+
+
+def recompute_daily_pnl(records: List[dict], day: str) -> Dict[str, Any]:
+    """Replay ledger records and recompute one UTC day's realized P&L percent.
+
+    `records` must be chronological (oldest first) and may span earlier days —
+    positions opened yesterday and closed today need their open event to know
+    the entry side. Only closes stamped with `day` are counted.
+
+    Returns {recorded, corrected, delta, closes, inverted, unresolved}, where
+    `recorded` is the sum that was actually fed into Redis and `corrected` is
+    the sum signed off the ENTRY side.
+    """
+    opens: Dict[str, str] = {}
+    recorded = 0.0
+    corrected = 0.0
+    closes = 0
+    inverted: List[Dict[str, Any]] = []
+    unresolved: List[str] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        event = str(rec.get("event") or "")
+        data = rec.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        ticker = str(data.get("ticker") or "").upper()
+        if event == "position_opened":
+            action = str(data.get("action") or "BUY").upper()
+            if ticker:
+                opens[ticker] = action if action in {"BUY", "SELL"} else "BUY"
+            continue
+        if event != "position_closed":
+            continue
+        same_day = str(rec.get("ts") or "").startswith(day)
+        direction = _ledger_close_direction(data, opens)
+        if ticker:
+            opens.pop(ticker, None)
+        if not same_day:
+            continue
+        try:
+            as_written = float(data.get("realized_pnl_pct") or 0.0)
+        except (TypeError, ValueError):
+            as_written = 0.0
+        closes += 1
+        recorded += as_written
+        entry = _positive_float(data.get("entry"))
+        exit_px = _positive_float(data.get("exit"))
+        if entry is None or exit_px is None or direction is None:
+            # Nothing to recompute from — keep whatever was booked and say so.
+            corrected += as_written
+            if ticker:
+                unresolved.append(ticker)
+            continue
+        true_pct = direction * ((exit_px - entry) / entry * 100.0)
+        corrected += true_pct
+        if abs(true_pct - as_written) > PNL_REPAIR_EPSILON:
+            inverted.append({
+                "ticker": ticker,
+                "booked_pct": round(as_written, 4),
+                "true_pct": round(true_pct, 4),
+            })
+    return {
+        "day": day,
+        "recorded": round(recorded, 6),
+        "corrected": round(corrected, 6),
+        "delta": round(corrected - recorded, 6),
+        "closes": closes,
+        "inverted": inverted,
+        "unresolved": unresolved,
+    }
+
+
+def _pnl_repair_key(day: str) -> str:
+    return f"daily_pnl_repair:{day}"
+
+
+async def _repair_daily_pnl() -> Dict[str, Any]:
+    """Correct today's stored `realized_pnl_today_pct` if the sign bug polluted
+    it. Runs once per startup; safe to re-run (already-applied corrections are
+    remembered per day, so a second pass is a no-op)."""
+    day = _utcnow().date().isoformat()
+    result: Dict[str, Any] = {"day": day, "status": "clean", "applied_delta": 0.0}
+    try:
+        stored = float((await state.get_daily())["realized_pnl_today_pct"])
+        previous = 0.0
+        raw_prev = await state.get(_pnl_repair_key(day))
+        if raw_prev:
+            try:
+                previous = float((json.loads(raw_prev) or {}).get("applied_delta") or 0.0)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                previous = 0.0
+        replay = recompute_daily_pnl(trade_ledger.recent(PNL_REPAIR_LEDGER_SCAN), day)
+        result.update({
+            "stored": round(stored, 6),
+            "ledger_recorded": replay["recorded"],
+            "ledger_corrected": replay["corrected"],
+            "closes": replay["closes"],
+            "inverted": replay["inverted"],
+            "unresolved": replay["unresolved"],
+            "previously_applied": round(previous, 6),
+        })
+        needed = replay["delta"] - previous
+        # FAIL-CLOSED: the ledger must explain the stored number (allowing for a
+        # correction already applied). If it doesn't, the ledger is incomplete
+        # (fresh disk after redeploy, closes booked before the ledger existed) —
+        # correcting from it could wipe a genuine loss, so refuse and shout.
+        if abs((replay["recorded"] + previous) - stored) > 0.01:
+            result["status"] = "unverifiable"
+            logger.warning(
+                f"[PNL-REPAIR] ledger does not account for stored daily P&L "
+                f"(stored={stored:.4f}%, ledger={replay['recorded']:.4f}%, "
+                f"already_applied={previous:.4f}%) — leaving it untouched"
+            )
+            if replay["closes"] or abs(stored) > PNL_REPAIR_EPSILON:
+                await alerts.send(
+                    "warning", "daily_pnl_unverifiable",
+                    f"Daily realized P&L ({stored:.2f}%) can't be verified against the trade "
+                    f"ledger ({replay['recorded']:.2f}% over {replay['closes']} close(s)). "
+                    "Left as-is — the daily loss limit still applies.",
+                    dedupe_key=f"pnl_repair_unverifiable:{day}",
+                )
+        elif abs(needed) <= PNL_REPAIR_EPSILON:
+            logger.info(
+                f"[PNL-REPAIR] daily P&L verified against ledger — {stored:.4f}% "
+                f"over {replay['closes']} close(s), no correction needed"
+            )
+        else:
+            new_value = await state.add_realized_pnl(needed)
+            result.update({
+                "status": "repaired",
+                "applied_delta": round(needed, 6),
+                "new_value": round(float(new_value), 6),
+            })
+            names = ", ".join(i["ticker"] for i in replay["inverted"][:5]) or "—"
+            logger.warning(
+                f"[PNL-REPAIR] ✅ corrected daily realized P&L {stored:.4f}% → "
+                f"{float(new_value):.4f}% ({len(replay['inverted'])} mis-signed close(s): {names})"
+            )
+            await trade_ledger.record("daily_pnl_repaired", {
+                "day": day, "was": round(stored, 4), "now": round(float(new_value), 4),
+                "delta": round(needed, 4), "closes": replay["closes"],
+                "inverted": replay["inverted"],
+            })
+            await alerts.send(
+                "warning", "daily_pnl_repaired",
+                f"Daily realized P&L corrected {stored:.2f}% → {float(new_value):.2f}% — "
+                f"{len(replay['inverted'])} close(s) were booked with an inverted sign.",
+                dedupe_key=f"pnl_repair:{day}",
+            )
+        payload = dict(result)
+        payload["applied_delta"] = round(previous + float(result.get("applied_delta") or 0.0), 6)
+        payload["ts"] = _utcnow().isoformat()
+        await state.set(_pnl_repair_key(day), json.dumps(payload), ex=3 * 24 * 3600)
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+        logger.error(f"[PNL-REPAIR] failed (non-fatal): {e}")
+    return result
 
 
 def _positive_float(value: Any) -> Optional[float]:
@@ -4848,6 +5267,22 @@ def _positive_float(value: Any) -> Optional[float]:
         return f if f > 0 else None
     except (TypeError, ValueError):
         return None
+
+
+def _account_for_balance(acct_list: List[Dict[str, Any]], resolved_key: Optional[str]) -> Dict[str, Any]:
+    """Pick the account record whose accountIdKey is the one orders route to.
+
+    Falls back to the first ACTIVE account, then to the first record, mirroring
+    `_resolve_account_id_key`'s own precedence so balance and orders can never
+    disagree about which account is being traded."""
+    if resolved_key:
+        for acct in acct_list:
+            if str(acct.get("accountIdKey") or "") == str(resolved_key):
+                return acct
+    return next(
+        (a for a in acct_list if str(a.get("accountStatus", "")).upper() == "ACTIVE"),
+        acct_list[0],
+    )
 
 
 async def _get_balance_compat(accounts: "pyetrade.ETradeAccounts", acct: Dict[str, Any]) -> Any:
@@ -4897,7 +5332,13 @@ async def _fetch_broker_balance() -> Optional[Dict[str, Optional[float]]]:
             acct_list = [acct_list]
         if not acct_list:
             return None
-        acct = acct_list[0]
+        # Read the balance of the account orders ACTUALLY route to. Blindly
+        # taking acct_list[0] read a DIFFERENT account whenever the resolved
+        # key came from ETRADE_ACCOUNT_ID or the first-ACTIVE fallback (this
+        # user has 3 linked accounts and hits that fallback every session) —
+        # so pre-flight funds clamps, fail-closed sizing and the equity shown
+        # in the app were all measured against money the bot cannot spend.
+        acct = _account_for_balance(acct_list, await _resolve_account_id_key(tokens))
         bal = await _get_balance_compat(accounts, acct)
         computed = ((bal or {}).get("BalanceResponse", {}) or {}).get("Computed", {}) or {}
         real_time = computed.get("RealTimeValues", {}) or {}
@@ -5106,11 +5547,11 @@ async def execute_live_order(payload: dict):
             "reason": f"mode={mode}, LIVE_TRADING={LIVE_TRADING}, sandbox={is_sandbox}",
         }
 
-    await check_risk_limits()
-
     # A queued job may execute after conditions changed — re-check the hard
     # gates for ENTRIES here too (closes always pass: they reduce risk).
     is_close = _is_close_payload(payload)
+    await check_risk_limits(is_close=is_close)
+
     if not is_close:
         if await state.is_killed():
             raise Exception("kill switch active — entry refused")
@@ -5505,7 +5946,12 @@ async def execute_live_order(payload: dict):
             return {"status": "success", "response": final}
 
     except Exception as e:
-        await _record_api_failure("order_placement", str(e))
+        # Only genuine broker/API failures feed the circuit breaker — our own
+        # gate refusals are working-as-intended, not signs of a sick broker.
+        if _is_local_refusal(str(e)):
+            logger.info(f"↩︎ {ticker} refused locally (breaker untouched): {e}")
+        else:
+            await _record_api_failure("order_placement", str(e))
         await trade_ledger.record("order_failed", {
             "ticker": ticker, "action": action, "instrument": instrument,
             "error": str(e)[:300],
@@ -5557,13 +6003,55 @@ async def token_keepalive_worker():
             )
 
 
+async def _run_queued_job(raw: str) -> None:
+    """Execute one queued signal with the SAME bookkeeping the direct path does.
+
+    The queue IS the production path (it is used whenever Redis is present), but
+    it used to swallow the outcome entirely: no dispatch verdict, no signal-key
+    status, and — critically — no parking of 401 failures. That made the
+    parked-signal replay-after-relink recovery dead code in production and left
+    /status.recent_dispatches showing every real order stuck on 'queued'.
+    """
+    try:
+        pd = dict(json.loads(raw)["payload"])
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        logger.error(f"queued job unreadable — dropped: {e}")
+        return
+
+    sig_key = _signal_key(pd)
+    mode = str(pd.get("mode") or "paper").lower()
+    live_intent = mode == "live" and LIVE_TRADING and not is_sandbox
+    try:
+        result = await execute_live_order(pd)
+        inner_status = str(result.get("status") or "processed")
+        await state.set(sig_key, inner_status, ex=86400)
+        await _record_dispatch_verdict(
+            pd,
+            "placed" if inner_status == "success" else inner_status,
+            "" if inner_status == "success" else str(result.get("reason") or ""),
+        )
+    except Exception as e:
+        err = str(e)
+        # Same disconnect→relink recovery the direct path has: a signal that
+        # failed ONLY because the session died is parked and replayed on relink
+        # instead of being silently lost.
+        if live_intent and _is_auth_error(err):
+            _park_signal(pd)
+            await state.set(sig_key, "parked", ex=86400)
+            await _record_dispatch_verdict(pd, "parked", f"auth error — replays after relink: {err[:120]}")
+            return
+        await state.set(sig_key, "failed", ex=86400)
+        await _record_dispatch_verdict(pd, "failed", err[:200])
+        logger.error(f"Queued placement failed for {pd.get('ticker')}: {e}")
+
+
 async def placement_worker():
     while not _worker_stop:
         try:
             if state.is_distributed:
                 job = await state.queue_pop(QUEUE_KEY)
                 if job:
-                    await execute_live_order(json.loads(job)["payload"])
+                    await _run_queued_job(job)
                 else:
                     await asyncio.sleep(0.5)
             else:
@@ -5919,6 +6407,13 @@ def _scanner_now_et() -> datetime:
 
 async def _start_scanner() -> None:
     global scanner
+    # Bind the scanner's configurable floors to THIS bot's live entry gate.
+    # Without it a user could set the scanner to min_score 60 / min_rvol 1.0
+    # and every candidate it dispatched would be rejected by
+    # _passes_entry_filters() a millisecond later — a loop that burns the
+    # daily signal budget and never places a trade.
+    gate = scanner_mod.set_entry_gate_floors(MIN_SCORE, MIN_RVOL)
+    logger.info(f"🔭 Scanner floors bound to entry gate — score ≥ {gate['min_score']}, rvol ≥ {gate['min_rvol']}")
     scanner = scanner_mod.Scanner(
         state,
         _scanner_fetch_quotes,
@@ -5975,6 +6470,11 @@ async def on_startup():
     # One-time migration of the legacy JSON STATE_FILE into Redis (skipped when
     # Redis already holds state; the file is renamed *.migrated afterwards).
     await state.migrate_from_file(STATE_FILE)
+    # DAILY P&L REPAIR — replay the ledger and correct today's realized P&L if
+    # the old sign bug inverted any close. Fail-closed: never writes unless the
+    # ledger fully accounts for the stored figure.
+    global _last_pnl_repair
+    _last_pnl_repair = await _repair_daily_pnl()
     # STARTUP RECONCILIATION — blocking broker→Redis sync BEFORE the placement
     # worker starts, so no order is ever placed against stale cold-start state.
     await _startup_reconcile()
@@ -6210,6 +6710,7 @@ async def status():
         "stop_guards": await state.all_guards(),
         "trades_today": daily["trades_today"],
         "realized_pnl_today_pct": daily["realized_pnl_today_pct"],
+        "daily_pnl_repair": _last_pnl_repair,
         "circuit_breaker_open": await _breaker_is_open(),
         "state_backend": state.backend_name,
         "last_reconcile": last_reconcile,
@@ -6309,7 +6810,7 @@ async def scanner_config_set(
 ):
     """Change the scanner live — no redeploy.
     Body: { "mode": "off"|"shadow"|"live", "universe": ["AAPL", ...],
-            "interval_seconds": 60, "min_score": 85, "min_rvol": 1.5,
+            "interval_seconds": 60, "min_score": 75, "min_rvol": 1.5,
             "max_spread_pct": 0.35, "max_signals_per_day": 3 }"""
     if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
         raise HTTPException(401, "invalid secret")
@@ -6355,6 +6856,30 @@ async def ledger_tail(count: int = Query(100, ge=1, le=500), verify: bool = Quer
         out["chain_records_checked"] = checked
         out["chain_error"] = err
     return out
+
+
+@app.post("/daily-pnl/repair")
+async def daily_pnl_repair(
+    dry_run: bool = Query(False),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Re-verify today's realized P&L against the immutable ledger and correct
+    it when the old inverted-sign bug polluted the daily loss-limit counter.
+    `?dry_run=true` reports what would change without writing."""
+    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
+        raise HTTPException(401, "invalid secret")
+    if dry_run:
+        day = _utcnow().date().isoformat()
+        replay = recompute_daily_pnl(trade_ledger.recent(PNL_REPAIR_LEDGER_SCAN), day)
+        daily = await state.get_daily()
+        return {
+            "dry_run": True,
+            "stored": daily["realized_pnl_today_pct"],
+            **replay,
+        }
+    global _last_pnl_repair
+    _last_pnl_repair = await _repair_daily_pnl()
+    return _last_pnl_repair
 
 
 @app.post("/kill")
