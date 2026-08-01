@@ -3065,7 +3065,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.12.1-pnl-repair"
+BOT_VERSION = "5.13.0-account-picker"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -3217,6 +3217,15 @@ _resolved_account_id_key: Optional[str] = None
 # can refuse to call the live path "trusted" while orders would land in an
 # account the user never named. Reset alongside the key on relink/disconnect.
 _account_binding: Optional[Dict[str, Any]] = None
+
+# USER-PINNED ACCOUNT (set from the app via POST /etrade/account/select).
+# Persisted in the state store under ACCOUNT_PIN_KEY so it survives restarts
+# and is shared by every worker. Takes precedence over ETRADE_ACCOUNT_ID —
+# an env var can only be changed with a redeploy, and picking the account that
+# receives real orders must not require one. Cleared explicitly, never on
+# relink (the pin is the user's intent, not session state).
+ACCOUNT_PIN_KEY = "etrade:pinned_account"
+_pinned_account_id: Optional[str] = None
 
 # Pending OAuth request tokens (token -> secret). E*TRADE request tokens are
 # single-use and expire ~5 minutes after issue. Memory is the PRIMARY store —
@@ -3867,11 +3876,18 @@ async def get_etrade_account():
             "institution_type": chosen.get("institutionType") or None,
         }
 
+    pinned = await _load_pinned_account()
     return {
         "status": "linked",
         "linked": True,
         "accounts": accounts_out,
         **routed,
+        # Which account the USER pinned from the app (null = auto-select).
+        "pinned_account_id": pinned,
+        "account_pin_source": (
+            "pinned" if pinned else ("env" if (TARGET_ACCOUNT_ID or "").strip() else "auto")
+        ),
+        "env_account_id": (TARGET_ACCOUNT_ID or "").strip() or None,
         # Provenance for the pick above — lets the app say "pinned" vs
         # "fell back to this one" without a second /status round-trip.
         "account_binding": _account_binding,
@@ -3880,6 +3896,119 @@ async def get_etrade_account():
         # Session health — `linked` means "tokens on file", these fields say
         # whether those tokens can actually place orders RIGHT NOW.
         **_token_session_fields(),
+    }
+
+
+@app.post("/etrade/account/select")
+async def select_etrade_account(data: dict = Body(default={})):
+    """Pin the E*TRADE account that real orders route to — from the app.
+
+    Previously the routed account could only be changed by editing the
+    ETRADE_ACCOUNT_ID env var and redeploying; with several accounts linked and
+    no env var set, orders silently went to the first ACTIVE one. This endpoint
+    lets the user choose, and the choice is persisted in the state store so it
+    survives restarts and applies to every worker.
+
+    Safety: switching accounts while positions are open would strand those
+    positions (their resting stops live at the OLD account and reconciliation
+    reads the NEW one), so an open position blocks the switch unless the caller
+    passes `force: true`.
+
+    Body: {"account_id": "146261816"} | {"clear": true} | {"account_id": null}
+    """
+    tokens = load_tokens()
+    if not tokens:
+        raise HTTPException(401, "E*TRADE account not linked")
+
+    requested = str(data.get("account_id") or data.get("account_id_key") or "").strip()
+    clearing = bool(data.get("clear")) or not requested
+    force = bool(data.get("force"))
+
+    current_pin = await _load_pinned_account()
+    if clearing and not current_pin:
+        # Nothing to clear — idempotent success, no broker call needed.
+        return {"status": "success", "changed": False, "pinned_account_id": None,
+                "message": "No account was pinned; the bot auto-selects."}
+
+    # Never silently re-route a live book.
+    open_positions = await state.all_positions()
+    if open_positions and not force:
+        raise HTTPException(
+            409,
+            f"{len(open_positions)} position(s) are open ({', '.join(sorted(open_positions))}). "
+            f"Switching the trading account would strand their resting stops at the "
+            f"current account — close or flatten first, then re-pick.",
+        )
+
+    matched: Optional[Dict[str, Any]] = None
+    account_list: List[Dict[str, Any]] = []
+    if not clearing:
+        # Validate against the broker's real list — a typo must fail HERE, not
+        # at the next order placement with "Error 102: invalid Account Key".
+        try:
+            accounts_api = pyetrade.ETradeAccounts(
+                CONSUMER_KEY, CONSUMER_SECRET,
+                tokens["oauth_token"], tokens["oauth_token_secret"],
+                dev=is_sandbox,
+            )
+            resp = await _etrade_call(accounts_api.list_accounts, resp_format="json", source="select_account")
+        except Exception as e:
+            logger.error(f"Account select failed to enumerate accounts: {e}")
+            raise HTTPException(502, f"Could not read your E*TRADE accounts: {e}")
+        account_list = (((resp or {}).get("AccountListResponse") or {}).get("Accounts") or {}).get("Account") or []
+        if isinstance(account_list, dict):
+            account_list = [account_list]
+        for acct in account_list:
+            if requested in {str(acct.get("accountId", "")), str(acct.get("accountIdKey", ""))}:
+                matched = acct
+                break
+        if not matched:
+            raise HTTPException(
+                404,
+                f"Account {requested} is not one of the {len(account_list)} account(s) "
+                f"linked to this E*TRADE session.",
+            )
+        if str(matched.get("accountStatus", "")).upper() == "CLOSED":
+            raise HTTPException(400, f"Account {requested} is CLOSED at E*TRADE and cannot be traded.")
+
+    # Persist the pin by ACCOUNT ID (stable and human-recognisable); the opaque
+    # accountIdKey is re-resolved from it on the next order.
+    pin_value = str(matched.get("accountId") or requested).strip() if matched else None
+    await _save_pinned_account(pin_value)
+
+    resolved_key: Optional[str] = None
+    try:
+        resolved_key = await _resolve_account_id_key(tokens)
+    except Exception as e:
+        logger.warning(f"Account select: re-resolution failed (will retry on next use): {e}")
+
+    acct_id = str((matched or {}).get("accountId") or "").strip()
+    logger.info(
+        f"📌 Trading account {'pinned to ****' + acct_id[-4:] if acct_id else 'pin cleared (auto-select)'}"
+        f"{' [forced with open positions]' if (open_positions and force) else ''}"
+    )
+    await alerts.send(
+        "info", "account_pin_changed",
+        (f"Trading account pinned to ****{acct_id[-4:]} "
+         f"({(matched or {}).get('accountDesc', 'n/a')}) from the app."
+         if pin_value else
+         "Trading account pin cleared — the bot will auto-select again."),
+        dedupe_key=f"acctpin:set:{pin_value or 'cleared'}",
+    )
+
+    return {
+        "status": "success",
+        "changed": pin_value != current_pin,
+        "pinned_account_id": pin_value,
+        "account_id": acct_id or None,
+        "account_id_key": str((matched or {}).get("accountIdKey") or "").strip() or None,
+        "account_desc": (matched or {}).get("accountDesc") or (matched or {}).get("accountName") or None,
+        "account_type": (matched or {}).get("accountType") or None,
+        "account_status": (matched or {}).get("accountStatus") or None,
+        "account_last4": acct_id[-4:] if acct_id else None,
+        "resolved_account_id_key": resolved_key,
+        "account_binding": _account_binding,
+        "forced_with_open_positions": bool(open_positions and force),
     }
 
 
@@ -4080,6 +4209,42 @@ async def init_db():
 
 
 # ==================== ACCOUNT KEY RESOLUTION ====================
+async def _load_pinned_account() -> Optional[str]:
+    """Read the user's pinned account id from the state store into memory.
+
+    Called at startup and before every resolution so a pin set on ANOTHER
+    worker is honoured here too (the cached key is per-process, the pin is not).
+    """
+    global _pinned_account_id
+    try:
+        raw = await state.get(ACCOUNT_PIN_KEY)
+    except Exception as e:
+        logger.warning(f"could not read pinned account: {e}")
+        return _pinned_account_id
+    pinned = (raw or "").strip() or None
+    if pinned != _pinned_account_id:
+        logger.info(f"Pinned trading account is now {pinned or 'unset (auto-select)'}")
+        # A different pin invalidates this process's cached accountIdKey.
+        global _resolved_account_id_key
+        _resolved_account_id_key = None
+    _pinned_account_id = pinned
+    return _pinned_account_id
+
+
+async def _save_pinned_account(account_id: Optional[str]) -> None:
+    """Persist (or clear) the pinned account and drop the cached key."""
+    global _pinned_account_id, _resolved_account_id_key, _account_binding
+    value = (account_id or "").strip() or None
+    if value:
+        await state.set(ACCOUNT_PIN_KEY, value)
+    else:
+        await state.delete(ACCOUNT_PIN_KEY)
+    _pinned_account_id = value
+    # Force re-resolution so the very next order routes to the new account.
+    _resolved_account_id_key = None
+    _account_binding = None
+
+
 async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
     """Return the E*TRADE accountIdKey required by order/balance APIs.
 
@@ -4088,8 +4253,15 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
     opaque value only obtainable from /accounts/list. If ETRADE_ACCOUNT_ID is
     set, match it against BOTH accountId and accountIdKey; otherwise (or if no
     match) fall back to the first ACTIVE account. Cached per linked session.
+
+    Precedence: user pin (POST /etrade/account/select) → ETRADE_ACCOUNT_ID →
+    first ACTIVE → first. The pin wins because it is a deliberate in-app choice
+    the user can see and change; the env var needs a redeploy.
     """
     global _resolved_account_id_key
+    # Refresh the pin FIRST — a pin set on another worker must invalidate this
+    # process's cached key before we return it.
+    pinned = await _load_pinned_account()
     if _resolved_account_id_key:
         return _resolved_account_id_key
 
@@ -4108,11 +4280,26 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
     target = (TARGET_ACCOUNT_ID or "").strip()
     chosen = None
     matched = False
-    if target:
+    source = "fallback"
+    if pinned:
+        for acct in account_list:
+            if pinned in {str(acct.get("accountId", "")), str(acct.get("accountIdKey", ""))}:
+                chosen = acct
+                matched = True
+                source = "pinned"
+                break
+        if not chosen:
+            logger.warning(
+                f"⚠️ Pinned account {pinned} matches none of the {len(account_list)} "
+                f"linked account(s) — the pin is stale (account closed or a different "
+                f"E*TRADE login is linked). Falling back."
+            )
+    if not chosen and target:
         for acct in account_list:
             if target in {str(acct.get("accountId", "")), str(acct.get("accountIdKey", ""))}:
                 chosen = acct
                 matched = True
+                source = "env"
                 break
         if not chosen:
             logger.warning(
@@ -4140,15 +4327,30 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
     global _account_binding
     _account_binding = {
         "configured": target or None,
+        "pinned": pinned,
+        "source": source,
         "resolved_account_id": acct_id or None,
+        "resolved_account_id_key": _resolved_account_id_key,
         "resolved_last4": acct_id[-4:] if acct_id else None,
         "resolved_description": chosen.get("accountDesc") or None,
         "account_count": len(account_list),
         "matched_configured": matched,
         "fallback": (not matched),
         "ambiguous": (not matched) and len(account_list) > 1,
+        "pin_stale": bool(pinned) and source != "pinned",
     }
-    if target and not matched:
+    if pinned and source != "pinned":
+        await alerts.send(
+            "warning", "account_pin_stale",
+            f"Pinned account {pinned} is not among the {len(account_list)} linked "
+            f"accounts — orders route to ****{acct_id[-4:] or '????'} instead. "
+            f"Re-pick the account in the app.",
+            dedupe_key=f"acctpin:stale:{pinned}",
+        )
+    elif source == "pinned":
+        # Deliberate in-app choice — nothing ambiguous to warn about.
+        pass
+    elif target and not matched:
         await alerts.send(
             "warning", "account_binding_mismatch",
             f"ETRADE_ACCOUNT_ID ({target}) matched none of {len(account_list)} linked accounts — "
@@ -4161,7 +4363,8 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
             "warning", "account_binding_unset",
             f"ETRADE_ACCOUNT_ID is not set and {len(account_list)} accounts are linked — "
             f"orders route to the first ACTIVE one (****{acct_id[-4:] or '????'}, "
-            f"{chosen.get('accountDesc', 'n/a')}). Set ETRADE_ACCOUNT_ID to pin it.",
+            f"{chosen.get('accountDesc', 'n/a')}). Pick the account in the app "
+            f"(E*TRADE Account → Trading account) to pin it.",
             dedupe_key=f"acctbind:unset:{acct_id}",
         )
     return _resolved_account_id_key
@@ -6502,6 +6705,8 @@ async def on_startup():
     # and survives restarts — no redeploy needed to change alert delivery.
     await alerts.load_persisted()
     trade_ledger.init(TRADE_LEDGER_FILE)
+    # Which account the user pinned from the app (survives restarts/redeploys).
+    await _load_pinned_account()
     await init_db()
     await preload_tokens()
     # One-time migration of the legacy JSON STATE_FILE into Redis (skipped when
