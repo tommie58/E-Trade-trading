@@ -1562,6 +1562,8 @@ hours (and at a slower cadence off-hours), pulls:
     tracked position) and cancels them when auto-heal is enabled
   • flags UNPROTECTED positions (tracked position, no live stop order, no
     active guard) and re-arms the stop guard via the injected callback
+  • enforces the PROTECTION INVARIANT: exactly ONE resting protective stop per
+    position, for exactly the position's quantity (see `plan_protection_repair`)
 
 Only ONE instance reconciles at a time — the pass runs under the Redis
 distributed lock `lock:reconcile`, so this is safe with multiple workers.
@@ -1593,6 +1595,12 @@ RECONCILE_REPORT_KEY = "reconcile:last"
 # a position younger than this.
 GHOST_GRACE_SECONDS = 180
 _OPEN_ORDER_STATUSES = {"OPEN", "PARTIAL", "INDIVIDUAL_FILLS", "PENDING", "DO_NOT_EXERCISE"}
+_PROTECTIVE_PRICE_TYPES = {"STOP", "STOP_LIMIT", "TRAILING_STOP_CNST", "TRAILING_STOP_PRCT"}
+# Order actions that CLOSE a position — the only ones a protective stop uses.
+_CLOSING_ACTIONS = {"SELL", "SELL_CLOSE", "BUY_TO_COVER", "BUY_CLOSE"}
+# A stop armed against a partial fill is legitimate for a few seconds while the
+# rest of the entry completes; only repair coverage once the dust settles.
+COVERAGE_GRACE_SECONDS = 60
 
 
 def _utcnow_iso() -> str:
@@ -1662,6 +1670,111 @@ def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
                     "ordered": ordered,
                 })
     return out
+
+
+def protective_stops_by_symbol(live_orders: List[dict]) -> Dict[str, List[dict]]:
+    """Group live CLOSING stop orders by symbol — the resting protection the
+    broker is actually holding for each position."""
+    out: Dict[str, List[dict]] = {}
+    for order in live_orders:
+        if order.get("price_type") not in _PROTECTIVE_PRICE_TYPES:
+            continue
+        action = str(order.get("order_action") or "")
+        if action and action not in _CLOSING_ACTIONS:
+            continue
+        symbol = str(order.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        out.setdefault(symbol, []).append(order)
+    return out
+
+
+def _stop_remaining(order: dict) -> int:
+    """Contracts/shares a resting stop would still sell if it triggered."""
+    try:
+        ordered = int(order.get("ordered") or 0)
+        filled = int(order.get("filled") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(ordered - filled, 0)
+
+
+def plan_protection_repair(
+    symbol: str,
+    position_qty: int,
+    stops: List[dict],
+    tracked_stop_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Enforce the protection invariant: **exactly one** resting protective stop,
+    sized to **exactly** the position.
+
+    Both ways of breaking it cost real money:
+
+      OVER-COMMITTED — several stops (or one oversized stop) pledge more
+        contracts than the position holds. E*TRADE then refuses genuine exits
+        with error 3004 ("shares for this security may already be allocated to
+        an existing open order"), and if the stops trigger, the surplus fills
+        open a NAKED SHORT option position.
+
+      UNDER-COVERED — the stop covers fewer contracts than are held (a stop
+        armed off a partial fill that later completed). The uncovered remainder
+        has no protection at all.
+
+    Returns None when the invariant already holds, otherwise the repair plan:
+
+      {symbol, position_qty, covered_qty, keep_order_id, cancel_order_ids,
+       rearm, reason}
+
+    `keep_order_id` is a stop that already covers the position exactly — keeping
+    it means protection is never lifted, so cancelling the surplus is safe. When
+    no stop fits, every stop is cancelled and `rearm` asks the caller to place
+    one correct stop. Cancel-then-place is deliberate in that order: placing
+    first would trip the very 3004 allocation error being repaired.
+    """
+    if position_qty < 1 or not stops:
+        return None
+
+    remaining = {str(o.get("order_id")): _stop_remaining(o) for o in stops}
+    unknown_qty = any(q <= 0 for q in remaining.values())
+    covered = 0 if unknown_qty else sum(remaining.values())
+
+    if len(stops) == 1 and covered == position_qty:
+        return None  # invariant holds
+
+    exact = [oid for oid, q in remaining.items() if q == position_qty]
+    keep: Optional[str] = None
+    if tracked_stop_id and str(tracked_stop_id) in exact:
+        keep = str(tracked_stop_id)
+    elif exact:
+        keep = exact[0]
+
+    if unknown_qty:
+        reason = "duplicate_stops"
+        # Quantities unreadable: the only safe assumption is that stacked stops
+        # over-commit, so thin them down to the one the bot tracks.
+        if keep is None and tracked_stop_id and str(tracked_stop_id) in remaining:
+            keep = str(tracked_stop_id)
+    elif covered > position_qty:
+        reason = "over_committed"
+    elif covered < position_qty:
+        reason = "under_covered"
+        keep = None  # a partial stop must be replaced, not kept
+    else:
+        reason = "duplicate_stops"  # right total, split across orders
+
+    cancel_ids = [oid for oid in remaining if oid != keep]
+    if not cancel_ids and keep is not None:
+        return None
+    return {
+        "symbol": symbol,
+        "position_qty": int(position_qty),
+        "covered_qty": int(covered),
+        "unknown_qty": unknown_qty,
+        "keep_order_id": keep,
+        "cancel_order_ids": cancel_ids,
+        "rearm": keep is None,
+        "reason": reason,
+    }
 
 
 async def reconcile_once(
@@ -1784,6 +1897,93 @@ async def reconcile_once(
                                  f"{ticker}: protective stop re-arm FAILED: {e}",
                                  dedupe_key=f"rearm_fail:{ticker}")
 
+    # --- 1b) protection invariant: exactly ONE resting stop, sized to the
+    #         position. Runs after the filled_qty sync above so the audit
+    #         compares against the broker's real position size.
+    stops_by_symbol = protective_stops_by_symbol(live_orders)
+    for ticker, pos in tracked.items():
+        broker = broker_positions.get(ticker)
+        if broker is None:
+            continue
+        guard = guards.get(ticker)
+        if bool(guard) and not guard.get("done"):
+            continue  # a live guard owns this position's stop right now
+        stops = stops_by_symbol.get(ticker) or []
+        position_qty = abs(int(broker.get("qty") or 0)) or int(pos.get("filled_qty") or 0)
+        plan = plan_protection_repair(ticker, position_qty, stops,
+                                      tracked_stop_id=pos.get("stop_order_id"))
+        if plan is None:
+            continue
+
+        opened_ts = 0.0
+        try:
+            opened_ts = datetime.fromisoformat(str(pos.get("ts"))).timestamp()
+        except (TypeError, ValueError):
+            pass
+        if plan["reason"] == "under_covered" and opened_ts and (now - opened_ts) < COVERAGE_GRACE_SECONDS:
+            continue  # entry still filling — its stop is sized to the partial fill
+
+        detail = (
+            f"{ticker}: {plan['reason'].replace('_', ' ')} — {len(stops)} resting stop"
+            f"{'' if len(stops) == 1 else 's'} covering {plan['covered_qty']} of {position_qty}"
+        )
+        report["warnings"].append(detail)
+        logger.error(f"[RECONCILE] 🛡️ protection invariant broken — {detail}")
+        await _alert(
+            "critical", f"protection_{plan['reason']}",
+            f"{detail}. Surplus stops block real exits (E*TRADE 3004) and can leave a naked "
+            f"short; uncovered contracts have no stop at all. Repairing now.",
+            dedupe_key=f"protect:{ticker}",
+        )
+        if not auto_heal:
+            continue
+
+        cancelled_all = True
+        for order_id in plan["cancel_order_ids"]:
+            try:
+                ok = await cancel_order(order_id)
+            except Exception as e:
+                ok = False
+                logger.error(f"[RECONCILE] cancel of surplus stop {order_id} on {ticker} failed: {e}")
+            if ok:
+                report["healed"].append(f"{ticker}: surplus stop {order_id} cancelled")
+            else:
+                cancelled_all = False
+                report["warnings"].append(f"{ticker}: surplus stop {order_id} cancel FAILED")
+
+        if plan["keep_order_id"]:
+            # One correctly-sized stop survived: adopt it so the trailing engine
+            # cancel/replaces the order that is actually resting.
+            if str(pos.get("stop_order_id") or "") != str(plan["keep_order_id"]):
+                pos["stop_order_id"] = plan["keep_order_id"]
+                await state.set_position(ticker, pos)
+                report["healed"].append(f"{ticker}: adopted resting stop {plan['keep_order_id']}")
+            continue
+
+        if not cancelled_all:
+            # Something is still pledged at the broker; placing another stop now
+            # would re-create the over-commitment. Leave it for the next pass.
+            await _alert("critical", "protection_repair_blocked",
+                         f"{ticker}: could not clear the surplus stops, so no replacement was "
+                         f"placed. Check the open orders at E*TRADE.",
+                         dedupe_key=f"protect_blocked:{ticker}")
+            continue
+
+        if rearm_guard is None:
+            continue
+        try:
+            pos["stop_order_id"] = None
+            pos["filled_qty"] = position_qty
+            await rearm_guard(ticker, pos)
+            report["healed"].append(f"{ticker}: single stop re-armed for {position_qty}")
+            logger.warning(f"[RECONCILE] 🛡️ {ticker} protection rebuilt — one stop for {position_qty}")
+        except Exception as e:
+            report["warnings"].append(f"{ticker}: protection rebuild failed: {e}")
+            await _alert("critical", "protection_rebuild_failed",
+                         f"{ticker}: the surplus stops were cancelled but the replacement stop "
+                         f"failed to rest — position is UNPROTECTED: {e}",
+                         dedupe_key=f"protect_rebuild:{ticker}")
+
     # --- 2) orphaned protective stops (stop order live, no tracked position,
     #        no broker position) ---
     for order in live_orders:
@@ -1894,6 +2094,20 @@ The ladder mirrors how a disciplined day trader manages a live position:
 3. ATR NOISE FLOOR — never tighter than 0.45 × ATR (capped at the initial 1R)
    so intraday noise can't shake out a healthy runner.
 4. MONOTONIC RATCHET — the stop only ever moves in the trade's favor.
+5. GIVE-BACK CAP — an R-only ladder is useless when R itself is enormous. An
+   option bought at $4.90 with a 30%-of-premium broker stop has R = $1.50, so
+   +0.75R means the premium must run +23% before ANY protection tightens — a
+   trade can run +20% and still round-trip to a full −30% loss. The give-back
+   cap works in PERCENT of the entry price instead of R: past +8% it surrenders
+   only a bounded fraction of the open profit, and it governs the trail whenever
+   it is tighter than the R tier.
+6. SPREAD FLOOR — the trail is never placed inside 1.5 × the round-trip bid/ask
+   spread (capped at 1R), so a wide option chain can't be stopped out by its
+   own quote rather than by the market.
+
+Percent rungs are self-scaling: a 0.5% underlying swing never reaches the +8%
+give-back trigger, so equity/underlying trails are unchanged. They only bite on
+option premiums, where a 10-30% swing is a normal afternoon.
 
 `plan_ratchet` adds the broker-aware layer: given a tracked position record
 and a live mark, it returns the watermark updates plus whether the resting
@@ -1911,6 +2125,12 @@ from typing import Any, Dict, Optional
 BREAKEVEN_TRIGGER_R = 0.75
 # Fraction of ATR the trail must always leave for normal noise.
 ATR_NOISE_FLOOR = 0.45
+# MFE as a fraction of entry price that ALSO locks breakeven, independent of R.
+BREAKEVEN_TRIGGER_PCT = 0.12
+# MFE percent at which the give-back cap starts governing the trail.
+GIVEBACK_TRIGGER_PCT = 0.08
+# Multiple of the bid/ask spread the trail must always clear.
+SPREAD_FLOOR_MULT = 1.5
 
 # Profit-tier ladder: (minimum MFE in R, trail distance as fraction of R, tier).
 TIER_LADDER = (
@@ -1919,12 +2139,21 @@ TIER_LADDER = (
     (1.0, 0.75, "protect"),
 )
 
+# Give-back ladder: (minimum MFE percent, fraction of the open profit KEPT).
+GIVEBACK_LADDER = (
+    (0.30, 0.70),
+    (0.20, 0.60),
+    (0.12, 0.50),
+    (GIVEBACK_TRIGGER_PCT, 0.33),
+)
+
 TRAIL_TIER_LABEL = {
     "initial": "Initial 1R trail",
     "breakeven": "Breakeven locked",
     "protect": "+1R — trailing 0.75R",
     "locked": "+2R — trailing 0.50R",
     "runner": "+3R runner — trailing 0.35R",
+    "giveback": "Profit give-back capped",
 }
 
 
@@ -1958,6 +2187,18 @@ def trail_tier_for(r_multiple: float) -> Dict[str, Any]:
     return {"tier": "initial", "frac": 1.0}
 
 
+def giveback_keep_for(mfe_percent: float) -> Optional[float]:
+    """Fraction of the open profit the give-back cap keeps at this MFE percent,
+    or None when the run is too small for the cap to govern."""
+    pct = _finite(mfe_percent)
+    if pct is None:
+        return None
+    for min_pct, keep in GIVEBACK_LADDER:
+        if pct >= min_pct:
+            return keep
+    return None
+
+
 def compute_trail_level(
     side: str,
     entry_price: float,
@@ -1966,6 +2207,7 @@ def compute_trail_level(
     low_since: float,
     atr: Optional[float] = None,
     prev_trail: Optional[float] = None,
+    spread: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Compute the current trailing-stop level for a position.
 
@@ -1983,6 +2225,8 @@ def compute_trail_level(
         "tier": "initial",
         "r_multiple": 0.0,
         "breakeven_locked": False,
+        "mfe_percent": 0.0,
+        "giveback_active": False,
     }
     if entry <= 0 or risk <= 0:
         return fallback
@@ -1998,16 +2242,50 @@ def compute_trail_level(
 
     mfe = (water_mark - entry) if is_buy else (entry - water_mark)
     r_multiple = mfe / risk
+    mfe_percent = mfe / entry
 
     rung = trail_tier_for(r_multiple)
-    distance = rung["frac"] * risk
+    tier = rung["tier"]
+    # A big percent run locks breakeven even when R is too wide to reach 0.75R.
+    if tier == "initial" and mfe_percent >= BREAKEVEN_TRIGGER_PCT:
+        tier = "breakeven"
+
+    tier_distance = rung["frac"] * risk
     atr_f = _finite(atr)
     if atr_f is not None and atr_f > 0:
-        distance = max(distance, min(risk, ATR_NOISE_FLOOR * atr_f))
+        tier_distance = max(tier_distance, min(risk, ATR_NOISE_FLOOR * atr_f))
+
+    # Give-back cap: surrender only a bounded slice of the run. Takes over
+    # whenever it is TIGHTER than the R-tier trail (the normal case on option
+    # premiums, where R is a huge fraction of the entry price).
+    distance = tier_distance
+    giveback_active = False
+    keep = giveback_keep_for(mfe_percent)
+    if keep is not None and mfe > 0:
+        giveback_distance = mfe * (1.0 - keep)
+        if giveback_distance < distance:
+            distance = giveback_distance
+            giveback_active = True
+            tier = "giveback"
+
+    # Spread floor LAST: nothing may rest inside the round-trip spread. If the
+    # floor erases the give-back edge the tier label reverts to the R rung.
+    spread_f = _finite(spread)
+    if spread_f is not None and spread_f > 0:
+        floor = min(risk, SPREAD_FLOOR_MULT * spread_f)
+        if floor > distance:
+            distance = floor
+            if distance >= tier_distance:
+                giveback_active = False
+                tier = (
+                    "breakeven"
+                    if rung["tier"] == "initial" and mfe_percent >= BREAKEVEN_TRIGGER_PCT
+                    else rung["tier"]
+                )
 
     raw = (water_mark - distance) if is_buy else (water_mark + distance)
 
-    if r_multiple >= BREAKEVEN_TRIGGER_R:
+    if r_multiple >= BREAKEVEN_TRIGGER_R or mfe_percent >= BREAKEVEN_TRIGGER_PCT:
         raw = max(raw, entry) if is_buy else min(raw, entry)
 
     trail = max(stop, raw) if is_buy else min(stop, raw)
@@ -2019,9 +2297,11 @@ def compute_trail_level(
     return {
         "trail_price": trail,
         "trail_distance": _round2(distance),
-        "tier": rung["tier"],
+        "tier": tier,
         "r_multiple": round(r_multiple * 100) / 100.0,
         "breakeven_locked": (trail >= entry) if is_buy else (trail <= entry),
+        "mfe_percent": math.floor(mfe_percent * 10000 + 0.5) / 10000.0,
+        "giveback_active": giveback_active,
     }
 
 
@@ -2030,6 +2310,7 @@ def plan_ratchet(
     mark: float,
     min_step_frac: float = 0.10,
     min_step_abs: float = 0.02,
+    spread: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """Decide whether a position's resting stop should be ratcheted.
 
@@ -2049,6 +2330,11 @@ def plan_ratchet(
     A replace is only proposed when the improvement over the currently resting
     level clears max(min_step_abs, min_step_frac × initial risk) — small
     ratchets aren't worth a cancel/replace round-trip at the broker.
+
+    `spread` is the live bid/ask spread on the SAME basis as `mark` (premium for
+    options). It floors the trail distance so a wide chain is never stopped out
+    by its own quote. The min step is likewise floored at half the spread: a
+    ratchet smaller than the spread is noise, not progress.
     """
     is_option = bool((position.get("contract") or {}).get("right"))
     side = str(position.get("action") or "BUY").upper()
@@ -2085,9 +2371,13 @@ def plan_ratchet(
         low_since=low,
         atr=position.get("atr"),
         prev_trail=current_stop,
+        spread=spread,
     )
 
     step = max(float(min_step_abs), float(min_step_frac) * risk)
+    spread_f = _finite(spread)
+    if spread_f is not None and spread_f > 0:
+        step = max(step, 0.5 * spread_f)
     improvement = (trail["trail_price"] - current_stop) if is_buy else (current_stop - trail["trail_price"])
     return {
         "entry": entry,
@@ -3065,7 +3355,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.13.0-account-picker"
+BOT_VERSION = "5.16.0-premium-basis-risk"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -3145,6 +3435,15 @@ TRADE_LEDGER_FILE = Path(os.getenv("TRADE_LEDGER_FILE", "trade_ledger.jsonl"))
 # Option stop protection: when the app doesn't send an explicit option stop
 # premium, protect at this percent below the entry premium (0 disables).
 OPTION_STOP_LOSS_PCT = float(os.getenv("OPTION_STOP_LOSS_PCT", "30"))
+# Sanity band for an APP-SUPPLIED `option_stop_price` (delta-derived, premium
+# basis — see expo/services/optionStop.ts). The app owns the policy; these are
+# guardrails against a bad number, not a second policy. Tighter than MIN% of
+# the fill is inside ordinary option noise and scratches instantly; wider than
+# MAX% risks more than the blind percentage stop it replaces. Out-of-band
+# values are CLAMPED and logged, so systematic drift is visible instead of
+# silently resting a dangerous level.
+OPTION_STOP_MIN_HAIRCUT_PCT = float(os.getenv("OPTION_STOP_MIN_HAIRCUT_PCT", "8"))
+OPTION_STOP_MAX_HAIRCUT_PCT = float(os.getenv("OPTION_STOP_MAX_HAIRCUT_PCT", "45"))
 
 # ---- V5.2 hardening ----
 # Exponential backoff for ALL E*TRADE API calls. The same env vars configure
@@ -4765,23 +5064,99 @@ async def _order_state(order_id: Optional[str], client_id: Optional[str]) -> Tup
     return "NOT_FOUND", 0
 
 
-async def _cancel_order_safe(order_id: Optional[str]) -> bool:
-    """Best-effort broker order cancel. Returns True only when the cancel call
-    succeeded — callers must treat False as 'the order may still be live'."""
+# ---- Broker-verified cancel -------------------------------------------------
+# Cancel outcomes. The distinction between "gone" and "filled" is the whole
+# point: a protective stop that EXECUTED means the position is already flat, so
+# replacing it (trailing engine) or selling again (exit path) is a double-sell.
+CANCEL_NONE = "none"
+CANCEL_CONFIRMED = "cancelled"
+CANCEL_FILLED = "filled"
+CANCEL_LIVE = "live"
+
+# Broker statuses that PROVE the order is no longer working.
+_CANCEL_CONFIRMED_STATUSES = {"CANCELLED", "CANCEL_REQUESTED", "REJECTED", "EXPIRED", "NOT_FOUND"}
+
+
+async def _cancel_order_call(order_id: str) -> None:
+    """Issue the cancel request. The raw async client goes first because
+    E*TRADE answers PUT /orders/cancel.json with an EMPTY body — pyetrade
+    json-decodes that and dies with "Expecting value: line 1 column 1 (char 0)"
+    even though the broker cancelled the order. The raw client treats an empty
+    2xx as success; pyetrade remains the fallback transport."""
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("E*TRADE tokens not set")
+    acct_key = await _resolve_account_id_key(tokens)
+    if USE_RAW_ORDER_API:
+        try:
+            await _raw_client(tokens).cancel_order(acct_key, int(order_id))
+            return
+        except ETradeAPIError as e:
+            # A 4xx is a real broker verdict (already cancelled / filled / bad
+            # id) — surface it so verification can classify it. Anything else
+            # is transport noise worth retrying on the pyetrade path.
+            if 400 <= e.status_code < 500:
+                raise
+            logger.warning(f"raw cancel path failed for {order_id} ({e}) — falling back to pyetrade")
+    orders = _orders_client(tokens)
+    await _etrade_call(orders.cancel_order, acct_key, int(order_id), resp_format="json", source="cancel_order")
+
+
+async def _cancel_order_verified(order_id: Optional[str]) -> str:
+    """Cancel a resting broker order and VERIFY the outcome against the
+    broker's own order book. Returns one of:
+
+      CANCEL_NONE      — nothing to cancel (no order id)
+      CANCEL_CONFIRMED — provably no longer working: safe to replace the stop
+                         or send a closing order
+      CANCEL_FILLED    — the order EXECUTED (the stop triggered): the position
+                         is already flat — never replace it, never sell again
+      CANCEL_LIVE      — not confirmed gone; assume it may still fill
+
+    Verification is what makes this trustworthy. The cancel *call* can fail for
+    reasons that have nothing to do with the broker (empty body, dropped
+    socket) while the cancel itself went through. Trusting the exception alone
+    froze the trailing engine: every ratchet reported "could not cancel", yet
+    the stop really was gone, so positions sat unprotected until the reconciler
+    re-armed them at the ORIGINAL level and the trail never moved.
+    """
     if not order_id:
-        return False
+        return CANCEL_NONE
+
+    call_ok = True
     try:
-        tokens = load_tokens()
-        if not tokens:
-            return False
-        acct_key = await _resolve_account_id_key(tokens)
-        orders = _orders_client(tokens)
-        await _etrade_call(orders.cancel_order, acct_key, int(order_id), resp_format="json", source="cancel_order")
-        logger.info(f"[STOP GUARD] cancelled order {order_id}")
-        return True
+        await _cancel_order_call(str(order_id))
     except Exception as e:
-        logger.warning(f"order cancel failed ({order_id}): {e}")
-        return False
+        call_ok = False
+        logger.warning(f"order cancel call failed ({order_id}): {e} — verifying against broker order book")
+
+    status, filled = "UNKNOWN", 0
+    try:
+        status, filled = await _order_state(str(order_id), None)
+    except Exception as e:
+        logger.warning(f"cancel verification unavailable for order {order_id}: {e}")
+
+    if status == "EXECUTED" or (filled > 0 and status in _CANCEL_CONFIRMED_STATUSES):
+        logger.warning(
+            f"[CANCEL] order {order_id} already filled at the broker "
+            f"(status={status}, filled={filled}) — treating as FILLED, not cancelled"
+        )
+        return CANCEL_FILLED
+    if status in _CANCEL_CONFIRMED_STATUSES:
+        logger.info(f"[CANCEL] order {order_id} confirmed gone at broker (status={status})")
+        return CANCEL_CONFIRMED
+    if call_ok:
+        # Cancel accepted and no fill seen; the order book can lag a few seconds.
+        logger.info(f"[CANCEL] cancelled order {order_id}")
+        return CANCEL_CONFIRMED
+    return CANCEL_LIVE
+
+
+async def _cancel_order_safe(order_id: Optional[str]) -> bool:
+    """Boolean view of `_cancel_order_verified`: True only when the order is
+    provably no longer working. A FILLED stop is deliberately NOT "cancelled" —
+    callers that must tell the two apart use `_cancel_order_verified`."""
+    return await _cancel_order_verified(order_id) == CANCEL_CONFIRMED
 
 
 async def _current_bid_ask(ticker: str, contract: Optional[dict] = None) -> Tuple[float, float]:
@@ -4992,6 +5367,59 @@ async def _emergency_flatten(ticker: str, guard: dict, qty: int) -> Optional[str
     return _order_id_from_place(placed)
 
 
+def plan_flatten(positions: dict, guards: dict) -> list:
+    """Build the ordered EMERGENCY EXIT plan for every tracked position.
+
+    The kill switch was a HALF-KILL: /kill set the killed flag so no new entries
+    could dispatch, but every position already open kept running with only its
+    resting stop for company. A "kill" that leaves live risk on the table is the
+    most dangerous kind of safety control - it feels like an exit and isn't one.
+
+    This is the pure planning half, so the sequencing is testable without a
+    broker. Two rules matter and both cost real money when broken:
+
+      CANCEL BEFORE CLOSE - the resting protective stop already pledges the
+        shares/contracts. Sending a market close while it rests earns E*TRADE
+        error 3004 ("already allocated to an existing open order") and the
+        flatten silently fails on exactly the position you most wanted gone.
+
+      NEVER GUESS A CONTRACT - an option close needs right + expiration +
+        strike. Missing any of them, _emergency_flatten would raise mid-loop and
+        abandon every remaining position, so those are reported BLOCKED instead
+        and the loop carries on.
+
+    Returns one entry per tracked ticker, sorted for deterministic execution.
+    """
+    plan: list = []
+    for ticker in sorted(positions.keys()):
+        pos = dict(positions.get(ticker) or {})
+        guard = dict((guards or {}).get(ticker) or {})
+        contract = pos.get("contract") or guard.get("contract") or None
+        kind = str(guard.get("kind") or ("option" if contract else "equity"))
+        try:
+            qty = int(pos.get("filled_qty") or pos.get("qty") or guard.get("guarded_qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        item = {
+            "ticker": ticker,
+            "qty": qty,
+            "kind": kind,
+            "contract": contract,
+            "action": str(pos.get("action") or guard.get("action") or "BUY").upper(),
+            "stop_order_id": pos.get("stop_order_id") or guard.get("stop_order_id") or None,
+            "blocked": None,
+        }
+        if qty <= 0:
+            item["blocked"] = "no tracked quantity to close"
+        elif kind == "option":
+            c = dict(contract or {})
+            missing = [k for k in ("right", "expiration", "strike") if not c.get(k)]
+            if missing:
+                item["blocked"] = f"option contract incomplete (missing {', '.join(missing)})"
+        plan.append(item)
+    return plan
+
+
 async def _finish_guard(ticker: str, result: str) -> None:
     await state.update_guard(ticker, done=True, result=result)
     logger.info(f"[STOP GUARD] {ticker} finished: {result}")
@@ -5042,8 +5470,18 @@ async def _stop_guard_worker(ticker: str) -> None:
                 can_place = True
                 if guard.get("stop_order_id"):
                     # Replace flow: only place a new stop if the old one is truly
-                    # cancelled — never risk two live stops double-selling.
-                    can_place = await _cancel_order_safe(guard.get("stop_order_id"))
+                    # cancelled — never risk two live stops double-selling, and
+                    # never re-arm behind a stop that already filled.
+                    replace_outcome = await _cancel_order_verified(guard.get("stop_order_id"))
+                    can_place = replace_outcome == CANCEL_CONFIRMED
+                    if replace_outcome == CANCEL_FILLED:
+                        logger.warning(
+                            f"[STOP GUARD] {ticker} protective stop already executed — position closed, "
+                            f"not re-arming"
+                        )
+                        await _finish_guard(ticker, "closed_by_stop")
+                        await _record_close(ticker, None, {"ticker": ticker, "action": guard.get("action") or "BUY"})
+                        return
                 if can_place:
                     try:
                         if is_option:
@@ -5669,6 +6107,55 @@ def _round_to_option_tick(price: float, direction: str = "nearest") -> float:
     return max(tick, round(ticks * tick, 2))
 
 
+def _clamp_option_stop_premium(candidate: float, fill_ref: float) -> tuple:
+    """Clamp an app-supplied protective stop PREMIUM into the sanity band.
+
+    The app derives this level from the underlying stop through delta, which is
+    what finally makes broker-side risk equal the risk the user sized. It is
+    still a number from another process, so it is bounded here:
+
+      * tighter than OPTION_STOP_MIN_HAIRCUT_PCT of the fill — inside ordinary
+        option noise; the position would scratch on the first tick.
+      * wider than OPTION_STOP_MAX_HAIRCUT_PCT of the fill — risks MORE than
+        the blind percentage stop this replaces.
+      * at/above the fill, or non-positive — not a protective level at all.
+
+    Returns `(stop, note)`; `note` is empty when the value passed untouched and
+    is a human-readable explanation when it was clamped.
+    """
+    try:
+        stop = float(candidate)
+    except (TypeError, ValueError):
+        return None, "was not a number — falling back to the percentage stop"
+    if not math.isfinite(stop) or stop <= 0:
+        return None, "was not positive — falling back to the percentage stop"
+    try:
+        fill = float(fill_ref)
+    except (TypeError, ValueError):
+        fill = 0.0
+    if not math.isfinite(fill) or fill <= 0:
+        # No reference premium to judge against; accept as-is (the guard still
+        # reprices below the live bid if the broker rejects it).
+        return round(stop, 2), ""
+
+    tightest = fill * (1.0 - OPTION_STOP_MIN_HAIRCUT_PCT / 100.0)
+    widest = fill * (1.0 - OPTION_STOP_MAX_HAIRCUT_PCT / 100.0)
+    if widest <= 0:
+        return None, "band collapsed (max haircut ≥ 100%) — falling back to the percentage stop"
+
+    if stop > tightest:
+        return round(tightest, 2), (
+            f"{stop:.2f} risks only {((fill - stop) / fill * 100.0):.1f}% of the {fill:.2f} fill — "
+            f"widened to {tightest:.2f} ({OPTION_STOP_MIN_HAIRCUT_PCT:.0f}% floor)"
+        )
+    if stop < widest:
+        return round(widest, 2), (
+            f"{stop:.2f} risks {((fill - stop) / fill * 100.0):.1f}% of the {fill:.2f} fill — "
+            f"tightened to {widest:.2f} ({OPTION_STOP_MAX_HAIRCUT_PCT:.0f}% ceiling)"
+        )
+    return round(stop, 2), ""
+
+
 # ==================== CONTRACT SNAP ====================
 def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_put: str):
     """Snap a requested option expiry/strike to REAL listed contract values.
@@ -5882,24 +6369,19 @@ async def execute_live_order(payload: dict):
                 pos = await state.get_position(sym_u) or {}
                 opt_guard = await state.get_guard(sym_u) or {}
                 resting_stop_id = pos.get("stop_order_id") or opt_guard.get("stop_order_id")
-                if resting_stop_id and not await _cancel_order_safe(resting_stop_id):
-                    try:
-                        stop_status, _sf = await _order_state(resting_stop_id, None)
-                    except Exception as e:
-                        stop_status = "UNKNOWN"
-                        logger.warning(f"option stop status check failed for {sym_u}: {e}")
-                    if stop_status == "EXECUTED":
-                        await _finish_guard(sym_u, "closed_by_stop")
-                        await _record_close(sym_u, None, payload)
-                        logger.info(f"[LIVE option CLOSE] {sym_u} already closed by resting stop {resting_stop_id}")
-                        return {
-                            "status": "success",
-                            "response": {"note": "resting protective stop already executed at broker", "stop_order_id": resting_stop_id},
-                        }
-                    if stop_status not in {"CANCELLED", "REJECTED", "EXPIRED", "NOT_FOUND"}:
-                        raise Exception(
-                            f"could not cancel resting option stop {resting_stop_id} — refusing to double-sell {sym_u}"
-                        )
+                stop_outcome = await _cancel_order_verified(resting_stop_id)
+                if stop_outcome == CANCEL_FILLED:
+                    await _finish_guard(sym_u, "closed_by_stop")
+                    await _record_close(sym_u, None, payload)
+                    logger.info(f"[LIVE option CLOSE] {sym_u} already closed by resting stop {resting_stop_id}")
+                    return {
+                        "status": "success",
+                        "response": {"note": "resting protective stop already executed at broker", "stop_order_id": resting_stop_id},
+                    }
+                if stop_outcome == CANCEL_LIVE:
+                    raise Exception(
+                        f"could not cancel resting option stop {resting_stop_id} — refusing to double-sell {sym_u}"
+                    )
                 await _finish_guard(sym_u, "closed_by_app")
 
                 # EXIT (SELL_CLOSE): protective exits must FILL. Default to
@@ -5995,6 +6477,7 @@ async def execute_live_order(payload: dict):
                 # STOP on the same OCC contract.
                 entry_order_id = _order_id_from_place(final)
                 stop_premium: Optional[float] = None
+                stop_basis = "pct_default"
                 explicit = payload.get("option_stop_price")
                 try:
                     if explicit is not None and float(explicit) > 0:
@@ -6002,6 +6485,15 @@ async def execute_live_order(payload: dict):
                 except (TypeError, ValueError):
                     stop_premium = None
                 fill_ref = float(common.get("limitPrice") or 0)
+                if stop_premium is not None:
+                    # App-supplied premium stop (delta-derived). Clamp into the
+                    # sanity band so a bad number can never rest a stop inside
+                    # the noise or wider than the percentage stop it replaces.
+                    stop_premium, clamp_note = _clamp_option_stop_premium(stop_premium, fill_ref)
+                    stop_basis = str(payload.get("option_stop_basis") or "app_delta")
+                    if clamp_note:
+                        stop_basis = f"{stop_basis}+clamped"
+                        logger.warning(f"⚠️ {symbol} app option stop {clamp_note}")
                 if stop_premium is None and fill_ref > 0 and OPTION_STOP_LOSS_PCT > 0:
                     stop_premium = fill_ref * (1.0 - OPTION_STOP_LOSS_PCT / 100.0)
                 if stop_premium and stop_premium > 0:
@@ -6018,9 +6510,10 @@ async def execute_live_order(payload: dict):
                         if fill_ref > 0:
                             pos_rec["entry_premium"] = round(fill_ref, 2)
                         await state.set_position(str(symbol).upper(), pos_rec)
+                    risk_pct = ((fill_ref - stop_premium) / fill_ref * 100.0) if fill_ref > 0 else 0.0
                     logger.info(
                         f"[STOP GUARD] option guard armed for {symbol} at premium {stop_premium:.2f} "
-                        f"(entry order={entry_order_id})"
+                        f"(risk {risk_pct:.1f}% of {fill_ref:.2f}, basis={stop_basis}, entry order={entry_order_id})"
                     )
                 else:
                     logger.warning(f"⚠️ {symbol} option entry has no derivable stop premium — no broker-side stop armed")
@@ -6039,19 +6532,12 @@ async def execute_live_order(payload: dict):
                 pos = tracked_pos or {}
                 guard = await state.get_guard(symbol) or {}
                 stop_order_id = pos.get("stop_order_id") or guard.get("stop_order_id")
-                already_closed_by_stop = False
-                if stop_order_id and not await _cancel_order_safe(stop_order_id):
-                    try:
-                        stop_status, _stop_filled = await _order_state(stop_order_id, None)
-                    except Exception as e:
-                        stop_status = "UNKNOWN"
-                        logger.warning(f"stop status check failed for {symbol}: {e}")
-                    if stop_status == "EXECUTED":
-                        already_closed_by_stop = True
-                    elif stop_status not in {"CANCELLED", "REJECTED", "EXPIRED", "NOT_FOUND"}:
-                        raise Exception(
-                            f"could not cancel resting stop {stop_order_id} — refusing to double-sell {symbol}"
-                        )
+                stop_outcome = await _cancel_order_verified(stop_order_id)
+                already_closed_by_stop = stop_outcome == CANCEL_FILLED
+                if stop_outcome == CANCEL_LIVE:
+                    raise Exception(
+                        f"could not cancel resting stop {stop_order_id} — refusing to double-sell {symbol}"
+                    )
                 await _finish_guard(symbol, "closed_by_app")
                 if already_closed_by_stop:
                     await _record_close(symbol, None, payload)
@@ -6409,7 +6895,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     is_option = bool(contract and contract.get("right"))
     qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
     stop_order_id = pos.get("stop_order_id")
-    if qty < 1 or not stop_order_id:
+    if qty < 1:
         return
 
     bid, ask = await _current_bid_ask(ticker, dict(contract) if is_option else None)
@@ -6420,7 +6906,15 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     if mark <= 0:
         return
 
-    plan = trailing_engine.plan_ratchet(pos, mark, min_step_frac=TRAIL_MIN_STEP_FRAC)
+    # Live round-trip spread on the same basis as the mark. It floors the trail
+    # distance so a wide chain (ARM at 10.85/11.75) is never stopped out by its
+    # own quote, and floors the min ratchet step so sub-spread moves don't burn
+    # a cancel/replace round-trip.
+    spread = (ask - bid) if (ask > 0 and bid > 0 and ask >= bid) else None
+
+    plan = trailing_engine.plan_ratchet(
+        pos, mark, min_step_frac=TRAIL_MIN_STEP_FRAC, spread=spread,
+    )
     if plan is None:
         return
 
@@ -6431,6 +6925,8 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     pos["trail_tier"] = plan["trail"]["tier"]
     pos["trail_r"] = plan["trail"]["r_multiple"]
     pos["breakeven_locked"] = plan["trail"]["breakeven_locked"]
+    pos["trail_mfe_pct"] = plan["trail"]["mfe_percent"]
+    pos["trail_giveback"] = plan["trail"]["giveback_active"]
     pos["trail_checked_at"] = _utcnow().isoformat()
 
     new_stop = plan["new_stop"]
@@ -6438,15 +6934,47 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         new_stop = _round_to_option_tick(new_stop, "down")
     replace = plan["should_replace"] and new_stop > float(plan["current_stop"]) if is_buy \
         else plan["should_replace"] and new_stop < float(plan["current_stop"])
+
+    if not stop_order_id:
+        # No stop resting (a placement failed, or the reconciler hasn't re-armed
+        # yet). The watermark still advances and the improved level is recorded
+        # as `trail`, so whoever re-arms does it at the RATCHETED price instead
+        # of the original stop — an unprotected minute never costs progress.
+        if replace:
+            pos["trail"] = new_stop
+            logger.info(
+                f"[TRAIL] {ticker} no resting stop — banked ratchet level {new_stop:.2f} "
+                f"for re-arm ({plan['trail']['tier']}, {plan['trail']['r_multiple']:+.2f}R)"
+            )
+        await state.set_position(ticker, pos)
+        return
+
     if not replace:
         await state.set_position(ticker, pos)
         return
 
     # Cancel/replace: never leave two live stops, and only place after the
-    # cancel is confirmed (same discipline as the stop guard's replace flow).
-    cancelled = await _cancel_order_safe(stop_order_id)
-    if not cancelled:
-        logger.warning(f"[TRAIL] {ticker} could not cancel resting stop {stop_order_id} — ratchet skipped this pass")
+    # cancel is confirmed against the broker's own order book.
+    outcome = await _cancel_order_verified(stop_order_id)
+    if outcome == CANCEL_FILLED:
+        # The stop we were about to tighten already triggered — the position is
+        # flat. Replacing it would rest a naked short; book the close instead.
+        logger.warning(f"[TRAIL] {ticker} resting stop {stop_order_id} already executed — booking the close")
+        await _finish_guard(ticker, "closed_by_stop")
+        await _record_close(ticker, float(plan["current_stop"]), {"ticker": ticker, "action": pos.get("action") or "BUY"})
+        await trade_ledger.record("trail_stop_executed", {
+            "ticker": ticker, "stop": plan["current_stop"], "order_id": stop_order_id,
+        })
+        await alerts.send(
+            "info", "trail_stop_executed",
+            f"{ticker}: trailing stop filled at the broker around {float(plan['current_stop']):.2f} — position closed.",
+            dedupe_key=f"trail_hit:{ticker}",
+        )
+        return
+    if outcome != CANCEL_CONFIRMED:
+        logger.warning(
+            f"[TRAIL] {ticker} resting stop {stop_order_id} still live at the broker — ratchet skipped this pass"
+        )
         await state.set_position(ticker, pos)
         return
 
@@ -6464,9 +6992,46 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
             logger.error(f"[TRAIL] {ticker} ratchet placement failed (attempt {attempt}/2): {e}")
 
     if stop_info is None:
-        # Old stop is cancelled and the new one didn't stick — the position is
-        # UNPROTECTED. Record the trail level so the reconciler re-arms at the
-        # ratcheted price, and scream.
+        # Old stop is cancelled and the tighter one didn't stick. Rather than
+        # sit naked until the next reconcile pass, immediately re-arm at the
+        # level that WAS resting — worse protection than intended still beats
+        # none at all.
+        try:
+            if is_option:
+                stop_info = await _place_option_protective_stop(
+                    ticker, dict(contract), qty, float(plan["current_stop"]),
+                )
+            else:
+                stop_info = await _place_protective_stop(
+                    ticker, str(pos.get("action") or "BUY"), qty, float(plan["current_stop"]),
+                )
+        except Exception as e:
+            logger.error(f"[TRAIL] {ticker} fallback re-arm at previous level also failed: {e}")
+
+    if stop_info is not None and float(stop_info["stop"]) != new_stop:
+        # Fallback re-arm succeeded: protection is restored at the old level and
+        # the ratcheted level is banked for the next pass.
+        pos["stop_order_id"] = stop_info["order_id"]
+        pos["trail"] = float(stop_info["stop"])
+        if is_option:
+            pos["stop_premium"] = float(stop_info["stop"])
+        await state.set_position(ticker, pos)
+        logger.warning(
+            f"[TRAIL] {ticker} ratchet to {new_stop:.2f} failed — protection restored at "
+            f"{float(stop_info['stop']):.2f} (order={stop_info['order_id']}), will retry next pass"
+        )
+        await alerts.send(
+            "warning", "trail_ratchet_recovered",
+            f"{ticker}: could not tighten the stop to {new_stop:.2f} — the previous stop at "
+            f"{float(stop_info['stop']):.2f} is resting again, so the position stayed protected. "
+            f"Reason: {last_err}",
+            dedupe_key=f"trail_recover:{ticker}",
+        )
+        return
+
+    if stop_info is None:
+        # Nothing rests at the broker — the position is UNPROTECTED. Record the
+        # trail level so the reconciler re-arms at the ratcheted price, and scream.
         pos["stop_order_id"] = None
         pos["trail"] = new_stop
         await state.set_position(ticker, pos)
@@ -6495,6 +7060,8 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         "ticker": ticker, "kind": "option" if is_option else "equity",
         "from": plan["current_stop"], "to": float(stop_info["stop"]),
         "tier": tier, "r_multiple": plan["trail"]["r_multiple"],
+        "mfe_percent": plan["trail"]["mfe_percent"],
+        "giveback_active": plan["trail"]["giveback_active"],
         "breakeven_locked": plan["trail"]["breakeven_locked"],
         "order_id": stop_info["order_id"],
     })
@@ -7138,6 +7705,82 @@ async def kill(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"
         dedupe_key="kill_switch",
     )
     return {"status": "killed", "open_positions": open_tickers}
+
+
+@app.post("/flatten")
+async def flatten(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret")):
+    """PANIC EXIT - halt new entries AND market-close every open position.
+
+    /kill only stops the next trade. This closes the ones already on. Kill is
+    engaged FIRST so nothing can enter behind the flatten, then each position has
+    its resting stop cancelled before the market close so E*TRADE cannot refuse
+    the exit with 3004.
+
+    Always MARKET: once the panic button is pressed, certainty of fill beats
+    price. Per-position failures are reported, never fatal - one bad contract must
+    not strand the rest of the book.
+    """
+    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
+        raise HTTPException(401, "invalid secret")
+
+    await state.set_killed(True)
+    positions = await state.all_positions()
+    guards = await state.all_guards()
+    plan = plan_flatten(positions, guards)
+    logger.warning(
+        f"[FLATTEN] panic exit requested - entries halted, {len(plan)} tracked position(s): "
+        f"{', '.join(p['ticker'] for p in plan) or 'none'}"
+    )
+
+    results: list = []
+    for item in plan:
+        ticker = item["ticker"]
+        if item["blocked"]:
+            logger.error(f"[FLATTEN] {ticker} BLOCKED - {item['blocked']}")
+            results.append({"ticker": ticker, "status": "blocked", "detail": item["blocked"]})
+            continue
+        try:
+            stop_outcome = "none"
+            if item["stop_order_id"]:
+                stop_outcome = await _cancel_order_verified(item["stop_order_id"])
+                if stop_outcome == "executed":
+                    # The stop filled while we were cancelling: the position is
+                    # already flat, and selling again would open a short.
+                    logger.info(f"[FLATTEN] {ticker} already closed by its resting stop")
+                    await _finish_guard(ticker, "flattened_by_stop")
+                    results.append({"ticker": ticker, "status": "already_flat",
+                                    "detail": "resting stop executed"})
+                    continue
+                if stop_outcome not in {"cancelled", "gone"}:
+                    raise Exception(
+                        f"could not cancel resting stop {item['stop_order_id']} "
+                        f"(outcome={stop_outcome}) - refusing to double-sell"
+                    )
+            guard_shape = {"kind": item["kind"], "contract": item["contract"],
+                           "action": item["action"]}
+            order_id = await _emergency_flatten(ticker, guard_shape, item["qty"])
+            await _finish_guard(ticker, "flattened")
+            logger.warning(
+                f"[FLATTEN] {ticker} market close placed - qty={item['qty']} "
+                f"kind={item['kind']} order={order_id} (stop {stop_outcome})"
+            )
+            results.append({"ticker": ticker, "status": "closing", "order_id": order_id,
+                            "qty": item["qty"], "kind": item["kind"], "stop": stop_outcome})
+        except Exception as e:
+            logger.error(f"[FLATTEN] {ticker} FAILED - {e}")
+            results.append({"ticker": ticker, "status": "failed", "detail": str(e)[:300]})
+
+    closing = [r["ticker"] for r in results if r["status"] == "closing"]
+    failed = [r["ticker"] for r in results if r["status"] in {"failed", "blocked"}]
+    await trade_ledger.record("flatten_all", {"results": results})
+    await alerts.send(
+        "critical", "flatten_all",
+        "PANIC EXIT - entries halted. "
+        f"Closing: {', '.join(closing) or 'none'}. "
+        + (f"NEEDS ATTENTION: {', '.join(failed)}" if failed else "All positions handled."),
+    )
+    return {"status": "flattened", "killed": True, "closing": closing,
+            "failed": failed, "results": results}
 
 
 @app.post("/resume")
