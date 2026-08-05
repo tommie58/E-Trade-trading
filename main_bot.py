@@ -1601,6 +1601,50 @@ _CLOSING_ACTIONS = {"SELL", "SELL_CLOSE", "BUY_TO_COVER", "BUY_CLOSE"}
 # A stop armed against a partial fill is legitimate for a few seconds while the
 # rest of the entry completes; only repair coverage once the dust settles.
 COVERAGE_GRACE_SECONDS = 60
+# A live guard owns its position's stop, so the protection-invariant audit stands
+# down while one is running. It may NOT stand down forever: a guard whose task
+# died leaves `done` unset, which would exempt the position from the audit for as
+# long as it is held. Past its own deadline plus this slack, audit it anyway.
+GUARD_TRUST_SLACK_SECONDS = 120
+
+
+def protective_level(position: dict) -> float:
+    """The protective price a tracked position is supposed to have resting.
+
+    Equity positions keep it in `stop`; OPTION positions keep it in
+    `stop_premium` (the premium trigger) and `stop` may legitimately be None or
+    hold the underlying-price stop instead. Reading only `stop` made every
+    option position look like it had no stop to check, so the UNPROTECTED
+    detector skipped options entirely. `trail` is included because a ratcheted
+    position's live protection is the trail, not the original stop.
+    """
+    best = 0.0
+    for key in ("stop", "stop_premium", "trail"):
+        try:
+            value = float(position.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > best:
+            best = value
+    return best
+
+
+def guard_owns_stop(guard: Optional[dict], now: float) -> bool:
+    """True while an active guard is still credibly responsible for the stop.
+
+    An unfinished guard past its deadline is assumed dead (worker restart, task
+    exception) — trusting it forever would exempt the position from every
+    protection audit below.
+    """
+    if not guard or guard.get("done"):
+        return False
+    try:
+        deadline = float(guard.get("deadline_ts") or 0)
+    except (TypeError, ValueError):
+        deadline = 0.0
+    if deadline <= 0:
+        return True  # no deadline recorded — take the guard at its word
+    return now <= deadline + GUARD_TRUST_SLACK_SECONDS
 
 
 def _utcnow_iso() -> str:
@@ -1830,10 +1874,12 @@ async def reconcile_once(
     report["live_orders"] = len(live_orders)
 
     now = time.time()
-    live_stop_symbols = {
-        o["symbol"] for o in live_orders
-        if o["price_type"] in {"STOP", "STOP_LIMIT", "TRAILING_STOP_CNST", "TRAILING_STOP_PRCT"}
-    }
+    # PROTECTION means a resting stop that CLOSES the position. A stop-entry
+    # order (BUY_STOP on a breakout) is also priceType STOP, and counting it as
+    # protection reported a naked position as protected — a false green on the
+    # one check that exists to catch naked risk.
+    stops_by_symbol = protective_stops_by_symbol(live_orders)
+    live_stop_symbols = set(stops_by_symbol.keys())
 
     # --- 1) tracked positions vs broker ---
     for ticker, pos in tracked.items():
@@ -1880,8 +1926,8 @@ async def reconcile_once(
 
         # Unprotected: real position, no live stop order, no active guard.
         guard = guards.get(ticker)
-        guard_active = bool(guard) and not guard.get("done")
-        if ticker not in live_stop_symbols and not guard_active and float(pos.get("stop") or 0) > 0:
+        guard_active = guard_owns_stop(guards.get(ticker), now)
+        if ticker not in live_stop_symbols and not guard_active and protective_level(pos) > 0:
             msg = f"{ticker}: UNPROTECTED — position at broker with no live stop and no active guard"
             report["warnings"].append(msg)
             logger.error(f"[RECONCILE] 🚨 {msg}")
@@ -1900,13 +1946,11 @@ async def reconcile_once(
     # --- 1b) protection invariant: exactly ONE resting stop, sized to the
     #         position. Runs after the filled_qty sync above so the audit
     #         compares against the broker's real position size.
-    stops_by_symbol = protective_stops_by_symbol(live_orders)
     for ticker, pos in tracked.items():
         broker = broker_positions.get(ticker)
         if broker is None:
             continue
-        guard = guards.get(ticker)
-        if bool(guard) and not guard.get("done"):
+        if guard_owns_stop(guards.get(ticker), now):
             continue  # a live guard owns this position's stop right now
         stops = stops_by_symbol.get(ticker) or []
         position_qty = abs(int(broker.get("qty") or 0)) or int(pos.get("filled_qty") or 0)
@@ -1988,6 +2032,13 @@ async def reconcile_once(
     #        no broker position) ---
     for order in live_orders:
         if order["price_type"] not in {"STOP", "STOP_LIMIT"}:
+            continue
+        # Only CLOSING stops can be orphaned. A BUY_STOP entry order legitimately
+        # rests with no position behind it — that is the whole point of a
+        # stop-entry — and cancelling it silently deleted pending breakout
+        # entries the user was waiting on.
+        action = str(order.get("order_action") or "")
+        if action and action not in _CLOSING_ACTIONS:
             continue
         symbol = order["symbol"]
         if symbol in tracked or symbol in broker_positions:
@@ -2724,14 +2775,21 @@ def detect_setup(
 
     Setup names deliberately match the bot's ALLOWED_SETUPS vocabulary so a
     scanner signal is judged by the exact same allowlist as an app signal.
-    Long-side only — the scanner never initiates a short."""
+    Long-side only — the scanner never initiates a short.
+
+    `series` holds the observations BEFORE this reading (the caller appends the
+    current quote only after evaluating it), so every element is prior history.
+    Dropping the last one — as `series[:-1]` did — hid the most recent
+    observation from `prior_high`, letting a price BELOW the real sampled high
+    be called a breakout, and made `prev_price` two observations stale so the
+    VWAP-reclaim test compared against the wrong bar."""
     if len(series) < MIN_SAMPLES:
         return None
     last = quote.get("last")
     if last is None:
         return None
-    prior = [s.get("last") for s in series[:-1] if s.get("last") is not None]
-    if len(prior) < MIN_SAMPLES - 1:
+    prior = [s.get("last") for s in series if s.get("last") is not None]
+    if len(prior) < MIN_SAMPLES:
         return None
     prior_high = max(prior)
     prev_price = prior[-1]
@@ -2794,8 +2852,11 @@ def score_factors(
     readings: List[Tuple[str, str, Optional[float], float, str, float]] = [
         ("rvol", "Relative volume", rvol, FULL_RVOL,
          "x", clamp01(((rvol or 0.0) - 1.0) / (FULL_RVOL - 1.0))),
+        # Long-side only: credit UPSIDE movement. `abs()` here paid full
+        # momentum points to a stock down 1.5% off the open, so a gap-up that
+        # faded hard scored like a leader.
         ("momentum", "Move off the open", change_from_open_pct, FULL_MOVE_PCT,
-         "%", clamp01(abs(change_from_open_pct or 0.0) / FULL_MOVE_PCT)),
+         "%", clamp01((change_from_open_pct or 0.0) / FULL_MOVE_PCT)),
         ("vwap", "Lead over VWAP", vwap_distance_pct, FULL_VWAP_PCT,
          "%", clamp01((vwap_distance_pct or 0.0) / FULL_VWAP_PCT)),
         ("liquidity", "Spread", spread, ceiling,
@@ -3355,7 +3416,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.16.0-premium-basis-risk"
+BOT_VERSION = "5.17.0-protection-truth"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -6980,6 +7041,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
 
     stop_info = None
     last_err: Optional[Exception] = None
+    used_fallback = False
     for attempt in (1, 2):
         try:
             if is_option:
@@ -6992,6 +7054,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
             logger.error(f"[TRAIL] {ticker} ratchet placement failed (attempt {attempt}/2): {e}")
 
     if stop_info is None:
+        used_fallback = True
         # Old stop is cancelled and the tighter one didn't stick. Rather than
         # sit naked until the next reconcile pass, immediately re-arm at the
         # level that WAS resting — worse protection than intended still beats
@@ -7008,7 +7071,13 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         except Exception as e:
             logger.error(f"[TRAIL] {ticker} fallback re-arm at previous level also failed: {e}")
 
-    if stop_info is not None and float(stop_info["stop"]) != new_stop:
+    # Whether the fallback ran is tracked explicitly. Inferring it by comparing
+    # the placed price against `new_stop` misread a SUCCESSFUL ratchet as a
+    # failure whenever the placement helper's own rounding produced a value that
+    # differed in the last float bit (_round2 can return 10.130000000000001 where
+    # round(x, 2) returns 10.13) — the user then got a "could not tighten the
+    # stop" alert about a stop that had just tightened correctly.
+    if used_fallback and stop_info is not None:
         # Fallback re-arm succeeded: protection is restored at the old level and
         # the ratcheted level is banked for the next pass.
         pos["stop_order_id"] = stop_info["order_id"]
