@@ -1586,6 +1586,12 @@ hours (and at a slower cadence off-hours), pulls:
 …compares them against Redis state, and auto-heals discrepancies:
 
   • updates filled quantities on tracked positions
+  • CAPTURES BROKER-SIDE FILLS: when a tracked position has vanished at the
+    broker, the pass first looks for the EXECUTED closing order that flattened
+    it (usually the bot's own resting protective stop) and books a REAL close
+    with the actual fill price via the injected `record_close` callback — so
+    realized P&L, the daily loss limit and the learning stack all see the
+    outcome instead of a silent "ghost removed"
   • marks/removes GHOST positions (tracked in Redis, absent at the broker,
     older than a grace period so an in-flight entry is never nuked)
   • detects ORPHANED protective stops (live stop order at the broker with no
@@ -1636,6 +1642,14 @@ COVERAGE_GRACE_SECONDS = 60
 # died leaves `done` unset, which would exempt the position from the audit for as
 # long as it is held. Past its own deadline plus this slack, audit it anyway.
 GUARD_TRUST_SLACK_SECONDS = 120
+# Ghost-resolution verdicts: the vanished position CLOSED (an executed closing
+# order with a readable fill was found) vs a true GHOST (no evidence of a fill).
+GHOST_CLOSED = "closed"
+GHOST_UNKNOWN = "ghost"
+# An executed close must postdate the position's open (minus clock slack) —
+# otherwise a stale EXECUTED order from an EARLIER round-trip on the same
+# symbol would be booked as this position's exit at the wrong price.
+FILL_CAPTURE_SLACK_SECONDS = 60
 
 
 def protective_level(position: dict) -> float:
@@ -1715,14 +1729,23 @@ def parse_broker_positions(portfolio_resp: Dict[str, Any]) -> Dict[str, dict]:
 
 
 def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
-    """Flatten an OrdersResponse into live (non-terminal) order records:
-    {order_id, symbol, status, price_type, order_action, filled, ordered}."""
+    """Flatten an OrdersResponse into order records (live AND terminal):
+    {order_id, symbol, status, price_type, order_action, filled, ordered,
+     exec_price, executed_ts}. `exec_price` is the average execution price of
+    a filled instrument (0 when not filled); `executed_ts` is the epoch-seconds
+    execution time (0 when unknown) — both are what fill capture books a
+    broker-side close from."""
     out: List[dict] = []
     root = (orders_resp or {}).get("OrdersResponse", {}) or {}
     for order in _as_list(root.get("Order")):
         order_id = str(order.get("orderId") or "")
         for detail in _as_list(order.get("OrderDetail")):
             status = str(detail.get("status") or "OPEN").upper()
+            try:
+                # E*TRADE stamps executedTime in epoch MILLISECONDS.
+                executed_ts = float(detail.get("executedTime") or 0) / 1000.0
+            except (TypeError, ValueError):
+                executed_ts = 0.0
             for inst in _as_list(detail.get("Instrument")):
                 product = inst.get("Product") or {}
                 try:
@@ -1733,6 +1756,10 @@ def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
                     ordered = int(float(inst.get("orderedQuantity") or inst.get("quantity") or 0))
                 except (TypeError, ValueError):
                     ordered = 0
+                try:
+                    exec_price = float(inst.get("averageExecutionPrice") or 0)
+                except (TypeError, ValueError):
+                    exec_price = 0.0
                 out.append({
                     "order_id": order_id,
                     "symbol": str(product.get("symbol") or "").upper(),
@@ -1742,6 +1769,8 @@ def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
                     "order_action": str(inst.get("orderAction") or "").upper(),
                     "filled": filled,
                     "ordered": ordered,
+                    "exec_price": exec_price,
+                    "executed_ts": executed_ts,
                 })
     return out
 
@@ -1851,12 +1880,95 @@ def plan_protection_repair(
     }
 
 
+def plan_ghost_resolution(
+    ticker: str,
+    pos: dict,
+    all_orders: List[dict],
+    opened_ts: float = 0.0,
+) -> dict:
+    """A tracked position has vanished at the broker. Decide whether it CLOSED
+    — an EXECUTED closing order with a readable fill exists for it — or is a
+    true ghost with no evidence of an exit.
+
+    Before this, every broker-side stop fill was handled as "ghost position
+    removed": the trade's exit price, realized P&L and outcome were silently
+    discarded, so the daily loss limit never saw the loss and the learning
+    stack never saw the win.
+
+    Resolution order:
+      1. the position's own tracked protective stop (`stop_order_id`) — the
+         authoritative close when it EXECUTED,
+      2. any other EXECUTED order on the symbol with an explicit CLOSING
+         action (manual close, app exit whose ack was lost).
+
+    A stop-ENTRY order executing OPENS a position, so anything with a non-
+    closing action is never a close. Fills stamped BEFORE the position opened
+    (minus `FILL_CAPTURE_SLACK_SECONDS`) belong to an earlier round-trip on
+    the same symbol and are ignored.
+
+    Returns {kind: GHOST_CLOSED, order_id, exit_price, basis, source} or
+    {kind: GHOST_UNKNOWN}. `basis` is "premium" for option positions (the fill
+    price of an option order IS the premium) and "underlying" for equities.
+    """
+    symbol = str(ticker or "").upper()
+    basis = "premium" if (pos or {}).get("contract") else "underlying"
+    tracked_stop_id = str((pos or {}).get("stop_order_id") or "")
+
+    def _fill_of(order: dict, require_closing_action: bool) -> Optional[dict]:
+        if str(order.get("status") or "").upper() != "EXECUTED":
+            return None
+        action = str(order.get("order_action") or "")
+        if require_closing_action:
+            if action not in _CLOSING_ACTIONS:
+                return None
+        elif action and action not in _CLOSING_ACTIONS:
+            return None
+        try:
+            filled = int(order.get("filled") or 0)
+            price = float(order.get("exec_price") or 0)
+            executed_ts = float(order.get("executed_ts") or 0)
+        except (TypeError, ValueError):
+            return None
+        if filled <= 0 or price <= 0:
+            return None
+        if opened_ts > 0 and executed_ts > 0 and executed_ts < opened_ts - FILL_CAPTURE_SLACK_SECONDS:
+            return None  # a fill from BEFORE this position opened is not its exit
+        return {
+            "kind": GHOST_CLOSED,
+            "order_id": str(order.get("order_id") or ""),
+            "exit_price": price,
+            "basis": basis,
+        }
+
+    if tracked_stop_id:
+        for order in all_orders:
+            if str(order.get("order_id") or "") != tracked_stop_id:
+                continue
+            hit = _fill_of(order, require_closing_action=False)
+            if hit:
+                hit["source"] = "tracked_stop"
+                return hit
+
+    for order in all_orders:
+        if str(order.get("symbol") or "").upper() != symbol:
+            continue
+        if tracked_stop_id and str(order.get("order_id") or "") == tracked_stop_id:
+            continue  # already checked above
+        hit = _fill_of(order, require_closing_action=True)
+        if hit:
+            hit["source"] = "closing_order"
+            return hit
+
+    return {"kind": GHOST_UNKNOWN}
+
+
 async def reconcile_once(
     state: StateStore,
     fetch_portfolio: Callable[[], Awaitable[Dict[str, Any]]],
     fetch_orders: Callable[[], Awaitable[Dict[str, Any]]],
     cancel_order: Callable[[str], Awaitable[bool]],
     rearm_guard: Optional[Callable[[str, dict], Awaitable[None]]] = None,
+    record_close: Optional[Callable[[str, dict, dict], Awaitable[None]]] = None,
     auto_heal: bool = True,
     alert: Optional[Callable[..., Awaitable[None]]] = None,
 ) -> Dict[str, Any]:
@@ -1930,18 +2042,59 @@ async def reconcile_once(
             )
             if has_live_entry or age < GHOST_GRACE_SECONDS:
                 continue
-            if auto_heal:
-                await state.delete_position(ticker)
-                guard = guards.get(ticker)
-                if guard and not guard.get("done"):
-                    await state.update_guard(ticker, done=True, result="reconciled_ghost")
-                report["healed"].append(f"{ticker}: ghost position removed (not at broker)")
-                logger.warning(f"[RECONCILE] 👻 {ticker} ghost position removed — not present at broker")
-                await _alert("warning", "ghost_position_removed",
-                             f"{ticker}: tracked position absent at broker — removed from state",
-                             dedupe_key=f"ghost:{ticker}")
-            else:
-                report["warnings"].append(f"{ticker}: ghost position (not at broker)")
+            # FILL CAPTURE — before writing the position off as a ghost, look
+            # for the executed closing order that actually flattened it. A
+            # protective stop filling at the broker is a real trade outcome:
+            # it must be BOOKED (realized P&L, daily loss limit, ledger,
+            # learning), not silently deleted.
+            resolution = plan_ghost_resolution(ticker, pos, all_orders, opened_ts=opened_ts)
+            if not auto_heal:
+                if resolution["kind"] == GHOST_CLOSED:
+                    report["warnings"].append(
+                        f"{ticker}: closed at broker (order {resolution['order_id']} filled "
+                        f"@ {resolution['exit_price']}) — not booked, auto-heal off"
+                    )
+                else:
+                    report["warnings"].append(f"{ticker}: ghost position (not at broker)")
+                continue
+            if resolution["kind"] == GHOST_CLOSED and record_close is not None:
+                booked = False
+                try:
+                    # record_close pops the position from state itself so the
+                    # close is booked exactly once.
+                    await record_close(ticker, pos, resolution)
+                    booked = True
+                except Exception as e:
+                    logger.error(
+                        f"[RECONCILE] fill-capture close for {ticker} failed: {e} — "
+                        f"falling back to ghost removal"
+                    )
+                if booked:
+                    guard = guards.get(ticker)
+                    if guard and not guard.get("done"):
+                        await state.update_guard(ticker, done=True, result="reconciled_stop_filled")
+                    detail = (
+                        f"{ticker}: broker-side fill captured — closed @ "
+                        f"{resolution['exit_price']:.2f} ({resolution['basis']}, "
+                        f"order {resolution['order_id']}, {resolution['source']})"
+                    )
+                    report["healed"].append(detail)
+                    logger.warning(f"[RECONCILE] 💰 {detail}")
+                    await _alert("warning", "stop_fill_captured",
+                                 f"{ticker}: position closed at the broker — order "
+                                 f"{resolution['order_id']} filled @ {resolution['exit_price']}. "
+                                 f"Realized P&L booked; daily loss limit and learning updated.",
+                                 dedupe_key=f"fill_capture:{ticker}")
+                    continue
+            await state.delete_position(ticker)
+            guard = guards.get(ticker)
+            if guard and not guard.get("done"):
+                await state.update_guard(ticker, done=True, result="reconciled_ghost")
+            report["healed"].append(f"{ticker}: ghost position removed (not at broker)")
+            logger.warning(f"[RECONCILE] 👻 {ticker} ghost position removed — not present at broker")
+            await _alert("warning", "ghost_position_removed",
+                         f"{ticker}: tracked position absent at broker — removed from state",
+                         dedupe_key=f"ghost:{ticker}")
             continue
 
         # Sync filled quantity from the broker's actual position size.
@@ -2113,6 +2266,7 @@ async def reconciliation_loop(
     is_market_open: Callable[[], bool],
     has_tokens: Callable[[], bool],
     rearm_guard: Optional[Callable[[str, dict], Awaitable[None]]] = None,
+    record_close: Optional[Callable[[str, dict, dict], Awaitable[None]]] = None,
     interval_seconds: int = 300,
     offhours_interval_seconds: int = 900,
     auto_heal: bool = True,
@@ -2139,7 +2293,8 @@ async def reconciliation_loop(
                     try:
                         await reconcile_once(
                             state, fetch_portfolio, fetch_orders, cancel_order,
-                            rearm_guard=rearm_guard, auto_heal=auto_heal, alert=alert,
+                            rearm_guard=rearm_guard, record_close=record_close,
+                            auto_heal=auto_heal, alert=alert,
                         )
                     finally:
                         await lock.release()
@@ -3446,7 +3601,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.19.0-audit-repair"
+BOT_VERSION = "5.20.0-fill-capture"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -5944,20 +6099,41 @@ def _entry_direction(pos: Optional[dict], payload: dict) -> float:
     return 1.0 if action == "BUY" else -1.0
 
 
-async def _record_close(ticker: str, exit_price: Optional[float], payload: dict) -> None:
-    """Pop the position and feed realized pnl (underlying move, signed by the
-    ENTRY direction) into the daily loss-limit accounting — plus credit equity
-    proceeds back into the tracked balance so wins/losses immediately update
-    the funds available for the next entry."""
+async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
+                        exit_premium: Optional[float] = None,
+                        close_reason: Optional[str] = None) -> None:
+    """Pop the position and feed realized pnl (signed by the ENTRY direction)
+    into the daily loss-limit accounting — plus credit equity proceeds back
+    into the tracked balance so wins/losses immediately update the funds
+    available for the next entry.
+
+    `exit_premium` books an OPTION close on the PREMIUM basis — the actual
+    fill price of the option order (a protective premium stop executing at the
+    broker). Premium move percent and real contract dollars (×100 multiplier)
+    are what the trade actually made or lost; the underlying-move percent used
+    for equities means almost nothing for a levered contract. The ledger
+    records `basis` so replays and the app know which unit `entry`/`exit` are
+    in. `close_reason` tags how the close was detected (e.g. the reconciler's
+    fill capture) for the audit trail."""
     pos = await state.delete_position(ticker)
     entry = float((pos or {}).get("entry") or payload.get("entry") or 0)
     exit_px = float(exit_price or payload.get("exit_price") or payload.get("limit_price") or entry or 0)
     direction = _entry_direction(pos, payload)
     qty = int((pos or {}).get("filled_qty") or (pos or {}).get("qty") or 0)
     is_option = bool((pos or {}).get("contract"))
+    entry_premium = float((pos or {}).get("entry_premium") or 0)
     pnl_pct: Optional[float] = None
     realized_usd: Optional[float] = None
-    if entry > 0 and exit_px > 0:
+    basis = "underlying"
+    if exit_premium is not None and is_option and float(exit_premium) > 0:
+        basis = "premium"
+        exit_px = float(exit_premium)
+        if entry_premium > 0:
+            pnl_pct = direction * ((exit_px - entry_premium) / entry_premium * 100.0)
+            await state.add_realized_pnl(pnl_pct)
+            if qty > 0:
+                realized_usd = direction * (exit_px - entry_premium) * 100.0 * qty
+    elif entry > 0 and exit_px > 0:
         pnl_pct = direction * ((exit_px - entry) / entry * 100.0)
         await state.add_realized_pnl(pnl_pct)
         if qty > 0 and not is_option:
@@ -5973,14 +6149,18 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict)
             logger.warning(f"balance credit failed (non-fatal): {e}")
     await trade_ledger.record("position_closed", {
         "ticker": ticker,
-        "entry": entry or None,
+        # On the premium basis, entry/exit are BOTH premiums so a replay
+        # re-derives the same percent the daily counter was fed.
+        "entry": (entry_premium if basis == "premium" else entry) or None,
         "exit": exit_px or None,
+        "basis": basis,
         # The ENTRY side is recorded explicitly so a later replay of the ledger
         # can verify the P&L sign without having to hunt for the matching open.
         "entry_action": "BUY" if direction > 0 else "SELL",
         "realized_pnl_pct": round(pnl_pct, 4) if pnl_pct is not None else None,
         "realized_pnl_usd": round(realized_usd, 2) if realized_usd is not None else None,
         "qty": qty or None,
+        "reason": close_reason,
     })
 
 
@@ -7064,6 +7244,24 @@ async def _reconcile_cancel(order_id: str) -> bool:
     return await _cancel_order_safe(order_id)
 
 
+async def _reconcile_record_close(ticker: str, pos: dict, resolution: dict) -> None:
+    """Book a broker-side close the reconciler captured — a protective stop (or
+    other closing order) that EXECUTED while nothing was watching. Before fill
+    capture, such an exit surfaced only as "ghost position removed": the fill
+    price, realized P&L and outcome were discarded, so the daily loss limit
+    stayed blind to stop-outs and the learning stack never graded the trade.
+
+    Option fills are booked on the PREMIUM basis (the executed price of an
+    option order IS the premium); equity fills on the underlying basis."""
+    exit_price = float(resolution.get("exit_price") or 0)
+    payload = {"ticker": ticker, "action": pos.get("action") or "BUY", "intent": "close"}
+    reason = f"fill_capture:{resolution.get('source') or 'unknown'}"
+    if str(resolution.get("basis") or "") == "premium":
+        await _record_close(ticker, None, payload, exit_premium=exit_price, close_reason=reason)
+    else:
+        await _record_close(ticker, exit_price, payload, close_reason=reason)
+
+
 async def _reconcile_rearm_guard(ticker: str, pos: dict) -> None:
     """Re-arm a protective stop for a position the reconciler found
     UNPROTECTED (filled at broker, no live stop, no active guard). Re-arms at
@@ -7105,6 +7303,7 @@ def _start_reconciler() -> None:
         _is_market_open,
         _reconcile_has_tokens,
         rearm_guard=_reconcile_rearm_guard,
+        record_close=_reconcile_record_close,
         interval_seconds=RECONCILE_INTERVAL_SECONDS,
         offhours_interval_seconds=RECONCILE_OFFHOURS_SECONDS,
         auto_heal=RECONCILE_AUTO_HEAL,
@@ -7390,6 +7589,7 @@ async def _startup_reconcile() -> None:
             reconciliation.reconcile_once(
                 state, _reconcile_fetch_portfolio, _reconcile_fetch_orders,
                 _reconcile_cancel, rearm_guard=_reconcile_rearm_guard,
+                record_close=_reconcile_record_close,
                 auto_heal=RECONCILE_AUTO_HEAL, alert=alerts.send,
             ),
             timeout=STARTUP_RECONCILE_TIMEOUT_SECONDS,
