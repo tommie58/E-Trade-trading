@@ -542,13 +542,29 @@ class StateStore:
             await self._memory.srem(GUARDS_INDEX, ticker)
 
     async def all_guards(self) -> Dict[str, dict]:
+        """Every live guard record, self-healing the index as it goes.
+
+        `all_positions` already drops index entries whose value key vanished;
+        guards did not, so an evicted or manually-deleted `stop_guard:{T}` left
+        its ticker in `stop_guards:index` permanently. The set then grew without
+        bound and every caller paid an extra round-trip per dead entry on every
+        reconcile, trail and flatten pass.
+        """
         out: Dict[str, dict] = {}
+        stale: List[str] = []
         tickers = (await self.redis.smembers(GUARDS_INDEX)) if self.redis is not None \
             else await self._memory.smembers(GUARDS_INDEX)
         for ticker in sorted(tickers):
             guard = await self.get_guard(ticker)
             if guard is not None:
                 out[ticker] = guard
+            else:
+                stale.append(ticker)
+        for ticker in stale:
+            if self.redis is not None:
+                await self.redis.srem(GUARDS_INDEX, ticker)
+            else:
+                await self._memory.srem(GUARDS_INDEX, ticker)
         return out
 
     async def pending_guards(self) -> Dict[str, dict]:
@@ -766,6 +782,11 @@ class ETradeAPIError(Exception):
 class OTOCOUnsupported(ETradeAPIError):
     """The atomic multi-leg submission was rejected — fall back to sequential
     placement + stop guard."""
+
+
+# 4xx statuses that say nothing about whether the broker accepts multi-leg
+# orders: the session, the permissions, or the rate budget failed instead.
+_NOT_AN_OTOCO_VERDICT = {401, 403, 429}
 
 
 def _extract_error_message(body: str) -> str:
@@ -1046,6 +1067,15 @@ class ETradeAsyncClient:
         try:
             return await self.preview_and_place(account_id_key, order_type, client_order_id, details)
         except ETradeAPIError as e:
+            # Only a genuine REJECTION of the multi-leg shape means "OTOCO is not
+            # supported here". An expired session (401), a permissions problem
+            # (403) or an exhausted throttle budget (429) are 4xx too, and
+            # relabelling them as OTOCOUnsupported sent the caller down the
+            # sequential fallback path where the identical failure was guaranteed
+            # to repeat — burning a second round-trip and writing a log line that
+            # blamed the order shape for an auth or rate-limit problem.
+            if e.status_code in _NOT_AN_OTOCO_VERDICT:
+                raise
             if 400 <= e.status_code < 500:
                 raise OTOCOUnsupported(e.status_code, e.message, e.body) from e
             raise
@@ -3416,7 +3446,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.17.0-protection-truth"
+BOT_VERSION = "5.19.0-audit-repair"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -3520,6 +3550,13 @@ ETRADE_RETRY_MAX_SECONDS = float(os.getenv("ETRADE_RETRY_MAX_SECONDS", "8"))
 # deadline with no stop: an unfilled entry is auto-cancelled; a filled entry
 # is emergency-flattened at market (a fill cannot be cancelled). 0 disables.
 STOP_PLACEMENT_TIMEOUT_SECONDS = int(os.getenv("STOP_PLACEMENT_TIMEOUT_SECONDS", "60"))
+# CANCEL SETTLEMENT: E*TRADE answers a cancel with CANCEL_REQUESTED, which is a
+# PENDING state — the contracts/shares stay allocated to the dying order for a
+# beat afterwards. Sending the replacement stop or the closing order inside that
+# window earns error 1037/3004 ("not enough available contracts … may already be
+# allocated to an existing open order"). Wait for a TERMINAL status first.
+CANCEL_SETTLE_TIMEOUT_SECONDS = float(os.getenv("CANCEL_SETTLE_TIMEOUT_SECONDS", "8"))
+CANCEL_SETTLE_POLL_SECONDS = float(os.getenv("CANCEL_SETTLE_POLL_SECONDS", "0.6"))
 
 
 def _utcnow() -> datetime:
@@ -3810,11 +3847,7 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
 
     try:
         account_ref = float(os.getenv("ACCOUNT_SIZE", "50000"))
-        open_risk = sum(
-            abs(float(pos.get("entry") or 0) - float(pos.get("stop") or 0)) * float(pos.get("qty") or 0)
-            for pos in open_positions.values()
-            if pos.get("entry") and pos.get("stop")
-        )
+        open_risk = sum(position_risk_usd(pos) for pos in open_positions.values())
         new_risk = account_ref * (RISK_PER_TRADE_PCT / 100.0)
         heat = (open_risk + new_risk) / max(account_ref, 1) * 100.0
         if heat > PORTFOLIO_HEAT_PCT:
@@ -3823,6 +3856,55 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
         pass
 
     return len(blocked) == 0, blocked
+
+
+def position_risk_usd(pos: dict) -> float:
+    """Dollars at risk on one tracked position, from ENTRY to protective stop.
+
+    Options are priced on the PREMIUM, not the underlying, and one contract
+    controls 100 shares. The portfolio-heat gate used to compute
+    `abs(entry - stop) * qty` for everything, which on an option position
+    multiplied an UNDERLYING dollar move by a CONTRACT count — two different
+    units. A 3-contract NVDA call risking $1,470 of premium was counted as $9 of
+    heat, so the gate that is supposed to cap total exposure never fired on the
+    instrument the bot actually trades most.
+
+    Falls back to the underlying basis when premium fields are absent, and to 0
+    when nothing is measurable — an unmeasurable position must not be invented
+    into the heat sum either way.
+    """
+    def num(key: str) -> float:
+        try:
+            value = float(pos.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if math.isfinite(value) else 0.0
+
+    try:
+        qty = abs(int(float(pos.get("filled_qty") or pos.get("qty") or 0)))
+    except (TypeError, ValueError):
+        qty = 0
+    if qty < 1:
+        return 0.0
+
+    contract = pos.get("contract") or {}
+    if isinstance(contract, dict) and contract.get("right"):
+        entry_premium = num("entry_premium")
+        # The live protective level is the trail once the engine has ratcheted.
+        stop_premium = max(num("stop_premium"), num("trail"))
+        if entry_premium > 0 and stop_premium > 0:
+            return max(0.0, entry_premium - stop_premium) * 100.0 * qty
+        if entry_premium > 0:
+            # Stop unknown: the whole premium is at risk. Never report 0 — that
+            # reads as "no exposure" on a position that can lose everything.
+            return entry_premium * 100.0 * qty
+        return 0.0
+
+    entry = num("entry")
+    stop = max(num("stop"), num("trail")) if num("trail") > 0 else num("stop")
+    if entry <= 0 or stop <= 0:
+        return 0.0
+    return abs(entry - stop) * qty
 
 
 def _occ_symbol(ticker: str, expiry: str, right: str, strike: float) -> str:
@@ -4177,6 +4259,12 @@ async def get_etrade_account():
     # Best-effort account enumeration so the app can show which account will
     # receive orders. Never fail the linked check on an enumeration error.
     accounts_out = []
+    # Bound BEFORE the try: enumeration fails on every expired token (401), and
+    # the routed-identity block below reads `raw` unconditionally. Leaving it
+    # unbound turned a recoverable "session expired" into an UnboundLocalError
+    # 500 on /etrade/account — so the app could not even render the relink
+    # prompt that fixes it (observed live 2026-08-05 05:07 UTC).
+    raw: List[dict] = []
     try:
         accounts_api = pyetrade.ETradeAccounts(
             CONSUMER_KEY, CONSUMER_SECRET,
@@ -5134,8 +5222,71 @@ CANCEL_CONFIRMED = "cancelled"
 CANCEL_FILLED = "filled"
 CANCEL_LIVE = "live"
 
-# Broker statuses that PROVE the order is no longer working.
-_CANCEL_CONFIRMED_STATUSES = {"CANCELLED", "CANCEL_REQUESTED", "REJECTED", "EXPIRED", "NOT_FOUND"}
+# Broker statuses that PROVE the order is no longer working AND that the broker
+# has released the shares/contracts it had pledged to it.
+_CANCEL_TERMINAL_STATUSES = {"CANCELLED", "REJECTED", "EXPIRED", "NOT_FOUND"}
+# CANCEL_REQUESTED is NOT terminal. E*TRADE has accepted the cancel but the order
+# is still on the book, still holding its allocation. Treating it as "gone" is
+# what produced the 1037/3004 storm: cancel at T+0.0s, replacement order at
+# T+0.6s, broker still counting the old order, rejection — and on the trailing
+# path that left a live option position with NO resting stop at all.
+_CANCEL_PENDING_STATUSES = {"CANCEL_REQUESTED", "CANCEL_REQUEST", "CANCELLING"}
+# Kept as the union for callers that only care "is it still working?".
+_CANCEL_CONFIRMED_STATUSES = _CANCEL_TERMINAL_STATUSES | _CANCEL_PENDING_STATUSES
+
+
+def classify_cancel_status(status: Optional[str], filled: int) -> str:
+    """Pure classification of a broker order status during a cancel.
+
+    Returns 'filled' | 'terminal' | 'pending' | 'working'.
+
+    'terminal' is the ONLY verdict that means the broker has released the
+    shares/contracts. 'pending' means the cancel was accepted but the allocation
+    is still held — anything sent now races the broker and loses.
+    """
+    s = str(status or "").upper().strip()
+    try:
+        filled_n = int(filled or 0)
+    except (TypeError, ValueError):
+        filled_n = 0
+    if s == "EXECUTED" or (filled_n > 0 and s in _CANCEL_CONFIRMED_STATUSES):
+        return "filled"
+    if s in _CANCEL_TERMINAL_STATUSES:
+        return "terminal"
+    if s in _CANCEL_PENDING_STATUSES:
+        return "pending"
+    return "working"
+
+
+async def _await_cancel_settled(order_id: str) -> Tuple[str, int, str]:
+    """Poll the broker until a cancelled order reaches a TERMINAL status, so the
+    allocation it held is provably released before we place anything against the
+    same contract. Returns (verdict, filled, last_status).
+
+    Bounded by CANCEL_SETTLE_TIMEOUT_SECONDS — this sits in the trailing-ratchet
+    and panic-exit paths, so it must never block them indefinitely.
+    """
+    deadline = time.time() + max(0.0, CANCEL_SETTLE_TIMEOUT_SECONDS)
+    verdict, filled, status = "working", 0, "UNKNOWN"
+    attempt = 0
+    while True:
+        try:
+            status, filled = await _order_state(str(order_id), None)
+            verdict = classify_cancel_status(status, filled)
+        except Exception as e:
+            logger.warning(f"cancel verification unavailable for order {order_id}: {e}")
+            verdict, status = "working", "UNKNOWN"
+        if verdict in ("filled", "terminal"):
+            return verdict, filled, status
+        if time.time() >= deadline:
+            return verdict, filled, status
+        attempt += 1
+        if attempt == 1 and verdict == "pending":
+            logger.info(
+                f"[CANCEL] order {order_id} is {status} — waiting for the broker to release "
+                f"the allocation before placing against this contract"
+            )
+        await asyncio.sleep(min(CANCEL_SETTLE_POLL_SECONDS * attempt, 2.0))
 
 
 async def _cancel_order_call(order_id: str) -> None:
@@ -5191,20 +5342,29 @@ async def _cancel_order_verified(order_id: Optional[str]) -> str:
         call_ok = False
         logger.warning(f"order cancel call failed ({order_id}): {e} — verifying against broker order book")
 
-    status, filled = "UNKNOWN", 0
-    try:
-        status, filled = await _order_state(str(order_id), None)
-    except Exception as e:
-        logger.warning(f"cancel verification unavailable for order {order_id}: {e}")
+    # Wait for the broker to actually retire the order. Returning on the first
+    # CANCEL_REQUESTED is what caused every "not enough available contracts"
+    # rejection: the order was dying, but its allocation was still held.
+    verdict, filled, status = await _await_cancel_settled(str(order_id))
 
-    if status == "EXECUTED" or (filled > 0 and status in _CANCEL_CONFIRMED_STATUSES):
+    if verdict == "filled":
         logger.warning(
             f"[CANCEL] order {order_id} already filled at the broker "
             f"(status={status}, filled={filled}) — treating as FILLED, not cancelled"
         )
         return CANCEL_FILLED
-    if status in _CANCEL_CONFIRMED_STATUSES:
+    if verdict == "terminal":
         logger.info(f"[CANCEL] order {order_id} confirmed gone at broker (status={status})")
+        return CANCEL_CONFIRMED
+    if verdict == "pending":
+        # Accepted but never went terminal inside the window. The order IS dying,
+        # so it is not "live" in the double-sell sense, but the allocation may
+        # still be held — say so plainly instead of pretending it settled.
+        logger.warning(
+            f"[CANCEL] order {order_id} still {status} after "
+            f"{CANCEL_SETTLE_TIMEOUT_SECONDS:.0f}s — proceeding; a follow-on order may be "
+            f"rejected for allocation while the broker finishes the cancel"
+        )
         return CANCEL_CONFIRMED
     if call_ok:
         # Cancel accepted and no fill seen; the order book can lag a few seconds.
@@ -5568,6 +5728,19 @@ async def _stop_guard_worker(ticker: str) -> None:
                             await state.set_position(ticker, pos)
                         guarded = filled
                     except Exception as e:
+                        # The OLD stop was already cancelled above and the new one
+                        # did not stick, so nothing is resting. The guard record
+                        # still pointed at the dead order id, and the stop-placement
+                        # timeout breaker below only fires when `stop_order_id` is
+                        # falsy — so a stale-truthy id disarmed the one control that
+                        # emergency-flattens an unprotected fill. Clear it: the guard
+                        # must describe what is ACTUALLY resting at the broker.
+                        guard = await state.update_guard(ticker, stop_order_id=None,
+                                                         stop_client_id=None) or guard
+                        pos = await state.get_position(ticker)
+                        if pos and pos.get("stop_order_id"):
+                            pos["stop_order_id"] = None
+                            await state.set_position(ticker, pos)
                         logger.error(f"[STOP GUARD] {ticker} stop placement FAILED (will retry): {e}")
                         await alerts.send(
                             "critical", "stop_placement_failed",
@@ -6960,7 +7133,12 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         return
 
     bid, ask = await _current_bid_ask(ticker, dict(contract) if is_option else None)
-    is_buy = str(pos.get("action") or "BUY").upper() != "SELL"
+    # Long options are ALWAYS held long here (exits are SELL_CLOSE), which is
+    # exactly what `plan_ratchet` assumes. Deriving `is_buy` from the raw action
+    # let a position tagged SELL flip the improvement comparison below against a
+    # plan computed on the BUY side, so a genuine ratchet read as a regression
+    # and never replaced.
+    is_buy = is_option or str(pos.get("action") or "BUY").upper() != "SELL"
     # Conservative mark: longs (and long options) trail off the BID, shorts
     # off the ASK — the trail only ratchets on prices we could actually exit at.
     mark = bid if (is_buy or is_option) else ask
@@ -7146,14 +7324,22 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
 async def _trail_pass() -> None:
     """One trailing pass over every tracked position with a resting stop.
     Positions whose entry guard is still active are skipped — the guard owns
-    the stop until it finishes."""
+    the stop until it finishes.
+
+    "Active" means `reconciliation.guard_owns_stop`, not a bare `done` check. A
+    guard whose task died (worker restart, unhandled exception) never sets
+    `done`, and the bare check therefore skipped that ticker on EVERY pass for
+    as long as the position was held — the trail silently stopped ratcheting on
+    exactly the positions whose protection had already gone wrong once. The
+    reconciler learned this lesson; the trailing pass had not.
+    """
     positions = await state.all_positions()
     if not positions:
         return
     guards = await state.all_guards()
+    now = time.time()
     for ticker, pos in positions.items():
-        guard = guards.get(ticker)
-        if guard and not guard.get("done"):
+        if reconciliation.guard_owns_stop(guards.get(ticker), now):
             continue
         try:
             await _trail_ratchet_one(ticker, pos)
@@ -7809,18 +7995,30 @@ async def flatten(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secr
             results.append({"ticker": ticker, "status": "blocked", "detail": item["blocked"]})
             continue
         try:
-            stop_outcome = "none"
+            stop_outcome = CANCEL_NONE
             if item["stop_order_id"]:
+                # Compare against the CANCEL_* constants, never string literals.
+                # This branch used to test for "executed"/"gone" — neither is a
+                # verdict `_cancel_order_verified` can return, so an
+                # already-triggered stop (CANCEL_FILLED == "filled") fell through
+                # to the guard below and was reported as a FAILED flatten. The
+                # position was flat, the panic screen said NEEDS ATTENTION, and
+                # because the close was never booked the ticker stayed in Redis
+                # forever — holding a slot against the position cap, blocking
+                # re-entry, and keeping the trailing engine working a dead symbol.
                 stop_outcome = await _cancel_order_verified(item["stop_order_id"])
-                if stop_outcome == "executed":
+                if stop_outcome == CANCEL_FILLED:
                     # The stop filled while we were cancelling: the position is
                     # already flat, and selling again would open a short.
                     logger.info(f"[FLATTEN] {ticker} already closed by its resting stop")
                     await _finish_guard(ticker, "flattened_by_stop")
+                    # Book the close so the position leaves Redis. Without this
+                    # the panic exit "succeeds" but the book never empties.
+                    await _record_close(ticker, None, {"ticker": ticker, "action": item["action"]})
                     results.append({"ticker": ticker, "status": "already_flat",
                                     "detail": "resting stop executed"})
                     continue
-                if stop_outcome not in {"cancelled", "gone"}:
+                if stop_outcome != CANCEL_CONFIRMED:
                     raise Exception(
                         f"could not cancel resting stop {item['stop_order_id']} "
                         f"(outcome={stop_outcome}) - refusing to double-sell"
