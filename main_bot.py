@@ -47,6 +47,19 @@ Key layout (exact names, no surprises):
 Every method is async. When REDIS_URL is absent or Redis is unreachable the
 store degrades to a single-process in-memory backend and logs a loud warning —
 correct for local dev, NOT safe for multi-worker production.
+
+DURABLE MEMORY MODE: when no Redis is available but a `persistence` adapter is
+supplied (duck-typed: async `load_all() -> [(key, kind, value)]`,
+`save(key, kind, value)`, `delete(key)` — the bot wires this to Postgres), the
+memory backend becomes restart-safe: durable keys (positions, guards, indexes,
+daily counters, kill switch, and any un-TTL'd config like the pinned account or
+alert webhook) are written through to the adapter on every mutation and
+hydrated back at boot. Ephemeral keys (locks, idempotency sig:, cooldowns,
+balance snapshots — anything with a TTL) deliberately stay memory-only: their
+expiry IS their meaning, and resurrecting them stale would be wrong. This was
+the production gap: LIVE trading with no REDIS_URL meant every container
+restart erased open positions, ratcheted trails, today's realized P&L (the
+daily loss limit's memory) and the kill switch.
 """
 from __future__ import annotations
 
@@ -308,28 +321,52 @@ class _MemoryBackend:
     async def close(self) -> None:
         return None
 
+    async def restore(self, kind: str, key: str, value: str) -> None:
+        """Hydrate one persisted row back into the backend (boot only)."""
+        async with self._lock:
+            if kind == "set":
+                try:
+                    members = json.loads(value)
+                except json.JSONDecodeError:
+                    return
+                self._sets[key] = set(str(m) for m in members)
+            elif kind == "hash":
+                try:
+                    fields = json.loads(value)
+                except json.JSONDecodeError:
+                    return
+                self._hashes[key] = ({str(k): str(v) for k, v in fields.items()}, 0.0)
+            else:  # "kv" and "list" both live in _kv (lists are stored as JSON)
+                self._kv[key] = (value, 0.0)
+
 
 class StateStore:
     """Unified async state API over Redis (or the memory fallback)."""
 
-    def __init__(self, redis_client: Any = None) -> None:
+    def __init__(self, redis_client: Any = None, persistence: Any = None) -> None:
         self.redis = redis_client            # redis.asyncio client or None
         self._memory = _MemoryBackend()
+        # Durable write-through adapter — only consulted in memory mode.
+        # Redis is already durable, so persistence is ignored when Redis is up.
+        self._persistence = persistence if redis_client is None else None
         self._release_sha: Optional[str] = None
         self._extend_sha: Optional[str] = None
 
     @property
     def backend_name(self) -> str:
-        return "redis" if self.redis is not None else "memory"
+        if self.redis is not None:
+            return "redis"
+        return "memory+durable" if self._persistence is not None else "memory"
 
     @property
     def is_distributed(self) -> bool:
         return self.redis is not None
 
     @classmethod
-    async def create(cls, redis_url: Optional[str]) -> "StateStore":
+    async def create(cls, redis_url: Optional[str], persistence: Any = None) -> "StateStore":
         """Connect to Redis when configured; otherwise return the memory
-        fallback with a loud warning."""
+        fallback — durable when a persistence adapter is supplied, loud
+        warning when not."""
         if redis_url:
             try:
                 from redis.asyncio import from_url as redis_from_url
@@ -345,15 +382,77 @@ class StateStore:
                 return cls(client)
             except Exception as e:
                 logger.error(
-                    f"⛔ StateStore: Redis unreachable ({e}) — FALLING BACK to in-memory state. "
-                    f"NOT safe for multi-worker deployments."
+                    f"⛔ StateStore: Redis unreachable ({e}) — falling back to "
+                    f"{'DURABLE memory (persistence adapter)' if persistence is not None else 'in-memory state — NOT safe for multi-worker deployments'}."
                 )
+        store = cls(None, persistence=persistence)
+        if store._persistence is not None:
+            await store.hydrate()
+            logger.info(
+                "✅ StateStore: durable memory mode — positions/guards/daily P&L/kill "
+                "switch persist to the database across restarts (single worker)."
+            )
         else:
             logger.warning(
-                "⚠️ StateStore: no REDIS_URL — using in-memory state. "
-                "Set REDIS_URL for restart-safe, multi-worker-safe state."
+                "⚠️ StateStore: no REDIS_URL and no persistence — using in-memory state. "
+                "A restart LOSES positions, trails, daily P&L and the kill switch."
             )
-        return cls(None)
+        return store
+
+    # ---------------- durable write-through ----------------
+    # Ephemeral prefixes whose TTL/locality IS their semantics — never persisted.
+    _EPHEMERAL_PREFIXES = ("lock:", "sig:", "cooldown:", "queue:", "balance:")
+
+    def _durable_kv(self, key: str, px: Optional[int], ex: Optional[int]) -> bool:
+        """A KV write is durable when it carries no TTL and is not ephemeral by
+        prefix. TTL'd values (idempotency keys, cooldowns, balance snapshots,
+        breaker counters) MUST die on schedule — resurrecting them stale after
+        a restart would be worse than losing them."""
+        if self._persistence is None or px or ex:
+            return False
+        return not any(key.startswith(p) for p in self._EPHEMERAL_PREFIXES)
+
+    async def _persist(self, key: str, kind: str, value: str) -> None:
+        if self._persistence is None:
+            return
+        try:
+            await self._persistence.save(key, kind, value)
+        except Exception as e:
+            logger.warning(f"state persistence save failed for {key} (non-fatal): {e}")
+
+    async def _persist_delete(self, key: str) -> None:
+        if self._persistence is None:
+            return
+        try:
+            await self._persistence.delete(key)
+        except Exception as e:
+            logger.warning(f"state persistence delete failed for {key} (non-fatal): {e}")
+
+    async def _persist_set_members(self, key: str) -> None:
+        members = await self._memory.smembers(key)
+        await self._persist(key, "set", json.dumps(members))
+
+    async def _persist_hash(self, key: str) -> None:
+        fields = await self._memory.hgetall(key)
+        await self._persist(key, "hash", json.dumps(fields))
+
+    async def hydrate(self) -> int:
+        """Load every persisted row back into the memory backend (boot only).
+        Returns the number of rows restored."""
+        if self._persistence is None:
+            return 0
+        try:
+            rows = await self._persistence.load_all()
+        except Exception as e:
+            logger.error(f"state hydration failed — starting empty: {e}")
+            return 0
+        count = 0
+        for key, kind, value in rows:
+            await self._memory.restore(str(kind), str(key), str(value))
+            count += 1
+        if count:
+            logger.info(f"✅ StateStore: hydrated {count} durable row(s) from the database")
+        return count
 
     # ---------------- raw primitives ----------------
     async def _set_raw(self, key: str, value: str, px: Optional[int] = None,
@@ -385,7 +484,10 @@ class StateStore:
 
     # ---------------- generic KV (idempotency, cooldowns) ----------------
     async def set(self, key: str, value: str, ex: Optional[int] = None, nx: bool = False) -> bool:
-        return await self._set_raw(key, value, ex=ex, nx=nx)
+        ok = await self._set_raw(key, value, ex=ex, nx=nx)
+        if ok and self.redis is None and self._durable_kv(key, None, ex):
+            await self._persist(key, "kv", value)
+        return ok
 
     async def get(self, key: str) -> Optional[str]:
         if self.redis is not None:
@@ -404,6 +506,9 @@ class StateStore:
             await self.redis.delete(*keys)
             return
         await self._memory.delete(*keys)
+        for key in keys:
+            if self._durable_kv(key, None, None):
+                await self._persist_delete(key)
 
     # ---------------- counters (circuit breaker) ----------------
     async def incr(self, key: str, ex: Optional[int] = None) -> int:
@@ -425,6 +530,9 @@ class StateStore:
             await self.redis.ltrim(key, 0, max_len - 1)
             return
         await self._memory.lpush_capped(key, value, max_len)
+        if self._durable_kv(key, None, None):
+            items = await self._memory.lrange_head(key, max_len)
+            await self._persist(key, "list", json.dumps(items))
 
     async def list_range(self, key: str, count: int = 50) -> List[str]:
         if self.redis is not None:
@@ -457,22 +565,35 @@ class StateStore:
         except json.JSONDecodeError:
             return None
 
+    async def _sadd_index(self, index_key: str, ticker: str) -> None:
+        if self.redis is not None:
+            await self.redis.sadd(index_key, ticker)
+            return
+        await self._memory.sadd(index_key, ticker)
+        if self._persistence is not None:
+            await self._persist_set_members(index_key)
+
+    async def _srem_index(self, index_key: str, ticker: str) -> None:
+        if self.redis is not None:
+            await self.redis.srem(index_key, ticker)
+            return
+        await self._memory.srem(index_key, ticker)
+        if self._persistence is not None:
+            await self._persist_set_members(index_key)
+
     async def set_position(self, ticker: str, position: dict) -> None:
         ticker = ticker.upper()
-        await self._set_raw(self._pos_key(ticker), _dumps(position))
-        if self.redis is not None:
-            await self.redis.sadd(POSITIONS_INDEX, ticker)
-        else:
-            await self._memory.sadd(POSITIONS_INDEX, ticker)
+        payload = _dumps(position)
+        await self._set_raw(self._pos_key(ticker), payload)
+        if self.redis is None and self._durable_kv(self._pos_key(ticker), None, None):
+            await self._persist(self._pos_key(ticker), "kv", payload)
+        await self._sadd_index(POSITIONS_INDEX, ticker)
 
     async def delete_position(self, ticker: str) -> Optional[dict]:
         ticker = ticker.upper()
         existing = await self.get_position(ticker)
         await self.delete(self._pos_key(ticker))
-        if self.redis is not None:
-            await self.redis.srem(POSITIONS_INDEX, ticker)
-        else:
-            await self._memory.srem(POSITIONS_INDEX, ticker)
+        await self._srem_index(POSITIONS_INDEX, ticker)
         return existing
 
     async def position_tickers(self) -> List[str]:
@@ -492,10 +613,7 @@ class StateStore:
                 stale.append(ticker)
         # Self-heal index entries whose value key vanished.
         for ticker in stale:
-            if self.redis is not None:
-                await self.redis.srem(POSITIONS_INDEX, ticker)
-            else:
-                await self._memory.srem(POSITIONS_INDEX, ticker)
+            await self._srem_index(POSITIONS_INDEX, ticker)
         return out
 
     async def position_count(self) -> int:
@@ -517,11 +635,11 @@ class StateStore:
 
     async def set_guard(self, ticker: str, guard: dict) -> None:
         ticker = ticker.upper()
-        await self._set_raw(self._guard_key(ticker), _dumps(guard))
-        if self.redis is not None:
-            await self.redis.sadd(GUARDS_INDEX, ticker)
-        else:
-            await self._memory.sadd(GUARDS_INDEX, ticker)
+        payload = _dumps(guard)
+        await self._set_raw(self._guard_key(ticker), payload)
+        if self.redis is None and self._durable_kv(self._guard_key(ticker), None, None):
+            await self._persist(self._guard_key(ticker), "kv", payload)
+        await self._sadd_index(GUARDS_INDEX, ticker)
 
     async def update_guard(self, ticker: str, **fields: Any) -> Optional[dict]:
         """Read-modify-write of guard fields. Callers mutating from concurrent
@@ -536,10 +654,7 @@ class StateStore:
     async def delete_guard(self, ticker: str) -> None:
         ticker = ticker.upper()
         await self.delete(self._guard_key(ticker))
-        if self.redis is not None:
-            await self.redis.srem(GUARDS_INDEX, ticker)
-        else:
-            await self._memory.srem(GUARDS_INDEX, ticker)
+        await self._srem_index(GUARDS_INDEX, ticker)
 
     async def all_guards(self) -> Dict[str, dict]:
         """Every live guard record, self-healing the index as it goes.
@@ -561,10 +676,7 @@ class StateStore:
             else:
                 stale.append(ticker)
         for ticker in stale:
-            if self.redis is not None:
-                await self.redis.srem(GUARDS_INDEX, ticker)
-            else:
-                await self._memory.srem(GUARDS_INDEX, ticker)
+            await self._srem_index(GUARDS_INDEX, ticker)
         return out
 
     async def pending_guards(self) -> Dict[str, dict]:
@@ -590,7 +702,13 @@ class StateStore:
             val = await self.redis.hincrby(key, "trades_today", 1)
             await self.redis.expire(key, DAILY_TTL_SECONDS)
             return int(val)
-        return int(await self._memory.hincrbyfloat(key, "trades_today", 1, DAILY_TTL_SECONDS))
+        result = int(await self._memory.hincrbyfloat(key, "trades_today", 1, DAILY_TTL_SECONDS))
+        # The daily counters are the loss limit's memory — a restart must not
+        # hand the bot a fresh risk budget. The key is date-scoped, so a stale
+        # hydrated day simply never gets read.
+        if self._persistence is not None:
+            await self._persist_hash(key)
+        return result
 
     async def add_realized_pnl(self, pct: float) -> float:
         key = self._daily_key()
@@ -598,7 +716,10 @@ class StateStore:
             val = await self.redis.hincrbyfloat(key, "realized_pnl_today_pct", pct)
             await self.redis.expire(key, DAILY_TTL_SECONDS)
             return float(val)
-        return await self._memory.hincrbyfloat(key, "realized_pnl_today_pct", pct, DAILY_TTL_SECONDS)
+        result = await self._memory.hincrbyfloat(key, "realized_pnl_today_pct", pct, DAILY_TTL_SECONDS)
+        if self._persistence is not None:
+            await self._persist_hash(key)
+        return result
 
     # ---------------- balance tracker ----------------
     # Tracks available funds between broker refreshes so consecutive entries
@@ -1413,7 +1534,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("etrade-bot.ledger")
 
@@ -1540,6 +1661,14 @@ class TradeLedger:
 
 
 _ledger: Optional[TradeLedger] = None
+# Optional durable mirror: async (seq, hash, line) → None. The JSONL file lives
+# on an EPHEMERAL container filesystem — every redeploy wiped the "immutable"
+# ledger back to 0 records, so the daily P&L repair had nothing to replay and
+# the app could never recover a real exit across a restart. The mirror writes
+# each record to Postgres as it is appended; `restore_lines()` rebuilds the
+# local file from those rows at boot. Best-effort by design: a mirror failure
+# must never block an order.
+_mirror: Optional[Callable[[int, str, str], Awaitable[None]]] = None
 
 
 def init(path: Path) -> None:
@@ -1548,13 +1677,46 @@ def init(path: Path) -> None:
     _ledger = TradeLedger(path)
 
 
+def set_mirror(fn: Optional[Callable[[int, str, str], Awaitable[None]]]) -> None:
+    """Install the durable mirror callback (async (seq, hash, line) → None)."""
+    global _mirror
+    _mirror = fn
+
+
+def restore_lines(path: Path, lines: List[str]) -> int:
+    """Rebuild the local JSONL file from mirrored rows BEFORE `init()` — only
+    when the local file is missing or empty (a restart on an ephemeral disk).
+    A non-empty local file is always preferred: it is the chain `init()` will
+    resume, and overwriting it could drop records newer than the mirror.
+    Returns the number of lines written."""
+    try:
+        if path.exists() and path.stat().st_size > 0:
+            return 0
+        payload = [ln for ln in lines if ln and ln.strip()]
+        if not payload:
+            return 0
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(payload) + "\n")
+        logger.info(f"✅ trade ledger restored from durable mirror — {len(payload)} record(s)")
+        return len(payload)
+    except OSError as e:
+        logger.error(f"ledger restore failed ({e}) — starting fresh")
+        return 0
+
+
 async def record(event: str, data: Optional[Dict[str, Any]] = None) -> None:
     """Append an event. Never raises — a ledger failure must not block trading."""
     try:
         if _ledger is None:
             logger.warning(f"ledger not initialised — dropped event '{event}'")
             return
-        await _ledger.record(event, data)
+        rec = await _ledger.record(event, data)
+        if _mirror is not None:
+            try:
+                await _mirror(int(rec["seq"]), str(rec["hash"]), _canonical(rec))
+            except Exception as e:
+                logger.warning(f"ledger mirror write failed (non-fatal, {event}): {e}")
     except Exception as e:
         logger.error(f"ledger append failed ({event}): {e}")
 
@@ -1563,6 +1725,18 @@ def tail(count: int = 100) -> List[Dict[str, Any]]:
     if _ledger is None:
         return []
     return _ledger.tail(count)
+
+
+def recent(count: int = 100) -> List[Dict[str, Any]]:
+    """Last `count` records in CHRONOLOGICAL order (oldest first).
+
+    This module-level export was MISSING: `recent()` existed only as a method
+    on TradeLedger, yet the daily P&L repair called `trade_ledger.recent(...)`
+    — an AttributeError on every boot and every /pnl/repair call, so the one
+    mechanism that corrects a polluted daily loss-limit figure never ran."""
+    if _ledger is None:
+        return []
+    return _ledger.recent(count)
 
 
 def verify() -> Tuple[bool, int, Optional[str]]:
@@ -3561,7 +3735,7 @@ from datetime import datetime, date, time as dtime, timezone
 from zoneinfo import ZoneInfo
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy import Column, String, Text, DateTime
+from sqlalchemy import Column, String, Text, DateTime, text as sql_text
 from requests_oauthlib import OAuth1Session
 from urllib.parse import quote
 from dotenv import load_dotenv
@@ -3601,7 +3775,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.20.0-fill-capture"
+BOT_VERSION = "5.21.0-durable-state"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -4809,6 +4983,110 @@ async def init_db():
     except Exception as e:
         logger.error(f"Database table creation / sessionmaker error: {e}")
         async_session = None  # downstream checks must see the failure
+
+
+# ==================== DURABLE STATE (Postgres write-through) ====================
+# The production deployment runs LIVE with no REDIS_URL — every container
+# restart erased open positions, ratcheted trails, today's realized P&L (the
+# daily loss limit's memory), the kill switch, AND the "immutable" trade ledger
+# (the JSONL file lives on an ephemeral disk; it rebooted with 0 records).
+# DATABASE_URL already exists for token persistence, so the same engine now
+# backs a key-value table the StateStore writes through to in memory mode, and
+# a ledger table that mirrors every hash-chained record.
+
+_STATE_TABLE_SQL = (
+    "CREATE TABLE IF NOT EXISTS bot_state ("
+    "key TEXT PRIMARY KEY, "
+    "kind TEXT NOT NULL, "
+    "value TEXT NOT NULL, "
+    "updated_at TEXT)"
+)
+_LEDGER_TABLE_SQL = (
+    "CREATE TABLE IF NOT EXISTS bot_ledger ("
+    "hash TEXT PRIMARY KEY, "
+    "seq BIGINT NOT NULL, "
+    "line TEXT NOT NULL)"
+)
+
+
+class PgStatePersistence:
+    """Duck-typed persistence adapter for StateStore's durable memory mode.
+    All methods are best-effort from the caller's perspective — StateStore
+    swallows and logs adapter failures so a DB blip never blocks an order."""
+
+    def __init__(self, db_engine) -> None:
+        self._engine = db_engine
+
+    async def save(self, key: str, kind: str, value: str) -> None:
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                sql_text(
+                    "INSERT INTO bot_state (key, kind, value, updated_at) "
+                    "VALUES (:key, :kind, :value, :ts) "
+                    "ON CONFLICT (key) DO UPDATE SET "
+                    "kind = :kind, value = :value, updated_at = :ts"
+                ),
+                {"key": key, "kind": kind, "value": value, "ts": _utcnow().isoformat()},
+            )
+
+    async def delete(self, key: str) -> None:
+        async with self._engine.begin() as conn:
+            await conn.execute(sql_text("DELETE FROM bot_state WHERE key = :key"), {"key": key})
+
+    async def load_all(self):
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql_text("SELECT key, kind, value FROM bot_state"))
+            return [(row[0], row[1], row[2]) for row in result.fetchall()]
+
+
+_state_persistence: Optional[PgStatePersistence] = None
+
+
+async def _init_durable_state() -> Optional[PgStatePersistence]:
+    """Create the durable-state tables and return the adapter — None when the
+    DB is unavailable (the store then falls back to plain memory, loudly)."""
+    global _state_persistence
+    if engine is None:
+        logger.warning("durable state unavailable — no database engine")
+        return None
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(sql_text(_STATE_TABLE_SQL))
+            await conn.execute(sql_text(_LEDGER_TABLE_SQL))
+        _state_persistence = PgStatePersistence(engine)
+        return _state_persistence
+    except Exception as e:
+        logger.error(f"durable state init failed — falling back to plain memory: {e}")
+        return None
+
+
+async def _ledger_mirror(seq: int, rec_hash: str, line: str) -> None:
+    """Mirror one ledger record to Postgres (PK on hash → naturally idempotent)."""
+    if engine is None:
+        return
+    async with engine.begin() as conn:
+        await conn.execute(
+            sql_text(
+                "INSERT INTO bot_ledger (hash, seq, line) VALUES (:hash, :seq, :line) "
+                "ON CONFLICT (hash) DO NOTHING"
+            ),
+            {"hash": rec_hash, "seq": int(seq), "line": line},
+        )
+
+
+async def _restore_ledger_from_db() -> None:
+    """Rebuild the local JSONL ledger from the Postgres mirror when the local
+    file was wiped by a redeploy. Never overwrites a non-empty local file."""
+    if engine is None:
+        return
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(sql_text("SELECT line FROM bot_ledger ORDER BY seq"))
+            lines = [row[0] for row in result.fetchall()]
+        if lines:
+            trade_ledger.restore_lines(TRADE_LEDGER_FILE, lines)
+    except Exception as e:
+        logger.error(f"ledger restore from DB failed (non-fatal): {e}")
 
 
 # ==================== ACCOUNT KEY RESOLUTION ====================
@@ -7718,18 +7996,28 @@ async def start_worker():
 async def on_startup():
     global state
     logger.info(f"Starting → {'SANDBOX' if is_sandbox else 'PRODUCTION'} | LIVE={LIVE_TRADING} | VERSION={BOT_VERSION}")
-    # Distributed state first — everything else reads through it.
-    state = await StateStore.create(REDIS_URL)
+    # Database FIRST — it now backs durable state and the ledger mirror, so it
+    # must exist before the StateStore hydrates and before the ledger restores.
+    await init_db()
+    persistence = await _init_durable_state()
+    # State next — everything else reads through it. With no Redis, the
+    # Postgres adapter makes memory mode restart-safe (positions, guards,
+    # daily P&L, kill switch all hydrate back).
+    state = await StateStore.create(REDIS_URL, persistence=persistence)
     # Alerting + immutable ledger come up right after state — everything
     # downstream (breaker, guards, reconciler) reports through them.
     alerts.init(state, ALERT_WEBHOOK_URL, dedupe_seconds=ALERT_DEDUPE_SECONDS)
     # A webhook saved live via POST /alerts/config overrides the env default
     # and survives restarts — no redeploy needed to change alert delivery.
     await alerts.load_persisted()
+    # Rebuild the JSONL ledger from the Postgres mirror if a redeploy wiped it,
+    # then resume the hash chain and mirror every new record.
+    await _restore_ledger_from_db()
     trade_ledger.init(TRADE_LEDGER_FILE)
+    if persistence is not None:
+        trade_ledger.set_mirror(_ledger_mirror)
     # Which account the user pinned from the app (survives restarts/redeploys).
     await _load_pinned_account()
-    await init_db()
     await preload_tokens()
     # One-time migration of the legacy JSON STATE_FILE into Redis (skipped when
     # Redis already holds state; the file is renamed *.migrated afterwards).
