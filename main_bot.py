@@ -2070,8 +2070,10 @@ def plan_ghost_resolution(
     stack never saw the win.
 
     Resolution order:
-      1. the position's own tracked protective stop (`stop_order_id`) — the
-         authoritative close when it EXECUTED,
+      1. the position's own tracked closing orders — the protective stop
+         (`stop_order_id`) or a deferred close the bot placed but could not
+         price inline (`close_order_id`, set with pending_close) — the
+         authoritative close when either EXECUTED,
       2. any other EXECUTED order on the symbol with an explicit CLOSING
          action (manual close, app exit whose ack was lost).
 
@@ -2087,6 +2089,8 @@ def plan_ghost_resolution(
     symbol = str(ticker or "").upper()
     basis = "premium" if (pos or {}).get("contract") else "underlying"
     tracked_stop_id = str((pos or {}).get("stop_order_id") or "")
+    tracked_close_id = str((pos or {}).get("close_order_id") or "")
+    tracked_ids = [i for i in (tracked_stop_id, tracked_close_id) if i]
 
     def _fill_of(order: dict, require_closing_action: bool) -> Optional[dict]:
         if str(order.get("status") or "").upper() != "EXECUTED":
@@ -2114,19 +2118,20 @@ def plan_ghost_resolution(
             "basis": basis,
         }
 
-    if tracked_stop_id:
+    if tracked_ids:
         for order in all_orders:
-            if str(order.get("order_id") or "") != tracked_stop_id:
+            oid = str(order.get("order_id") or "")
+            if oid not in tracked_ids:
                 continue
             hit = _fill_of(order, require_closing_action=False)
             if hit:
-                hit["source"] = "tracked_stop"
+                hit["source"] = "tracked_stop" if oid == tracked_stop_id else "tracked_close"
                 return hit
 
     for order in all_orders:
         if str(order.get("symbol") or "").upper() != symbol:
             continue
-        if tracked_stop_id and str(order.get("order_id") or "") == tracked_stop_id:
+        if str(order.get("order_id") or "") in tracked_ids:
             continue  # already checked above
         hit = _fill_of(order, require_closing_action=True)
         if hit:
@@ -3775,7 +3780,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.21.0-durable-state"
+BOT_VERSION = "5.24.0-entry-fill-truth"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -5646,6 +5651,195 @@ async def _order_state(order_id: Optional[str], client_id: Optional[str]) -> Tup
     return "NOT_FOUND", 0
 
 
+# ---- Close-fill truth --------------------------------------------------------
+# Every close the bot itself placed used to be booked WITHOUT its fill price:
+# `_record_close(..., None, ...)` fell back to exit = entry — a fake breakeven.
+# The 2026-08-07 SPY close (order 765, MARKET) is the canonical case: the real
+# loss never reached the ledger, the daily loss limit or the learning stack.
+# Broker-side stop fills were fixed by fill capture (5.20); these helpers close
+# the remaining half: closes the bot places either book their ACTUAL executed
+# price, or the position stays tracked (pending_close) until the reconciler's
+# fill capture prices it from the broker's own order history. NOTHING is ever
+# booked as a guessed breakeven again.
+EXIT_FILL_POLL_SECONDS = 1.5
+EXIT_FILL_TIMEOUT_SECONDS = 8.0
+
+
+async def _resolve_exit_fill(order_id, timeout_s: float = EXIT_FILL_TIMEOUT_SECONDS) -> Optional[float]:
+    """Poll the broker's order list for a closing order's ACTUAL average
+    execution price. Returns None when the order has not EXECUTED (or has no
+    readable price) within the window — callers must then DEFER the booking to
+    the reconciler, never guess an exit."""
+    if not order_id:
+        return None
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        try:
+            resp = await _reconcile_fetch_orders()
+            for order in reconciliation.parse_open_orders(resp):
+                if str(order.get("order_id") or "") != str(order_id):
+                    continue
+                if str(order.get("status") or "") == "EXECUTED":
+                    price = float(order.get("exec_price") or 0)
+                    if price > 0:
+                        return price
+        except Exception as e:
+            logger.warning(f"[CLOSE FILL] fill poll for order {order_id} failed: {e}")
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(EXIT_FILL_POLL_SECONDS)
+
+
+async def _defer_close_to_reconciler(ticker: str, close_order_id, note: str) -> None:
+    """A close was placed (or a stop filled) but its execution price is not
+    readable yet. Do NOT book a fake breakeven: keep the position tracked,
+    tagged with the closing order id, and let the reconciler's fill capture
+    book the REAL exit from the broker's order history on its next pass."""
+    ticker = str(ticker).upper()
+    pos = await state.get_position(ticker)
+    if not pos:
+        logger.warning(f"[CLOSE FILL] {ticker} close unpriced and no tracked position — nothing to defer ({note})")
+        return
+    pos["pending_close"] = True
+    if close_order_id:
+        pos["close_order_id"] = str(close_order_id)
+    await state.set_position(ticker, pos)
+    logger.warning(
+        f"[CLOSE FILL] {ticker} exit fill not yet priced ({note}) — position held for "
+        f"reconciler fill capture instead of booking a fake breakeven"
+    )
+
+
+# ---- Intent-preserving entry repricing ---------------------------------------
+# 2026-08-07: every option entry was sized on the APP'S ESTIMATED premium, then
+# silently repriced to the real ask WITH THE SAME QUANTITY:
+#   MSTR est 1.12 → paid 5.70 (409% drift — 5× the planned dollars)
+#   CRM  est 1.34 ×4 → paid 2.65 ×4 (intended ≈$536, spent ≈$1,060)
+#   SPY  est 1.38 ×4 → paid 2.25 ×4 (intended ≈$552, spent ≈$900)
+# Roughly double the intended risk on every entry is why the day bled out. The
+# bot honored the app's PRICE intent (reprice to ask so the order fills) but
+# ignored its DOLLAR intent (the risk the position was sized for). Past a small
+# drift the quantity now shrinks to the intended outlay; when even one contract
+# multiplies the planned risk, the entry is REJECTED — the trade premise
+# (sizing, stop distance, R math) was computed on a price that doesn't exist.
+ENTRY_REPRICE_DRIFT_PCT = 10.0
+ENTRY_MAX_OVERSPEND_FACTOR = 1.25
+
+
+def plan_entry_reprice(app_limit, qty, real_price) -> Dict[str, Any]:
+    """Pure sizing decision for a repriced option entry.
+
+    `app_limit` is the premium the app sized the trade on, `qty` its requested
+    contracts, `real_price` the premium actually about to be paid (sanitized
+    limit / real ask). Returns {action, qty, drift_pct, intended_usd,
+    actual_unit_usd}:
+
+      proceed — keep the requested quantity (no intent expressed, repriced
+                cheaper, or drift within ENTRY_REPRICE_DRIFT_PCT);
+      resize  — shrink quantity so real cost stays inside the intended outlay
+                (app_limit × 100 × qty);
+      reject  — even ONE contract exceeds the intent by more than
+                ENTRY_MAX_OVERSPEND_FACTOR — refuse to multiply planned risk.
+    """
+    try:
+        est = float(app_limit or 0)
+        px = float(real_price or 0)
+        q = int(qty or 0)
+    except (TypeError, ValueError):
+        return {"action": "proceed", "qty": qty, "drift_pct": 0.0,
+                "intended_usd": None, "actual_unit_usd": None}
+    unit = round(px * 100.0, 2) if px > 0 else None
+    if est <= 0 or px <= 0 or q < 1:
+        # No price intent (MARKET entry) or no market reference — nothing to
+        # preserve here; the funds clamp still applies downstream.
+        return {"action": "proceed", "qty": q if q >= 1 else qty, "drift_pct": 0.0,
+                "intended_usd": None, "actual_unit_usd": unit}
+    drift_pct = (px - est) / est * 100.0
+    intended = round(est * 100.0 * q, 2)
+    if drift_pct <= ENTRY_REPRICE_DRIFT_PCT:
+        # Cheaper than planned, or within tolerance — the sizing premise holds.
+        return {"action": "proceed", "qty": q, "drift_pct": round(drift_pct, 2),
+                "intended_usd": intended, "actual_unit_usd": unit}
+    resized = int(intended // (px * 100.0))
+    if resized < 1:
+        # One contract already busts the plan. Allow a modest overshoot so a
+        # near-miss single contract can still trade; beyond that, refuse.
+        if px * 100.0 <= intended * ENTRY_MAX_OVERSPEND_FACTOR:
+            resized = 1
+        else:
+            return {"action": "reject", "qty": 0, "drift_pct": round(drift_pct, 2),
+                    "intended_usd": intended, "actual_unit_usd": unit}
+    if resized >= q:
+        return {"action": "proceed", "qty": q, "drift_pct": round(drift_pct, 2),
+                "intended_usd": intended, "actual_unit_usd": unit}
+    return {"action": "resize", "qty": resized, "drift_pct": round(drift_pct, 2),
+            "intended_usd": intended, "actual_unit_usd": unit}
+
+
+# ---- Entry-fill truth --------------------------------------------------------
+# Broker statements from 2026-08-07 proved the last untrue number in the
+# pipeline: ENTRIES were booked at the LIMIT price, never the actual fill.
+#   MSTR booked 5.70 — actually filled ≈ 5.105 (broker: $510.51 for 1)
+#   CRM  booked 2.65 — actually filled ≈ 2.435 (broker: $974.05 for 4)
+#   SPY  booked 2.25 — actually filled ≈ 2.195 (broker: $878.05 for 4)
+# Every P&L percent, R-multiple, account-scaled daily contribution and ledger
+# dollar figure was computed off an entry that didn't happen. The stop guard
+# already polls the entry order for its fill — it now also reads the average
+# execution price and TRUES UP the tracked entry the moment a fill is seen.
+
+
+async def _true_up_entry_fill(ticker: str, guard: dict) -> bool:
+    """Replace the position's booked entry (the sanitized LIMIT price) with the
+    broker's ACTUAL average execution price for the entry order. Options true
+    up `entry_premium` (the P&L basis); equities true up `entry`. Returns True
+    when a price was readable (booked, or already accurate), False when the
+    broker hasn't reported one yet — the caller retries on the next poll."""
+    entry_order_id = guard.get("entry_order_id")
+    if not entry_order_id:
+        return False
+    actual = 0.0
+    try:
+        resp = await _reconcile_fetch_orders()
+        for order in reconciliation.parse_open_orders(resp):
+            if str(order.get("order_id") or "") != str(entry_order_id):
+                continue
+            price = float(order.get("exec_price") or 0)
+            if price > 0 and int(order.get("filled") or 0) > 0:
+                actual = price
+                break
+    except Exception as e:
+        logger.warning(f"[ENTRY FILL] {ticker} true-up poll failed (will retry): {e}")
+        return False
+    if actual <= 0:
+        return False
+    pos = await state.get_position(ticker)
+    if not pos:
+        return True  # price readable but nothing tracked — nothing to true up
+    is_option = bool(pos.get("contract"))
+    key = "entry_premium" if is_option else "entry"
+    booked = float(pos.get(key) or 0)
+    if booked > 0 and abs(actual - booked) / booked < 0.001:
+        return True  # already accurate
+    pos[key] = round(actual, 4)
+    await state.set_position(ticker, pos)
+    drift = round((actual - booked) / booked * 100.0, 2) if booked > 0 else None
+    await trade_ledger.record("entry_fill_trued", {
+        "ticker": ticker,
+        "basis": "premium" if is_option else "underlying",
+        "booked": round(booked, 4) if booked > 0 else None,
+        "actual": round(actual, 4),
+        "drift_pct": drift,
+        "entry_order_id": str(entry_order_id),
+    })
+    logger.info(
+        f"[ENTRY FILL] ⚖️ {ticker} entry trued {booked or '?'} → {actual} "
+        f"({'premium' if is_option else 'underlying'}"
+        f"{f', {drift:+.1f}% vs booked' if drift is not None else ''}) — "
+        f"P&L now measures from the REAL fill"
+    )
+    return True
+
+
 # ---- Broker-verified cancel -------------------------------------------------
 # Cancel outcomes. The distinction between "gone" and "filled" is the whole
 # point: a protective stop that EXECUTED means the position is already flat, so
@@ -6118,6 +6312,16 @@ async def _stop_guard_worker(ticker: str) -> None:
                     stop_deadline_ts=time.time() + STOP_PLACEMENT_TIMEOUT_SECONDS,
                 ) or guard
 
+            # ENTRY-FILL TRUTH — the tracked entry starts as the sanitized
+            # LIMIT price; replace it with the broker's actual average
+            # execution price as soon as a fill (or a bigger partial) is seen,
+            # so every downstream P&L number measures from reality. `trued_qty`
+            # re-arms the true-up when partials grow the position (the average
+            # price moves with each partial).
+            if filled > int(guard.get("trued_qty") or 0):
+                if await _true_up_entry_fill(ticker, guard):
+                    guard = await state.update_guard(ticker, trued_qty=filled) or guard
+
             guarded = int(guard.get("guarded_qty") or 0)
             if filled > guarded:
                 # (Re)place the protective stop for the total filled quantity.
@@ -6134,7 +6338,15 @@ async def _stop_guard_worker(ticker: str) -> None:
                             f"not re-arming"
                         )
                         await _finish_guard(ticker, "closed_by_stop")
-                        await _record_close(ticker, None, {"ticker": ticker, "action": guard.get("action") or "BUY"})
+                        stop_fill = await _resolve_exit_fill(guard.get("stop_order_id"))
+                        payload_g = {"ticker": ticker, "action": guard.get("action") or "BUY"}
+                        if stop_fill and is_option:
+                            await _record_close(ticker, None, payload_g, exit_premium=stop_fill, close_reason="stop_fill")
+                        elif stop_fill:
+                            await _record_close(ticker, stop_fill, payload_g, close_reason="stop_fill")
+                        else:
+                            await _defer_close_to_reconciler(ticker, guard.get("stop_order_id"),
+                                                             "guard stop executed — fill price unavailable")
                         return
                 if can_place:
                     try:
@@ -6201,7 +6413,15 @@ async def _stop_guard_worker(ticker: str) -> None:
                         await _cancel_order_safe(guard.get("entry_order_id"))
                     try:
                         flatten_id = await _emergency_flatten(ticker, guard, filled)
-                        await _record_close(ticker, None, {"ticker": ticker, "action": guard.get("action") or "BUY"})
+                        exit_fill = await _resolve_exit_fill(flatten_id)
+                        payload_g = {"ticker": ticker, "action": guard.get("action") or "BUY"}
+                        if exit_fill and is_option:
+                            await _record_close(ticker, None, payload_g, exit_premium=exit_fill, close_reason="emergency_flatten_fill")
+                        elif exit_fill:
+                            await _record_close(ticker, exit_fill, payload_g, close_reason="emergency_flatten_fill")
+                        else:
+                            await _defer_close_to_reconciler(ticker, flatten_id,
+                                                             "emergency flatten placed — fill not yet priced")
                         await _finish_guard(ticker, "stop_timeout_flattened")
                         await trade_ledger.record("stop_timeout_flattened", {
                             "ticker": ticker, "qty": filled, "flatten_order_id": flatten_id,
@@ -6408,21 +6628,46 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         exit_px = float(exit_premium)
         if entry_premium > 0:
             pnl_pct = direction * ((exit_px - entry_premium) / entry_premium * 100.0)
-            await state.add_realized_pnl(pnl_pct)
             if qty > 0:
                 realized_usd = direction * (exit_px - entry_premium) * 100.0 * qty
     elif entry > 0 and exit_px > 0:
         pnl_pct = direction * ((exit_px - entry) / entry * 100.0)
-        await state.add_realized_pnl(pnl_pct)
         if qty > 0 and not is_option:
             realized_usd = direction * (exit_px - entry) * qty
+    # DAILY LOSS-LIMIT CONTRIBUTION — an ACCOUNT-level percent, never a raw
+    # per-trade move. Summing premium moves put the counter in the wrong unit
+    # entirely: two ~50% option stop-outs read as "daily loss limit (-101.76%)"
+    # against a 2% account-level limit. With the trade's real dollars and a
+    # tracked balance the contribution is dollars/balance; without a balance
+    # the raw per-trade percent remains as a deliberately OVER-braking
+    # fallback (a too-sensitive halt is safe; an insensitive one is not).
+    account_pct: Optional[float] = None
+    if pnl_pct is not None:
+        if realized_usd is not None:
+            balance = None
+            try:
+                balance = await state.tracked_balance()
+            except Exception:
+                balance = None
+            if balance and float(balance) > 0:
+                account_pct = realized_usd / float(balance) * 100.0
+            else:
+                logger.warning(
+                    f"[PNL] {ticker} no tracked balance — daily counter fed the raw "
+                    f"per-trade move ({pnl_pct:+.2f}%) as an over-braking fallback"
+                )
+        await state.add_realized_pnl(account_pct if account_pct is not None else pnl_pct)
     # BALANCE TRACKING — equity closes return known proceeds (qty × exit).
-    # Option proceeds can't be derived from underlying prices, so we stay
-    # conservative: credit nothing and let the next fresh broker fetch true it
-    # up (a too-low tracked balance can never cause an insufficient-funds trade).
     if not is_option and exit_px > 0 and qty > 0:
         try:
             await state.adjust_balance(exit_px * qty)
+        except Exception as e:
+            logger.warning(f"balance credit failed (non-fatal): {e}")
+    # Option closes booked on the premium basis carry the REAL fill, so the
+    # proceeds are exact too: premium × 100 × contracts back into tracked funds.
+    if is_option and basis == "premium" and exit_px > 0 and qty > 0:
+        try:
+            await state.adjust_balance(exit_px * 100.0 * qty)
         except Exception as e:
             logger.warning(f"balance credit failed (non-fatal): {e}")
     await trade_ledger.record("position_closed", {
@@ -6437,6 +6682,9 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         "entry_action": "BUY" if direction > 0 else "SELL",
         "realized_pnl_pct": round(pnl_pct, 4) if pnl_pct is not None else None,
         "realized_pnl_usd": round(realized_usd, 2) if realized_usd is not None else None,
+        # The ACCOUNT-level percent actually fed into the daily loss counter —
+        # recorded so the ledger replay/repair verifies the same unit.
+        "account_pnl_pct": round(account_pct, 4) if account_pct is not None else None,
         "qty": qty or None,
         "reason": close_reason,
     })
@@ -6509,10 +6757,17 @@ def recompute_daily_pnl(records: List[dict], day: str) -> Dict[str, Any]:
             opens.pop(ticker, None)
         if not same_day:
             continue
+        # Since 5.22 the daily counter is fed the ACCOUNT-level percent
+        # (`account_pnl_pct`), so the replay must count the same unit —
+        # summing the raw per-trade move would "repair" the counter back into
+        # the broken unit. Older records carry only `realized_pnl_pct`.
+        acct_raw = data.get("account_pnl_pct")
+        has_account = isinstance(acct_raw, (int, float)) and not isinstance(acct_raw, bool)
         try:
-            as_written = float(data.get("realized_pnl_pct") or 0.0)
+            as_written = float(acct_raw) if has_account else float(data.get("realized_pnl_pct") or 0.0)
         except (TypeError, ValueError):
             as_written = 0.0
+            has_account = False
         closes += 1
         recorded += as_written
         entry = _positive_float(data.get("entry"))
@@ -6524,6 +6779,20 @@ def recompute_daily_pnl(records: List[dict], day: str) -> Dict[str, Any]:
                 unresolved.append(ticker)
             continue
         true_pct = direction * ((exit_px - entry) / entry * 100.0)
+        if has_account:
+            # Account-scaled close: entry/exit re-derive the PER-TRADE move,
+            # so only the SIGN is verifiable — the magnitude depends on the
+            # balance at close time. A sign flip is the inversion bug.
+            if as_written == 0.0 or true_pct == 0.0 or (true_pct > 0) == (as_written > 0):
+                corrected += as_written
+            else:
+                corrected += -as_written
+                inverted.append({
+                    "ticker": ticker,
+                    "booked_pct": round(as_written, 4),
+                    "true_pct": round(-as_written, 4),
+                })
+            continue
         corrected += true_pct
         if abs(true_pct - as_written) > PNL_REPAIR_EPSILON:
             inverted.append({
@@ -7064,7 +7333,12 @@ async def execute_live_order(payload: dict):
                 stop_outcome = await _cancel_order_verified(resting_stop_id)
                 if stop_outcome == CANCEL_FILLED:
                     await _finish_guard(sym_u, "closed_by_stop")
-                    await _record_close(sym_u, None, payload)
+                    stop_fill = await _resolve_exit_fill(resting_stop_id)
+                    if stop_fill:
+                        await _record_close(sym_u, None, payload, exit_premium=stop_fill, close_reason="stop_fill")
+                    else:
+                        await _defer_close_to_reconciler(sym_u, resting_stop_id,
+                                                         "option stop executed — fill price unavailable")
                     logger.info(f"[LIVE option CLOSE] {sym_u} already closed by resting stop {resting_stop_id}")
                     return {
                         "status": "success",
@@ -7135,6 +7409,61 @@ async def execute_live_order(payload: dict):
                         f"trail_stop={payload.get('trail_stop')} trail_amount={payload.get('trail_amount') or payload.get('trailing_stop_amount')}"
                     )
 
+                # INTENT-PRESERVING SIZING — the app sized this trade on its
+                # estimated premium. If the real market repriced the entry
+                # upward, shrink the quantity to the app's intended DOLLARS
+                # (or refuse when even one contract multiplies the plan).
+                reprice = plan_entry_reprice(
+                    limit_price, quantity,
+                    float(common.get("limitPrice") or 0) or float(real_ask or 0),
+                )
+                if reprice["action"] == "reject":
+                    await trade_ledger.record("entry_reprice_rejected", {
+                        "ticker": str(symbol).upper(),
+                        "estimate": float(limit_price or 0) or None,
+                        "real": float(common.get("limitPrice") or 0) or float(real_ask or 0),
+                        "qty_requested": quantity,
+                        "drift_pct": reprice["drift_pct"],
+                        "intended_usd": reprice["intended_usd"],
+                        "one_contract_usd": reprice["actual_unit_usd"],
+                    })
+                    await alerts.send(
+                        "warning", "entry_reprice_rejected",
+                        f"{symbol}: entry REJECTED — real premium is {reprice['drift_pct']:.0f}% above the "
+                        f"app's estimate (≈${reprice['actual_unit_usd']:.0f}/contract vs "
+                        f"≈${reprice['intended_usd']:.0f} intended outlay). The sizing premise no longer exists.",
+                        dedupe_key=f"reprice_reject:{symbol}",
+                    )
+                    raise Exception(
+                        f"entry price drifted {reprice['drift_pct']:.0f}% above the app's estimate "
+                        f"(≈${reprice['actual_unit_usd']:.0f}/contract vs ≈${reprice['intended_usd']:.0f} intended) "
+                        f"— refusing to multiply the planned risk"
+                    )
+                if reprice["action"] == "resize":
+                    logger.warning(
+                        f"⚖️ {symbol} intent-preserving resize: qty {quantity} → {reprice['qty']} "
+                        f"(estimate {limit_price} vs real {common.get('limitPrice')}, "
+                        f"drift {reprice['drift_pct']:.0f}% — intended ≈${reprice['intended_usd']:.0f} preserved)"
+                    )
+                    await trade_ledger.record("entry_repriced", {
+                        "ticker": str(symbol).upper(),
+                        "estimate": float(limit_price or 0) or None,
+                        "real": float(common.get("limitPrice") or 0) or float(real_ask or 0),
+                        "qty_requested": quantity,
+                        "qty_placed": reprice["qty"],
+                        "drift_pct": reprice["drift_pct"],
+                        "intended_usd": reprice["intended_usd"],
+                    })
+                    await alerts.send(
+                        "warning", "entry_repriced",
+                        f"{symbol}: real premium {reprice['drift_pct']:.0f}% above the app's estimate — "
+                        f"resized {quantity} → {reprice['qty']} contract(s) to hold the intended "
+                        f"≈${reprice['intended_usd']:.0f} outlay.",
+                        dedupe_key=f"reprice_resize:{symbol}",
+                    )
+                    quantity = reprice["qty"]
+                    common["quantity"] = quantity
+
             logger.info(f"📤 Placing OPTION: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
             if is_exit:
                 # Closes must always cover the full tracked position — never clamp.
@@ -7151,7 +7480,19 @@ async def execute_live_order(payload: dict):
             logger.info(f"✅ LIVE OPTION TRADE SUCCESS: {symbol} {call_put} {strike} {expiry}")
             await _record_api_success()
             if is_exit:
-                await _record_close(str(symbol).upper(), None, payload)
+                # CLOSE-FILL TRUTH: book the close at its ACTUAL executed
+                # premium. A resting STOP close won't execute now — defer it
+                # straight to the reconciler; MARKET/LIMIT closes fill in
+                # seconds and are polled inline.
+                close_order_id = _order_id_from_place(final)
+                exit_fill = None
+                if common.get("priceType") != "STOP":
+                    exit_fill = await _resolve_exit_fill(close_order_id)
+                if exit_fill:
+                    await _record_close(sym_u, None, payload, exit_premium=exit_fill, close_reason="close_fill")
+                else:
+                    await _defer_close_to_reconciler(sym_u, close_order_id,
+                                                     "option close placed — not executed yet")
             else:
                 contract = {
                     "occ_symbol": _occ_symbol(symbol, expiry, call_put, float(strike)),
@@ -7232,7 +7573,12 @@ async def execute_live_order(payload: dict):
                     )
                 await _finish_guard(symbol, "closed_by_app")
                 if already_closed_by_stop:
-                    await _record_close(symbol, None, payload)
+                    stop_fill = await _resolve_exit_fill(stop_order_id)
+                    if stop_fill:
+                        await _record_close(symbol, stop_fill, payload, close_reason="stop_fill")
+                    else:
+                        await _defer_close_to_reconciler(symbol, stop_order_id,
+                                                         "equity stop executed — fill price unavailable")
                     logger.info(f"[LIVE equity CLOSE] {symbol} already closed by resting stop {stop_order_id}")
                     return {
                         "status": "success",
@@ -7260,7 +7606,13 @@ async def execute_live_order(payload: dict):
                 )
                 logger.info(f"📤 Placing EQUITY CLOSE: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
                 final = await _place_order_smart("equity", common, tokens)
-                await _record_close(symbol, None, payload)
+                close_order_id = _order_id_from_place(final)
+                exit_fill = await _resolve_exit_fill(close_order_id)
+                if exit_fill:
+                    await _record_close(symbol, exit_fill, payload, close_reason="close_fill")
+                else:
+                    await _defer_close_to_reconciler(symbol, close_order_id,
+                                                     "equity close placed — not executed yet")
                 logger.info(f"✅ LIVE EQUITY CLOSE SUCCESS: {exit_side} {qty} {symbol}")
                 await _record_api_success()
                 return {"status": "success", "response": final}
@@ -7677,7 +8029,19 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         # flat. Replacing it would rest a naked short; book the close instead.
         logger.warning(f"[TRAIL] {ticker} resting stop {stop_order_id} already executed — booking the close")
         await _finish_guard(ticker, "closed_by_stop")
-        await _record_close(ticker, float(plan["current_stop"]), {"ticker": ticker, "action": pos.get("action") or "BUY"})
+        # Book the REAL fill when readable; fall back to the stop's trigger
+        # level — on the CORRECT basis. This site used to pass the option
+        # premium level through the underlying `exit_price` parameter, booking
+        # a premium (e.g. 3.70) against an underlying entry (e.g. 317): a
+        # nonsense −99% that polluted the daily counter and the ledger.
+        stop_fill = await _resolve_exit_fill(stop_order_id)
+        level = float(stop_fill or plan["current_stop"])
+        payload_t = {"ticker": ticker, "action": pos.get("action") or "BUY"}
+        trail_reason = "trail_stop_fill" if stop_fill else "trail_stop_level"
+        if is_option:
+            await _record_close(ticker, None, payload_t, exit_premium=level, close_reason=trail_reason)
+        else:
+            await _record_close(ticker, level, payload_t, close_reason=trail_reason)
         await trade_ledger.record("trail_stop_executed", {
             "ticker": ticker, "stop": plan["current_stop"], "order_id": stop_order_id,
         })
@@ -8500,9 +8864,19 @@ async def flatten(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secr
                     # already flat, and selling again would open a short.
                     logger.info(f"[FLATTEN] {ticker} already closed by its resting stop")
                     await _finish_guard(ticker, "flattened_by_stop")
-                    # Book the close so the position leaves Redis. Without this
-                    # the panic exit "succeeds" but the book never empties.
-                    await _record_close(ticker, None, {"ticker": ticker, "action": item["action"]})
+                    # Book the close at its REAL fill so the position leaves
+                    # Redis with true P&L. Unpriced → deferred to the
+                    # reconciler's fill capture (kill switch is already on, so
+                    # nothing re-enters behind it).
+                    stop_fill = await _resolve_exit_fill(item["stop_order_id"], timeout_s=3.0)
+                    payload_f = {"ticker": ticker, "action": item["action"]}
+                    if stop_fill and item["kind"] == "option":
+                        await _record_close(ticker, None, payload_f, exit_premium=stop_fill, close_reason="flatten_stop_fill")
+                    elif stop_fill:
+                        await _record_close(ticker, stop_fill, payload_f, close_reason="flatten_stop_fill")
+                    else:
+                        await _defer_close_to_reconciler(ticker, item["stop_order_id"],
+                                                         "flatten: stop executed — fill not yet priced")
                     results.append({"ticker": ticker, "status": "already_flat",
                                     "detail": "resting stop executed"})
                     continue
@@ -8515,6 +8889,10 @@ async def flatten(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secr
                            "action": item["action"]}
             order_id = await _emergency_flatten(ticker, guard_shape, item["qty"])
             await _finish_guard(ticker, "flattened")
+            # The market close fills in seconds — hand the position to the
+            # reconciler's fill capture so the REAL exit gets booked (never a
+            # fake breakeven, never a silent ghost).
+            await _defer_close_to_reconciler(ticker, order_id, "flatten close placed")
             logger.warning(
                 f"[FLATTEN] {ticker} market close placed - qty={item['qty']} "
                 f"kind={item['kind']} order={order_id} (stop {stop_outcome})"
