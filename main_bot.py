@@ -2141,6 +2141,16 @@ def plan_ghost_resolution(
     return {"kind": GHOST_UNKNOWN}
 
 
+class BrokerSessionExpired(Exception):
+    """The broker session is known-DEAD (midnight-ET hard expiry or a user
+    unlink). Raised by the fetch callbacks so a reconcile pass can skip
+    QUIETLY: every broker call during a dead session is a guaranteed 401,
+    and treating each one as a fresh reconcile_fetch_failed ERROR spammed
+    an alert every 15 minutes all night (observed 2026-08-09, 04:06→12:36
+    UTC — 34+ Discord alerts for one expired token). The expiry itself is
+    alerted ONCE at the state transition by the session tracker."""
+
+
 async def reconcile_once(
     state: StateStore,
     fetch_portfolio: Callable[[], Awaitable[Dict[str, Any]]],
@@ -2175,6 +2185,13 @@ async def reconcile_once(
     }
     try:
         portfolio_resp, orders_resp = await asyncio.gather(fetch_portfolio(), fetch_orders())
+    except BrokerSessionExpired as e:
+        # Known-dead session — not a new failure. The transition was already
+        # alerted once; repeating an ERROR per cycle is pure noise.
+        report["warnings"].append(f"skipped — broker session expired, awaiting relink: {e}")
+        await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
+        logger.info(f"[RECONCILE] skipped — session expired, awaiting relink ({e})")
+        return report
     except Exception as e:
         report["warnings"].append(f"broker fetch failed: {e}")
         await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
@@ -3780,7 +3797,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.24.0-entry-fill-truth"
+BOT_VERSION = "5.25.0-session-quiesce"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -4332,8 +4349,73 @@ def _mark_token_session(valid: bool, reason: str = "") -> None:
     _token_session["checked_at"] = _utcnow().isoformat()
     if prev is not False and valid is False:
         logger.warning(f"Broker session marked EXPIRED — {reason}")
+        # ONE alert at the TRANSITION — the keepalive and reconcile loops
+        # quiesce while expired, so this is the only relink prompt the user
+        # gets (instead of an ERROR every 15 minutes all night).
+        _alert_session_transition(
+            "error", "broker_session_expired",
+            f"E*TRADE session is DEAD ({reason}). Broker polling is paused until "
+            f"you relink — open the app and tap Link Account.",
+        )
     elif prev is not True and valid is True:
         logger.info("Broker session marked ACTIVE")
+        if prev is False:
+            _alert_session_transition(
+                "info", "broker_session_restored",
+                "E*TRADE session restored — broker polling resumed.",
+            )
+
+
+def _alert_session_transition(severity: str, event: str, message: str) -> None:
+    """Best-effort one-shot alert on a session-state TRANSITION. Fire-and-forget:
+    session marking is synchronous and must never block or fail on alerting."""
+    try:
+        asyncio.get_running_loop()
+        asyncio.create_task(alerts.send(severity, event, message, dedupe_key=event))
+    except RuntimeError:
+        pass  # no running loop (import/startup) — the log line already records it
+    except Exception as e:
+        logger.debug(f"session transition alert failed: {e}")
+
+
+# While the session is EXPIRED every broker call is a guaranteed 401. One
+# probe per window keeps a self-heal path open in case the flag was set by a
+# transient 401 mislabelled as expiry — without hammering E*TRADE all night.
+EXPIRED_SESSION_PROBE_SECONDS = int(os.getenv("EXPIRED_SESSION_PROBE_SECONDS", str(4 * 3600)))
+_expired_probe_ts: float = 0.0
+
+
+def _session_probe_due(now_ts: float, last_probe_ts: float,
+                       probe_seconds: float = None) -> bool:
+    """True when the quiesced (expired) session is due one broker probe."""
+    window = EXPIRED_SESSION_PROBE_SECONDS if probe_seconds is None else probe_seconds
+    return (float(now_ts) - float(last_probe_ts)) >= float(window)
+
+
+def _keepalive_should_run(session_valid: Optional[bool]) -> bool:
+    """renew_access_token can only EXTEND a live session — a midnight-ET-expired
+    token can never be renewed back to life; only a full relink issues a working
+    session. Attempting renewal against a known-dead session burns E*TRADE rate
+    budget and fires a warning alert per cycle (observed 2026-08-09: 8+ hours of
+    401/404/500 renew attempts overnight)."""
+    return session_valid is not False
+
+
+def _require_probeable_session() -> None:
+    """Gate for reconcile broker fetches: while the session is expired, skip
+    the guaranteed-401 call with a QUIET BrokerSessionExpired — except one
+    probe every EXPIRED_SESSION_PROBE_SECONDS so a wrongly-flagged session
+    still self-heals without a relink."""
+    global _expired_probe_ts
+    if _token_session["valid"] is not False:
+        return
+    now = time.time()
+    if _session_probe_due(now, _expired_probe_ts):
+        _expired_probe_ts = now
+        return
+    raise reconciliation.BrokerSessionExpired(
+        _token_session["reason"] or "token expired — relink required"
+    )
 
 
 def _looks_like_auth_failure(err: Exception) -> bool:
@@ -4441,10 +4523,23 @@ async def etrade_auth_start():
         # Request tokens are disposable — fetching is safe to retry with
         # backoff (unlike the access-token exchange, whose verifier is
         # single-use and must NEVER be retried).
-        fetch_response = await asyncio.to_thread(
-            _sync_etrade_call, etrade_session.fetch_request_token, REQUEST_TOKEN_URL,
-            source="request_token",
-        )
+        try:
+            fetch_response = await asyncio.to_thread(
+                _sync_etrade_call, etrade_session.fetch_request_token, REQUEST_TOKEN_URL,
+                source="request_token",
+            )
+        except Exception as fetch_err:
+            # E*TRADE's OAuth service throws intermittent 500s (observed
+            # 2026-08-09 12:37 UTC — request_token AND access_token both 500'd
+            # for minutes). A raw 500 here read as "the bot is broken"; it is
+            # E*TRADE's sign-in service, and waiting a minute fixes it.
+            logger.error(f"Request token fetch failed: {fetch_err}")
+            raise HTTPException(
+                503,
+                "E*TRADE's sign-in service returned an error while starting the "
+                "link — this is a hiccup on their side, not yours. Wait about a "
+                "minute and tap Link Account again.",
+            )
         token_val = fetch_response.get("oauth_token")
         secret_val = fetch_response.get("oauth_token_secret")
         if not token_val or not secret_val:
@@ -4505,6 +4600,28 @@ async def etrade_auth_start():
         raise HTTPException(500, detail=str(e))
 
 
+def _classify_exchange_error(msg: str) -> Tuple[int, str]:
+    """Map a raw access-token exchange failure to (http_status, user message).
+    E*TRADE's OAuth service fails in three distinct ways and each needs a
+    different user action — an opaque 500 with a Tomcat HTML blob (observed
+    live 2026-08-09 12:37 UTC) told the user nothing."""
+    low = str(msg).lower()
+    if "token_rejected" in low or "401" in str(msg):
+        return 400, (
+            "E*TRADE rejected the request token — it expired (5-minute limit) or "
+            "was already used. Tap Link Account again and paste the fresh code right away."
+        )
+    if "verifier" in low:
+        return 400, "E*TRADE rejected the verification code. Double-check the code and try again."
+    if "500" in str(msg) or "internal server error" in low:
+        return 502, (
+            "E*TRADE's sign-in service had an internal error during the final step — "
+            "this happens on their side from time to time. Tap Link Account again for "
+            "a fresh link and code."
+        )
+    return 502, f"E*TRADE token exchange failed: {str(msg)[:200]} — tap Link Account again for a fresh link."
+
+
 @app.post("/etrade/auth/complete")
 @app.post("/complete-link")
 async def etrade_auth_complete(data: dict = Body(...)):
@@ -4554,11 +4671,15 @@ async def etrade_auth_complete(data: dict = Body(...)):
         except Exception as oauth_err:
             msg = str(oauth_err)
             logger.error(f"Access token exchange failed: {msg}")
-            if "token_rejected" in msg or "401" in msg:
-                raise HTTPException(400, "E*TRADE rejected the request token — it expired (5-minute limit) or was already used. Tap Link Account again and paste the fresh code right away.")
-            if "verifier" in msg.lower():
-                raise HTTPException(400, "E*TRADE rejected the verification code. Double-check the code and try again.")
-            raise HTTPException(500, detail=msg)
+            # The request token is SINGLE-USE — a failed exchange may have
+            # consumed it at E*TRADE. Discard it so a retry can never re-send
+            # a dead token (guaranteed token_rejected); the user restarts with
+            # a fresh link instead.
+            _pending_request_tokens.pop(str(token_val), None)
+            if _latest_request_token == token_val:
+                _latest_request_token = None
+            status_code, friendly = _classify_exchange_error(msg)
+            raise HTTPException(status_code, friendly)
 
         final_token = access_tokens.get("oauth_token")
         final_secret = access_tokens.get("oauth_token_secret")
@@ -7751,6 +7872,10 @@ async def token_keepalive_worker():
         tokens = load_tokens()
         if not tokens:
             continue
+        if not _keepalive_should_run(_token_session["valid"]):
+            # A midnight-ET-expired token can never be renewed back to life —
+            # only a relink (save_tokens → session ACTIVE) restarts renewals.
+            continue
         try:
             auth_manager = pyetrade.ETradeAccessManager(
                 CONSUMER_KEY, CONSUMER_SECRET,
@@ -7842,6 +7967,7 @@ async def _reconcile_fetch_portfolio() -> Dict[str, Any]:
     tokens = load_tokens()
     if not tokens:
         raise Exception("E*TRADE not linked")
+    _require_probeable_session()
     try:
         acct_key = await _resolve_account_id_key(tokens)
         result = await _raw_client(tokens).get_portfolio(acct_key)
@@ -7859,6 +7985,7 @@ async def _reconcile_fetch_orders() -> Dict[str, Any]:
     tokens = load_tokens()
     if not tokens:
         raise Exception("E*TRADE not linked")
+    _require_probeable_session()
     try:
         acct_key = await _resolve_account_id_key(tokens)
         result = await _raw_client(tokens).list_orders(acct_key)
