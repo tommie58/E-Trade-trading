@@ -1878,9 +1878,17 @@ def _as_list(node: Any) -> List[dict]:
 
 
 def parse_broker_positions(portfolio_resp: Dict[str, Any]) -> Dict[str, dict]:
-    """Flatten a PortfolioResponse into {SYMBOL: {qty, security_type, occ}}.
+    """Flatten a PortfolioResponse into
+    {SYMBOL: {qty, eq_qty, optn_qty, security_type, occ}}.
+
     Options are keyed by UNDERLYING symbol (matching how the bot tracks
-    positions) with the OCC display symbol preserved."""
+    positions) but counted SEPARATELY from any equity lot on the same symbol.
+    Summing them (100 AAPL shares + 2 AAPL calls → qty=102) "healed" the
+    option's filled_qty to 102, made the correctly-sized 2-lot stop look
+    under-covering, cancelled it, and asked for a 102-contract replacement
+    the broker rejected — protection destroyed by the repair meant to
+    enforce it. `qty` remains the blended total for display only; sizing
+    logic must go through `broker_qty_for()`."""
     out: Dict[str, dict] = {}
     root = (portfolio_resp or {}).get("PortfolioResponse", {}) or {}
     for acct in _as_list(root.get("AccountPortfolio")):
@@ -1894,12 +1902,37 @@ def parse_broker_positions(portfolio_resp: Dict[str, Any]) -> Dict[str, dict]:
                 qty = int(float(pos.get("quantity") or 0))
             except (TypeError, ValueError):
                 qty = 0
-            record = out.setdefault(symbol, {"qty": 0, "security_type": sec_type, "occ": None})
+            record = out.setdefault(symbol, {
+                "qty": 0, "eq_qty": 0, "optn_qty": 0,
+                "security_type": sec_type, "occ": None,
+            })
             record["qty"] += qty
             if sec_type == "OPTN":
+                record["optn_qty"] += qty
                 record["security_type"] = "OPTN"
                 record["occ"] = pos.get("symbolDescription") or product.get("displaySymbol")
+            else:
+                record["eq_qty"] += qty
     return out
+
+
+def broker_qty_for(record: Optional[dict], is_option: bool) -> int:
+    """Broker quantity on the SAME basis as a tracked position — option
+    contracts for option positions, shares for equities. Never the blended
+    total. Falls back to the legacy `qty` for records written before the
+    split (a restart mid-deploy replaying an old report)."""
+    if not isinstance(record, dict):
+        return 0
+    key = "optn_qty" if is_option else "eq_qty"
+    if key in record:
+        try:
+            return int(record.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+    try:
+        return int(record.get("qty") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
@@ -2109,6 +2142,12 @@ def plan_ghost_resolution(
             return None
         if filled <= 0 or price <= 0:
             return None
+        if require_closing_action and executed_ts <= 0:
+            # An UNTRACKED closing order with an unreadable execution time
+            # cannot be proven to belong to THIS round-trip — booking it can
+            # price today's position off yesterday's close. Tracked ids
+            # (our own stop/close orders) keep the lenient rule.
+            return None
         if opened_ts > 0 and executed_ts > 0 and executed_ts < opened_ts - FILL_CAPTURE_SLACK_SECONDS:
             return None  # a fill from BEFORE this position opened is not its exit
         return {
@@ -2222,6 +2261,8 @@ async def reconcile_once(
     # --- 1) tracked positions vs broker ---
     for ticker, pos in tracked.items():
         broker = broker_positions.get(ticker)
+        is_opt_pos = bool(pos.get("contract"))
+        basis_qty = abs(broker_qty_for(broker, is_opt_pos))
         opened_ts = 0.0
         try:
             opened_ts = datetime.fromisoformat(str(pos.get("ts"))).timestamp()
@@ -2229,7 +2270,9 @@ async def reconcile_once(
             pass
         age = now - opened_ts if opened_ts else 1e9
 
-        if broker is None:
+        # "Present" means present ON THE SAME BASIS: a tracked option with
+        # only equity shares at the broker is a ghost of the option position.
+        if broker is None or basis_qty == 0:
             # Not at the broker. In-flight entries get a grace period; a live
             # unfilled entry order also keeps the position tracked.
             has_live_entry = any(
@@ -2293,8 +2336,9 @@ async def reconcile_once(
                          dedupe_key=f"ghost:{ticker}")
             continue
 
-        # Sync filled quantity from the broker's actual position size.
-        broker_qty = abs(int(broker.get("qty") or 0))
+        # Sync filled quantity from the broker's actual position size — on the
+        # position's OWN basis (contracts for options, shares for equities).
+        broker_qty = basis_qty
         tracked_qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
         if broker_qty > 0 and broker_qty != tracked_qty:
             pos["filled_qty"] = broker_qty
@@ -2321,6 +2365,17 @@ async def reconcile_once(
                     await _alert("critical", "guard_rearm_failed",
                                  f"{ticker}: protective stop re-arm FAILED: {e}",
                                  dedupe_key=f"rearm_fail:{ticker}")
+        elif ticker not in live_stop_symbols and not guard_active:
+            # The position most in need of the UNPROTECTED alert — one that
+            # never got ANY stop level recorded (e.g. a MARKET option entry
+            # with no readable fill reference) — was silently exempt forever
+            # because protective_level() == 0 skipped the whole check.
+            msg = (f"{ticker}: NO STOP LEVEL RECORDED — live position with no protective "
+                   f"level to re-arm; set a stop or close it manually")
+            report["warnings"].append(msg)
+            logger.error(f"[RECONCILE] 🚨 {msg}")
+            await _alert("critical", "position_no_stop_level", msg,
+                         dedupe_key=f"nostop:{ticker}")
 
     # --- 1b) protection invariant: exactly ONE resting stop, sized to the
     #         position. Runs after the filled_qty sync above so the audit
@@ -2329,10 +2384,13 @@ async def reconcile_once(
         broker = broker_positions.get(ticker)
         if broker is None:
             continue
+        basis_qty_1b = abs(broker_qty_for(broker, bool(pos.get("contract"))))
+        if basis_qty_1b == 0:
+            continue  # not present on this basis — section 1 handled the ghost
         if guard_owns_stop(guards.get(ticker), now):
             continue  # a live guard owns this position's stop right now
         stops = stops_by_symbol.get(ticker) or []
-        position_qty = abs(int(broker.get("qty") or 0)) or int(pos.get("filled_qty") or 0)
+        position_qty = basis_qty_1b or int(pos.get("filled_qty") or 0)
         plan = plan_protection_repair(ticker, position_qty, stops,
                                       tracked_stop_id=pos.get("stop_order_id"))
         if plan is None:
@@ -2406,6 +2464,29 @@ async def reconcile_once(
                          f"{ticker}: the surplus stops were cancelled but the replacement stop "
                          f"failed to rest — position is UNPROTECTED: {e}",
                          dedupe_key=f"protect_rebuild:{ticker}")
+
+    # --- 1c) broker positions NOBODY tracks — the most dangerous state on
+    #         the book: no stop, no trail, no heat accounting, no cap slot.
+    #         Real paths here: process death between placement and recording,
+    #         a guard timeout that deleted the position before the entry
+    #         filled, a partial close remainder, or a manual trade.
+    for symbol, record in broker_positions.items():
+        if symbol in tracked:
+            continue
+        try:
+            qty_untracked = abs(int(record.get("qty") or 0))
+        except (TypeError, ValueError):
+            qty_untracked = 0
+        if qty_untracked <= 0:
+            continue
+        sec = str(record.get("security_type") or "EQ")
+        msg = (f"{symbol}: UNTRACKED position at broker ({qty_untracked} "
+               f"{'contract(s)' if sec == 'OPTN' else 'share(s)'}) — no stop, no trail, "
+               f"no risk accounting. Close it at E*TRADE or re-enter it through the bot.")
+        report["warnings"].append(msg)
+        logger.error(f"[RECONCILE] 🚨 {msg}")
+        await _alert("critical", "untracked_position", msg,
+                     dedupe_key=f"untracked:{symbol}")
 
     # --- 2) orphaned protective stops (stop order live, no tracked position,
     #        no broker position) ---
@@ -2878,7 +2959,7 @@ import json
 import logging
 import math
 import re
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 try:  # package-style import (python -m bot...) or flat (uvicorn main_bot:app)
@@ -3147,16 +3228,22 @@ def pct_change(now: Optional[float], base: Optional[float]) -> Optional[float]:
     return round((n - b) / b * 100.0, 3)
 
 
-def detect_setup(
+def detect_setup_side(
     series: List[Dict[str, Any]],
     quote: Dict[str, Any],
     vwap: Optional[float],
-) -> Optional[str]:
-    """Name the setup a reading satisfies, or None.
+) -> Optional[Tuple[str, str]]:
+    """Name the (setup, side) a reading satisfies, or None.
 
     Setup names deliberately match the bot's ALLOWED_SETUPS vocabulary so a
     scanner signal is judged by the exact same allowlist as an app signal.
-    Long-side only — the scanner never initiates a short.
+
+    TWO-SIDED: each long setup has an exact short mirror ('vwap rejection',
+    'breakdown', 'momentum fade'). The long-only scanner went structurally
+    SILENT in a down tape — the sessions with the most opportunity produced
+    zero scanner flow while the app alone carried the short side. Short
+    exposure is expressed downstream as a LONG PUT (capped risk), never a
+    short sale.
 
     `series` holds the observations BEFORE this reading (the caller appends the
     current quote only after evaluating it), so every element is prior history.
@@ -3173,27 +3260,47 @@ def detect_setup(
     if len(prior) < MIN_SAMPLES:
         return None
     prior_high = max(prior)
+    prior_low = min(prior)
     prev_price = prior[-1]
     open_px = quote.get("open")
     prev_close = quote.get("previous_close")
+    change_open = pct_change(last, open_px)
 
     # VWAP reclaim: was below the sampled VWAP on the previous observation and
     # is now above it, with the session still positive on the day.
+    # VWAP rejection is the mirror: lost the VWAP with the session negative.
     if vwap is not None and prev_price is not None:
-        if prev_price < vwap <= float(last) and (pct_change(last, open_px) or 0) > 0:
-            return "vwap reclaim"
+        if prev_price < vwap <= float(last) and (change_open or 0) > 0:
+            return ("vwap reclaim", "long")
+        if prev_price > vwap >= float(last) and (change_open or 0) < 0:
+            return ("vwap rejection", "short")
 
     # Breakout: new session high across the sampled window AND above the prior
-    # close by a real margin.
+    # close by a real margin. Breakdown is the mirror.
     if float(last) > prior_high and (pct_change(last, prev_close) or 0) >= 0.5:
-        return "breakout"
+        return ("breakout", "long")
+    if float(last) < prior_low and (pct_change(last, prev_close) or 0) <= -0.5:
+        return ("breakdown", "short")
 
     # Momentum: sustained push off the open with price leading the VWAP.
-    change_open = pct_change(last, open_px)
     if change_open is not None and change_open >= 0.3 and (vwap is None or float(last) >= vwap):
         if float(last) >= prior_high:
-            return "momentum"
+            return ("momentum", "long")
+    if change_open is not None and change_open <= -0.3 and (vwap is None or float(last) <= vwap):
+        if float(last) <= prior_low:
+            return ("momentum fade", "short")
     return None
+
+
+def detect_setup(
+    series: List[Dict[str, Any]],
+    quote: Dict[str, Any],
+    vwap: Optional[float],
+) -> Optional[str]:
+    """Legacy long-only view of `detect_setup_side` — kept so callers written
+    before the two-sided scanner keep their exact behavior."""
+    hit = detect_setup_side(series, quote, vwap)
+    return hit[0] if hit is not None and hit[1] == "long" else None
 
 
 # Score anatomy. A score is BASE plus a weighted share of SPAN, so the worst
@@ -3278,18 +3385,31 @@ def score_candidate(
     return int(round(SCORE_BASE + SCORE_SPAN * blended))
 
 
-def risk_levels(entry: float, series: List[Dict[str, Any]]) -> Tuple[float, float]:
+def risk_levels(entry: float, series: List[Dict[str, Any]], side: str = "long") -> Tuple[float, float]:
     """(stop, target) from the observed intraday range.
 
-    Stop = entry − max(observed swing, 0.4% floor); target = 2R. The swing is
+    Long: stop = entry − max(observed swing, 0.4% floor); target = 2R.
+    Short: the exact mirror — stop ABOVE entry, target below. The swing is
     the scanner's own sampled high−low, so the stop reflects real volatility
     rather than a fixed guess."""
     prices = [float(s["last"]) for s in series if s.get("last") is not None]
     swing = (max(prices) - min(prices)) if len(prices) >= 2 else 0.0
     distance = max(swing, entry * 0.004)
+    if side == "short":
+        stop = round(entry + distance, 2)
+        target = round(max(0.01, entry - 2 * distance), 2)
+        return stop, target
     stop = round(max(0.01, entry - distance), 2)
     target = round(entry + 2 * (entry - stop), 2)
     return stop, target
+
+
+def next_friday_expiry(now_et: datetime) -> str:
+    """Nearest Friday (today when it IS Friday) as YYYY-MM-DD. The bot snaps
+    every expiry to a contract that actually exists on the chain, so market
+    holidays self-correct server-side."""
+    days_ahead = (4 - now_et.weekday()) % 7
+    return (now_et.date() + timedelta(days=days_ahead)).isoformat()
 
 
 def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) -> Dict[str, Any]:
@@ -3297,10 +3417,17 @@ def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) ->
 
     `position_size_shares` is deliberately omitted — the bot sizes equity
     entries from live account equity, the configured risk percent and the stop
-    distance, which is strictly safer than a scanner-side guess."""
-    return {
+    distance, which is strictly safer than a scanner-side guess.
+
+    SHORT candidates are expressed as a LONG PUT (one contract): the bot
+    refuses bare short-equity entries (a naked short at the broker), and a
+    bought put caps the worst case at the premium paid. Strike and expiry are
+    hints only — the bot snaps both to a contract that actually exists and
+    prices the entry from the REAL bid/ask."""
+    side = str(candidate.get("side") or "long")
+    payload: Dict[str, Any] = {
         "ticker": candidate["ticker"],
-        "action": "BUY",
+        "action": "BUY" if side == "long" else "SELL",
         "mode": mode,
         "instrument": "stock",
         "entry": candidate["entry"],
@@ -3312,6 +3439,13 @@ def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) ->
         "source": "bot_scanner",
         "timestamp": candidate["ts"],
     }
+    if side == "short":
+        payload["instrument"] = "option"
+        payload["option_right"] = "PUT"
+        payload["option_contracts"] = 1
+        payload["strike_hint"] = round(float(candidate["entry"]))
+        payload["expiration_hint"] = candidate.get("expiry") or next_friday_expiry(_utcnow())
+    return payload
 
 
 def evaluate_quote(
@@ -3330,9 +3464,16 @@ def evaluate_quote(
     vwap = sampled_vwap(series)
     change_open = pct_change(last, quote.get("open"))
     vwap_dist = pct_change(last, vwap) if vwap else None
-    setup = detect_setup(series, quote, vwap)
-    factors = score_factors(rvol, change_open, vwap_dist, spread, float(cfg["max_spread_pct"]))
-    score = score_candidate(rvol, change_open, vwap_dist, spread, float(cfg["max_spread_pct"]))
+    hit = detect_setup_side(series, quote, vwap)
+    setup = hit[0] if hit is not None else None
+    side = hit[1] if hit is not None else "long"
+    # Side-adjusted readings: a short earns momentum/VWAP credit from movement
+    # in ITS direction (down, price trailing VWAP). The factor arithmetic
+    # itself is unchanged — the app renders the same math.
+    momo_reading = change_open if side == "long" else (None if change_open is None else -change_open)
+    vwap_reading = vwap_dist if side == "long" else (None if vwap_dist is None else -vwap_dist)
+    factors = score_factors(rvol, momo_reading, vwap_reading, spread, float(cfg["max_spread_pct"]))
+    score = score_candidate(rvol, momo_reading, vwap_reading, spread, float(cfg["max_spread_pct"]))
 
     reasons: List[str] = []
     if len(series) < MIN_SAMPLES:
@@ -3352,9 +3493,11 @@ def evaluate_quote(
     if score < int(cfg["min_score"]):
         reasons.append(f"score {score} < {cfg['min_score']}")
 
-    stop, target = risk_levels(last, series + [quote])
+    stop, target = risk_levels(last, series + [quote], side)
     return {
         "ticker": quote["symbol"],
+        "side": side,
+        "action": "BUY" if side == "long" else "SELL",
         "entry": round(last, 2),
         "stop": stop,
         "target": target,
@@ -3529,7 +3672,11 @@ class Scanner:
             quote = next((q for q in quotes if q["symbol"] == cand["ticker"]), None)
             if quote is None:
                 continue
-            payload = build_signal(quote, cand, "live")
+            payload = build_signal(
+                quote,
+                {**cand, "expiry": next_friday_expiry(self.now_et())},
+                "live",
+            )
             try:
                 result = await self.dispatch(payload)
                 verdict = str((result or {}).get("status") or "unknown")
@@ -3538,10 +3685,10 @@ class Scanner:
                 logger.error(f"scanner dispatch failed for {cand['ticker']}: {e}")
             cand["dispatch"] = verdict
             used = await self._note_emit(used)
-            emitted.append({"ticker": cand["ticker"], "setup": cand["setup"],
+            emitted.append({"ticker": cand["ticker"], "setup": cand["setup"], "side": cand.get("side") or "long",
                             "score": cand["score"], "rvol": cand["rvol"], "verdict": verdict})
             logger.info(
-                f"🔭 Scanner signal → {cand['ticker']} {cand['setup']} score={cand['score']} "
+                f"🔭 Scanner signal → {cand['ticker']} {cand.get('side') or 'long'} {cand['setup']} score={cand['score']} "
                 f"rvol={cand['rvol']} entry={cand['entry']} stop={cand['stop']} → {verdict}"
             )
             if self.alert is not None:
@@ -3740,6 +3887,7 @@ from fastapi import FastAPI, HTTPException, Body, Query, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator, ValidationError
 from typing import Optional, Dict, Any, List, Tuple
+import httpx
 import pyetrade
 import os
 import json
@@ -3797,7 +3945,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.25.0-session-quiesce"
+BOT_VERSION = "5.26.0-two-sided-truth"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -3812,7 +3960,11 @@ ALLOWED_SETUPS = {
     for s in os.getenv(
         "ALLOWED_SETUPS",
         "ema cross + adx,ema cross,bull flag + adx,bull flag,bear flag + adx,"
-        "bear flag,volume breakout,breakout,vwap reclaim,momentum",
+        "bear flag,volume breakout,breakout,vwap reclaim,momentum,"
+        # Short-side vocabulary — the scanner's bearish setups route through
+        # long PUTs; without these names in the allowlist every scanner short
+        # is dead on arrival at the entry filter.
+        "breakdown,vwap rejection,momentum fade",
     ).split(",")
     if s.strip()
 }
@@ -4104,6 +4256,20 @@ async def _replay_parked_signals() -> None:
             if not _is_market_open() and not bool(pd.get("force_execute")):
                 logger.info(f"\U0001f17f\ufe0f Dropping parked entry {ticker} — market closed")
                 await trade_ledger.record("parked_signal_dropped", {"ticker": ticker, "age_seconds": int(age), "reason": "market_closed"})
+                continue
+            # Risk state may have changed during the outage (positions filled,
+            # daily loss accrued, duplicate ticker) — a replay must clear the
+            # same gates a fresh signal would.
+            try:
+                ok, reasons = await _passes_entry_filters(pd)
+            except Exception as gate_err:
+                ok, reasons = False, [f"entry filter check failed: {gate_err}"]
+            if not ok:
+                logger.info(f"\U0001f17f\ufe0f Dropping parked entry {ticker} — {'; '.join(reasons)[:200]}")
+                await trade_ledger.record("parked_signal_dropped", {
+                    "ticker": ticker, "age_seconds": int(age),
+                    "reason": f"entry_filters: {'; '.join(reasons)[:180]}",
+                })
                 continue
         try:
             result = await execute_live_order(pd)
@@ -5440,6 +5606,13 @@ _LOCAL_REFUSAL_MARKERS = (
     "tokens not set",
     "missing strike or expiration",
     "refusing to double-sell",
+    # The breaker's own refusal counted as a broker failure, so every attempt
+    # while it was open refreshed the failure window and re-tripped it the
+    # moment it closed — a breaker that latched itself open.
+    "circuit breaker open",
+    # Intent-preserving reprice rejection is OUR verdict on OUR estimate.
+    "refusing to multiply",
+    "short equity entries are not supported",
 )
 
 
@@ -5448,6 +5621,106 @@ def _is_local_refusal(err: str) -> bool:
     broker API call — it says nothing about broker health."""
     low = str(err).lower()
     return any(marker in low for marker in _LOCAL_REFUSAL_MARKERS)
+
+
+def _raw_place_fallback_safe(status_code: Optional[int], is_connect_error: bool) -> bool:
+    """True ONLY when a raw-path order failure provably happened BEFORE the
+    broker could accept the order, making a pyetrade re-place safe.
+
+    - connect error: the request never reached E*TRADE → safe to re-send.
+    - 4xx: the broker's own verdict — the order was REJECTED, not placed →
+      safe to re-send through the fallback transport.
+    - anything else (read timeout after send, 5xx on place.json): the order
+      MAY have been accepted. Re-placing here was a double-fill machine —
+      two live orders, one tracked. Ambiguity must surface as a failure and
+      let the reconciler heal whatever state actually resulted.
+    """
+    if is_connect_error:
+        return True
+    try:
+        code = int(status_code or 0)
+    except (TypeError, ValueError):
+        return False
+    return 400 <= code < 500
+
+
+def plan_option_route(action: str, is_close: bool, requested_right: str) -> Tuple[str, str]:
+    """Route an option payload by INTENT, never by the action verb.
+
+    Returns (order_action, call_put). Every option this bot opens is LONG —
+    a bearish signal expresses direction through the PUT right, not a short
+    sale. The old `action != "BUY"` test sent a SELL ENTRY down the CLOSE
+    flow: it cancelled the ticker's resting protective stop, marked the guard
+    closed_by_app, and placed SELL_CLOSE on a contract the account doesn't
+    even hold (broker rejection at best, a naked short PUT at worst).
+    """
+    right = str(requested_right or "CALL").upper()
+    right = "CALL" if right.startswith("C") else "PUT"
+    if is_close:
+        return "SELL_CLOSE", right
+    if str(action or "BUY").upper() in {"SELL", "SHORT"}:
+        return "BUY_OPEN", "PUT"
+    return "BUY_OPEN", right
+
+
+def _close_cover_qty(pos: Optional[dict], requested: Any) -> int:
+    """Quantity a close order must cover: the broker-synced TRACKED size when
+    one exists, else the caller's number.
+
+    The payload's contract count is guaranteed stale whenever the entry was
+    resized (intent-preserving reprice, 8400 funds clamp) and defaults to 1
+    when the app omits it. Closing the payload's count either leaves a
+    remainder live at the broker — untracked, unstopped, invisible — or
+    oversells into a naked short. The equity close path already reads the
+    tracked size; this gives options the same discipline.
+    """
+    try:
+        tracked = int((pos or {}).get("filled_qty") or (pos or {}).get("qty") or 0)
+    except (TypeError, ValueError):
+        tracked = 0
+    if tracked > 0:
+        return tracked
+    try:
+        return max(1, int(requested or 0))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _is_option_close(pos: Optional[dict], exit_premium: Optional[float]) -> bool:
+    """An option close is proven by the tracked contract OR by the caller
+    passing a real fill premium. Deriving it from the tracked position alone
+    meant an option close arriving for an untracked ticker (restart with lost
+    state, replayed close) dropped its premium and mixed units — booking a
+    $2.50 premium against a $250 underlying entry as a fake −99% that tripped
+    the daily loss limit instantly."""
+    if bool((pos or {}).get("contract")):
+        return True
+    try:
+        return exit_premium is not None and float(exit_premium) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _final_cancel_verdict(verdict: str, status: str, call_ok: bool, broker_answered: bool) -> str:
+    """Map a settled cancel poll onto the caller-facing outcome.
+
+    NOT_FOUND is only proof of death when the cancel CALL itself succeeded or
+    the broker returned a real 4xx verdict for the order id. The order list
+    is ONE page of recent orders — on a busy day a still-live stop simply
+    falls off the page, and 'cancel call failed + not on the page' used to
+    read as CANCEL_CONFIRMED: the trailing engine then rested a SECOND stop
+    against the same contracts (over-commitment, or a naked short when both
+    triggered).
+    """
+    if verdict == "filled":
+        return CANCEL_FILLED
+    if verdict == "terminal":
+        if str(status or "").upper() == "NOT_FOUND" and not (call_ok or broker_answered):
+            return CANCEL_LIVE
+        return CANCEL_CONFIRMED
+    if verdict == "pending":
+        return CANCEL_CONFIRMED
+    return CANCEL_CONFIRMED if call_ok else CANCEL_LIVE
 
 
 async def check_risk_limits(is_close: bool = False) -> None:
@@ -5612,9 +5885,14 @@ async def _place_order_smart(kind: str, common: dict, tokens: Dict[str, str]) ->
                 limit_price=limit_price, stop_price=stop_price,
             )
         except ETradeAPIError as e:
-            logger.warning(f"RAW order path rejected ({e}) — falling back to pyetrade")
-        except Exception as e:
-            logger.warning(f"RAW order path error ({e}) — falling back to pyetrade")
+            if _raw_place_fallback_safe(e.status_code, False):
+                logger.warning(f"RAW order path rejected ({e}) — falling back to pyetrade")
+            else:
+                # A 5xx on place.json may FOLLOW acceptance — re-placing through
+                # pyetrade risks a double fill. Surface the ambiguity instead.
+                raise
+        except httpx.ConnectError as e:
+            logger.warning(f"RAW order path unreachable before send ({e}) — falling back to pyetrade")
     orders = _orders_client(tokens)
     fn = orders.place_option_order if kind == "option" else orders.place_equity_order
     # NON-IDEMPOTENT — executed exactly once (no blind retry of a place).
@@ -6084,10 +6362,17 @@ async def _cancel_order_verified(order_id: Optional[str]) -> str:
         return CANCEL_NONE
 
     call_ok = True
+    broker_answered = False
     try:
         await _cancel_order_call(str(order_id))
     except Exception as e:
         call_ok = False
+        # A 4xx is the broker's real verdict on this order id (already
+        # cancelled / filled / unknown id) — trustworthy context for a
+        # NOT_FOUND below. Transport noise is not. Read duck-typed so this
+        # function stays liftable without the etrade_async import.
+        code = getattr(e, "status_code", None)
+        broker_answered = isinstance(code, int) and 400 <= code < 500
         logger.warning(f"order cancel call failed ({order_id}): {e} — verifying against broker order book")
 
     # Wait for the broker to actually retire the order. Returning on the first
@@ -6095,13 +6380,22 @@ async def _cancel_order_verified(order_id: Optional[str]) -> str:
     # rejection: the order was dying, but its allocation was still held.
     verdict, filled, status = await _await_cancel_settled(str(order_id))
 
-    if verdict == "filled":
+    outcome = _final_cancel_verdict(verdict, status, call_ok, broker_answered)
+    if outcome == CANCEL_FILLED:
         logger.warning(
             f"[CANCEL] order {order_id} already filled at the broker "
             f"(status={status}, filled={filled}) — treating as FILLED, not cancelled"
         )
         return CANCEL_FILLED
     if verdict == "terminal":
+        if outcome == CANCEL_LIVE:
+            # NOT_FOUND after a FAILED cancel call proves nothing — the order
+            # list is one page and a still-live stop can simply roll off it.
+            logger.warning(
+                f"[CANCEL] order {order_id} NOT_FOUND after a failed cancel call — "
+                f"cannot prove it is gone; treating as LIVE (no replacement placed)"
+            )
+            return CANCEL_LIVE
         logger.info(f"[CANCEL] order {order_id} confirmed gone at broker (status={status})")
         return CANCEL_CONFIRMED
     if verdict == "pending":
@@ -6736,10 +7030,14 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
     fill capture) for the audit trail."""
     pos = await state.delete_position(ticker)
     entry = float((pos or {}).get("entry") or payload.get("entry") or 0)
-    exit_px = float(exit_price or payload.get("exit_price") or payload.get("limit_price") or entry or 0)
+    # NO GUESSED EXITS — exit_px is the caller's REAL fill or the payload's
+    # explicit exit_price, nothing else. The old `… or limit_price or entry`
+    # chain could book an option PREMIUM against an underlying entry (a fake
+    # −99% into the daily loss counter) or a silent fake breakeven.
+    exit_px = float(exit_price or payload.get("exit_price") or 0)
     direction = _entry_direction(pos, payload)
     qty = int((pos or {}).get("filled_qty") or (pos or {}).get("qty") or 0)
-    is_option = bool((pos or {}).get("contract"))
+    is_option = _is_option_close(pos, exit_premium)
     entry_premium = float((pos or {}).get("entry_premium") or 0)
     pnl_pct: Optional[float] = None
     realized_usd: Optional[float] = None
@@ -7391,8 +7689,6 @@ async def execute_live_order(payload: dict):
             symbol = payload["ticker"]
             strike = payload.get("strike_hint") or payload.get("strike")
             expiry = _resolve_expiry_string(payload)
-            call_put = str(payload.get("option_right") or payload.get("call_put") or "CALL").upper()
-            call_put = "CALL" if call_put.startswith("C") else "PUT"
             # The app sends `option_contracts`; accept `contracts`/`quantity`
             # aliases so hand-rolled test payloads size correctly too.
             quantity = int(
@@ -7401,7 +7697,12 @@ async def execute_live_order(payload: dict):
                 or payload.get("quantity")
                 or 1
             )
-            order_action = "SELL_CLOSE" if (is_close or action != "BUY") else "BUY_OPEN"
+            # INTENT ROUTING — a SELL signal is a bearish ENTRY (long PUT),
+            # never a close. Only an explicit close intent reaches SELL_CLOSE.
+            order_action, call_put = plan_option_route(
+                action, is_close,
+                payload.get("option_right") or payload.get("call_put") or "CALL",
+            )
             is_exit = order_action == "SELL_CLOSE"
 
             if not strike or not expiry:
@@ -7449,6 +7750,15 @@ async def execute_live_order(payload: dict):
                 # double-sell against it.
                 sym_u = str(symbol).upper()
                 pos = await state.get_position(sym_u) or {}
+                # CLOSE QUANTITY TRUTH — cover what the account actually holds.
+                # The payload count is stale whenever the entry was resized.
+                cover_qty = _close_cover_qty(pos, quantity)
+                if cover_qty != quantity:
+                    logger.warning(
+                        f"[CLOSE] {sym_u} covering tracked {cover_qty} contract(s) — payload said {quantity}"
+                    )
+                    quantity = cover_qty
+                    common["quantity"] = quantity
                 opt_guard = await state.get_guard(sym_u) or {}
                 resting_stop_id = pos.get("stop_order_id") or opt_guard.get("stop_order_id")
                 stop_outcome = await _cancel_order_verified(resting_stop_id)
@@ -7588,7 +7898,19 @@ async def execute_live_order(payload: dict):
             logger.info(f"📤 Placing OPTION: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
             if is_exit:
                 # Closes must always cover the full tracked position — never clamp.
-                final = await _place_order_smart("option", common, tokens)
+                try:
+                    final = await _place_order_smart("option", common, tokens)
+                except Exception:
+                    # The resting protective stop was cancelled above. A failed
+                    # close must NOT leave the position naked until the next
+                    # reconcile pass (up to 15 min off-hours) — re-arm now.
+                    if pos:
+                        try:
+                            await _reconcile_rearm_guard(sym_u, dict(pos))
+                            logger.warning(f"[CLOSE] {sym_u} close placement failed — protective stop re-armed")
+                        except Exception as re_err:
+                            logger.error(f"[CLOSE] {sym_u} close failed AND stop re-arm failed: {re_err}")
+                    raise
             else:
                 # Per-contract cost = premium × 100 shares. Prefer the sanitized
                 # limit price (set from the real ask above); fall back to the
@@ -7621,10 +7943,14 @@ async def execute_live_order(payload: dict):
                     "strike": float(strike),
                     "expiration": expiry,
                 }
+                # Recorded as BUY always: the position IS long (BUY_OPEN), even
+                # when the signal said SELL (bearish → long PUT). Recording the
+                # signal verb would flip `_entry_direction` to −1 and invert the
+                # premium P&L of every put exit.
                 await _record_open(
                     str(symbol).upper(), quantity,
                     payload.get("entry"), payload.get("stop") or payload.get("stop_price"),
-                    payload.get("target"), contract, action,
+                    payload.get("target"), contract, "BUY",
                 )
                 # OPTION STOP PROTECTION — async guard task (state in Redis,
                 # survives restarts): poll the fill, then rest a SELL_CLOSE
@@ -7726,7 +8052,18 @@ async def execute_live_order(payload: dict):
                     priceType="MARKET",  # protective closes prioritize certainty of fill
                 )
                 logger.info(f"📤 Placing EQUITY CLOSE: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
-                final = await _place_order_smart("equity", common, tokens)
+                try:
+                    final = await _place_order_smart("equity", common, tokens)
+                except Exception:
+                    # Stop already cancelled above — a failed close must not
+                    # leave the position naked until the next reconcile pass.
+                    if pos:
+                        try:
+                            await _reconcile_rearm_guard(symbol, dict(pos))
+                            logger.warning(f"[CLOSE] {symbol} close placement failed — protective stop re-armed")
+                        except Exception as re_err:
+                            logger.error(f"[CLOSE] {symbol} close failed AND stop re-arm failed: {re_err}")
+                    raise
                 close_order_id = _order_id_from_place(final)
                 exit_fill = await _resolve_exit_fill(close_order_id)
                 if exit_fill:
@@ -7758,7 +8095,15 @@ async def execute_live_order(payload: dict):
                         "from live equity — refusing to default to 1 share"
                     )
 
-            order_action = "BUY" if action == "BUY" else "SELL"
+            if str(action or "BUY").upper() != "BUY":
+                # A bare SELL with no tracked position would OPEN a naked short
+                # (and E*TRADE expects SELL_SHORT for that anyway). Bearish
+                # exposure routes through long PUTs on the option path.
+                raise Exception(
+                    "short equity entries are not supported — bearish signals route "
+                    "through PUT options (instrument=option, option_right=PUT)"
+                )
+            order_action = "BUY"
             common = dict(
                 resp_format="json",
                 accountIdKey=account_id_key,
