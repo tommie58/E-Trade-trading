@@ -694,6 +694,7 @@ class StateStore:
         return {
             "trades_today": int(float(fields.get("trades_today", "0") or 0)),
             "realized_pnl_today_pct": float(fields.get("realized_pnl_today_pct", "0") or 0),
+            "realized_pnl_today_usd": float(fields.get("realized_pnl_today_usd", "0") or 0),
         }
 
     async def incr_trades_today(self) -> int:
@@ -717,6 +718,25 @@ class StateStore:
             await self.redis.expire(key, DAILY_TTL_SECONDS)
             return float(val)
         result = await self._memory.hincrbyfloat(key, "realized_pnl_today_pct", pct, DAILY_TTL_SECONDS)
+        if self._persistence is not None:
+            await self._persist_hash(key)
+        return result
+
+    async def add_realized_usd(self, usd: float) -> float:
+        """Accumulate today's realized P&L in REAL DOLLARS.
+
+        The percent counter answers "how much of the account did today move?".
+        The daily profit objective is denominated in DOLLARS, and a percent of a
+        moving balance cannot answer it. Only closes carrying a broker-verified
+        fill contribute here, so this is settled money — never a mark-to-market
+        estimate, and never an app-side guess.
+        """
+        key = self._daily_key()
+        if self.redis is not None:
+            val = await self.redis.hincrbyfloat(key, "realized_pnl_today_usd", usd)
+            await self.redis.expire(key, DAILY_TTL_SECONDS)
+            return float(val)
+        result = await self._memory.hincrbyfloat(key, "realized_pnl_today_usd", usd, DAILY_TTL_SECONDS)
         if self._persistence is not None:
             await self._persist_hash(key)
         return result
@@ -3945,7 +3965,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.26.0-two-sided-truth"
+BOT_VERSION = "5.28.0-risk-budget"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -3970,10 +3990,43 @@ ALLOWED_SETUPS = {
 }
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "2.0"))
-DAILY_TRADE_LIMIT = int(os.getenv("DAILY_TRADE_LIMIT", "20"))
+# A daily TRADE COUNT is not a risk control and no longer gates entries. It let
+# 6 trades at 1% risk (6% of the account) through while refusing 20 at 0.25%
+# (5%) — exactly backwards — and it killed the 7th good setup on a day the first
+# six worked. Risk is measured in DOLLARS by `plan_risk_budget` below. The count
+# is still tracked for reporting, and this ceiling survives only as a runaway
+# circuit breaker (a loop placing hundreds of orders is a BUG, not a strategy).
+RUNAWAY_TRADE_CIRCUIT_BREAKER = int(os.getenv("RUNAWAY_TRADE_CIRCUIT_BREAKER", "60"))
+# ---- Execution cost ----
+# The edge must survive the round trip. E*TRADE charges per contract each way,
+# which is brutal on cheap options: $0.65 on a $0.30 contract is 2.2% each way
+# before the spread. A gross edge smaller than the cost of capturing it is a fee
+# generator that looks profitable on a chart.
+COMMISSION_PER_CONTRACT = float(os.getenv("COMMISSION_PER_CONTRACT", "0.65"))
+# Round-trip cost above this share of premium refuses the entry outright.
+MAX_ROUND_TRIP_COST_PCT = float(os.getenv("MAX_ROUND_TRIP_COST_PCT", "12.0"))
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
 PORTFOLIO_HEAT_PCT = float(os.getenv("PORTFOLIO_HEAT_PCT", "6.0"))
 TICKER_COOLDOWN_MINUTES = int(os.getenv("TICKER_COOLDOWN_MINUTES", "15"))
+# ---- Daily profit objective ----
+# The standing minimum daily profit target, in REAL dollars. Once the ledger
+# proves it banked, the bot stops handing the day back: further entries are
+# allowed only while a full loss would still finish at or above the target.
+DAILY_PROFIT_TARGET_USD = float(os.getenv("DAILY_PROFIT_TARGET_USD", "500"))
+# Cushion below which a made day takes NO further risk at all.
+PROFIT_LOCK_MIN_CUSHION_USD = float(os.getenv("PROFIT_LOCK_MIN_CUSHION_USD", "50"))
+# ---- Scale-out / runner ----
+# Measured on real fills 2026-08-11/12: winners averaged +13.8% and losers
+# −9.5%, with an average hold of 7 minutes and exits at 0m. Every winner was
+# closed in full at the first exit, so no trade ever paid for the losers.
+# Banking half at the capture the book actually achieves while letting the rest
+# run is the only lever that raises the average winner.
+SCALE_OUT_ENABLED = os.getenv("SCALE_OUT_ENABLED", "true").lower() == "true"
+SCALE_OUT_FIRST_TARGET_PCT = float(os.getenv("SCALE_OUT_FIRST_TARGET_PCT", "14.0"))
+# A trailing exit may not fire inside this many seconds of the entry fill. The
+# hard stop is NEVER delayed — this only stops quote noise from flattening a
+# position that has barely started working.
+MIN_HOLD_SECONDS_FOR_TRAIL = int(os.getenv("MIN_HOLD_SECONDS_FOR_TRAIL", "120"))
 # Stop-guard: how long an entry may sit unfilled before it is cancelled, and
 # how often the guard polls the broker for fill state.
 ENTRY_FILL_TIMEOUT_MIN = int(os.getenv("ENTRY_FILL_TIMEOUT_MIN", "20"))
@@ -4354,14 +4407,29 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     open_positions = await state.all_positions()
     if daily["realized_pnl_today_pct"] <= -abs(DAILY_LOSS_LIMIT_PCT):
         blocked.append(f"daily loss limit ({daily['realized_pnl_today_pct']:.2f}%)")
-    if daily["trades_today"] >= DAILY_TRADE_LIMIT:
-        blocked.append(f"daily trade limit ({DAILY_TRADE_LIMIT}) reached")
+    # PROFIT LOCK — a banked day is not a licence to keep swinging. Once the
+    # objective is proven met in broker-verified dollars, further entries are
+    # refused while the cushion is too thin to absorb a full loss. Giving a made
+    # day back to chase a bigger one is the most expensive habit a daily-target
+    # system can form, and it is invisible in percent terms.
+    lock = plan_profit_lock(daily.get("realized_pnl_today_usd"))
+    if lock["locked"]:
+        blocked.append(lock["reason"])
+    # The daily trade COUNT no longer gates entries — see the config note on
+    # RUNAWAY_TRADE_CIRCUIT_BREAKER. This ceiling only catches a dispatch loop,
+    # which is a bug rather than a strategy, and is set far above any real day.
+    if daily["trades_today"] >= RUNAWAY_TRADE_CIRCUIT_BREAKER:
+        blocked.append(
+            f"runaway circuit breaker: {daily['trades_today']} entries today — this is a "
+            f"dispatch loop, not a trading day"
+        )
     if len(open_positions) >= MAX_CONCURRENT_POSITIONS:
         blocked.append(f"max positions ({MAX_CONCURRENT_POSITIONS}) open")
     ticker = str(p.get("ticker") or "").upper()
     if ticker and ticker in open_positions:
         blocked.append(f"already in {ticker}")
 
+    account_ref = 50000.0
     try:
         account_ref = float(os.getenv("ACCOUNT_SIZE", "50000"))
         open_risk = sum(position_risk_usd(pos) for pos in open_positions.values())
@@ -4371,6 +4439,34 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
             blocked.append(f"portfolio heat {heat:.2f}% > {PORTFOLIO_HEAT_PCT}%")
     except (TypeError, ValueError):
         pass
+
+    # RISK BUDGET — the DOLLAR limit that replaced the trade count. Realized
+    # losses and committed open risk draw from one budget (the daily loss limit),
+    # so the limit is enforced on exposure rather than discovered at the close.
+    try:
+        open_risk_usd = sum(position_risk_usd(pos) for pos in open_positions.values())
+        budget = plan_risk_budget(
+            account_size=account_ref,
+            realized_usd=daily.get("realized_pnl_today_usd"),
+            open_risk_usd=open_risk_usd,
+            profit_lock_max_risk=(lock["max_risk_usd"] if lock["cushion_usd"] > 0 else None),
+        )
+        requested_risk = account_ref * (RISK_PER_TRADE_PCT / 100.0)
+        if budget["remaining_usd"] < requested_risk * 0.25:
+            blocked.append(
+                f"daily risk budget spent: ${budget['used_usd']:,.0f} of "
+                f"${budget['budget_usd']:,.0f} committed (realized losses + open risk) — "
+                f"${budget['remaining_usd']:,.0f} left against a ${requested_risk:,.0f} entry"
+            )
+    except (TypeError, ValueError):
+        pass
+
+    # EXECUTION COST — refuse a contract whose round trip eats the edge. A
+    # $0.30 option pays 4.3% in commission alone before the spread; no win rate
+    # survives that. Only applied when the payload priced a real contract.
+    cost = assess_entry_cost(p)
+    if cost["prohibitive"]:
+        blocked.append(cost["reason"])
 
     return len(blocked) == 0, blocked
 
@@ -5686,6 +5782,223 @@ def _close_cover_qty(pos: Optional[dict], requested: Any) -> int:
         return 1
 
 
+def plan_scale_out(qty: Any, first_target_pct: float = None) -> Dict[str, Any]:
+    """Split a position into a partial to bank and a runner to let work.
+
+    THE CAPTURE PROBLEM. Measured on real broker fills (2026-08-11/12):
+
+        PLTR 2c  +21.18%   IWM 3c  -1.93%   AAPL 1c -11.87%
+        NVDA 4c   +6.48%   SPY 1c -14.73%
+
+    Winners averaged +13.8%, losers -9.5%, average hold SEVEN MINUTES with
+    exits recorded at 0m. Every winner was closed in FULL at the first exit,
+    so no winner was ever big enough to pay for the losers. At the journal's
+    17% win rate that is -5.5% of expectancy per trade: a daily dollar target
+    is unreachable by arithmetic, not by effort.
+
+    Banking half at the capture the book actually achieves, while the rest
+    runs on the ratcheting trail, is the only lever that raises the average
+    winner without touching win rate or size. The extra contract on an odd lot
+    goes to the RUNNER — the tail is where the outsized winner comes from.
+
+    A single contract cannot be split; the plan says so explicitly rather than
+    silently doing nothing, because that is an argument for sizing entries in
+    even lots when risk allows.
+    """
+    try:
+        n = max(0, int(qty or 0))
+    except (TypeError, ValueError):
+        n = 0
+    target = float(first_target_pct if first_target_pct is not None else SCALE_OUT_FIRST_TARGET_PCT)
+    if n < 2:
+        return {
+            "enabled": False,
+            "scale_qty": 0,
+            "runner_qty": n,
+            "first_target_pct": target,
+            "reason": (
+                f"single contract — all-or-nothing position, every winner is capped at the "
+                f"first exit (2+ contracts would bank half at +{target:.1f}% and run the rest)"
+            ),
+        }
+    scale_qty = n // 2
+    return {
+        "enabled": True,
+        "scale_qty": scale_qty,
+        "runner_qty": n - scale_qty,
+        "first_target_pct": target,
+        "reason": (
+            f"bank {scale_qty} of {n} at +{target:.1f}% premium, run {n - scale_qty} on the trail"
+        ),
+    }
+
+
+def plan_profit_lock(realized_usd: Any, target_usd: float = None,
+                     min_cushion: float = None) -> Dict[str, Any]:
+    """Largest loss that still leaves the day at or above the profit target.
+
+    Giving a made day back to chase a bigger one is the most expensive habit a
+    daily-target system can form. Once the target is banked the only trades
+    worth taking are ones whose FULL loss still finishes at target.
+    """
+    target = float(target_usd if target_usd is not None else DAILY_PROFIT_TARGET_USD)
+    cushion_floor = float(min_cushion if min_cushion is not None else PROFIT_LOCK_MIN_CUSHION_USD)
+    try:
+        realized = float(realized_usd or 0.0)
+    except (TypeError, ValueError):
+        realized = 0.0
+    cushion = realized - target
+    if target <= 0 or cushion <= 0:
+        return {"locked": False, "max_risk_usd": 0.0, "cushion_usd": 0.0,
+                "reason": "objective not banked — normal risk rules apply"}
+    if cushion < cushion_floor:
+        return {
+            "locked": True, "max_risk_usd": 0.0, "cushion_usd": round(cushion, 2),
+            "reason": (
+                f"daily objective BANKED (${realized:,.0f} vs ${target:,.0f}) with only "
+                f"${cushion:,.0f} of cushion — no further risk, the day is made"
+            ),
+        }
+    return {
+        "locked": False, "max_risk_usd": round(cushion, 2), "cushion_usd": round(cushion, 2),
+        "reason": (
+            f"daily objective BANKED (${realized:,.0f} vs ${target:,.0f}) — further risk "
+            f"capped at ${cushion:,.0f} so a full loss still finishes at target"
+        ),
+    }
+
+
+def plan_risk_budget(account_size: Any, realized_usd: Any, open_risk_usd: Any,
+                     profit_lock_max_risk: Any = None,
+                     loss_limit_pct: float = None) -> Dict[str, Any]:
+    """The day's risk budget in DOLLARS — what replaced the trade-count cap.
+
+    A trade count is not a risk control. Six trades at 1% risk is 6% of the
+    account; twenty at 0.25% is 5%. The old cap allowed the first and refused
+    the second, and on a day where the first six setups all worked it refused
+    the seventh — the most valuable trade available.
+
+    Two rules are load-bearing here:
+
+      1. Realized losses AND committed open risk draw from the SAME budget.
+         Counting only realized losses lets three open positions each risking 1%
+         coexist with a 2% limit; the breach is then discovered at the close.
+      2. Profits expand the budget at HALF credit, capped at +50% of the base.
+         The cushion is real, but full credit is how a +$900 day becomes a
+         −$200 day.
+
+    Mirrors `services/riskBudget.ts` in the app. Fails toward LESS risk on any
+    unreadable input — an unmeasurable budget must never read as a full one.
+    """
+    limit_pct = float(loss_limit_pct if loss_limit_pct is not None else DAILY_LOSS_LIMIT_PCT)
+
+    def num(value: Any, default: float = 0.0) -> float:
+        try:
+            out = float(value if value is not None else default)
+        except (TypeError, ValueError):
+            return default
+        return out if math.isfinite(out) else default
+
+    account = max(0.0, num(account_size))
+    base_budget = account * abs(limit_pct) / 100.0
+    realized = num(realized_usd)
+
+    # Rule 2: half credit on profits, capped at +50% of the base budget.
+    credit = min(max(0.0, realized) * 0.5, base_budget * 0.5)
+    budget = base_budget + credit
+
+    # Rule 1: realized losses and open risk both consume it.
+    used = max(0.0, -realized) + max(0.0, num(open_risk_usd))
+    remaining = max(0.0, budget - used)
+
+    # The profit lock is a CEILING on what remains, never an expansion of it.
+    if profit_lock_max_risk is not None:
+        remaining = min(remaining, max(0.0, num(profit_lock_max_risk)))
+
+    return {
+        "budget_usd": round(budget, 2),
+        "base_budget_usd": round(base_budget, 2),
+        "used_usd": round(used, 2),
+        "remaining_usd": round(remaining, 2),
+        "utilization_pct": round(min(100.0, (used / budget * 100.0) if budget > 0 else 100.0), 2),
+        "reason": (
+            f"${remaining:,.0f} of ${budget:,.0f} risk budget left — there is no trade-count "
+            f"cap, dollars are the limit"
+        ),
+    }
+
+
+def assess_entry_cost(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Round-trip trading cost for the payload's contract, as % of premium.
+
+    Charges the FULL round trip: the bid/ask spread crossed on the way out (a
+    protective stop is a market order in disguise) plus commission both ways.
+    Counting only the entry under-reports the real cost by roughly half.
+
+    Cheap contracts are the trap: ${COMMISSION_PER_CONTRACT} each way on a $0.30
+    option is 4.3% before the spread is considered. Returns `prohibitive` only
+    when a real premium was priced — an unpriced payload is not evidence of a
+    bad contract, and refusing it here would block the connectivity test.
+    """
+    def num(key: str) -> float:
+        try:
+            value = float(payload.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if math.isfinite(value) else 0.0
+
+    premium = num("limit_price") or num("premium") or num("contract_premium")
+    if premium <= 0:
+        return {"prohibitive": False, "total_pct": 0.0, "priced": False,
+                "reason": "no contract premium in payload — cost not measurable"}
+
+    bid = num("contract_bid")
+    ask = num("contract_ask")
+    spread_pct = ((ask - bid) / premium * 100.0) if (ask > bid > 0) else 0.0
+    commission_pct = (COMMISSION_PER_CONTRACT * 2.0) / (premium * 100.0) * 100.0
+    total_pct = spread_pct + commission_pct
+
+    if total_pct > MAX_ROUND_TRIP_COST_PCT:
+        return {
+            "prohibitive": True,
+            "total_pct": round(total_pct, 2),
+            "priced": True,
+            "reason": (
+                f"execution cost {total_pct:.1f}% of premium (spread {spread_pct:.1f}% + "
+                f"commission {commission_pct:.1f}%) over the {MAX_ROUND_TRIP_COST_PCT:.0f}% "
+                f"ceiling on a ${premium:.2f} contract — the round trip eats the edge"
+            ),
+        }
+    return {"prohibitive": False, "total_pct": round(total_pct, 2), "priced": True,
+            "reason": f"round-trip cost {total_pct:.1f}% of premium"}
+
+
+def trail_exit_allowed(held_seconds: Any, is_hard_stop: bool) -> Tuple[bool, str]:
+    """May a TRAILING exit fire yet? Hard stops are never delayed.
+
+    The journal recorded exits at 0m on +0.31R and +0.92R and a 0m 'BREAKEVEN'
+    at +0.92R. Those were the option's own bid/ask crossing a trail that armed
+    the instant the fill printed — not trades ending. Each one converted a live
+    winner into a few dollars.
+
+    Fails OPEN: an unreadable hold time must never pin a protective trail shut.
+    """
+    if is_hard_stop:
+        return True, "hard stop — never delayed"
+    try:
+        held = float(held_seconds)
+    except (TypeError, ValueError):
+        return True, "hold time unreadable — failing open"
+    if not math.isfinite(held):
+        return True, "hold time unreadable — failing open"
+    if held >= MIN_HOLD_SECONDS_FOR_TRAIL:
+        return True, ""
+    return False, (
+        f"trail held: {held:.0f}s since entry (min {MIN_HOLD_SECONDS_FOR_TRAIL}s) — "
+        f"0-1m exits were the option's own spread; the hard stop still protects"
+    )
+
+
 def _is_option_close(pos: Optional[dict], exit_premium: Optional[float]) -> bool:
     """An option close is proven by the tracked contract OR by the caller
     passing a real fill premium. Deriving it from the tracked position alone
@@ -6630,6 +6943,156 @@ async def _emergency_flatten(ticker: str, guard: dict, qty: int) -> Optional[str
     return _order_id_from_place(placed)
 
 
+async def _place_option_market_close(ticker: str, contract: dict, qty: int) -> Optional[str]:
+    """MARKET SELL_CLOSE for `qty` contracts of an OCC contract we hold."""
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("E*TRADE tokens not set")
+    if not contract or not contract.get("right") or not contract.get("expiration"):
+        raise Exception(f"cannot close {ticker} — option contract details missing")
+    acct_key = await _resolve_account_id_key(tokens)
+    common = dict(
+        resp_format="json",
+        accountIdKey=acct_key,
+        symbol=ticker,
+        orderAction="SELL_CLOSE",
+        clientOrderId=str(uuid.uuid4().int)[:18],
+        priceType="MARKET",
+        quantity=int(qty),
+        orderTerm="GOOD_FOR_DAY",
+        marketSession="REGULAR",
+        allOrNone=False,
+        callPut=str(contract["right"]).upper(),
+        strikePrice=float(contract["strike"]),
+        expiryDate=str(contract["expiration"])[:10],
+    )
+    placed = await _place_order_smart("option", common, tokens)
+    return _order_id_from_place(placed)
+
+
+async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
+    """Bank half the position at the first target and let the rest run.
+
+    THE CAPTURE FIX. On the real book every winner was closed in FULL at the
+    first exit — NVDA's four contracts came off together at +6.48% after ZERO
+    minutes — so the average winner (+13.8%) never grew big enough to pay for
+    the average loser (−9.5%). No daily dollar objective survives that shape.
+
+    Here the position sells `scale_qty` at market once the premium clears the
+    first target, then re-arms the protective stop over the REMAINING
+    contracts. The runner keeps ratcheting on the normal trail, so the tail
+    that actually pays for the losers is finally allowed to develop.
+
+    Returns True when contracts were sold (the caller must re-read state).
+    Every failure path leaves the position PROTECTED: if the partial cannot be
+    placed the original stop is re-armed over the full size before returning.
+    """
+    if not SCALE_OUT_ENABLED or pos.get("scaled_out"):
+        return False
+    contract = dict(pos.get("contract") or {})
+    if not contract.get("right"):
+        return False  # options only — equity sizing is share-based
+    try:
+        entry_premium = float(pos.get("entry_premium") or 0.0)
+        qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
+    except (TypeError, ValueError):
+        return False
+    if entry_premium <= 0 or qty < 2 or mark <= 0:
+        return False
+
+    split = plan_scale_out(qty)
+    if not split["enabled"]:
+        return False
+    gain_pct = (mark - entry_premium) / entry_premium * 100.0
+    if gain_pct < split["first_target_pct"]:
+        return False
+
+    scale_qty = int(split["scale_qty"])
+    runner_qty = int(split["runner_qty"])
+    stop_order_id = pos.get("stop_order_id")
+
+    # The resting stop covers the FULL size. It must come off before a partial
+    # close, or the stop and the scale-out can both fill and oversell into a
+    # naked short. CANCEL_FILLED means the stop beat us — the position is flat
+    # and there is nothing left to scale.
+    if stop_order_id:
+        outcome = await _cancel_order_verified(stop_order_id)
+        if outcome == CANCEL_FILLED:
+            logger.warning(f"[SCALE-OUT] {ticker} protective stop filled first — nothing to scale")
+            return False
+        if outcome != CANCEL_CONFIRMED:
+            logger.warning(
+                f"[SCALE-OUT] {ticker} could not confirm the resting stop is dead ({outcome}) — "
+                f"skipping the scale-out rather than risking a double sale"
+            )
+            return False
+        pos["stop_order_id"] = None
+        await state.set_position(ticker, pos)
+
+    try:
+        close_id = await _place_option_market_close(ticker, contract, scale_qty)
+    except Exception as e:
+        logger.error(f"[SCALE-OUT] {ticker} partial close FAILED: {e} — re-arming the full stop")
+        try:
+            await _reconcile_rearm_guard(ticker, pos)
+        except Exception as re:
+            logger.error(f"[SCALE-OUT] {ticker} stop re-arm after failed scale-out ALSO failed: {re}")
+            await alerts.send(
+                "critical", "scale_out_unprotected",
+                f"{ticker}: scale-out failed AND the protective stop could not be re-armed — "
+                f"position is UNPROTECTED, manual review needed",
+            )
+        return False
+
+    fill = await _resolve_exit_fill(close_id)
+    logger.info(
+        f"[SCALE-OUT] {ticker} banked {scale_qty}/{qty} at +{gain_pct:.1f}% premium "
+        f"(entry {entry_premium:.2f} → mark {mark:.2f}), {runner_qty} left running"
+    )
+    await trade_ledger.record("scaled_out", {
+        "ticker": ticker, "scale_qty": scale_qty, "runner_qty": runner_qty,
+        "entry_premium": round(entry_premium, 4), "mark": round(mark, 4),
+        "gain_pct": round(gain_pct, 2), "order_id": close_id,
+        "exit_premium": round(fill, 4) if fill else None,
+    })
+
+    # Book the realized half so the daily objective counter sees the money.
+    realized = ((fill or mark) - entry_premium) * 100.0 * scale_qty
+    try:
+        await state.add_realized_usd(realized)
+        await state.adjust_balance((fill or mark) * 100.0 * scale_qty)
+    except Exception as e:
+        logger.warning(f"[SCALE-OUT] {ticker} accounting update failed (non-fatal): {e}")
+
+    # The position now tracks ONLY the runner. Its cost basis is unchanged (the
+    # per-contract entry premium), so the trail's R math stays correct.
+    pos["filled_qty"] = runner_qty
+    pos["qty"] = runner_qty
+    pos["scaled_out"] = True
+    pos["scaled_out_qty"] = scale_qty
+    pos["scaled_out_at"] = _utcnow().isoformat()
+    await state.set_position(ticker, pos)
+
+    # Re-arm protection over the runner immediately — an unprotected runner is
+    # exactly the naked-position failure the whole guard architecture exists to
+    # prevent.
+    try:
+        await _reconcile_rearm_guard(ticker, pos)
+    except Exception as e:
+        logger.error(f"[SCALE-OUT] {ticker} runner stop re-arm FAILED: {e}")
+        await alerts.send(
+            "critical", "scale_out_runner_unprotected",
+            f"{ticker}: {runner_qty} runner contract(s) left WITHOUT a protective stop after "
+            f"scale-out — manual review needed",
+        )
+    await alerts.send(
+        "info", "scaled_out",
+        f"{ticker}: banked {scale_qty}/{qty} contracts at +{gain_pct:.1f}% premium — "
+        f"{runner_qty} running on the trail",
+    )
+    return True
+
+
 def plan_flatten(positions: dict, guards: dict) -> list:
     """Build the ordered EMERGENCY EXIT plan for every tracked position.
 
@@ -7076,6 +7539,17 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
                     f"per-trade move ({pnl_pct:+.2f}%) as an over-braking fallback"
                 )
         await state.add_realized_pnl(account_pct if account_pct is not None else pnl_pct)
+    # DAILY OBJECTIVE CONTRIBUTION — the same close in REAL DOLLARS. The $500
+    # objective is denominated in money, and a percent of a moving balance can
+    # never answer it. Only broker-verified dollars count: when the close had
+    # no derivable dollar figure nothing is added, so the counter under-reports
+    # rather than inventing progress toward a target (which would arm the
+    # profit lock on a day that never actually made the money).
+    if realized_usd is not None:
+        try:
+            await state.add_realized_usd(float(realized_usd))
+        except Exception as e:
+            logger.warning(f"[OBJECTIVE] {ticker} realized-USD accumulation failed (non-fatal): {e}")
     # BALANCE TRACKING — equity closes return known proceeds (qty × exit).
     if not is_option and exit_px > 0 and qty > 0:
         try:
@@ -8451,6 +8925,13 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     # own quote, and floors the min ratchet step so sub-spread moves don't burn
     # a cancel/replace round-trip.
     spread = (ask - bid) if (ask > 0 and bid > 0 and ask >= bid) else None
+
+    # CAPTURE: bank half at the first target BEFORE the trail is evaluated, so
+    # the runner ratchets on its own (smaller) size from this pass onward. When
+    # contracts were sold the position shape changed underneath us — re-read it
+    # from state and let the NEXT pass trail the runner.
+    if await _maybe_scale_out(ticker, pos, mark):
+        return
 
     plan = trailing_engine.plan_ratchet(
         pos, mark, min_step_frac=TRAIL_MIN_STEP_FRAC, spread=spread,
