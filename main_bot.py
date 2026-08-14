@@ -1243,6 +1243,13 @@ Duplicate storms are suppressed: the same `dedupe_key` reaches the webhook at
 most once per `dedupe_seconds` (Redis SET NX + TTL — multi-worker safe).
 Deduped alerts still land in the log and the recent list.
 
+TRADE FILLS BYPASS THE SEVERITY FLOOR (`force_deliver=True`). A real-money buy
+or sell is not a warning to be filtered — it is the event the operator most
+needs to see, and it is factually `info` severity. With the default floor at
+`warning`, an honestly-labelled fill notice would be logged and then silently
+dropped before the webhook. `force_deliver` is delivery-path only: it skips the
+floor, NOT the dedupe key, so a re-poll of the same fill cannot double-post.
+
 Fire-and-forget by design: an alerting failure must NEVER break trading, so
 every path here swallows and logs its own errors.
 """
@@ -1375,7 +1382,9 @@ class AlertManager:
 
     async def send(self, severity: str, event: str, message: str,
                    dedupe_key: Optional[str] = None,
-                   data: Optional[Dict[str, Any]] = None) -> None:
+                   data: Optional[Dict[str, Any]] = None,
+                   force_deliver: bool = False,
+                   webhook_text: Optional[str] = None) -> None:
         severity = severity.lower() if severity.lower() in _VALID_SEVERITIES else "warning"
         record: Dict[str, Any] = {
             "ts": _utcnow_iso(),
@@ -1403,7 +1412,9 @@ class AlertManager:
         # 3) Webhook — severity-filtered, deduped, best-effort.
         if not self._webhook_url:
             return
-        if _SEVERITY_RANK.get(severity, 1) < _SEVERITY_RANK.get(self._min_severity, 1):
+        if not force_deliver and (
+            _SEVERITY_RANK.get(severity, 1) < _SEVERITY_RANK.get(self._min_severity, 1)
+        ):
             return  # below the configured delivery floor — log + /alerts only
         if dedupe_key:
             try:
@@ -1415,16 +1426,23 @@ class AlertManager:
                     return  # same alert fired recently — webhook suppressed
             except Exception as e:
                 logger.warning(f"alert dedupe check failed (sending anyway): {e}")
-        await self._post_webhook(record)
+        await self._post_webhook(record, text_override=webhook_text)
 
-    async def _post_webhook(self, record: Dict[str, Any]) -> tuple:
+    async def _post_webhook(self, record: Dict[str, Any],
+                            text_override: Optional[str] = None) -> tuple:
         """POST to the webhook; returns (ok, detail) and records the outcome so
         GET /alerts/config can show whether real delivery is actually working."""
         ok = False
         detail = ""
         try:
             import httpx  # lazy import — alerting must not hard-require httpx
-            text = f"[{record['severity'].upper()}] {record['event']}: {record['message']}"
+            text = text_override or (
+                f"[{record['severity'].upper()}] {record['event']}: {record['message']}"
+            )
+            # Discord rejects content over 2000 chars with a 400 — a long alert
+            # would fail delivery entirely rather than arrive clipped.
+            if len(text) > 1900:
+                text = text[:1897] + "…"
             payload = {"text": text, "content": text, **record}
             async with httpx.AsyncClient(timeout=8.0) as client:
                 resp = await client.post(self._webhook_url, json=payload)
@@ -1506,13 +1524,22 @@ async def test_fire() -> Dict[str, Any]:
 
 async def send(severity: str, event: str, message: str,
                dedupe_key: Optional[str] = None,
-               data: Optional[Dict[str, Any]] = None) -> None:
-    """Fire an alert. Safe to call before init (logs only) and never raises."""
+               data: Optional[Dict[str, Any]] = None,
+               force_deliver: bool = False,
+               webhook_text: Optional[str] = None) -> None:
+    """Fire an alert. Safe to call before init (logs only) and never raises.
+
+    `force_deliver` delivers regardless of the configured min-severity floor —
+    for real-money fills, which are `info` by nature but must never be filtered
+    away. `webhook_text` carries a multi-line Discord body while the log line
+    stays single-line and greppable.
+    """
     try:
         if _manager is None:
             logger.warning(f"[ALERT][{severity.upper()}] {event} — {message} (alerting not initialised)")
             return
-        await _manager.send(severity, event, message, dedupe_key=dedupe_key, data=data)
+        await _manager.send(severity, event, message, dedupe_key=dedupe_key, data=data,
+                            force_deliver=force_deliver, webhook_text=webhook_text)
     except Exception as e:
         logger.error(f"alert send failed ({event}): {e}")
 
@@ -3965,7 +3992,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.28.0-risk-budget"
+BOT_VERSION = "5.29.0-fill-alerts"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -7085,10 +7112,27 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
             f"{ticker}: {runner_qty} runner contract(s) left WITHOUT a protective stop after "
             f"scale-out — manual review needed",
         )
-    await alerts.send(
-        "info", "scaled_out",
-        f"{ticker}: banked {scale_qty}/{qty} contracts at +{gain_pct:.1f}% premium — "
-        f"{runner_qty} running on the trail",
+    # SELL ALERT for the banked half. This is a REAL sale of real contracts and
+    # never reaches `_record_close` (the position survives as the runner), so it
+    # needs its own notice — otherwise the money hits the account silently.
+    # `fill` is the broker's price; when it is unavailable the alert says the
+    # dollars are marked, not filled, rather than presenting an estimate as fact.
+    await _alert_fill(
+        {
+            "side": "SELL",
+            "ticker": ticker,
+            "contract": contract,
+            "qty": scale_qty,
+            "price": float(fill or mark),
+            "price_confirmed": bool(fill),
+            "entry_price": entry_premium,
+            "realized_usd": round(realized, 2),
+            "realized_pct": round(gain_pct, 2),
+            "remaining_qty": runner_qty,
+            "reason": "scale_out",
+            "order_id": close_id,
+        },
+        dedupe_key=f"sellfill:scale:{close_id}:{scale_qty}",
     )
     return True
 
@@ -7199,6 +7243,11 @@ async def _stop_guard_worker(ticker: str) -> None:
             if filled > int(guard.get("trued_qty") or 0):
                 if await _true_up_entry_fill(ticker, guard):
                     guard = await state.update_guard(ticker, trued_qty=filled) or guard
+                    # BUY ALERT — fired here, not at placement: this is the first
+                    # moment a real average execution price exists. The dedupe key
+                    # carries the cumulative qty, so a re-poll cannot double-post
+                    # while a growing partial still announces itself.
+                    await _alert_entry_fill(ticker, guard, filled)
 
             guarded = int(guard.get("guarded_qty") or 0)
             if filled > guarded:
@@ -7428,6 +7477,248 @@ async def _resume_guards() -> None:
         _spawn_guard(t)
 
 
+# ==================== TRADE FILL ALERTS (buy / sell to Discord) ====================
+# Every other alert in this bot fires when something is WRONG. These fire when
+# something happened: real contracts bought, real contracts sold, at a real
+# price, for real money.
+#
+# Three rules make them trustworthy:
+#   1. ONLY BROKER-CONFIRMED PRICES. The alert is fired from the fill-truth
+#      paths, never from order placement. A limit price is a request; posting it
+#      as "bought at 2.44" when the fill came back 2.61 would make Discord a
+#      record of intentions rather than of trades. Where a price could not be
+#      confirmed the alert says so instead of quietly printing an estimate.
+#   2. THE EXACT CONTRACT, NOT THE TICKER. Three strikes on the same symbol are
+#      three different positions; "NVDA filled" cannot be reconciled against a
+#      brokerage statement, so strike, right, expiry and per-contract price all
+#      appear.
+#   3. MONEY MODE IS UNMISSABLE. A sandbox fill that reads like a real one is
+#      worse than no alert at all, so the banner states which it is every time.
+
+OPTION_MULTIPLIER = 100.0
+
+_CLOSE_REASON_LABELS = {
+    "stop_fill": "protective stop executed at the broker",
+    "close_fill": "closed on signal",
+    "emergency_flatten_fill": "EMERGENCY FLATTEN (no protective stop could be placed)",
+    "panic_exit": "PANIC EXIT (manual flatten-all)",
+    "reconciler": "close detected by broker reconciliation",
+    "trailing_stop": "trailing stop executed",
+    "scale_out": "scale-out at the first target",
+}
+
+
+def _contract_label(ticker: str, contract: Optional[dict]) -> str:
+    """'NVDA $190 CALL 2026-11-21' — the position, not just the symbol."""
+    c = contract or {}
+    right = str(c.get("right") or "").upper()
+    strike = c.get("strike")
+    expiry = str(c.get("expiration") or "")[:10]
+    if not right or strike in (None, ""):
+        return f"{str(ticker).upper()} shares"
+    try:
+        strike_txt = f"${float(strike):g}"
+    except (TypeError, ValueError):
+        strike_txt = f"${strike}"
+    return f"{str(ticker).upper()} {strike_txt} {right} {expiry}".strip()
+
+
+def _money(value: Optional[float]) -> str:
+    if value is None:
+        return "unknown"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    return f"{'-' if v < 0 else ''}${abs(v):,.2f}"
+
+
+def format_fill_alert(fill: dict) -> dict:
+    """Render a confirmed fill as a Discord message + a one-line log headline.
+
+    Pure: takes a dict, returns {'headline', 'text', 'event', 'severity'}. All
+    money is derived here so the app, the log and Discord can never disagree.
+
+    Recognised keys: side ('BUY'|'SELL'), ticker, contract, qty, ordered_qty,
+    price (per contract/share), entry_price (sells), realized_usd, realized_pct,
+    remaining_qty, reason, order_id, live (bool), sandbox (bool), stop, target,
+    price_confirmed (bool).
+    """
+    side = "SELL" if str(fill.get("side") or "BUY").upper() in ("SELL", "SELL_CLOSE", "EXIT") else "BUY"
+    ticker = str(fill.get("ticker") or "?").upper()
+    contract = fill.get("contract") or None
+    is_option = bool((contract or {}).get("right"))
+    label = _contract_label(ticker, contract)
+    unit = "contract" if is_option else "share"
+    qty = int(fill.get("qty") or 0)
+    units = f"{qty} {unit}{'' if qty == 1 else 's'}"
+    try:
+        price = float(fill.get("price") or 0.0)
+    except (TypeError, ValueError):
+        price = 0.0
+    multiplier = OPTION_MULTIPLIER if is_option else 1.0
+    per_unit_usd = price * multiplier if price > 0 else None
+    gross_usd = per_unit_usd * qty if (per_unit_usd is not None and qty > 0) else None
+    confirmed = bool(fill.get("price_confirmed", True)) and price > 0
+
+    if fill.get("sandbox"):
+        banner = "🧪 **SANDBOX** — E*TRADE test environment, no real money moved"
+    elif fill.get("live"):
+        banner = "🔴 **REAL MONEY** — live E*TRADE account"
+    else:
+        banner = "📝 **PAPER** — simulated, no real money moved"
+
+    lines: List[str] = []
+    if side == "BUY":
+        lines.append(f"🟩 **BOUGHT — {label}**")
+    else:
+        try:
+            pnl = float(fill.get("realized_usd")) if fill.get("realized_usd") is not None else None
+        except (TypeError, ValueError):
+            pnl = None
+        mark = "🟦" if pnl is None else ("✅" if pnl >= 0 else "🔴")
+        lines.append(f"{mark} **SOLD — {label}**")
+    lines.append(banner)
+
+    ordered = int(fill.get("ordered_qty") or 0)
+    if side == "BUY" and ordered > qty > 0:
+        lines.append(f"> Quantity: **{units}** of {ordered} ordered (partial fill)")
+    else:
+        lines.append(f"> Quantity: **{units}**")
+
+    price_word = "Fill price" if side == "BUY" else "Exit price"
+    if confirmed:
+        detail = f"> {price_word}: **${price:,.2f}** per {unit}"
+        if is_option:
+            detail += f" ({_money(per_unit_usd)} each ×100)"
+        lines.append(detail)
+    else:
+        lines.append(
+            f"> {price_word}: **not yet confirmed by the broker** — dollars below are "
+            f"the last mark, not a fill"
+        )
+        if price > 0:
+            lines.append(f"> Last mark: ${price:,.2f} per {unit}")
+
+    if side == "BUY":
+        if gross_usd is not None:
+            lines.append(f"> Total {'paid' if confirmed else 'estimated'}: **{_money(gross_usd)}**")
+        stop = fill.get("stop")
+        target = fill.get("target")
+        if stop:
+            risk = None
+            if price > 0:
+                risk = (float(stop) - price) * multiplier * qty
+            stop_line = f"> Protective stop: ${float(stop):,.2f}"
+            if risk is not None:
+                stop_line += f" — risking {_money(abs(risk))} if hit"
+            lines.append(stop_line)
+        if target:
+            lines.append(f"> Target: ${float(target):,.2f}")
+    else:
+        if gross_usd is not None:
+            lines.append(f"> Proceeds: **{_money(gross_usd)}**")
+        entry_price = fill.get("entry_price")
+        if entry_price:
+            try:
+                ep = float(entry_price)
+                cost = ep * multiplier * qty
+                lines.append(f"> Entry was: ${ep:,.2f} per {unit} ({_money(cost)} for {units})")
+            except (TypeError, ValueError):
+                pass
+        pnl_usd = fill.get("realized_usd")
+        pnl_pct = fill.get("realized_pct")
+        if pnl_usd is not None:
+            try:
+                p = float(pnl_usd)
+                pct_txt = ""
+                if pnl_pct is not None:
+                    pct_txt = f" ({float(pnl_pct):+.1f}%)"
+                lines.append(f"> **P&L: {'+' if p >= 0 else ''}{_money(p)}{pct_txt}**")
+            except (TypeError, ValueError):
+                pass
+        elif pnl_pct is not None:
+            try:
+                lines.append(f"> **P&L: {float(pnl_pct):+.1f}%** (dollar figure unavailable)")
+            except (TypeError, ValueError):
+                pass
+        remaining = int(fill.get("remaining_qty") or 0)
+        if remaining > 0:
+            lines.append(f"> Still open: **{remaining} {unit}{'' if remaining == 1 else 's'}** running")
+        else:
+            lines.append("> Position now **flat**")
+
+    reason = fill.get("reason")
+    if reason:
+        lines.append(f"> Why: {_CLOSE_REASON_LABELS.get(str(reason), str(reason))}")
+    if fill.get("order_id"):
+        lines.append(f"> Order: `{fill.get('order_id')}`")
+
+    verb = "BOUGHT" if side == "BUY" else "SOLD"
+    headline = f"{verb} {units} {label} @ ${price:,.2f}"
+    if gross_usd is not None:
+        headline += f" ({_money(gross_usd)}{' total' if qty > 1 else ''})"
+    if side == "SELL" and fill.get("realized_usd") is not None:
+        try:
+            p = float(fill["realized_usd"])
+            headline += f" — P&L {'+' if p >= 0 else ''}{_money(p)}"
+        except (TypeError, ValueError):
+            pass
+    return {
+        "event": "trade_buy_filled" if side == "BUY" else "trade_sell_filled",
+        "severity": "info",
+        "headline": headline,
+        "text": "\n".join(lines),
+    }
+
+
+async def _alert_fill(fill: dict, dedupe_key: Optional[str] = None) -> None:
+    """Deliver a fill notice. `force_deliver` is required: a fill is honestly
+    `info` severity, and the default webhook floor is `warning` — without the
+    bypass the one alert the operator actually wants would be logged and then
+    dropped. Never raises: alerting must not be able to break trading."""
+    try:
+        fill = {**fill, "live": LIVE_TRADING and not is_sandbox, "sandbox": is_sandbox}
+        rendered = format_fill_alert(fill)
+        await alerts.send(
+            rendered["severity"], rendered["event"], rendered["headline"],
+            dedupe_key=dedupe_key,
+            data={k: v for k, v in fill.items() if k != "contract"} | {"contract": fill.get("contract")},
+            force_deliver=True,
+            webhook_text=rendered["text"],
+        )
+    except Exception as e:
+        logger.warning(f"fill alert failed (non-fatal): {e}")
+
+
+async def _alert_entry_fill(ticker: str, guard: dict, filled: int) -> None:
+    """Fire the BUY alert off the trued-up entry — the broker's real average
+    execution price, already written into the position by `_true_up_entry_fill`.
+    Priced from the position rather than the guard's limit so Discord shows what
+    was actually paid."""
+    pos = await state.get_position(ticker)
+    if not pos:
+        return
+    contract = pos.get("contract") or guard.get("contract")
+    is_option = bool((contract or {}).get("right"))
+    price = float((pos.get("entry_premium") if is_option else pos.get("entry")) or 0)
+    await _alert_fill(
+        {
+            "side": "BUY",
+            "ticker": ticker,
+            "contract": contract,
+            "qty": int(filled),
+            "ordered_qty": int(pos.get("qty") or filled),
+            "price": price,
+            "price_confirmed": price > 0,
+            "stop": pos.get("stop_premium") or guard.get("stop") or pos.get("stop"),
+            "target": pos.get("target"),
+            "order_id": guard.get("entry_order_id"),
+        },
+        dedupe_key=f"buyfill:{guard.get('entry_order_id')}:{filled}",
+    )
+
+
 # ==================== POSITION LEDGER (Redis-backed) ====================
 async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Optional[float],
                        target: Optional[float], contract: Optional[dict],
@@ -7581,6 +7872,26 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         "qty": qty or None,
         "reason": close_reason,
     })
+    # SELL ALERT — every close path in the bot funnels through `_record_close`
+    # (protective stop fill, signalled close, trailing exit, emergency flatten,
+    # panic exit, reconciler capture), so wiring the alert here means no real
+    # sale can happen without Discord hearing about it.
+    await _alert_fill(
+        {
+            "side": "SELL",
+            "ticker": ticker,
+            "contract": (pos or {}).get("contract"),
+            "qty": qty,
+            "price": exit_px,
+            "price_confirmed": exit_px > 0,
+            "entry_price": (entry_premium if basis == "premium" else entry) or None,
+            "realized_usd": round(realized_usd, 2) if realized_usd is not None else None,
+            "realized_pct": round(pnl_pct, 2) if pnl_pct is not None else None,
+            "remaining_qty": 0,
+            "reason": close_reason,
+        },
+        dedupe_key=f"sellfill:{ticker}:{qty}:{round(exit_px, 2)}",
+    )
 
 
 # ==================== DAILY P&L REPAIR (ledger replay) ====================
