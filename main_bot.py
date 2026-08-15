@@ -1848,6 +1848,9 @@ logger = logging.getLogger("etrade-bot.reconcile")
 
 RECONCILE_LOCK = "reconcile"
 RECONCILE_REPORT_KEY = "reconcile:last"
+# The account as the BROKER sees it, refreshed every reconcile pass. Read by
+# /status and /etrade/positions so the app never has to trust bot memory.
+ACCOUNT_SNAPSHOT_KEY = "account:snapshot"
 # A just-placed entry may not appear in /portfolio yet — never ghost-remove
 # a position younger than this.
 GHOST_GRACE_SECONDS = 180
@@ -2044,6 +2047,125 @@ def protective_stops_by_symbol(live_orders: List[dict]) -> Dict[str, List[dict]]
             continue
         out.setdefault(symbol, []).append(order)
     return out
+
+
+def build_account_snapshot(
+    broker_positions: Dict[str, dict],
+    all_orders: List[dict],
+    tracked: Dict[str, dict],
+    guards: Dict[str, dict],
+    balances: Optional[Dict[str, Optional[float]]] = None,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """THE ACCOUNT AS THE BROKER SEES IT — not as the bot remembers it.
+
+    Everything the app called "broker truth" was actually `state.all_positions()`:
+    the bot's OWN Redis memory of trades the bot itself placed. That memory is
+    wrong in exactly the situations that matter most — a manual trade in the
+    E*TRADE app, a position left over from a crashed process, a stop that filled
+    while nothing was watching, a partial close remainder. In every one of those
+    the bot's memory says one thing and the account says another, and the account
+    is the one holding the money.
+
+    The real broker portfolio WAS being fetched — once every 15 minutes, inside
+    the reconciler — and then thrown away, leaving only a count (`broker_positions:
+    3`) in the report. This builds the durable, exportable view instead, so both
+    the bot's own risk math and the app can read the account itself.
+
+    Pure: takes already-parsed broker data, returns a JSON-safe dict.
+    """
+    now = time.time() if now is None else now
+    live_orders = [o for o in all_orders if o.get("status") in _OPEN_ORDER_STATUSES]
+    stops_by_symbol = protective_stops_by_symbol(live_orders)
+
+    positions: List[dict] = []
+    untracked: List[str] = []
+    unprotected: List[str] = []
+
+    for symbol, record in sorted(broker_positions.items()):
+        try:
+            qty = int(record.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty == 0:
+            continue
+        pos = tracked.get(symbol)
+        is_tracked = pos is not None
+        stops = stops_by_symbol.get(symbol) or []
+        covered = sum(_stop_remaining(o) for o in stops)
+        guard_active = guard_owns_stop(guards.get(symbol), now)
+        # "Protected" means a resting CLOSING stop covers the whole position, or
+        # a live guard is mid-flight placing one. Anything else is naked risk
+        # regardless of what the bot's own record claims.
+        is_protected = guard_active or (covered > 0 and covered >= abs(qty))
+        if not is_tracked:
+            untracked.append(symbol)
+        if not is_protected:
+            unprotected.append(symbol)
+        positions.append({
+            "symbol": symbol,
+            "qty": qty,
+            "eq_qty": int(record.get("eq_qty") or 0),
+            "optn_qty": int(record.get("optn_qty") or 0),
+            "security_type": str(record.get("security_type") or "EQ"),
+            "occ": record.get("occ"),
+            "tracked": is_tracked,
+            "protected": is_protected,
+            "guard_active": guard_active,
+            "stop_orders": len(stops),
+            "stop_covered_qty": covered,
+            "entry": (pos or {}).get("entry"),
+            "stop": protective_level(pos) or None if pos else None,
+            "target": (pos or {}).get("target"),
+            "opened_ts": (pos or {}).get("ts"),
+        })
+
+    # Tracked-but-absent: the bot believes it owns something the account does
+    # not hold. Reported as its own class because the fix is the opposite of an
+    # untracked position — nothing to close, a memory to clear.
+    ghosts = [s for s in sorted(tracked.keys()) if not _broker_holds(broker_positions, s)]
+
+    orders_out = [{
+        "order_id": o.get("order_id"),
+        "symbol": o.get("symbol"),
+        "security_type": o.get("security_type"),
+        "status": o.get("status"),
+        "price_type": o.get("price_type"),
+        "order_action": o.get("order_action"),
+        "filled": o.get("filled"),
+        "ordered": o.get("ordered"),
+    } for o in live_orders]
+
+    bal = balances or {}
+    return {
+        "ts": _utcnow_iso(),
+        "epoch": now,
+        "equity": bal.get("total"),
+        "cash_available": bal.get("available"),
+        "positions": positions,
+        "open_orders": orders_out,
+        "untracked": untracked,
+        "ghosts": ghosts,
+        "unprotected": unprotected,
+        "counts": {
+            "broker_positions": len(positions),
+            "tracked_positions": len(tracked),
+            "open_orders": len(orders_out),
+            "untracked": len(untracked),
+            "ghosts": len(ghosts),
+            "unprotected": len(unprotected),
+        },
+    }
+
+
+def _broker_holds(broker_positions: Dict[str, dict], symbol: str) -> bool:
+    record = broker_positions.get(symbol)
+    if not record:
+        return False
+    try:
+        return int(record.get("qty") or 0) != 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _stop_remaining(order: dict) -> int:
@@ -2246,6 +2368,7 @@ async def reconcile_once(
     record_close: Optional[Callable[[str, dict, dict], Awaitable[None]]] = None,
     auto_heal: bool = True,
     alert: Optional[Callable[..., Awaitable[None]]] = None,
+    fetch_balance: Optional[Callable[[], Awaitable[Optional[Dict[str, Optional[float]]]]]] = None,
 ) -> Dict[str, Any]:
     """One reconciliation pass. Caller must already hold the reconcile lock.
     `alert(severity, event, message, dedupe_key=...)` is an optional async
@@ -2575,6 +2698,25 @@ async def reconcile_once(
             await state.update_guard(ticker, done=True, result="reconciled_stale_guard")
             report["healed"].append(f"{ticker}: stale guard closed (entry gone, no position)")
 
+    # --- 4) publish the account as the broker sees it -----------------------
+    # The portfolio and order data above was already paid for; throwing it away
+    # after the heal pass is what forced every other consumer (the app, the risk
+    # math, the operator) to fall back to the bot's own memory.
+    balances: Optional[Dict[str, Optional[float]]] = None
+    if fetch_balance is not None:
+        try:
+            balances = await fetch_balance()
+        except Exception as e:
+            logger.debug(f"[RECONCILE] balance fetch failed (snapshot still published): {e}")
+    try:
+        snapshot = build_account_snapshot(
+            broker_positions, all_orders, tracked, guards, balances=balances, now=now,
+        )
+        await state.set(ACCOUNT_SNAPSHOT_KEY, json.dumps(snapshot))
+        report["account_snapshot_ts"] = snapshot["ts"]
+    except Exception as e:
+        logger.warning(f"[RECONCILE] account snapshot publish failed: {e}")
+
     report["ok"] = True
     await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
     if report["healed"] or report["warnings"]:
@@ -2596,6 +2738,7 @@ async def reconciliation_loop(
     auto_heal: bool = True,
     stop_flag: Callable[[], bool] = lambda: False,
     alert: Optional[Callable[..., Awaitable[None]]] = None,
+    fetch_balance: Optional[Callable[[], Awaitable[Optional[Dict[str, Optional[float]]]]]] = None,
 ) -> None:
     """Continuous reconciler. Runs each pass under the distributed
     `lock:reconcile` so exactly one worker reconciles at a time.
@@ -2619,6 +2762,7 @@ async def reconciliation_loop(
                             state, fetch_portfolio, fetch_orders, cancel_order,
                             rearm_guard=rearm_guard, record_close=record_close,
                             auto_heal=auto_heal, alert=alert,
+                            fetch_balance=fetch_balance,
                         )
                     finally:
                         await lock.release()
@@ -3192,6 +3336,11 @@ def spread_pct(bid: Optional[float], ask: Optional[float]) -> Optional[float]:
     return round((a - b) / mid * 100.0, 3)
 
 
+# Quote statuses that represent a live print. Anything else (DELAYED, CLOSING,
+# an empty string) is treated as not-real-time — the safe direction.
+REALTIME_QUOTE_STATUSES = {"REALTIME", "EH_REALTIME"}
+
+
 def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Flatten an E*TRADE QuoteResponse into measured per-symbol readings.
     Only fields the broker actually returned are populated — absent numbers
@@ -3224,9 +3373,19 @@ def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
         last = num(all_q, "lastTrade")
         if last is None or last <= 0:
             continue
+        # E*TRADE stamps every quote REALTIME / DELAYED / CLOSING. Without the
+        # real-time market data agreement the broker serves 15-MINUTE-OLD
+        # prints, and the scanner was reading `lastTrade` from them as though
+        # they were live: a "breakout above the prior high" measured on a
+        # quarter-hour-old tape is a breakout that already happened, and the
+        # entry/stop derived from it were quoted against a market that had
+        # moved on. Carried here so scan_once can refuse to DISPATCH on them.
+        status = str(entry.get("quoteStatus") or "").upper().strip()
         out.append({
             "symbol": symbol,
             "last": last,
+            "quote_status": status,
+            "realtime": status in REALTIME_QUOTE_STATUSES,
             "bid": num(all_q, "bid"),
             "ask": num(all_q, "ask"),
             "open": num(all_q, "open"),
@@ -3719,6 +3878,19 @@ class Scanner:
             quote = next((q for q in quotes if q["symbol"] == cand["ticker"]), None)
             if quote is None:
                 continue
+            # REAL-TIME GATE. The scanner may still analyse and report on a
+            # delayed quote — that context is useful — but it must never turn
+            # one into a real order. The entry, stop and target were all priced
+            # off `last`; if that print is 15 minutes old every one of them is
+            # aimed at a market that no longer exists.
+            if not quote.get("realtime"):
+                status = quote.get("quote_status") or "unknown"
+                cand["dispatch"] = f"blocked: broker quote is {status}, not real-time"
+                logger.warning(
+                    f"🔭 Scanner refused to dispatch {cand['ticker']} — E*TRADE quote status "
+                    f"'{status}' is not real-time (accept the market data agreement to enable live scanning)"
+                )
+                continue
             payload = build_signal(
                 quote,
                 {**cand, "expiry": next_friday_expiry(self.now_et())},
@@ -3992,7 +4164,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.29.0-fill-alerts"
+BOT_VERSION = "5.31.0-real-eyes"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -4048,6 +4220,9 @@ PROFIT_LOCK_MIN_CUSHION_USD = float(os.getenv("PROFIT_LOCK_MIN_CUSHION_USD", "50
 # closed in full at the first exit, so no trade ever paid for the losers.
 # Banking half at the capture the book actually achieves while letting the rest
 # run is the only lever that raises the average winner.
+# Echo E*TRADE's raw QuoteResponse alongside the normalized quotes on
+# /etrade/quote. Diagnostic only — the app ignores the extra key.
+DEBUG_QUOTES = os.getenv("DEBUG_QUOTES", "false").lower() == "true"
 SCALE_OUT_ENABLED = os.getenv("SCALE_OUT_ENABLED", "true").lower() == "true"
 SCALE_OUT_FIRST_TARGET_PCT = float(os.getenv("SCALE_OUT_FIRST_TARGET_PCT", "14.0"))
 # A trailing exit may not fire inside this many seconds of the entry fill. The
@@ -5309,6 +5484,98 @@ async def etrade_auth_restore(data: dict = Body(...)):
 
 
 # ==================== QUOTE ====================
+# Quote status values E*TRADE stamps on every QuoteData entry. Anything that
+# is not explicitly realtime is treated as delayed by the app's live gate.
+_REALTIME_QUOTE_STATUSES = {"REALTIME", "EH_REALTIME"}
+
+
+def normalize_quote_response(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten E*TRADE's QuoteResponse into the flat contract the app parses.
+
+    THE BUG THIS FIXES (audit 2026-08-15): this endpoint returned E*TRADE's raw
+    payload — {"QuoteResponse": {"QuoteData": [{"All": {"lastTrade": ...}}]}} —
+    while the app read `json.quotes` and snake_case fields (`price`,
+    `change_percent`, `quote_status`). `json.quotes` was therefore ALWAYS
+    undefined, so the app parsed ZERO broker quotes on every single call, logged
+    "E*TRADE returned 0/N real-time broker quotes", recorded a feed failure,
+    engaged the cooldown gate, and silently fell through to TradingView / Yahoo /
+    Stooq.
+
+    The consequence: the broker's real-time feed — the whole point of linking the
+    account, and the only feed that matches what the order will actually fill
+    against — has never once priced a decision. Every displayed price, every
+    score, and every dispatched entry ran on a fallback feed, and the app's
+    `isEtradeDelayed` check could never fire because there were no quotes to
+    check.
+
+    `quote_time_utc` is passed through so the app can age a quote against the
+    BROKER'S OWN timestamp rather than against when the HTTP call returned — a
+    stalled feed that keeps re-serving the same 09:47 print is otherwise
+    indistinguishable from a live one.
+
+    Pure function: no I/O, unit-tested in test_bot_fixes.py.
+    """
+    def num(node: Dict[str, Any], key: str) -> float:
+        val = node.get(key)
+        if val is None or val == "":
+            return 0.0
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return 0.0
+        return f if math.isfinite(f) else 0.0
+
+    data = ((resp or {}).get("QuoteResponse") or {}).get("QuoteData")
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return {"quotes": []}
+
+    quotes: List[Dict[str, Any]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        all_q = entry.get("All") or {}
+        product = entry.get("Product") or {}
+        symbol = str(product.get("symbol") or entry.get("symbol") or "").upper().strip()
+        price = num(all_q, "lastTrade")
+        # A row with no last trade cannot price anything; dropping it here means
+        # the app sees an honest gap instead of a $0.00 quote.
+        if not symbol or price <= 0:
+            continue
+        status = str(entry.get("quoteStatus") or "").upper().strip()
+        previous_close = num(all_q, "previousClose")
+        change = num(all_q, "changeClose")
+        change_pct = num(all_q, "changeClosePercentage")
+        # Derive whichever of the pair the broker omitted rather than shipping a
+        # confident zero — a 0.00% change on a moving stock reads as "flat tape".
+        if change == 0.0 and previous_close > 0:
+            change = round(price - previous_close, 4)
+        if change_pct == 0.0 and previous_close > 0:
+            change_pct = round((change / previous_close) * 100, 4)
+        quotes.append({
+            "symbol": symbol,
+            "price": price,
+            "previous_close": previous_close,
+            "change": change,
+            "change_percent": change_pct,
+            "open": num(all_q, "open"),
+            "high": num(all_q, "high"),
+            "low": num(all_q, "low"),
+            "volume": num(all_q, "totalVolume"),
+            "bid": num(all_q, "bid"),
+            "ask": num(all_q, "ask"),
+            "market_cap": num(all_q, "marketCap"),
+            "name": str(all_q.get("companyName") or product.get("symbol") or symbol),
+            # Empty status is reported as-is: the app treats unknown as delayed,
+            # which is the safe direction. Never invent "REALTIME".
+            "quote_status": status,
+            "realtime": status in _REALTIME_QUOTE_STATUSES,
+            "quote_time_utc": entry.get("dateTimeUTC"),
+        })
+    return {"quotes": quotes}
+
+
 @app.get("/etrade/quote")
 async def get_quotes(symbols: str = Query(...)):
     tokens = load_tokens()
@@ -5319,9 +5586,143 @@ async def get_quotes(symbols: str = Query(...)):
     try:
         # Exponential backoff covers throttles, 5xx AND the post-renewal 401s
         # the old hand-rolled fixed-sleep loop existed for.
-        return await _etrade_call(market.get_quote, symbol_list, resp_format="json", source="quote")
+        raw = await _etrade_call(market.get_quote, symbol_list, resp_format="json", source="quote")
+        normalized = normalize_quote_response(raw)
+        delayed = [q["symbol"] for q in normalized["quotes"] if not q["realtime"]]
+        if delayed:
+            logger.warning(
+                f"E*TRADE served DELAYED quotes for {len(delayed)} symbol(s) "
+                f"({', '.join(delayed[:5])}) — the real-time market data agreement "
+                f"is not accepted on this account; the app will refuse live entries priced off them"
+            )
+        # Raw payload stays available for debugging without changing the contract.
+        return {**normalized, "raw": raw} if DEBUG_QUOTES else normalized
     except Exception as e:
         raise HTTPException(500, detail=str(e))
+
+
+@app.get("/etrade/positions")
+async def get_etrade_positions(refresh: bool = Query(False)):
+    """THE ACCOUNT ITSELF — what E*TRADE holds, not what the bot remembers.
+
+    Until now the only position data leaving this server was `state.all_positions()`
+    on /status: the bot's own record of trades the bot itself placed. The app
+    labelled that "broker truth", but it cannot see a manual trade, a leftover
+    lot from a crashed process, a stop that filled unobserved, or a partial-close
+    remainder — precisely the positions with no stop, no trail and no risk
+    accounting behind them.
+
+    The real portfolio was already being fetched every reconcile pass and then
+    discarded. This serves the published snapshot, and `?refresh=true` pays for
+    a live round-trip when the caller needs the account as of this second.
+    """
+    if not load_tokens():
+        raise HTTPException(401, "E*TRADE account not linked")
+
+    if refresh:
+        try:
+            portfolio_resp, orders_resp = await asyncio.gather(
+                _reconcile_fetch_portfolio(), _reconcile_fetch_orders(),
+            )
+            snapshot = reconciliation.build_account_snapshot(
+                reconciliation.parse_broker_positions(portfolio_resp),
+                reconciliation.parse_open_orders(orders_resp),
+                await state.all_positions(),
+                await state.all_guards(),
+                balances=await _fetch_broker_balance(),
+                now=time.time(),
+            )
+            await state.set(reconciliation.ACCOUNT_SNAPSHOT_KEY, json.dumps(snapshot))
+            return {"source": "live", "age_seconds": 0.0, **snapshot}
+        except Exception as e:
+            logger.warning(f"live positions fetch failed, serving cache: {e}")
+
+    snapshot = await _load_account_snapshot()
+    if snapshot is None:
+        # No pass has completed yet. Say so plainly rather than returning an
+        # empty position list, which reads identically to a flat account.
+        return {
+            "source": "none",
+            "age_seconds": None,
+            "positions": [],
+            "open_orders": [],
+            "untracked": [],
+            "ghosts": [],
+            "unprotected": [],
+            "counts": {},
+            "error": "no reconciliation pass has published an account snapshot yet",
+        }
+    return {"source": "snapshot", "age_seconds": _snapshot_age(snapshot), **snapshot}
+
+
+async def _load_account_snapshot() -> Optional[dict]:
+    """Last published broker-truth snapshot, or None when none exists."""
+    try:
+        raw = await state.get(reconciliation.ACCOUNT_SNAPSHOT_KEY)
+        if not raw:
+            return None
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception as e:
+        logger.debug(f"account snapshot read failed: {e}")
+        return None
+
+
+def _snapshot_age(snapshot: Optional[dict]) -> Optional[float]:
+    """Seconds since the snapshot was built. A consumer that cannot tell a
+    2-second-old view from a 6-hour-old one will trust a stale account."""
+    if not snapshot:
+        return None
+    try:
+        epoch = float(snapshot.get("epoch") or 0)
+    except (TypeError, ValueError):
+        return None
+    if epoch <= 0:
+        return None
+    return round(max(time.time() - epoch, 0.0), 1)
+
+
+@app.post("/app/heartbeat")
+async def app_heartbeat(data: dict = Body(default={})):
+    """The app tells the server it is alive, armed, and what it believes.
+
+    The bot trades autonomously — the scanner places real orders with nobody
+    watching. It had no way to know whether the operator's app was open, armed,
+    or running in a different money mode than the server, so an app showing
+    PAPER while the server traded LIVE was undetectable from either side.
+    """
+    beat = {
+        "ts": _utcnow().isoformat(),
+        "received_epoch": time.time(),
+        "armed": bool(data.get("armed")) if isinstance(data.get("armed"), bool) else None,
+        "mode": str(data.get("mode") or "").lower() or None,
+        "app_version": str(data.get("app_version") or "") or None,
+        "open_positions": data.get("open_positions"),
+        "symbols": data.get("symbols") if isinstance(data.get("symbols"), list) else None,
+        "daily_pnl_usd": data.get("daily_pnl_usd"),
+    }
+    try:
+        await state.set(APP_HEARTBEAT_KEY, json.dumps(beat), ex=APP_HEARTBEAT_TTL_SECONDS)
+    except Exception as e:
+        logger.warning(f"app heartbeat store failed: {e}")
+        raise HTTPException(500, detail="heartbeat not stored")
+
+    link = await _app_link_snapshot()
+    # A divergence found here is a real safety event: the operator and the
+    # server disagree about money. Alert once per kind (deduped), never on
+    # every 60-second beat.
+    for div in link.get("divergences") or []:
+        if div.get("severity") != "critical":
+            continue
+        try:
+            await alerts.send(
+                "critical", f"app_link_{div['kind']}", div["detail"],
+                dedupe_key=f"applink:{div['kind']}",
+            )
+        except Exception:
+            logger.debug("app link alert delivery failed", exc_info=True)
+
+    return {"ok": True, "bot_version": BOT_VERSION, "link": link}
 
 
 # ==================== DATABASE ====================
@@ -9196,6 +9597,7 @@ def _start_reconciler() -> None:
         auto_heal=RECONCILE_AUTO_HEAL,
         stop_flag=lambda: _worker_stop,
         alert=alerts.send,
+        fetch_balance=_fetch_broker_balance,
     ))
 
 
@@ -9722,6 +10124,169 @@ async def _recent_dispatch_verdicts(count: int = 20) -> List[dict]:
     return out
 
 
+# ==================== APP LINK — THE BOT'S EYES ON THE APP ====================
+# The bot has always been able to act completely alone: the scanner finds its
+# own setups and places real orders with no app involved. What it could never
+# do is notice that the operator's app had gone dark, disarmed, or was running
+# in a different money mode than the bot. Those are the states where autonomous
+# trading is most dangerous and they were entirely invisible from the server.
+APP_HEARTBEAT_KEY = "app:heartbeat"
+# A phone that backgrounds the app stops beating. Three missed 60s beats is a
+# real absence, not a scroll away from the screen.
+APP_LINK_STALE_SECONDS = 210
+APP_HEARTBEAT_TTL_SECONDS = 86_400
+
+
+def assess_app_link(
+    heartbeat: Optional[dict],
+    tracked: Dict[str, dict],
+    live_trading: bool,
+    killed: bool,
+    now: float,
+    stale_after: int = APP_LINK_STALE_SECONDS,
+) -> Dict[str, Any]:
+    """What the bot can see of the app, and where the two disagree.
+
+    Divergence between app and bot is not cosmetic. Each kind below has already
+    got money at stake behind it:
+
+    - `app_dark` — the bot is holding live positions and nobody is watching the
+      screen that would show them. Alone that is fine (the bot self-heals); it
+      matters because it is the state in which every OTHER divergence goes
+      unnoticed.
+    - `mode_mismatch` — the app believes it is paper trading while the server is
+      LIVE. Someone is placing what they think are simulated orders with real
+      money, which is the single most expensive misunderstanding this system can
+      produce.
+    - `position_mismatch` — the app's journal and the bot's book hold different
+      numbers of positions. Exactly the drift the reconciler catches at the
+      broker, one layer up.
+    - `armed_mismatch` — the operator disarmed the app while the server-side
+      scanner keeps trading. Disarming the app has never stopped the bot, and
+      nothing ever said so out loud.
+
+    Pure: no I/O, fully unit-testable.
+    """
+    out: Dict[str, Any] = {
+        "connected": False,
+        "seconds_since": None,
+        "stale": True,
+        "armed": None,
+        "mode": None,
+        "app_version": None,
+        "last_seen": None,
+        "divergences": [],
+    }
+    open_count = len(tracked)
+
+    if not isinstance(heartbeat, dict) or not heartbeat:
+        if open_count > 0 and not killed:
+            out["divergences"].append({
+                "kind": "app_dark",
+                "severity": "warning",
+                "detail": (f"No app has ever checked in, and the bot is holding {open_count} "
+                           f"open position(s). Everything is running unobserved."),
+            })
+        return out
+
+    try:
+        received = float(heartbeat.get("received_epoch") or 0)
+    except (TypeError, ValueError):
+        received = 0.0
+    seconds_since = max(now - received, 0.0) if received > 0 else None
+    stale = seconds_since is None or seconds_since > stale_after
+
+    mode = str(heartbeat.get("mode") or "").lower() or None
+    armed = heartbeat.get("armed")
+    armed = bool(armed) if isinstance(armed, bool) else None
+    app_positions = heartbeat.get("open_positions")
+    try:
+        app_positions = int(app_positions) if app_positions is not None else None
+    except (TypeError, ValueError):
+        app_positions = None
+
+    out.update({
+        "connected": not stale,
+        "seconds_since": round(seconds_since, 1) if seconds_since is not None else None,
+        "stale": stale,
+        "armed": armed,
+        "mode": mode,
+        "app_version": heartbeat.get("app_version"),
+        "last_seen": heartbeat.get("ts"),
+    })
+
+    if stale and open_count > 0 and not killed:
+        age = f"{int(seconds_since)}s" if seconds_since is not None else "an unknown time"
+        out["divergences"].append({
+            "kind": "app_dark",
+            "severity": "warning",
+            "detail": (f"The app has not checked in for {age} while the bot holds "
+                       f"{open_count} open position(s). Nobody is watching the screen."),
+        })
+
+    # Only trust a FRESH heartbeat for the comparisons below — a stale one
+    # describes a state the app may have left hours ago, and raising a mode
+    # mismatch off a dead beat is how a safety alert becomes noise.
+    if not stale:
+        if live_trading and mode in {"paper", "sandbox"}:
+            out["divergences"].append({
+                "kind": "mode_mismatch",
+                "severity": "critical",
+                "detail": (f"The app reports {mode.upper()} mode but this bot is LIVE — orders "
+                           f"placed from here spend real money."),
+            })
+        elif not live_trading and mode == "live":
+            out["divergences"].append({
+                "kind": "mode_mismatch",
+                "severity": "warning",
+                "detail": ("The app reports LIVE mode but this bot has LIVE_TRADING off — "
+                           "real orders will not be placed from the server."),
+            })
+        if app_positions is not None and app_positions != open_count:
+            out["divergences"].append({
+                "kind": "position_mismatch",
+                "severity": "warning",
+                "detail": (f"The app journals {app_positions} open position(s); the bot's book "
+                           f"holds {open_count}."),
+            })
+        if armed is False and open_count > 0 and not killed:
+            out["divergences"].append({
+                "kind": "armed_mismatch",
+                "severity": "warning",
+                "detail": (f"The app is DISARMED but the bot still holds {open_count} open "
+                           f"position(s) and keeps managing them. Disarming the app does not "
+                           f"stop the server — use the kill switch for that."),
+            })
+
+    return out
+
+
+async def _load_app_heartbeat() -> Optional[dict]:
+    try:
+        raw = await state.get(APP_HEARTBEAT_KEY)
+        if not raw:
+            return None
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception as e:
+        logger.debug(f"app heartbeat read failed: {e}")
+        return None
+
+
+async def _app_link_snapshot() -> Dict[str, Any]:
+    try:
+        return assess_app_link(
+            await _load_app_heartbeat(),
+            await state.all_positions(),
+            LIVE_TRADING,
+            await state.is_killed(),
+            time.time(),
+        )
+    except Exception as e:
+        logger.warning(f"app link assessment failed: {e}")
+        return {"connected": False, "stale": True, "divergences": [], "error": str(e)}
+
+
 # ==================== ENDPOINTS ====================
 # NOTE: "/" is a deliberate alias — apps configured with the bare bot host as
 # their webhook URL used to hit `POST /` and 404, silently losing the order
@@ -9873,6 +10438,7 @@ async def status():
     with qty/entry/stop/target/ts/contract), now read from reconciled Redis
     state and enriched with the last reconciliation report."""
     daily = await state.get_daily()
+    broker_snapshot = await _load_account_snapshot()
     last_reconcile = None
     raw_report = await state.get("reconcile:last")
     if raw_report:
@@ -9894,6 +10460,15 @@ async def status():
         "circuit_breaker_open": await _breaker_is_open(),
         "state_backend": state.backend_name,
         "last_reconcile": last_reconcile,
+        # THE ACCOUNT AS THE BROKER SEES IT. `open_positions` above is the bot's
+        # own memory of trades the bot placed; this is the portfolio E*TRADE
+        # actually holds, including positions nothing here opened. Served from
+        # the reconciler's published snapshot so /status stays a cheap read.
+        "broker_snapshot": broker_snapshot,
+        "broker_snapshot_age_seconds": _snapshot_age(broker_snapshot),
+        # What the server can see of the app: connected, armed, money mode, and
+        # every place the two disagree.
+        "app_link": await _app_link_snapshot(),
         "reconcile_interval_seconds": RECONCILE_INTERVAL_SECONDS,
         "trail_engine": {
             "enabled": TRAIL_ENGINE_ENABLED,
