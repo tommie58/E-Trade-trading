@@ -1837,7 +1837,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 try:  # package-style import (python -m bot...) or flat (uvicorn main_bot:app)
     from .state_store import StateStore
@@ -1858,6 +1858,9 @@ _OPEN_ORDER_STATUSES = {"OPEN", "PARTIAL", "INDIVIDUAL_FILLS", "PENDING", "DO_NO
 _PROTECTIVE_PRICE_TYPES = {"STOP", "STOP_LIMIT", "TRAILING_STOP_CNST", "TRAILING_STOP_PRCT"}
 # Order actions that CLOSE a position — the only ones a protective stop uses.
 _CLOSING_ACTIONS = {"SELL", "SELL_CLOSE", "BUY_TO_COVER", "BUY_CLOSE"}
+# Only OPTION orders carry the _OPEN/_CLOSE suffix — used to infer the basis of
+# an order whose securityType is missing.
+_OPTION_ORDER_ACTIONS = {"SELL_CLOSE", "BUY_CLOSE", "BUY_OPEN", "SELL_OPEN"}
 # A stop armed against a partial fill is legitimate for a few seconds while the
 # rest of the entry completes; only repair coverage once the dust settles.
 COVERAGE_GRACE_SECONDS = 60
@@ -1895,6 +1898,23 @@ def protective_level(position: dict) -> float:
         if value > best:
             best = value
     return best
+
+
+def position_is_option(position: Optional[dict]) -> bool:
+    """Is this TRACKED position an option position?
+
+    `contract` is the canonical marker, but it is not always there: records
+    written by older builds, or trued up by a path that only refreshed prices,
+    can carry the premium fields and no contract. Keying basis off `contract`
+    alone therefore mis-filed those positions onto the equity leg, which then
+    reported a real tracked option as an UNTRACKED manual lot — a critical alert
+    for a position the bot opened itself.
+    """
+    if not isinstance(position, dict):
+        return False
+    if position.get("contract"):
+        return True
+    return position.get("stop_premium") is not None or position.get("entry_premium") is not None
 
 
 def guard_owns_stop(guard: Optional[dict], now: float) -> bool:
@@ -2032,10 +2052,37 @@ def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
     return out
 
 
-def protective_stops_by_symbol(live_orders: List[dict]) -> Dict[str, List[dict]]:
-    """Group live CLOSING stop orders by symbol — the resting protection the
-    broker is actually holding for each position."""
-    out: Dict[str, List[dict]] = {}
+def order_is_option(order: dict) -> bool:
+    """Is this order an OPTION order? E*TRADE stamps `securityType`, but legacy
+    rows can omit it, so the open/close action verbs are the fallback: only
+    option orders use the _OPEN/_CLOSE suffix."""
+    if str(order.get("security_type") or "").upper() == "OPTN":
+        return True
+    return str(order.get("order_action") or "").upper() in _OPTION_ORDER_ACTIONS
+
+
+def protective_stops_by_leg(live_orders: List[dict]) -> Dict[Tuple[str, bool], List[dict]]:
+    """Group live CLOSING stop orders by **(symbol, is_option)** — the resting
+    protection the broker holds for each position ON ITS OWN BASIS.
+
+    Grouping by symbol ALONE conflated the two instruments that share an
+    underlying, and it broke in both directions:
+
+      FALSE GREEN — a plain SELL STOP on 100 AAPL shares made a tracked AAPL
+        CALL look protected. The naked-position alert never fired and the
+        reconciler never re-armed, because a stop existed "for AAPL". The one
+        check that exists to catch unprotected risk reported all clear on a
+        genuinely naked option.
+
+      PROTECTION CANCELLED — the invariant audit summed a 100-share equity stop
+        and a 2-contract option stop into `covered=102` against a 2-contract
+        position, called it `over_committed`, and auto-healed by CANCELLING.
+        The repair that exists to enforce protection destroyed it.
+
+    An equity stop can only ever close shares and an option stop can only ever
+    close contracts, so coverage must be counted per leg.
+    """
+    out: Dict[Tuple[str, bool], List[dict]] = {}
     for order in live_orders:
         if order.get("price_type") not in _PROTECTIVE_PRICE_TYPES:
             continue
@@ -2045,7 +2092,19 @@ def protective_stops_by_symbol(live_orders: List[dict]) -> Dict[str, List[dict]]
         symbol = str(order.get("symbol") or "").upper()
         if not symbol:
             continue
-        out.setdefault(symbol, []).append(order)
+        out.setdefault((symbol, order_is_option(order)), []).append(order)
+    return out
+
+
+def protective_stops_by_symbol(live_orders: List[dict]) -> Dict[str, List[dict]]:
+    """Live CLOSING stop orders grouped by symbol, both bases blended.
+
+    Kept for display/diagnostics only. Any coverage or sizing decision MUST use
+    `protective_stops_by_leg()` — see the failure modes documented there.
+    """
+    out: Dict[str, List[dict]] = {}
+    for (symbol, _is_option), orders in protective_stops_by_leg(live_orders).items():
+        out.setdefault(symbol, []).extend(orders)
     return out
 
 
@@ -2072,58 +2131,74 @@ def build_account_snapshot(
     3`) in the report. This builds the durable, exportable view instead, so both
     the bot's own risk math and the app can read the account itself.
 
+    Reported PER LEG: shares and contracts on the same underlying are separate
+    positions with separate protection, so a blended row cannot describe either.
+    See `protective_stops_by_leg()` for what conflating them costs.
+
     Pure: takes already-parsed broker data, returns a JSON-safe dict.
     """
     now = time.time() if now is None else now
     live_orders = [o for o in all_orders if o.get("status") in _OPEN_ORDER_STATUSES]
-    stops_by_symbol = protective_stops_by_symbol(live_orders)
+    stops_by_leg = protective_stops_by_leg(live_orders)
 
     positions: List[dict] = []
     untracked: List[str] = []
     unprotected: List[str] = []
 
     for symbol, record in sorted(broker_positions.items()):
-        try:
-            qty = int(record.get("qty") or 0)
-        except (TypeError, ValueError):
-            qty = 0
-        if qty == 0:
-            continue
         pos = tracked.get(symbol)
-        is_tracked = pos is not None
-        stops = stops_by_symbol.get(symbol) or []
-        covered = sum(_stop_remaining(o) for o in stops)
-        guard_active = guard_owns_stop(guards.get(symbol), now)
-        # "Protected" means a resting CLOSING stop covers the whole position, or
-        # a live guard is mid-flight placing one. Anything else is naked risk
-        # regardless of what the bot's own record claims.
-        is_protected = guard_active or (covered > 0 and covered >= abs(qty))
-        if not is_tracked:
-            untracked.append(symbol)
-        if not is_protected:
-            unprotected.append(symbol)
-        positions.append({
-            "symbol": symbol,
-            "qty": qty,
-            "eq_qty": int(record.get("eq_qty") or 0),
-            "optn_qty": int(record.get("optn_qty") or 0),
-            "security_type": str(record.get("security_type") or "EQ"),
-            "occ": record.get("occ"),
-            "tracked": is_tracked,
-            "protected": is_protected,
-            "guard_active": guard_active,
-            "stop_orders": len(stops),
-            "stop_covered_qty": covered,
-            "entry": (pos or {}).get("entry"),
-            "stop": protective_level(pos) or None if pos else None,
-            "target": (pos or {}).get("target"),
-            "opened_ts": (pos or {}).get("ts"),
-        })
+        tracked_is_option = position_is_option(pos)
+        # Options first: when a symbol holds both, the contract leg is the one
+        # this system trades and the one carrying leveraged risk.
+        for is_option in (True, False):
+            leg_qty = broker_qty_for(record, is_option)
+            if leg_qty == 0:
+                continue
+            # A tracked position only accounts for its OWN basis. The bot
+            # holding an AAPL call says nothing about 100 AAPL shares bought by
+            # hand, and reporting the shares as "tracked" hid a real manual
+            # position behind the bot's own record.
+            is_tracked = pos is not None and tracked_is_option == is_option
+            stops = stops_by_leg.get((symbol, is_option)) or []
+            covered = sum(_stop_remaining(o) for o in stops)
+            # A guard can only be mid-flight for a position the bot is tracking,
+            # and only on that position's own basis.
+            guard_active = is_tracked and guard_owns_stop(guards.get(symbol), now)
+            # "Protected" means a resting CLOSING stop of the SAME instrument
+            # covers the whole leg, or a live guard is placing one. Anything else
+            # is naked risk regardless of what the bot's own record claims.
+            is_protected = guard_active or (covered > 0 and covered >= abs(leg_qty))
+            if not is_tracked and symbol not in untracked:
+                untracked.append(symbol)
+            if not is_protected and symbol not in unprotected:
+                unprotected.append(symbol)
+            positions.append({
+                "symbol": symbol,
+                "qty": leg_qty,
+                "eq_qty": 0 if is_option else leg_qty,
+                "optn_qty": leg_qty if is_option else 0,
+                "security_type": "OPTN" if is_option else "EQ",
+                "occ": record.get("occ") if is_option else None,
+                "tracked": is_tracked,
+                "protected": is_protected,
+                "guard_active": guard_active,
+                "stop_orders": len(stops),
+                "stop_covered_qty": covered,
+                "entry": (pos or {}).get("entry") if is_tracked else None,
+                "stop": (protective_level(pos) or None) if is_tracked else None,
+                "target": (pos or {}).get("target") if is_tracked else None,
+                "opened_ts": (pos or {}).get("ts") if is_tracked else None,
+            })
 
     # Tracked-but-absent: the bot believes it owns something the account does
     # not hold. Reported as its own class because the fix is the opposite of an
-    # untracked position — nothing to close, a memory to clear.
-    ghosts = [s for s in sorted(tracked.keys()) if not _broker_holds(broker_positions, s)]
+    # untracked position — nothing to close, a memory to clear. Judged on the
+    # position's OWN basis: a tracked call whose contracts are gone is a ghost
+    # even while 100 shares of the same symbol sit in the account.
+    ghosts = [
+        s for s in sorted(tracked.keys())
+        if broker_qty_for(broker_positions.get(s), position_is_option(tracked.get(s))) == 0
+    ]
 
     orders_out = [{
         "order_id": o.get("order_id"),
@@ -2159,6 +2234,12 @@ def build_account_snapshot(
 
 
 def _broker_holds(broker_positions: Dict[str, dict], symbol: str) -> bool:
+    """Does the account hold ANY quantity of this symbol, either basis?
+
+    Blended on purpose — this is only a "symbol appears at all" test. Ghost and
+    coverage decisions must use `broker_qty_for()` so a tracked option is never
+    kept alive by an unrelated equity lot on the same underlying.
+    """
     record = broker_positions.get(symbol)
     if not record:
         return False
@@ -2425,13 +2506,16 @@ async def reconcile_once(
     # order (BUY_STOP on a breakout) is also priceType STOP, and counting it as
     # protection reported a naked position as protected — a false green on the
     # one check that exists to catch naked risk.
-    stops_by_symbol = protective_stops_by_symbol(live_orders)
-    live_stop_symbols = set(stops_by_symbol.keys())
+    # Grouped PER LEG. Keyed by symbol alone, a SELL STOP on 100 shares counted
+    # as protection for a tracked CALL on the same underlying (false green on
+    # naked risk), and the invariant audit below summed a share stop and a
+    # contract stop together and cancelled real protection as "over-committed".
+    stops_by_leg = protective_stops_by_leg(live_orders)
 
     # --- 1) tracked positions vs broker ---
     for ticker, pos in tracked.items():
         broker = broker_positions.get(ticker)
-        is_opt_pos = bool(pos.get("contract"))
+        is_opt_pos = position_is_option(pos)
         basis_qty = abs(broker_qty_for(broker, is_opt_pos))
         opened_ts = 0.0
         try:
@@ -2517,10 +2601,12 @@ async def reconcile_once(
             report["healed"].append(f"{ticker}: filled_qty {tracked_qty} → {broker_qty}")
             logger.info(f"[RECONCILE] {ticker} filled_qty synced {tracked_qty} → {broker_qty}")
 
-        # Unprotected: real position, no live stop order, no active guard.
+        # Unprotected: real position, no live stop order ON ITS OWN BASIS, no
+        # active guard.
         guard = guards.get(ticker)
         guard_active = guard_owns_stop(guards.get(ticker), now)
-        if ticker not in live_stop_symbols and not guard_active and protective_level(pos) > 0:
+        has_leg_stop = bool(stops_by_leg.get((ticker, is_opt_pos)))
+        if not has_leg_stop and not guard_active and protective_level(pos) > 0:
             msg = f"{ticker}: UNPROTECTED — position at broker with no live stop and no active guard"
             report["warnings"].append(msg)
             logger.error(f"[RECONCILE] 🚨 {msg}")
@@ -2535,7 +2621,7 @@ async def reconcile_once(
                     await _alert("critical", "guard_rearm_failed",
                                  f"{ticker}: protective stop re-arm FAILED: {e}",
                                  dedupe_key=f"rearm_fail:{ticker}")
-        elif ticker not in live_stop_symbols and not guard_active:
+        elif not has_leg_stop and not guard_active:
             # The position most in need of the UNPROTECTED alert — one that
             # never got ANY stop level recorded (e.g. a MARKET option entry
             # with no readable fill reference) — was silently exempt forever
@@ -2554,12 +2640,12 @@ async def reconcile_once(
         broker = broker_positions.get(ticker)
         if broker is None:
             continue
-        basis_qty_1b = abs(broker_qty_for(broker, bool(pos.get("contract"))))
+        basis_qty_1b = abs(broker_qty_for(broker, position_is_option(pos)))
         if basis_qty_1b == 0:
             continue  # not present on this basis — section 1 handled the ghost
         if guard_owns_stop(guards.get(ticker), now):
             continue  # a live guard owns this position's stop right now
-        stops = stops_by_symbol.get(ticker) or []
+        stops = stops_by_leg.get((ticker, position_is_option(pos))) or []
         position_qty = basis_qty_1b or int(pos.get("filled_qty") or 0)
         plan = plan_protection_repair(ticker, position_qty, stops,
                                       tracked_stop_id=pos.get("stop_order_id"))
@@ -4164,7 +4250,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.31.0-real-eyes"
+BOT_VERSION = "5.32.0-basis-truth"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -8277,6 +8363,19 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
     # (protective stop fill, signalled close, trailing exit, emergency flatten,
     # panic exit, reconciler capture), so wiring the alert here means no real
     # sale can happen without Discord hearing about it.
+    #
+    # ONLY when contracts/shares actually moved. `_record_close` is also reached
+    # with nothing to sell — a ghost whose size was never recorded, a position
+    # already popped by a racing path — and those posted "SOLD 0 shares @ $0.00,
+    # position now flat". A fill alert for a fill that never happened is worse
+    # than no alert: these bypass the severity floor precisely because they must
+    # always be read, and padding them with phantom sales teaches the operator
+    # to swipe them away.
+    if qty <= 0:
+        logger.info(
+            f"[FILL ALERT] {ticker} close booked with no recorded quantity — no sale to announce"
+        )
+        return
     await _alert_fill(
         {
             "side": "SELL",
@@ -8750,7 +8849,11 @@ def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_
     except ValueError:
         logger.warning(f"Contract snap skipped — unparseable expiry '{expiry}'")
         return snapped_expiry, snapped_strike, real_bid, real_ask
-    today = datetime.utcnow().date()
+    # The TRADING date in Eastern time, not the UTC date. UTC rolls over at
+    # 20:00 ET, so any expiry work in the post-close window (0DTE cleanup,
+    # after-hours arming) compared listed expirations against TOMORROW and
+    # snapped a still-valid same-day expiry forward to the next one.
+    today = _utcnow().astimezone(_ET_ZONE).date()
 
     try:
         resp = _sync_etrade_call(market.get_option_expire_date, symbol, resp_format="json", source="option_expiry")
