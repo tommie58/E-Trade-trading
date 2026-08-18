@@ -4240,7 +4240,29 @@ load_dotenv()
 ENV = os.getenv("ETRADE_ENV", "production").lower()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "true").lower() == "true"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-TARGET_ACCOUNT_ID = os.getenv("ETRADE_ACCOUNT_ID")
+
+
+def sanitize_account_id(raw: Optional[str]) -> Tuple[Optional[str], bool]:
+    """Strip stray whitespace out of an account number.
+
+    A real deployment carried ``ETRADE_ACCOUNT_ID="146 261816"`` — the digits
+    were right, an invisible space was not. E*TRADE matches the account number
+    as an exact string, so that space matched NOTHING, and the resolver silently
+    fell through to "first ACTIVE account". On a login with one account that is
+    harmless; on a login with several it aims real orders at whichever account
+    E*TRADE happens to list first. The only warning was a log line nobody reads.
+
+    Internal whitespace is removed, not just trimmed: a copy-paste from a
+    statement ("146 261816") is the exact shape of the bug. Returns the cleaned
+    value and whether anything was actually repaired, so the caller can say so.
+    """
+    if raw is None:
+        return None, False
+    cleaned = "".join(raw.split())
+    return (cleaned or None), (cleaned != raw.strip() or raw != raw.strip())
+
+
+TARGET_ACCOUNT_ID, _ACCOUNT_ID_REPAIRED = sanitize_account_id(os.getenv("ETRADE_ACCOUNT_ID"))
 REDIS_URL = os.getenv("REDIS_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
@@ -4250,7 +4272,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.32.0-basis-truth"
+BOT_VERSION = "5.33.0-preflight"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
@@ -5574,6 +5596,27 @@ async def etrade_auth_restore(data: dict = Body(...)):
 # is not explicitly realtime is treated as delayed by the app's live gate.
 _REALTIME_QUOTE_STATUSES = {"REALTIME", "EH_REALTIME"}
 
+# LAST OBSERVED ENTITLEMENT. The delayed-quote warning below was written to a
+# log file and nowhere else, so the single condition that refuses every live
+# entry was invisible to /health, to the app, and to Discord. Recorded here so
+# preflight can report it as the blocking condition it actually is.
+_quote_entitlement: Dict[str, Any] = {
+    "checked_at": None, "realtime": 0, "delayed": 0, "delayed_symbols": [],
+}
+
+
+def _record_quote_entitlement(quotes: List[Dict[str, Any]]) -> None:
+    """Remember whether the broker is serving real-time or delayed prints."""
+    if not quotes:
+        return
+    delayed = [q["symbol"] for q in quotes if not q.get("realtime")]
+    _quote_entitlement.update({
+        "checked_at": _utcnow().isoformat(),
+        "realtime": len(quotes) - len(delayed),
+        "delayed": len(delayed),
+        "delayed_symbols": delayed[:10],
+    })
+
 
 def normalize_quote_response(resp: Dict[str, Any]) -> Dict[str, Any]:
     """Flatten E*TRADE's QuoteResponse into the flat contract the app parses.
@@ -5675,6 +5718,7 @@ async def get_quotes(symbols: str = Query(...)):
         raw = await _etrade_call(market.get_quote, symbol_list, resp_format="json", source="quote")
         normalized = normalize_quote_response(raw)
         delayed = [q["symbol"] for q in normalized["quotes"] if not q["realtime"]]
+        _record_quote_entitlement(normalized["quotes"])
         if delayed:
             logger.warning(
                 f"E*TRADE served DELAYED quotes for {len(delayed)} symbol(s) "
@@ -5785,6 +5829,13 @@ async def app_heartbeat(data: dict = Body(default={})):
         "app_version": str(data.get("app_version") or "") or None,
         "open_positions": data.get("open_positions"),
         "symbols": data.get("symbols") if isinstance(data.get("symbols"), list) else None,
+        # CONTRACT-LEVEL BOOK (app 5.33+). `open_positions` is a count of
+        # DISTINCT UNDERLYINGS, so two apps holding wildly different contract
+        # counts on the same tickers compare as identical. `legs` carries the
+        # per-symbol size that makes the comparison mean something.
+        "legs": data.get("legs") if isinstance(data.get("legs"), list) else None,
+        "contracts": data.get("contracts"),
+        "truncated": data.get("truncated") is True,
         "daily_pnl_usd": data.get("daily_pnl_usd"),
     }
     try:
@@ -6379,6 +6430,138 @@ def plan_profit_lock(realized_usd: Any, target_usd: float = None,
             f"daily objective BANKED (${realized:,.0f} vs ${target:,.0f}) — further risk "
             f"capped at ${cushion:,.0f} so a full loss still finishes at target"
         ),
+    }
+
+
+def build_preflight(*,
+                    live_trading: bool,
+                    sandbox: bool,
+                    linked: bool,
+                    account_id_raw: Optional[str] = None,
+                    account_id_repaired: bool = False,
+                    resolved_account_key: Optional[str] = None,
+                    entitlement: Optional[Dict[str, Any]] = None,
+                    alert_webhook_configured: bool = False,
+                    state_backend: str = "memory",
+                    webhook_secret_set: bool = False,
+                    killed: bool = False,
+                    breaker_open: bool = False) -> Dict[str, Any]:
+    """Can this bot actually place a real order right now — and if not, WHY?
+
+    Every precondition for live trading already existed somewhere: a log line, a
+    boolean on /health, a warning nobody saw. What did not exist was a single
+    answer to "am I armed?". The bot could sit all session reporting
+    `status: ok`, `live_trading: true` and a green scanner while a delayed data
+    entitlement refused every entry — healthy and completely unable to trade,
+    with no one line anywhere saying so.
+
+    Each check carries a REMEDY, not just a symptom. "No real-time feed" is a
+    dead end; "accept the market data agreement at etrade.com" is an action.
+    Only checks that genuinely stop a real-money fill are `blocking`, and
+    nothing blocks in paper/sandbox — crying wolf about a paper session trains
+    the operator to ignore the one alert that matters.
+
+    Pure: all inputs are passed in, so the whole matrix is unit-testable.
+    """
+    real_money = bool(live_trading and not sandbox)
+    ent = entitlement or {}
+    checks: List[Dict[str, Any]] = []
+
+    def add(key: str, ok: bool, detail: str, remedy: Optional[str] = None,
+            blocking: bool = False) -> None:
+        checks.append({
+            "key": key, "ok": bool(ok), "detail": detail,
+            "remedy": None if ok else remedy,
+            # A failure only BLOCKS when real money is armed. In paper the same
+            # condition is worth reporting and worth nobody's pager.
+            "blocking": bool(blocking and real_money and not ok),
+        })
+
+    add("broker_link", linked,
+        "E*TRADE session linked" if linked else "no linked E*TRADE session",
+        "Open the app and reconnect E*TRADE — the OAuth session expired or was never established.",
+        blocking=True)
+
+    add("account_key", bool(resolved_account_key),
+        "account key resolved" if resolved_account_key else "no account key resolved yet",
+        "Link the account, then hit /etrade/account so the bot can resolve the accountIdKey orders route to.",
+        blocking=True)
+
+    # The whitespace bug. Not blocking — the digits still resolve once cleaned —
+    # but the env var stays wrong until someone edits it, and a silent repair
+    # that never surfaces is how the next deploy inherits the same typo.
+    add("account_id_env", not account_id_repaired,
+        f"ETRADE_ACCOUNT_ID clean ({account_id_raw})" if account_id_raw else "ETRADE_ACCOUNT_ID unset (auto-select)",
+        (f"ETRADE_ACCOUNT_ID contained whitespace and was auto-repaired to '{account_id_raw}' for this "
+         f"process. Fix the env var itself — as stored it matches no account, and the bot falls back to "
+         f"the first ACTIVE account, which on a multi-account login is not necessarily yours."))
+
+    checked = ent.get("checked_at")
+    delayed = int(ent.get("delayed") or 0)
+    realtime = int(ent.get("realtime") or 0)
+    if not checked:
+        add("market_data", True, "entitlement not yet observed (no quote served this session)")
+    else:
+        syms = ", ".join(ent.get("delayed_symbols") or [])
+        add("market_data", delayed == 0,
+            f"{realtime} real-time / {delayed} delayed on last quote" + (f" ({syms})" if delayed else ""),
+            "E*TRADE is serving DELAYED prints. Accept the real-time market data agreement: "
+            "etrade.com → Customer Service → Market Data Agreements. Until then every live entry is "
+            "refused at dispatch (protective exits still run — getting out is never gated on price age).",
+            blocking=True)
+
+    add("webhook_secret", bool(webhook_secret_set),
+        "webhook authentication enabled" if webhook_secret_set else "WEBHOOK_SECRET is not set",
+        "Set WEBHOOK_SECRET and redeploy — without it anyone who learns the URL can post signals "
+        "that place real orders.",
+        blocking=True)
+
+    add("alert_delivery", alert_webhook_configured,
+        "alerts deliverable" if alert_webhook_configured else "no alert webhook configured",
+        "Set the Discord webhook (env ALERT_WEBHOOK_URL or POST /alerts/config) — without it fills, "
+        "stop-outs and kill-switch trips happen silently.")
+
+    durable = str(state_backend or "").lower() != "memory"
+    add("durable_state", durable,
+        f"state backend: {state_backend}",
+        "No Redis or Postgres is attached, so positions, guards and daily P&L live in process memory. "
+        "A restart loses the record of open trades — the bot would stop protecting positions it forgot.")
+
+    add("kill_switch", not killed, "kill switch armed" if killed else "kill switch clear",
+        "The kill switch is engaged — clear it from the app when you intend to trade.", blocking=True)
+
+    add("circuit_breaker", not breaker_open,
+        "broker circuit breaker OPEN" if breaker_open else "broker circuit breaker closed",
+        "Repeated E*TRADE API failures tripped the breaker. It resets itself once calls succeed; "
+        "if it persists the session or the broker API is down.", blocking=True)
+
+    blocking = [c for c in checks if c["blocking"]]
+    warnings = [c for c in checks if not c["ok"] and not c["blocking"]]
+    ready = not blocking
+
+    if not real_money:
+        mode = "SANDBOX" if sandbox else "PAPER"
+        headline = f"{mode} mode — no real orders. " + (
+            f"{len(warnings)} advisory item(s)." if warnings else "All checks clean.")
+    elif ready:
+        headline = "ARMED — every precondition for a real-money order is satisfied." + (
+            f" {len(warnings)} advisory item(s)." if warnings else "")
+    else:
+        headline = (
+            f"NOT ARMED — {len(blocking)} blocking condition(s): "
+            + "; ".join(c["key"] for c in blocking)
+        )
+
+    return {
+        "ready": ready,
+        "real_money": real_money,
+        "headline": headline,
+        "blocking": [c["key"] for c in blocking],
+        "warnings": [c["key"] for c in warnings],
+        # The first thing to actually DO, so a caller that renders one line
+        # renders the actionable one.
+        "next_action": (blocking[0]["remedy"] if blocking else (warnings[0]["remedy"] if warnings else None)),
+        "checks": checks,
     }
 
 
@@ -10169,6 +10352,39 @@ async def on_startup():
     _start_reconciler()
     await start_worker()
     logger.info(f"✅ Bot ready (state backend: {state.backend_name})")
+    # GO-LIVE PREFLIGHT — say out loud whether this process can actually trade.
+    # A bot that boots clean, reports healthy and then refuses every entry for a
+    # session is the most expensive failure mode here, because it looks like a
+    # quiet tape rather than a broken deployment.
+    await _announce_preflight()
+
+
+async def _announce_preflight() -> None:
+    """Log the readiness report, and alert only when real money is armed and
+    blocked. Never raises — a reporting failure must not stop the bot."""
+    try:
+        report = await _current_preflight()
+        logger.info(f"[preflight] {report['headline']}")
+        for c in report["checks"]:
+            if not c["ok"]:
+                mark = "⛔" if c["blocking"] else "⚠"
+                logger.warning(f"[preflight] {mark} {c['key']}: {c['detail']} → {c['remedy']}")
+        if report["real_money"] and not report["ready"]:
+            lines = [f"• **{c['key']}** — {c['detail']}\n  → {c['remedy']}"
+                     for c in report["checks"] if c["blocking"]]
+            await alerts.send(
+                "critical", "preflight_blocked",
+                f"LIVE TRADING ARMED BUT NOT READY — {len(report['blocking'])} blocking condition(s)",
+                dedupe_key=f"preflight:{','.join(report['blocking'])}",
+                data={"blocking": report["blocking"], "version": BOT_VERSION},
+                force_deliver=True,
+                webhook_text=(
+                    f"⛔ **PREFLIGHT FAILED** — `{BOT_VERSION}` is armed for REAL MONEY "
+                    f"but cannot place an order.\n\n" + "\n".join(lines)
+                ),
+            )
+    except Exception as e:
+        logger.warning(f"preflight report failed (non-fatal): {e}")
 
 
 @app.on_event("shutdown")
@@ -10240,6 +10456,96 @@ APP_LINK_STALE_SECONDS = 210
 APP_HEARTBEAT_TTL_SECONDS = 86_400
 
 
+def _parse_app_legs(raw: Any) -> Dict[str, Optional[int]]:
+    """The app's open book as {SYMBOL: contracts}, contracts None when unknown.
+
+    A leg whose size the app never recorded maps to None, and one unknown leg
+    makes the whole underlying unknown: summing it as zero would invent a
+    shortfall and report a mismatch that is really missing data.
+    """
+    if not isinstance(raw, list):
+        return {}
+    grouped: Dict[str, List[Optional[int]]] = {}
+    for leg in raw:
+        if not isinstance(leg, dict):
+            continue
+        symbol = str(leg.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        try:
+            qty = int(float(leg["qty"])) if leg.get("qty") is not None else None
+        except (TypeError, ValueError, KeyError):
+            qty = None
+        grouped.setdefault(symbol, []).append(qty if (qty or 0) > 0 else None)
+    return {
+        symbol: (None if any(q is None for q in qtys) else sum(q for q in qtys if q))
+        for symbol, qtys in grouped.items()
+    }
+
+
+def _book_legs(tracked: Dict[str, dict]) -> Dict[str, Optional[int]]:
+    """The bot's own book as {SYMBOL: contracts}, None when the size is unknown."""
+    out: Dict[str, Optional[int]] = {}
+    for ticker, pos in (tracked or {}).items():
+        symbol = str(ticker).strip().upper()
+        if not symbol:
+            continue
+        try:
+            qty = int(float((pos or {}).get("filled_qty") or (pos or {}).get("qty") or 0))
+        except (TypeError, ValueError):
+            qty = 0
+        out[symbol] = qty if qty > 0 else None
+    return out
+
+
+def _compare_books(
+    app_legs: Dict[str, Optional[int]],
+    bot_legs: Dict[str, Optional[int]],
+    truncated: bool,
+) -> Optional[str]:
+    """Name where the two books actually disagree, or None when they agree.
+
+    Two rules keep this from crying wolf:
+
+    - A TRUNCATED symbol list is not evidence of absence. The app caps what it
+      sends, so a symbol missing from a capped list may simply have fallen off
+      the end; only sizes can be compared in that case.
+    - An UNKNOWN size on either side is not a disagreement. Missing data and
+      conflicting data are different findings, and only one of them means
+      something is wrong.
+    """
+    if not app_legs:
+        return None
+
+    details: List[str] = []
+    if not truncated:
+        app_only = sorted(set(app_legs) - set(bot_legs))
+        bot_only = sorted(set(bot_legs) - set(app_legs))
+        if app_only:
+            details.append(f"the app journals {', '.join(app_only)}, which the bot's book does not hold")
+        if bot_only:
+            details.append(f"the bot holds {', '.join(bot_only)}, which the app does not journal")
+
+    sizes = [
+        f"{symbol} app {app_legs[symbol]} vs bot {bot_legs[symbol]}"
+        for symbol in sorted(set(app_legs) & set(bot_legs))
+        if app_legs[symbol] is not None
+        and bot_legs[symbol] is not None
+        and app_legs[symbol] != bot_legs[symbol]
+    ]
+    if sizes:
+        details.append("contract counts differ — " + "; ".join(sizes))
+
+    if not details:
+        return None
+    return (
+        "The app and the bot disagree about the open book: "
+        + "; ".join(details)
+        + ". Reconcile against the broker before sizing anything new — position size, "
+        + "portfolio heat and the daily risk budget are all computed from this book."
+    )
+
+
 def assess_app_link(
     heartbeat: Optional[dict],
     tracked: Dict[str, dict],
@@ -10263,7 +10569,13 @@ def assess_app_link(
       produce.
     - `position_mismatch` — the app's journal and the bot's book hold different
       numbers of positions. Exactly the drift the reconciler catches at the
-      broker, one layer up.
+      broker, one layer up. Legacy apps only send a count, so this is all that
+      can be said about them.
+    - `contract_mismatch` — the two sides name different SYMBOLS, or agree on a
+      symbol and disagree on how many contracts sit behind it. A count-only
+      comparison passes cleanly while the app believes it holds 10 NVDA
+      contracts against the bot's 2, which is a 5x error in every sizing,
+      heat and risk-budget number the app computes from its own book.
     - `armed_mismatch` — the operator disarmed the app while the server-side
       scanner keeps trading. Disarming the app has never stopped the bot, and
       nothing ever said so out loud.
@@ -10308,6 +10620,10 @@ def assess_app_link(
     except (TypeError, ValueError):
         app_positions = None
 
+    truncated = heartbeat.get("truncated") is True
+    app_legs = _parse_app_legs(heartbeat.get("legs"))
+    bot_legs = _book_legs(tracked)
+
     out.update({
         "connected": not stale,
         "seconds_since": round(seconds_since, 1) if seconds_since is not None else None,
@@ -10345,7 +10661,17 @@ def assess_app_link(
                 "detail": ("The app reports LIVE mode but this bot has LIVE_TRADING off — "
                            "real orders will not be placed from the server."),
             })
-        if app_positions is not None and app_positions != open_count:
+        contract_detail = _compare_books(app_legs, bot_legs, truncated)
+        if contract_detail:
+            out["divergences"].append({
+                "kind": "contract_mismatch",
+                "severity": "warning",
+                "detail": contract_detail,
+            })
+        elif not app_legs and app_positions is not None and app_positions != open_count:
+            # Legacy app: a bare count is all it sends, so a bare count is all
+            # that can be compared. Never run this alongside the contract
+            # comparison — it would double-report the same disagreement.
             out["divergences"].append({
                 "kind": "position_mismatch",
                 "severity": "warning",
@@ -10526,6 +10852,33 @@ async def health():
         "alert_webhook_configured": alerts.webhook_configured(),
         "reconcile_interval_seconds": RECONCILE_INTERVAL_SECONDS,
     }
+
+
+async def _current_preflight() -> Dict[str, Any]:
+    """Gather live state and answer the one question: can we trade right now?"""
+    return build_preflight(
+        live_trading=LIVE_TRADING,
+        sandbox=is_sandbox,
+        linked=bool(load_tokens()),
+        account_id_raw=TARGET_ACCOUNT_ID,
+        account_id_repaired=_ACCOUNT_ID_REPAIRED,
+        resolved_account_key=_resolved_account_id_key,
+        entitlement=_quote_entitlement,
+        alert_webhook_configured=alerts.webhook_configured(),
+        state_backend=state.backend_name if state else "memory",
+        webhook_secret_set=bool(WEBHOOK_SECRET),
+        killed=await state.is_killed() if state else False,
+        breaker_open=await _breaker_is_open(),
+    )
+
+
+@app.get("/preflight")
+async def preflight():
+    """GO-LIVE READINESS. Every precondition for placing a real order, each with
+    the concrete action that clears it. Polled by the app so a bot that is
+    'healthy' but unable to fill can never look armed."""
+    report = await _current_preflight()
+    return {**report, "version": BOT_VERSION, "ts": _utcnow().isoformat()}
 
 
 @app.get("/healthz")
