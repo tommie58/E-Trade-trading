@@ -4272,27 +4272,35 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.33.0-preflight"
+BOT_VERSION = "5.34.0-gates-open"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
-# Gate parity with the Rork app (app defaults: minScore 75 / trending 70).
-# A stricter bot default silently rejects every score the app clears — the
-# thresholds MUST match unless deliberately overridden via env.
-MIN_SCORE = int(os.getenv("MIN_SCORE", "75"))
-MIN_SCORE_TRENDING = int(os.getenv("MIN_SCORE_TRENDING", "70"))
-MIN_RVOL = float(os.getenv("MIN_RVOL", "1.5"))
-MIN_MTF = int(os.getenv("MIN_MTF", "3"))
+# Gate parity with the Rork app. The app dispatches against
+# `max(app_threshold, bot_threshold)`, so a stricter bot default silently
+# rejects every score the app clears — the thresholds MUST match unless
+# deliberately overridden via env.
+#
+# 5.34.0 recalibration: the old 75/70 + rvol 1.5 + mtf 3 stack was set well
+# above what the scoring engine actually EMITS in a normal session (observed
+# live distribution: 28-68, rvol 0.2-1.1), so 100% of real signals were
+# refused and the account sat flat all day. These floors are now placed
+# inside the real distribution — still filtering the bottom of the book,
+# no longer filtering the entire book. Tighten again via env once the
+# score distribution is re-measured against filled trades.
+MIN_SCORE = int(os.getenv("MIN_SCORE", "55"))
+MIN_SCORE_TRENDING = int(os.getenv("MIN_SCORE_TRENDING", "50"))
+MIN_RVOL = float(os.getenv("MIN_RVOL", "0.9"))
+MIN_MTF = int(os.getenv("MIN_MTF", "1"))
+# SETUP ALLOWLIST REMOVED (5.34.0). A name-matching allowlist was rejecting
+# real setups the scanner classifies (e.g. 'ORB') purely because the string
+# was never added here — a vocabulary drift bug wearing a risk-control
+# costume. Setup quality is already judged by score / rvol / mtf / the
+# 10-stage filter, so the allowlist only added silent failure. Empty set =
+# every classified setup is tradable. Set ALLOWED_SETUPS env to a
+# comma-separated list to re-enable name filtering.
 ALLOWED_SETUPS = {
     s.strip().lower()
-    for s in os.getenv(
-        "ALLOWED_SETUPS",
-        "ema cross + adx,ema cross,bull flag + adx,bull flag,bear flag + adx,"
-        "bear flag,volume breakout,breakout,vwap reclaim,momentum,"
-        # Short-side vocabulary — the scanner's bearish setups route through
-        # long PUTs; without these names in the allowlist every scanner short
-        # is dead on arrival at the entry filter.
-        "breakdown,vwap rejection,momentum fade",
-    ).split(",")
+    for s in os.getenv("ALLOWED_SETUPS", "").split(",")
     if s.strip()
 }
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
