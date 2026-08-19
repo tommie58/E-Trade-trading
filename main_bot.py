@@ -3271,8 +3271,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "mode": "shadow",
     "universe": list(DEFAULT_UNIVERSE),
     "interval_seconds": 60,
-    "min_score": 75,
-    "min_rvol": 1.5,
+    "min_score": 55,
+    "min_rvol": 0.9,
     "max_spread_pct": 0.35,
     "min_price": 5.0,
     "max_signals_per_day": 3,
@@ -3293,17 +3293,37 @@ _SYMBOL_RE = re.compile(r"^[A-Z]{1,6}$")
 # rejected server-side — noise in the log, no trade, and a user staring at a
 # threshold the bot silently overrides. main_bot injects its REAL (env-aware)
 # gate here at wiring time; the defaults mirror main_bot's own defaults.
-ENTRY_GATE_FLOORS: Dict[str, float] = {"min_score": 75.0, "min_rvol": 1.5}
+ENTRY_GATE_FLOORS: Dict[str, float] = {"min_score": 55.0, "min_rvol": 0.9}
+
+# Floors this bot shipped BEFORE configs recorded their own provenance. A stored
+# value equal to one of these was almost certainly inherited from the gate of
+# the day rather than chosen, so it is allowed to follow the gate down once.
+LEGACY_GATE_FLOORS: Dict[str, Tuple[float, ...]] = {
+    "min_score": (75.0,),
+    "min_rvol": (1.5,),
+}
 
 
 def set_entry_gate_floors(min_score: float, min_rvol: float) -> Dict[str, float]:
     """Bind the scanner's configurable floors to the bot's live entry gate.
-    Called once from main_bot so the two can never drift apart."""
+    Called once from main_bot so the two can never drift apart.
+
+    The floor must be able to move DOWN as well as up. The original version
+    only ever raised, so after the gate recalibration the entry filter ran at
+    55 while the scanner kept screening at the old 75 — the bot's eyes stayed
+    shut on every setup scoring 55-74 and nothing in the logs said why. A value
+    that merely INHERITED the previous floor was never a choice, so it follows
+    the floor in both directions; a deliberately tighter value is preserved and
+    only ever pushed up to stay >= the live gate.
+    """
+    prev = dict(ENTRY_GATE_FLOORS)
     ENTRY_GATE_FLOORS["min_score"] = float(min_score)
     ENTRY_GATE_FLOORS["min_rvol"] = float(min_rvol)
     for key in ("min_score", "min_rvol"):
-        if DEFAULT_CONFIG[key] < ENTRY_GATE_FLOORS[key]:
-            DEFAULT_CONFIG[key] = type(DEFAULT_CONFIG[key])(ENTRY_GATE_FLOORS[key])
+        cast = type(DEFAULT_CONFIG[key])
+        inherited = float(DEFAULT_CONFIG[key]) <= prev[key] + 1e-9
+        if inherited or float(DEFAULT_CONFIG[key]) < ENTRY_GATE_FLOORS[key]:
+            DEFAULT_CONFIG[key] = cast(ENTRY_GATE_FLOORS[key])
     return dict(ENTRY_GATE_FLOORS)
 
 
@@ -3364,9 +3384,45 @@ def normalize_config(raw: Any) -> Dict[str, Any]:
                 cfg[key] = cast(max(lo, min(hi, cast(raw[key]))))
             except (TypeError, ValueError):
                 continue
-    # A stored config written before a gate change must still be re-floored.
-    cfg["min_score"] = int(max(cfg["min_score"], ENTRY_GATE_FLOORS["min_score"]))
-    cfg["min_rvol"] = float(max(cfg["min_rvol"], ENTRY_GATE_FLOORS["min_rvol"]))
+    # A stored config written before a gate change must be re-floored in BOTH
+    # directions. `gate_floor` records the floor that was live when the config
+    # was saved: a stored value at that floor was inherited, not chosen, so it
+    # tracks the new gate. Anything stricter is the operator's own decision and
+    # survives (clamped up only if the gate has since passed it).
+    prior = raw.get("gate_floor") if isinstance(raw, dict) else None
+    prior = prior if isinstance(prior, dict) else None
+    for key, cast in (("min_score", int), ("min_rvol", float)):
+        floor = ENTRY_GATE_FLOORS[key]
+        prior_floor: Optional[float] = None
+        if prior is not None:
+            try:
+                prior_floor = float(prior[key])
+            except (KeyError, TypeError, ValueError):
+                prior_floor = None
+        if prior is None and isinstance(raw, dict) and raw.get(key) is not None:
+            # Legacy blob written before provenance stamping. Only a value that
+            # matches a floor this bot actually SHIPPED can be assumed inherited
+            # — resetting every legacy value would silently loosen a threshold
+            # the operator chose on purpose, which is the same class of silent
+            # override this whole mechanism exists to kill.
+            if any(abs(float(cfg[key]) - old) <= 1e-9 for old in LEGACY_GATE_FLOORS[key]):
+                logger.warning(
+                    f"scanner {key} {cfg[key]} matches a retired entry-gate floor — adopting the live gate "
+                    f"{floor} (set it explicitly in scanner config to pin a stricter value)"
+                )
+                cfg[key] = cast(floor)
+            else:
+                cfg[key] = cast(max(float(cfg[key]), floor))
+        elif prior_floor is not None and float(cfg[key]) <= prior_floor + 1e-9:
+            cfg[key] = cast(floor)
+        else:
+            cfg[key] = cast(max(float(cfg[key]), floor))
+    # Stamp the floor these values were resolved against so the NEXT gate change
+    # can tell inherited values from chosen ones.
+    cfg["gate_floor"] = {
+        "min_score": float(ENTRY_GATE_FLOORS["min_score"]),
+        "min_rvol": float(ENTRY_GATE_FLOORS["min_rvol"]),
+    }
     return cfg
 
 
