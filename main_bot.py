@@ -4510,7 +4510,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.37.0-conn-strings"
+BOT_VERSION = "5.38.0-durable-session"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -4735,6 +4735,23 @@ _account_binding: Optional[Dict[str, Any]] = None
 # relink (the pin is the user's intent, not session state).
 ACCOUNT_PIN_KEY = "etrade:pinned_account"
 _pinned_account_id: Optional[str] = None
+
+# ACCESS TOKENS IN THE STATE STORE.
+# Tokens used to persist to Postgres ONLY. With no working DATABASE_URL that is
+# ephemeral SQLite, so every redeploy dropped the live session and
+# `load_tokens()` fell through to the ETRADE_ACCESS_TOKEN env var — a token
+# frozen at whatever value was pasted once, long dead. The bot then reported
+# LINKED (a token string exists) while every single broker call 401'd, and a
+# fresh relink could not fix it: the new tokens went to memory + the ephemeral
+# DB, so the next restart resurrected the dead env pair again. Redis is durable
+# the moment REDIS_URL is set, so the session now lives there too.
+TOKENS_KEY = "etrade:access_tokens"
+# Fingerprint of env-var tokens E*TRADE has already rejected. Survives restarts
+# so a proven-dead ETRADE_ACCESS_TOKEN is not re-adopted on every boot.
+DEAD_ENV_TOKEN_KEY = "etrade:dead_env_token"
+_dead_env_token_fp: Optional[str] = None
+# Where the in-memory tokens came from: relink | redis | db | env.
+_token_source: Optional[str] = None
 
 # Pending OAuth request tokens (token -> secret). E*TRADE request tokens are
 # single-use and expire ~5 minutes after issue. Memory is the PRIMARY store —
@@ -5167,6 +5184,20 @@ def _mark_token_session(valid: bool, reason: str = "") -> None:
     _token_session["checked_at"] = _utcnow().isoformat()
     if prev is not False and valid is False:
         logger.warning(f"Broker session marked EXPIRED — {reason}")
+        # If the dead session came from the env var, remember that: otherwise
+        # every restart re-adopts the same rejected token and the user cannot
+        # relink their way out of it.
+        if _token_source == "env":
+            logger.error(
+                "⛔ The rejected tokens came from ETRADE_ACCESS_TOKEN — that env var holds a "
+                "DEAD session and will be ignored from now on. Relink from the app (the new "
+                "tokens persist in Redis); then clear ETRADE_ACCESS_TOKEN/_SECRET."
+            )
+            try:
+                asyncio.get_running_loop()
+                asyncio.create_task(_remember_dead_env_tokens())
+            except RuntimeError:
+                pass
         # ONE alert at the TRANSITION — the keepalive and reconcile loops
         # quiesce while expired, so this is the only relink prompt the user
         # gets (instead of an ERROR every 15 minutes all night).
@@ -5241,6 +5272,27 @@ def _looks_like_auth_failure(err: Exception) -> bool:
     return "401" in text or "oauth_problem" in text or "Unauthorized" in text
 
 
+def _token_fingerprint(token: str) -> str:
+    """Short, non-reversible id for a token value — safe to log and to store as
+    a 'this one is dead' marker. Never log or persist the token itself."""
+    return hashlib.sha256((token or "").encode("utf-8")).hexdigest()[:16]
+
+
+async def _remember_dead_env_tokens() -> None:
+    """Record that the ETRADE_ACCESS_TOKEN env pair is dead, so the next boot
+    does not adopt it again and spend the day 401ing while reporting LINKED."""
+    global _dead_env_token_fp
+    env_token = os.getenv("ETRADE_ACCESS_TOKEN")
+    if not env_token:
+        return
+    fp = _token_fingerprint(env_token)
+    _dead_env_token_fp = fp
+    try:
+        await state.set(DEAD_ENV_TOKEN_KEY, fp)
+    except Exception as e:
+        logger.debug(f"could not persist dead-env-token marker: {e}")
+
+
 def _token_session_fields() -> Dict[str, Any]:
     valid = _token_session["valid"]
     return {
@@ -5252,12 +5304,13 @@ def _token_session_fields() -> Dict[str, Any]:
 
 
 def save_tokens(token: str, token_secret: str):
-    global _current_tokens, _resolved_account_id_key, _account_binding
+    global _current_tokens, _resolved_account_id_key, _account_binding, _token_source
     logger.info("=== NEW TOKENS RECEIVED ===")
     # Fresh tokens are validated by the auth flow before they get here — the
     # session starts ACTIVE.
     _mark_token_session(True, "new tokens adopted")
     _current_tokens = {"oauth_token": token, "oauth_token_secret": token_secret}
+    _token_source = "relink"
     _resolved_account_id_key = None  # re-resolve accountIdKey for the new session
     _account_binding = None
     # A fresh link is an explicit user action — clear any tripped breaker so
@@ -5267,6 +5320,10 @@ def save_tokens(token: str, token_secret: str):
         # Replay live signals that failed solely on the expired session — this
         # closes the disconnect→relink gap where dispatches used to be lost.
         asyncio.create_task(_replay_parked_signals())
+        # Redis is durable as soon as REDIS_URL is set, so the relink survives
+        # a redeploy even while DATABASE_URL is still unusable. Without this
+        # the only durable copy was Postgres.
+        asyncio.create_task(_save_tokens_to_state(token, token_secret))
     except RuntimeError:
         pass  # no running loop (e.g. import-time) — TTL reset still applies
     if async_session:
@@ -5274,6 +5331,40 @@ def save_tokens(token: str, token_secret: str):
             asyncio.create_task(_save_tokens_to_db(token, token_secret))
         except Exception as e:
             logger.warning(f"Failed to persist tokens to DB: {e}")
+
+
+async def _save_tokens_to_state(token: str, token_secret: str) -> None:
+    """Mirror the live session into the state store (Redis when configured)."""
+    try:
+        await state.set(TOKENS_KEY, json.dumps({
+            "oauth_token": token,
+            "oauth_token_secret": token_secret,
+            "saved_at": _utcnow().isoformat(),
+        }))
+        logger.info(f"✅ Tokens saved to state store ({state.backend_name})")
+    except Exception as e:
+        logger.warning(f"Failed to persist tokens to state store: {e}")
+
+
+async def _load_tokens_from_state() -> Optional[Dict[str, str]]:
+    """Read the persisted session out of the state store."""
+    try:
+        raw = await state.get(TOKENS_KEY)
+    except Exception as e:
+        logger.warning(f"could not read tokens from state store: {e}")
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        tok = str(data.get("oauth_token") or "")
+        sec = str(data.get("oauth_token_secret") or "")
+    except (json.JSONDecodeError, TypeError, AttributeError) as e:
+        logger.warning(f"persisted tokens unreadable — ignoring: {e}")
+        return None
+    if not tok or not sec:
+        return None
+    return {"oauth_token": tok, "oauth_token_secret": sec}
 
 
 async def _save_tokens_to_db(token: str, token_secret: str):
@@ -5290,13 +5381,25 @@ async def _save_tokens_to_db(token: str, token_secret: str):
 
 
 def load_tokens() -> Optional[Dict[str, str]]:
-    global _current_tokens
+    """Return the live session, falling back to the ETRADE_ACCESS_TOKEN env pair.
+
+    The env fallback is a LAST resort and is refused once E*TRADE has rejected
+    it: a static env token is frozen at the value pasted once, so re-adopting it
+    after every restart made the bot report LINKED while every call 401'd — and
+    it silently outranked nothing, because the durable copy (Postgres) was
+    unusable. Reporting NOT LINKED is the honest state: it points the user at
+    the relink that actually fixes it.
+    """
+    global _current_tokens, _token_source
     if _current_tokens:
         return _current_tokens
     token = os.getenv("ETRADE_ACCESS_TOKEN")
     secret = os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
     if token and secret:
+        if _dead_env_token_fp and _token_fingerprint(token) == _dead_env_token_fp:
+            return None
         _current_tokens = {"oauth_token": token, "oauth_token_secret": secret}
+        _token_source = "env"
         return _current_tokens
     return None
 
@@ -5315,15 +5418,45 @@ async def _load_tokens_from_db():
 
 
 async def preload_tokens():
-    global _current_tokens
+    """Rehydrate the broker session after a restart.
+
+    Precedence: state store (Redis) → Postgres → ETRADE_ACCESS_TOKEN env pair.
+    Redis comes first because it is the copy that actually survives a redeploy
+    on this deployment; the env var comes last because it is a frozen snapshot
+    that cannot be refreshed by a relink.
+    """
+    global _current_tokens, _token_source, _dead_env_token_fp
+    # Which env tokens are already known-dead (persisted across restarts).
+    try:
+        marker = await state.get(DEAD_ENV_TOKEN_KEY)
+        _dead_env_token_fp = (marker or "").strip() or None
+    except Exception as e:
+        logger.debug(f"could not read dead-env-token marker: {e}")
+    tokens = await _load_tokens_from_state()
+    if tokens:
+        _current_tokens = tokens
+        _token_source = "redis"
+        logger.info(f"✅ Broker session restored from the state store ({state.backend_name})")
+        return
     if async_session:
         try:
             tokens = await _load_tokens_from_db()
             if tokens:
                 _current_tokens = tokens
+                _token_source = "db"
                 logger.info("✅ Tokens pre-loaded from database into memory")
+                # Re-mirror into Redis so the NEXT restart does not depend on a
+                # database that may be ephemeral SQLite.
+                await _save_tokens_to_state(tokens["oauth_token"], tokens["oauth_token_secret"])
+                return
         except Exception as e:
             logger.warning(f"Could not preload tokens from DB: {e}")
+    env_token = os.getenv("ETRADE_ACCESS_TOKEN")
+    if env_token and _dead_env_token_fp and _token_fingerprint(env_token) == _dead_env_token_fp:
+        logger.warning(
+            "⚠️ ETRADE_ACCESS_TOKEN holds a session E*TRADE already rejected — ignoring it "
+            "(reporting NOT LINKED) instead of 401ing on every call. Relink from the app."
+        )
 
 
 # ==================== OAUTH ====================
@@ -5769,9 +5902,18 @@ async def etrade_auth_renew(data: dict = Body(...)):
 
 
 async def _forget_persisted_tokens() -> bool:
-    """Delete the persisted access-token row so a disconnect survives a restart."""
+    """Delete every persisted copy of the session so a disconnect survives a
+    restart. The state-store copy must go too — leaving it behind would
+    re-link the account on the next boot, which is the exact bug the DB row
+    caused before it was purged here."""
+    purged = False
+    try:
+        await state.delete(TOKENS_KEY)
+        purged = True
+    except Exception as e:
+        logger.warning(f"could not delete state-store tokens on disconnect: {e}")
     if not async_session:
-        return False
+        return purged
     try:
         async with async_session() as session:
             async with session.begin():
@@ -5781,7 +5923,7 @@ async def _forget_persisted_tokens() -> bool:
         return True
     except Exception as e:
         logger.warning(f"could not delete persisted tokens on disconnect: {e}")
-        return False
+        return purged
 
 
 @app.post("/etrade/disconnect")
@@ -5794,8 +5936,9 @@ async def etrade_disconnect():
     a `token_valid: true` session flag — i.e. the app could keep reporting a
     trusted live session for an account the user had just disconnected.
     """
-    global _current_tokens, _resolved_account_id_key, _account_binding
+    global _current_tokens, _resolved_account_id_key, _account_binding, _token_source
     _current_tokens = None
+    _token_source = None
     _resolved_account_id_key = None
     _account_binding = None
     _mark_token_session(False, "account disconnected by user")
@@ -6846,6 +6989,7 @@ def build_preflight(*,
                     db_backend: str = "none",
                     db_error: Optional[str] = None,
                     webhook_secret_set: bool = False,
+                    session_source: Optional[str] = None,
                     killed: bool = False,
                     breaker_open: bool = False) -> Dict[str, Any]:
     """Can this bot actually place a real order right now — and if not, WHY?
@@ -6880,9 +7024,19 @@ def build_preflight(*,
         })
 
     add("broker_link", linked,
-        "E*TRADE session linked" if linked else "no linked E*TRADE session",
+        (f"E*TRADE session linked (from {session_source or 'memory'})" if linked
+         else "no linked E*TRADE session"),
         "Open the app and reconnect E*TRADE — the OAuth session expired or was never established.",
         blocking=True)
+
+    # A session adopted from ETRADE_ACCESS_TOKEN is a frozen snapshot: a relink
+    # cannot refresh it, and once it dies every call 401s while the bot still
+    # reports LINKED. Worth saying out loud even while it happens to work.
+    add("session_source", session_source != "env",
+        f"session source: {session_source or 'none'}",
+        "This session came from the ETRADE_ACCESS_TOKEN env var, not from an in-app link. Env "
+        "tokens cannot be renewed by relinking and go dead within a day — link from the app "
+        "(tokens persist in Redis), then clear ETRADE_ACCESS_TOKEN and ETRADE_ACCESS_TOKEN_SECRET.")
 
     add("account_key", bool(resolved_account_key),
         "account key resolved" if resolved_account_key else "no account key resolved yet",
@@ -11313,6 +11467,7 @@ async def _current_preflight() -> Dict[str, Any]:
         db_backend=_db_backend,
         db_error=_db_error,
         webhook_secret_set=bool(WEBHOOK_SECRET),
+        session_source=_token_source,
         killed=await state.is_killed() if state else False,
         breaker_open=await _breaker_is_open(),
     )
