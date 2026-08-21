@@ -95,23 +95,61 @@ _ASSIGNMENT_RE = re.compile(r"^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.+)$"
 # button puts on the clipboard. A URL carrying one of these is not a network
 # problem — it resolves to a hostname that cannot exist — so it must be named
 # differently from a genuine connection failure.
-_PLACEHOLDER_RE = re.compile(
+#
+# Bracketed markers are unambiguous and are matched ANYWHERE in the URL.
+_BRACKET_PLACEHOLDER_RE = re.compile(
     r"<[^<>\s/@:]{1,60}>"                 # <project-ref>, <region>, <YOUR-PASSWORD>
     r"|\[[^\[\]\s/@:]{2,60}\]"            # [YOUR-PASSWORD]  (IPv6 hosts contain ':' and are excluded)
-    r"|\bYOUR[_-]?[A-Z0-9]{2,40}\b"       # YOUR_PASSWORD, YOUR-ENDPOINT
-    r"|\bPASSWORD\b"                      # a bare literal PASSWORD
 )
+
+# Bare words are NOT unambiguous: `PASSWORD` was previously matched with \b
+# anywhere in the URL, which rejected the perfectly valid password
+# `Trading-PASSWORD-2026` as "a template" and forced a real deployment onto
+# the ephemeral SQLite fallback. A bare word only means "never filled in" when
+# it is the ENTIRE password component, so it is anchored and checked against
+# that component alone. Uppercase-only, because documentation shouts its
+# placeholders and a lowercased `password` may well be someone's real one.
+_BARE_PLACEHOLDER_RE = re.compile(
+    r"\A(?:YOUR[_-]?)?(?:PASSWORD|PASSWD|DB[_-]?PASSWORD|DATABASE[_-]?PASSWORD)\Z"
+    r"|\AYOUR[_-]?[A-Z0-9]{2,40}\Z"
+)
+
+
+def password_component(url: str) -> str:
+    """The password from a URL's userinfo, or "" when there is none.
+
+    Pure and total — never raises on a malformed URL. Only the authority is
+    considered, so an '@' or ':' later in the path cannot be mistaken for
+    credentials.
+    """
+    try:
+        after = (url or "").split("://", 1)[1] if "://" in (url or "") else ""
+        authority = after.split("/", 1)[0]
+        if "@" not in authority:
+            return ""
+        # rsplit: an un-encoded '@' inside a password keeps the real host.
+        userinfo = authority.rsplit("@", 1)[0]
+        if ":" not in userinfo:
+            return ""
+        return userinfo.split(":", 1)[1]
+    except Exception:
+        return ""
 
 
 def unreplaced_placeholders(url: str) -> List[str]:
     """Template markers left in a connection string, in order, de-duplicated.
 
-    Safe to log: these are literals from documentation, never real secrets.
+    Safe to log: these are literals from documentation, never real secrets —
+    a bare marker is only reported when it is the whole password component,
+    so this can never echo part of a genuine password.
     """
     seen: List[str] = []
-    for match in _PLACEHOLDER_RE.findall(url or ""):
+    for match in _BRACKET_PLACEHOLDER_RE.findall(url or ""):
         if match not in seen:
             seen.append(match)
+    password = password_component(url or "")
+    if password and _BARE_PLACEHOLDER_RE.match(password) and password not in seen:
+        seen.append(password)
     return seen
 
 
@@ -4510,7 +4548,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.38.0-durable-session"
+BOT_VERSION = "5.39.0-conn-diagnosis"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -6288,6 +6326,69 @@ def _mask_db_url(url: str) -> str:
         return "<unparseable>"
 
 
+# Supabase's DIRECT host resolves to IPv6 ONLY unless the paid IPv4 add-on is
+# enabled. Most container hosts are IPv4-only, so a perfectly-typed password
+# against this host still dies — with `Network is unreachable` or a DNS error
+# that reads like the project does not exist. The fix is never "retype the
+# password"; it is to switch to the Session pooler host, which is IPv4.
+_SUPABASE_DIRECT_RE = re.compile(r"@db\.([a-z0-9]{8,40})\.supabase\.co\b", re.I)
+_IPV6_UNREACHABLE_SIGNS = (
+    "network is unreachable", "no route to host", "name or service not known",
+    "nodename nor servname", "temporary failure in name resolution",
+    "could not translate host name", "errno -2", "errno -5", "errno 101",
+    "errno 113", "gaierror",
+)
+_BAD_PASSWORD_SIGNS = (
+    "password authentication failed", "invalidpassworderror",
+    "invalid password", "authentication failed",
+)
+_POOLER_TENANT_SIGNS = ("tenant or user not found",)
+
+
+def _db_failure_hint(url: str, error: str) -> str:
+    """Name the ACTUAL cause of a Postgres connection failure.
+
+    Returns "" when nothing specific can be said. Pure — no I/O, no logging,
+    and it never echoes the password (only the project ref, which is public).
+    """
+    err = (error or "").lower()
+    direct = _SUPABASE_DIRECT_RE.search(url or "")
+    pooled = "pooler.supabase.com" in (url or "").lower()
+
+    if direct and any(sign in err for sign in _IPV6_UNREACHABLE_SIGNS):
+        ref = direct.group(1)
+        return (
+            "THIS IS NOT A PASSWORD PROBLEM. The direct Supabase host "
+            f"db.{ref}.supabase.co is IPv6-only unless the paid IPv4 add-on is on, "
+            "and this server is IPv4 — the address can never be reached. Use the "
+            "SESSION POOLER instead: Supabase → Connect → Session pooler, which "
+            f"looks like postgresql://postgres.{ref}:YOURPASSWORD"
+            "@aws-0-<your-region>.pooler.supabase.com:5432/postgres. Note the "
+            f"username becomes postgres.{ref}, not plain postgres."
+        )
+    if any(sign in err for sign in _POOLER_TENANT_SIGNS):
+        return (
+            "The pooler rejected the USERNAME, not the password. On the pooler the "
+            "user must be postgres.<project-ref> (e.g. postgres.abcd1234efgh), not "
+            "plain postgres. Copy the pooler string from Supabase → Connect verbatim."
+        )
+    if any(sign in err for sign in _BAD_PASSWORD_SIGNS):
+        return (
+            "The host was reached and it REJECTED THE PASSWORD — host, port and SSL "
+            "are all fine. Reset it at Supabase → Project Settings → Database → "
+            "Reset database password, then paste the new value. If the password "
+            "contains @ : / or #, percent-encode it (@ becomes %40)."
+        )
+    if direct and not pooled:
+        ref = direct.group(1)
+        return (
+            f"Host db.{ref}.supabase.co is the DIRECT (IPv6-only) endpoint. If this "
+            "server has no IPv6 route, switch to the Session pooler string from "
+            "Supabase → Connect (username becomes postgres." + ref + ")."
+        )
+    return ""
+
+
 def _normalize_db_url(raw: str) -> Tuple[str, Dict[str, Any], List[str]]:
     """Turn any provider's Postgres URL into one SQLAlchemy+asyncpg accepts.
 
@@ -6450,10 +6551,14 @@ async def init_db():
                     except Exception:
                         pass
                 engine = None
+                hint = _db_failure_hint(url, _db_error)
+                if hint:
+                    _db_error = f"{_db_error} | {hint}"
                 logger.error(
                     f"❌ DATABASE_URL is set but Postgres is UNREACHABLE @ {masked} — "
-                    f"{_db_error} (wrong host, port, password, SSL or network). "
-                    f"Falling back to SQLite on an ephemeral disk: tokens, durable "
+                    f"{type(conn_err).__name__}: {conn_err}. "
+                    + (f"{hint} " if hint else "")
+                    + f"Falling back to SQLite on an ephemeral disk: tokens, durable "
                     f"state and the trade ledger will NOT survive a restart."
                 )
 
