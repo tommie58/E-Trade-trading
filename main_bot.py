@@ -74,6 +74,27 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("etrade-bot.state")
 
+
+def _redact_redis_url(url: str) -> str:
+    """`redis://user:password@host:port` → `redis://user:***@host:port`.
+
+    Connection failures are useless to debug without seeing the host, but the
+    URL carries the password — and this line goes to container logs that get
+    pasted into chats. Never log the raw URL.
+    """
+    try:
+        scheme, _, rest = url.partition("://")
+        if not rest:
+            return "redis://<malformed>"
+        creds, at, hostpart = rest.rpartition("@")
+        if not at:
+            return f"{scheme}://{hostpart}"
+        user, colon, _pw = creds.partition(":")
+        return f"{scheme}://{user}{':***' if colon else ''}@{hostpart}"
+    except Exception:
+        return "redis://<unparseable>"
+
+
 # Lua: release the lock only if we still own it (token match) — never delete
 # a lock another worker re-acquired after our TTL expired.
 _RELEASE_LUA = """
@@ -351,6 +372,11 @@ class StateStore:
         self._persistence = persistence if redis_client is None else None
         self._release_sha: Optional[str] = None
         self._extend_sha: Optional[str] = None
+        # Set ONLY when REDIS_URL was configured but the connection failed.
+        # "No Redis configured" and "Redis configured but broken" look identical
+        # from backend_name alone (both report memory), and the second one is a
+        # silent lie to an operator who believes durable state is attached.
+        self.redis_error: Optional[str] = None
 
     @property
     def backend_name(self) -> str:
@@ -362,11 +388,18 @@ class StateStore:
     def is_distributed(self) -> bool:
         return self.redis is not None
 
+    @property
+    def redis_degraded(self) -> bool:
+        """True when Redis was CONFIGURED but is not connected — a
+        misconfiguration, not a deliberate dev-mode choice."""
+        return self.redis is None and self.redis_error is not None
+
     @classmethod
     async def create(cls, redis_url: Optional[str], persistence: Any = None) -> "StateStore":
         """Connect to Redis when configured; otherwise return the memory
         fallback — durable when a persistence adapter is supplied, loud
         warning when not."""
+        redis_error: Optional[str] = None
         if redis_url:
             try:
                 from redis.asyncio import from_url as redis_from_url
@@ -378,14 +411,21 @@ class StateStore:
                     health_check_interval=30,
                 )
                 await client.ping()
-                logger.info("✅ StateStore: Redis connected — distributed state + locks active")
+                logger.info(
+                    f"✅ StateStore: Redis connected ({_redact_redis_url(redis_url)}) — "
+                    f"distributed state + locks active"
+                )
                 return cls(client)
             except Exception as e:
+                redis_error = f"{type(e).__name__}: {e}"
                 logger.error(
-                    f"⛔ StateStore: Redis unreachable ({e}) — falling back to "
-                    f"{'DURABLE memory (persistence adapter)' if persistence is not None else 'in-memory state — NOT safe for multi-worker deployments'}."
+                    f"⛔ StateStore: REDIS_URL is set ({_redact_redis_url(redis_url)}) but Redis is "
+                    f"UNREACHABLE ({redis_error}) — falling back to "
+                    f"{'DURABLE memory (persistence adapter)' if persistence is not None else 'in-memory state — NOT safe for multi-worker deployments'}. "
+                    f"Check the host/port/password and that this host is allow-listed at the Redis provider."
                 )
         store = cls(None, persistence=persistence)
+        store.redis_error = redis_error
         if store._persistence is not None:
             await store.hydrate()
             logger.info(
@@ -4328,7 +4368,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.34.0-gates-open"
+BOT_VERSION = "5.36.0-durable-disk"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -5927,6 +5967,116 @@ async def app_heartbeat(data: dict = Body(default={})):
 
 
 # ==================== DATABASE ====================
+# What the engine ACTUALLY ended up on, and why. "postgres" is only claimed
+# after a real round-trip; a configured-but-broken DATABASE_URL records the
+# reason rather than quietly reading as plain "sqlite".
+_db_backend: str = "none"
+_db_error: Optional[str] = None
+
+# Endpoints that are pgbouncer TRANSACTION poolers. asyncpg caches prepared
+# statements per connection, but a transaction pooler hands the same backend
+# to different sessions — the cache desyncs and throws
+# DuplicatePreparedStatementError under concurrency. Cache must be off.
+_POOLER_HINTS = ("pooler.supabase.com", "pgbouncer")
+_POOLER_PORTS = (6543,)
+# libpq-only query params. asyncpg takes none of these as kwargs, so a pasted
+# Supabase/Prisma URI dies with
+# `connect() got an unexpected keyword argument 'sslmode'`.
+_LIBPQ_ONLY_PARAMS = (
+    "sslmode", "pgbouncer", "channel_binding", "target_session_attrs",
+    "connect_timeout", "options", "application_name", "gssencmode",
+)
+
+
+def _mask_db_url(url: str) -> str:
+    """Keep host/port/db visible, never the password."""
+    try:
+        scheme, _, rest = url.partition("://")
+        if not rest:
+            return "<malformed>"
+        creds, at, hostpart = rest.rpartition("@")
+        if not at:
+            return f"{scheme}://{hostpart}"
+        user, colon, _pw = creds.partition(":")
+        return f"{scheme}://{user}{':***' if colon else ''}@{hostpart}"
+    except Exception:
+        return "<unparseable>"
+
+
+def _normalize_db_url(raw: str) -> Tuple[str, Dict[str, Any], List[str]]:
+    """Turn any provider's Postgres URL into one SQLAlchemy+asyncpg accepts.
+
+    Three independent things break a pasted connection string, and every one
+    of them fails in a way that looks like "the database is just down":
+
+    1. Driver — `postgres://` / `postgresql://` resolve to psycopg2, which is
+       not installed and is not async.
+    2. libpq-only query params — Supabase and Prisma hand out URIs carrying
+       `?sslmode=require` (and sometimes `pgbouncer=true`); asyncpg has no
+       such kwargs and raises TypeError before any connection is attempted.
+    3. Transaction pooling — against Supabase's pooler (or port 6543) the
+       prepared-statement cache must be disabled or writes fail sporadically
+       under load rather than at startup, which is far worse.
+
+    Returns (url, connect_args, notes). Pure — testable without a database.
+    """
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+    url = (raw or "").strip()
+    connect_args: Dict[str, Any] = {}
+    notes: List[str] = []
+    if not url:
+        return url, connect_args, notes
+
+    if url.startswith("postgres://"):
+        url = "postgresql+asyncpg://" + url[len("postgres://"):]
+        notes.append("driver→asyncpg")
+    elif url.startswith("postgresql://"):
+        url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+        notes.append("driver→asyncpg")
+    elif url.startswith("postgresql+") and "+asyncpg" not in url:
+        _prefix, rest = url.split("://", 1)
+        url = "postgresql+asyncpg://" + rest
+        notes.append("driver→asyncpg")
+
+    if not url.startswith("postgresql+asyncpg://"):
+        return url, connect_args, notes  # sqlite/other — leave untouched
+
+    parts = urlsplit(url)
+    kept: List[Tuple[str, str]] = []
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        lowered = key.lower()
+        if lowered == "sslmode":
+            if value.lower() in ("require", "verify-ca", "verify-full", "prefer", "allow"):
+                connect_args["ssl"] = True
+                notes.append(f"sslmode={value}→ssl=true")
+            else:
+                notes.append(f"sslmode={value} dropped")
+            continue
+        if lowered in _LIBPQ_ONLY_PARAMS:
+            notes.append(f"{key} dropped (libpq-only)")
+            continue
+        kept.append((key, value))
+    url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept), parts.fragment))
+
+    host = (parts.hostname or "").lower()
+    port: Optional[int]
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    pooled = (
+        any(hint in host for hint in _POOLER_HINTS)
+        or "pgbouncer=true" in raw.lower()
+        or (port in _POOLER_PORTS)
+    )
+    if pooled:
+        connect_args["statement_cache_size"] = 0
+        connect_args["prepared_statement_cache_size"] = 0
+        notes.append("pgbouncer pooler → prepared-statement cache disabled")
+    return url, connect_args, notes
+
+
 async def init_db():
     """Initialize the async DB engine used for token persistence.
 
@@ -5941,53 +6091,66 @@ async def init_db():
     hostname/credential problem when the connection still fails before
     falling back to SQLite so the bot keeps running.
     """
-    global engine, async_session
+    global engine, async_session, _db_backend, _db_error
     engine = None
     async_session = None
+    _db_backend = "none"
+    _db_error = None
 
     if DATABASE_URL:
-        url = DATABASE_URL.strip()
-        original_url_for_log = url
-        # Normalize common postgres URLs to the asyncpg driver.
-        if url.startswith("postgres://"):
-            url = "postgresql+asyncpg://" + url[len("postgres://"):]
-        elif url.startswith("postgresql://") and "+asyncpg" not in url:
-            url = "postgresql+asyncpg://" + url[len("postgresql://"):]
-        if url.startswith("postgresql+") and "+asyncpg" not in url:
-            # e.g. postgresql+psycopg2://… → force asyncpg
-            _prefix, rest = url.split("://", 1)
-            url = "postgresql+asyncpg://" + rest
-
+        url, connect_args, notes = _normalize_db_url(DATABASE_URL)
+        masked = _mask_db_url(url)
         try:
             import asyncpg  # noqa: F401  # ensure the driver is installed
-            engine = create_async_engine(
-                url,
-                echo=False,
-                pool_pre_ping=True,  # detect/recover stale cloud-DB connections
-            )
-            safe_log = url.split("@", 1)[1] if "@" in url else url
-            logger.info(f"✅ DATABASE_URL normalized — postgres engine created @ {safe_log}")
         except ImportError:
-            logger.warning(
-                "asyncpg not installed — cannot use postgres DATABASE_URL "
-                "(pip install asyncpg). Tokens will use the SQLite fallback "
-                "and will NOT persist across restarts."
-            )
-            engine = None
-        except Exception as conn_err:
-            masked = original_url_for_log.split("@")[-1] if "@" in original_url_for_log else original_url_for_log
+            _db_error = "asyncpg is not installed on this server"
             logger.error(
-                f"❌ Database connection FAILED (wrong hostname, port, credentials, "
-                f"SSL, or network issue): {conn_err} | DATABASE_URL host (masked): {masked}"
+                "⛔ DATABASE_URL is set but asyncpg is NOT INSTALLED — the postgres "
+                "URL cannot be used at all. Add `asyncpg>=0.29` to requirements.txt "
+                "and redeploy. Falling back to SQLite on the container's ephemeral "
+                "disk: tokens, durable state and the trade ledger will NOT survive a restart."
             )
-            logger.warning("→ Falling back to SQLite — tokens will NOT survive restarts until DATABASE_URL is fixed")
-            engine = None
+        else:
+            try:
+                engine = create_async_engine(
+                    url,
+                    echo=False,
+                    pool_pre_ping=True,  # detect/recover stale cloud-DB connections
+                    connect_args=connect_args,
+                )
+                # create_async_engine is LAZY — it opens no socket. A wrong
+                # host or password used to sail straight through this block and
+                # only surface later as a vague "table creation error", leaving
+                # a broken engine installed with NO SQLite fallback. Force a
+                # real round-trip here so the failure is attributable.
+                async with engine.connect() as conn:
+                    await conn.execute(sql_text("SELECT 1"))
+                _db_backend = "postgres"
+                suffix = f" [{', '.join(notes)}]" if notes else ""
+                logger.info(f"✅ Postgres connected @ {masked}{suffix}")
+            except Exception as conn_err:
+                _db_error = f"{type(conn_err).__name__}: {conn_err}"
+                if engine is not None:
+                    try:
+                        await engine.dispose()
+                    except Exception:
+                        pass
+                engine = None
+                logger.error(
+                    f"❌ DATABASE_URL is set but Postgres is UNREACHABLE @ {masked} — "
+                    f"{_db_error} (wrong host, port, password, SSL or network). "
+                    f"Falling back to SQLite on an ephemeral disk: tokens, durable "
+                    f"state and the trade ledger will NOT survive a restart."
+                )
 
     if engine is None:
         try:
             engine = create_async_engine("sqlite+aiosqlite:///etrade_cache.db", echo=False)
+            _db_backend = "sqlite"
         except Exception as sqlite_err:
             logger.error(f"Even the SQLite fallback failed: {sqlite_err}")
+            _db_backend = "none"
+            _db_error = _db_error or f"sqlite fallback failed: {sqlite_err}"
             engine = None
             async_session = None
             return  # bot continues without DB; tokens won't persist at all
@@ -5996,9 +6159,10 @@ async def init_db():
         async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        logger.info("✅ Database ready (tokens will persist across restarts)")
+        logger.info(f"✅ Database ready (backend: {_db_backend})")
     except Exception as e:
         logger.error(f"Database table creation / sessionmaker error: {e}")
+        _db_error = _db_error or f"{type(e).__name__}: {e}"
         async_session = None  # downstream checks must see the failure
 
 
@@ -6507,6 +6671,9 @@ def build_preflight(*,
                     entitlement: Optional[Dict[str, Any]] = None,
                     alert_webhook_configured: bool = False,
                     state_backend: str = "memory",
+                    state_error: Optional[str] = None,
+                    db_backend: str = "none",
+                    db_error: Optional[str] = None,
                     webhook_secret_set: bool = False,
                     killed: bool = False,
                     breaker_open: bool = False) -> Dict[str, Any]:
@@ -6586,10 +6753,38 @@ def build_preflight(*,
         "stop-outs and kill-switch trips happen silently.")
 
     durable = str(state_backend or "").lower() != "memory"
-    add("durable_state", durable,
-        f"state backend: {state_backend}",
-        "No Redis or Postgres is attached, so positions, guards and daily P&L live in process memory. "
-        "A restart loses the record of open trades — the bot would stop protecting positions it forgot.")
+    if state_error:
+        # REDIS_URL is set but the connection failed. This is strictly worse
+        # than having no Redis at all: the operator believes state is durable
+        # and it is not. Say exactly that instead of the generic message.
+        add("durable_state", False,
+            f"state backend: {state_backend} — REDIS_URL IS SET BUT UNREACHABLE ({state_error})",
+            "Redis is configured but the bot could not connect, so it silently fell back to process "
+            "memory — positions, trails, daily P&L and the kill switch will NOT survive a restart. "
+            "Verify the Redis host/port/password and that this server is allow-listed at the provider.")
+    else:
+        add("durable_state", durable,
+            f"state backend: {state_backend}",
+            "No Redis or Postgres is attached, so positions, guards and daily P&L live in process memory. "
+            "A restart loses the record of open trades — the bot would stop protecting positions it forgot.")
+
+    # The hash-chained trade ledger is the only record of what actually
+    # happened, and it lives on the container's ephemeral disk. Postgres is
+    # what makes it survive a redeploy — without it a restart rebuilds the
+    # "immutable" chain with 0 records and the learning loop starts blind.
+    if db_error:
+        add("durable_ledger", False,
+            f"database: {db_backend} — DATABASE_URL IS SET BUT UNUSABLE ({db_error})",
+            "Postgres is configured but the bot could not use it, so it fell back to SQLite on an "
+            "ephemeral disk. The trade ledger, E*TRADE tokens and durable state are all lost on the "
+            "next redeploy — which also forces a daily broker relink. Fix the connection string or "
+            "install asyncpg, then redeploy.")
+    else:
+        add("durable_ledger", db_backend == "postgres",
+            f"database: {db_backend}",
+            "No DATABASE_URL is attached, so the trade ledger and broker tokens live on the "
+            "container's ephemeral disk. A redeploy wipes the ledger the learning loop reads from "
+            "and de-links E*TRADE.")
 
     add("kill_switch", not killed, "kill switch armed" if killed else "kill switch clear",
         "The kill switch is engaged — clear it from the app when you intend to trade.", blocking=True)
@@ -10930,6 +11125,9 @@ async def _current_preflight() -> Dict[str, Any]:
         entitlement=_quote_entitlement,
         alert_webhook_configured=alerts.webhook_configured(),
         state_backend=state.backend_name if state else "memory",
+        state_error=(state.redis_error if state and state.redis_degraded else None),
+        db_backend=_db_backend,
+        db_error=_db_error,
         webhook_secret_set=bool(WEBHOOK_SECRET),
         killed=await state.is_killed() if state else False,
         breaker_open=await _breaker_is_open(),
