@@ -4548,7 +4548,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.39.0-conn-diagnosis"
+BOT_VERSION = "5.40.0-entry-pricing"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -9637,16 +9637,56 @@ def _resolve_expiry_string(payload: dict) -> Optional[str]:
 
 
 # ==================== OPTION PRICE SANITY ====================
-def _round_to_option_tick(price: float, direction: str = "nearest") -> float:
+# A quote that is itself off the $0.05/$0.10 grid is direct evidence from the
+# exchange that this contract accepts finer increments (penny pilot). Believing
+# that evidence matters: rounding a 2.42 ask UP to 2.45 pays 1.2% more on entry
+# before the trade has done anything, and on a strategy whose whole edge is a
+# few percent that is a material, silent tax. Verified against the live log --
+# AMD 470C quoted bid=2.32 ask=2.42, and the entry went in at 2.45, ABOVE the
+# offer.
+def _is_on_grid(value: float, tick: float) -> bool:
+    """True when `value` sits on the `tick` grid (float-noise tolerant)."""
+    if not (tick > 0) or value <= 0:
+        return True
+    return abs(round(value / tick) * tick - value) < 1e-6
+
+
+def _option_tick_from_quote(price: float, bid: float, ask: float) -> Optional[float]:
+    """The finest increment the LIVE QUOTE proves this contract accepts.
+
+    Returns 0.01 when either side of the quote is off the conservative grid,
+    otherwise None (meaning: keep the safe $0.05/$0.10 grid). Pure -- no I/O.
+
+    Conservative by construction: a penny quote can only ever be produced by a
+    venue that accepts penny orders, so this never invents permission that the
+    exchange has not already demonstrated. When the quote is missing or already
+    on the grid, nothing changes.
+    """
+    coarse = 0.05 if float(price or 0) < 3.0 else 0.10
+    for side in (bid, ask):
+        try:
+            value = float(side or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0 and not _is_on_grid(value, coarse):
+            return 0.01
+    return None
+
+
+def _round_to_option_tick(price: float, direction: str = "nearest", tick: Optional[float] = None) -> float:
     """Round an option premium to E*TRADE's accepted increments.
 
     E*TRADE Error 2040 rejects limit prices that aren't in valid increments:
     $0.05 ticks below $3.00 and $0.10 ticks at/above $3.00. Rounding to these
     ticks is accepted for ALL contracts (penny-pilot names simply allow finer
     increments too), so it is always safe.
+
+    `tick` overrides the conservative grid when the live quote has PROVEN the
+    contract trades in finer increments -- see `_option_tick_from_quote`.
     """
     price = max(0.01, float(price))
-    tick = 0.05 if price < 3.0 else 0.10
+    if tick is None or not (tick > 0):
+        tick = 0.05 if price < 3.0 else 0.10
     ticks = price / tick
     if direction == "up":
         ticks = math.ceil(ticks - 1e-9)
@@ -10001,7 +10041,21 @@ async def execute_live_order(payload: dict):
                             )
                         desired = real_ask
                     common["priceType"] = "LIMIT"
-                    common["limitPrice"] = _round_to_option_tick(desired, "up")
+                    # Believe the quote's own granularity before rounding UP
+                    # past the offer (see _option_tick_from_quote).
+                    quote_tick = _option_tick_from_quote(desired, real_bid, real_ask)
+                    priced = _round_to_option_tick(desired, "up", quote_tick)
+                    if priced > real_ask >= desired:
+                        # Never pay through the offer to satisfy a tick grid:
+                        # the ask is, by definition, a fillable price.
+                        on_ask = _round_to_option_tick(real_ask, "down", quote_tick)
+                        if on_ask >= real_bid:
+                            logger.info(
+                                f"entry tick: {priced} would cross above the {real_ask} "
+                                f"offer — using {on_ask} instead"
+                            )
+                            priced = on_ask
+                    common["limitPrice"] = priced
                 elif desired is not None:
                     # No real quote available — at minimum fix the tick size.
                     common["priceType"] = "LIMIT"
