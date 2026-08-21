@@ -66,6 +66,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -73,6 +74,116 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("etrade-bot.state")
+
+
+# Shapes people actually paste into a hosting dashboard's env field. Every one
+# of these produced an error that read like an outage instead of a typo:
+#
+#   redis-cli -u redis://…         provider docs show the CLI command, not the
+#                                  URL, so the whole command lands in the var
+#                                  and redis-py reports "URL must specify one of
+#                                  the following schemes" — as if the scheme
+#                                  were missing, when it is simply not first.
+#   "redis://…"                    quotes copied from a .env line
+#   REDIS_URL=redis://…            the whole assignment line
+#   psql 'postgresql://…'          same story for Postgres
+_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.I)
+_ASSIGNMENT_RE = re.compile(r"^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.+)$", re.S)
+
+# Template markers that were never filled in. `<project-ref>`/`<region>` come
+# straight from documentation; `[YOUR-PASSWORD]` is what Supabase's own copy
+# button puts on the clipboard. A URL carrying one of these is not a network
+# problem — it resolves to a hostname that cannot exist — so it must be named
+# differently from a genuine connection failure.
+_PLACEHOLDER_RE = re.compile(
+    r"<[^<>\s/@:]{1,60}>"                 # <project-ref>, <region>, <YOUR-PASSWORD>
+    r"|\[[^\[\]\s/@:]{2,60}\]"            # [YOUR-PASSWORD]  (IPv6 hosts contain ':' and are excluded)
+    r"|\bYOUR[_-]?[A-Z0-9]{2,40}\b"       # YOUR_PASSWORD, YOUR-ENDPOINT
+    r"|\bPASSWORD\b"                      # a bare literal PASSWORD
+)
+
+
+def unreplaced_placeholders(url: str) -> List[str]:
+    """Template markers left in a connection string, in order, de-duplicated.
+
+    Safe to log: these are literals from documentation, never real secrets.
+    """
+    seen: List[str] = []
+    for match in _PLACEHOLDER_RE.findall(url or ""):
+        if match not in seen:
+            seen.append(match)
+    return seen
+
+
+def sanitize_conn_url(raw: Optional[str]) -> Tuple[str, List[str]]:
+    """Recover the bare URL from however it was pasted.
+
+    Returns (url, notes). Notes name each repair so the boot log can say what
+    was corrected rather than silently accepting a mangled value. Pure and
+    total: never raises, never logs, and returns the input stripped when there
+    is nothing to repair.
+
+    Only unambiguous wrappers are removed. Anything that already parses as a
+    URL is returned untouched, so a legitimate password containing '=' or a
+    quote is never mangled.
+    """
+    notes: List[str] = []
+    text = (raw or "").strip()
+    if not text:
+        return "", notes
+
+    def _unquote(value: str) -> str:
+        while len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'`":
+            value = value[1:-1].strip()
+            if "surrounding quotes removed" not in notes:
+                notes.append("surrounding quotes removed")
+        return value
+
+    def _strip_stray_quotes(value: str) -> str:
+        """Drop an UNPAIRED quote. Removing a `psql '…'` wrapper eats the opening
+        quote and strands the closing one, which then becomes part of the
+        database name."""
+        cleaned = value.strip("\"'`")
+        if cleaned != value and "surrounding quotes removed" not in notes:
+            notes.append("surrounding quotes removed")
+        return cleaned
+
+    text = _unquote(text)
+
+    # `REDIS_URL=redis://…` / `export DATABASE_URL='postgres://…'`
+    if not _SCHEME_RE.match(text):
+        assigned = _ASSIGNMENT_RE.match(text)
+        if assigned and "://" in assigned.group(1):
+            text = _unquote(assigned.group(1).strip())
+            notes.append("VAR= assignment prefix removed")
+
+    # A shell command wrapping the URL (`redis-cli -u …`, `psql …`). Rewind
+    # from the first '://' across the scheme to find where the URL starts.
+    if not _SCHEME_RE.match(text):
+        marker = text.find("://")
+        if marker > 0:
+            start = marker
+            while start > 0 and (text[start - 1].isalnum() or text[start - 1] in "+-."):
+                start -= 1
+            dropped = text[:start].strip()
+            if dropped:
+                # Log the command name only — never the rest of the line, which
+                # can carry credentials in other flags.
+                notes.append(f"shell wrapper {dropped.split()[0]!r} removed")
+            text = _strip_stray_quotes(_unquote(text[start:].strip()))
+
+    # A URL cannot contain a raw space, so anything after one is a trailing
+    # shell argument (`… --tls`, `… -n 0`).
+    if re.search(r"\s", text):
+        text = text.split()[0]
+        notes.append("trailing arguments removed")
+
+    stripped = text.rstrip(";,")
+    if stripped != text:
+        text = stripped
+        notes.append("trailing punctuation removed")
+
+    return _strip_stray_quotes(_unquote(text)), notes
 
 
 def _redact_redis_url(url: str) -> str:
@@ -401,29 +512,56 @@ class StateStore:
         warning when not."""
         redis_error: Optional[str] = None
         if redis_url:
-            try:
-                from redis.asyncio import from_url as redis_from_url
-                client = redis_from_url(
-                    redis_url,
-                    decode_responses=True,
-                    socket_connect_timeout=5,
-                    socket_timeout=10,
-                    health_check_interval=30,
+            clean_url, repairs = sanitize_conn_url(redis_url)
+            if repairs:
+                # Say what was corrected. A silently-repaired value that then
+                # fails for a DIFFERENT reason is impossible to debug.
+                logger.warning(
+                    f"StateStore: REDIS_URL needed repair before use ({', '.join(repairs)}) — "
+                    f"using {_redact_redis_url(clean_url)}. Store just the URL itself in the "
+                    f"env var, not the surrounding shell command."
                 )
-                await client.ping()
-                logger.info(
-                    f"✅ StateStore: Redis connected ({_redact_redis_url(redis_url)}) — "
-                    f"distributed state + locks active"
+            holes = unreplaced_placeholders(clean_url)
+            if holes:
+                # Not a connection failure: the template was never filled in.
+                # Attempting the connect would report a DNS error and send the
+                # operator hunting a network problem that does not exist.
+                redis_error = (
+                    f"URL still contains unreplaced placeholder(s): {', '.join(holes)}"
                 )
-                return cls(client)
-            except Exception as e:
-                redis_error = f"{type(e).__name__}: {e}"
                 logger.error(
-                    f"⛔ StateStore: REDIS_URL is set ({_redact_redis_url(redis_url)}) but Redis is "
-                    f"UNREACHABLE ({redis_error}) — falling back to "
-                    f"{'DURABLE memory (persistence adapter)' if persistence is not None else 'in-memory state — NOT safe for multi-worker deployments'}. "
-                    f"Check the host/port/password and that this host is allow-listed at the Redis provider."
+                    f"⛔ StateStore: REDIS_URL is a TEMPLATE, not a connection string — "
+                    f"{', '.join(holes)} was never replaced with a real value "
+                    f"({_redact_redis_url(clean_url)}). Copy the URL from your Redis provider's "
+                    f"dashboard and set REDIS_URL to that exact value."
                 )
+            elif not clean_url:
+                redis_error = "REDIS_URL is set but empty after trimming"
+                logger.error("⛔ StateStore: REDIS_URL is set but empty.")
+            else:
+                try:
+                    from redis.asyncio import from_url as redis_from_url
+                    client = redis_from_url(
+                        clean_url,
+                        decode_responses=True,
+                        socket_connect_timeout=5,
+                        socket_timeout=10,
+                        health_check_interval=30,
+                    )
+                    await client.ping()
+                    logger.info(
+                        f"✅ StateStore: Redis connected ({_redact_redis_url(clean_url)}) — "
+                        f"distributed state + locks active"
+                    )
+                    return cls(client)
+                except Exception as e:
+                    redis_error = f"{type(e).__name__}: {e}"
+                    logger.error(
+                        f"⛔ StateStore: REDIS_URL is set ({_redact_redis_url(clean_url)}) but Redis is "
+                        f"UNREACHABLE ({redis_error}) — falling back to "
+                        f"{'DURABLE memory (persistence adapter)' if persistence is not None else 'in-memory state — NOT safe for multi-worker deployments'}. "
+                        f"Check the host/port/password and that this host is allow-listed at the Redis provider."
+                    )
         store = cls(None, persistence=persistence)
         store.redis_error = redis_error
         if store._persistence is not None:
@@ -4312,7 +4450,9 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 
 try:  # package-style import (python -m bot.main_bot) or flat (uvicorn main_bot:app)
-    from .state_store import StateStore, LockNotAcquired
+    from .state_store import (
+        StateStore, LockNotAcquired, sanitize_conn_url, unreplaced_placeholders,
+    )
     from .etrade_async import ETradeAsyncClient, ETradeAPIError, OTOCOUnsupported
     from . import reconciliation
     from . import alerts
@@ -4320,7 +4460,9 @@ try:  # package-style import (python -m bot.main_bot) or flat (uvicorn main_bot:
     from . import trailing_engine
     from . import scanner as scanner_mod
 except ImportError:
-    from state_store import StateStore, LockNotAcquired
+    from state_store import (
+        StateStore, LockNotAcquired, sanitize_conn_url, unreplaced_placeholders,
+    )
     from etrade_async import ETradeAsyncClient, ETradeAPIError, OTOCOUnsupported
     import reconciliation
     import alerts
@@ -4368,7 +4510,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.36.0-durable-disk"
+BOT_VERSION = "5.37.0-conn-strings"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -6006,9 +6148,12 @@ def _mask_db_url(url: str) -> str:
 def _normalize_db_url(raw: str) -> Tuple[str, Dict[str, Any], List[str]]:
     """Turn any provider's Postgres URL into one SQLAlchemy+asyncpg accepts.
 
-    Three independent things break a pasted connection string, and every one
+    Four independent things break a pasted connection string, and every one
     of them fails in a way that looks like "the database is just down":
 
+    0. How it was pasted — provider docs show a shell command (`psql '…'`) or
+       a whole `.env` line, so the var holds more than the URL. Handled by
+       `sanitize_conn_url` before anything else looks at it.
     1. Driver — `postgres://` / `postgresql://` resolve to psycopg2, which is
        not installed and is not async.
     2. libpq-only query params — Supabase and Prisma hand out URIs carrying
@@ -6022,9 +6167,8 @@ def _normalize_db_url(raw: str) -> Tuple[str, Dict[str, Any], List[str]]:
     """
     from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-    url = (raw or "").strip()
+    url, notes = sanitize_conn_url(raw)
     connect_args: Dict[str, Any] = {}
-    notes: List[str] = []
     if not url:
         return url, connect_args, notes
 
@@ -6100,9 +6244,36 @@ async def init_db():
     if DATABASE_URL:
         url, connect_args, notes = _normalize_db_url(DATABASE_URL)
         masked = _mask_db_url(url)
-        try:
-            import asyncpg  # noqa: F401  # ensure the driver is installed
-        except ImportError:
+        repairs = [n for n in notes if "removed" in n]
+        if repairs:
+            logger.warning(
+                f"DATABASE_URL needed repair before use ({', '.join(repairs)}) — using "
+                f"{masked}. Store just the URL itself in the env var, not the surrounding "
+                f"shell command."
+            )
+        holes = unreplaced_placeholders(url)
+        driver_missing = False
+        if not holes:
+            try:
+                import asyncpg  # noqa: F401  # ensure the driver is installed
+            except ImportError:
+                driver_missing = True
+
+        if holes:
+            # A template, not a connection string. Left alone this reports
+            # `gaierror: Name or service not known` — indistinguishable from a
+            # real DNS outage, so the operator debugs the network instead of
+            # re-reading their own env var.
+            _db_error = f"URL still contains unreplaced placeholder(s): {', '.join(holes)}"
+            logger.error(
+                f"⛔ DATABASE_URL is a TEMPLATE, not a connection string — "
+                f"{', '.join(holes)} was never replaced with a real value ({masked}). "
+                f"Copy the URI from Supabase → Project Settings → Database → Connection "
+                f"string, replace the password, and set DATABASE_URL to that exact value. "
+                f"Falling back to SQLite on an ephemeral disk: tokens, durable state and "
+                f"the trade ledger will NOT survive a restart."
+            )
+        elif driver_missing:
             _db_error = "asyncpg is not installed on this server"
             logger.error(
                 "⛔ DATABASE_URL is set but asyncpg is NOT INSTALLED — the postgres "
@@ -6757,11 +6928,17 @@ def build_preflight(*,
         # REDIS_URL is set but the connection failed. This is strictly worse
         # than having no Redis at all: the operator believes state is durable
         # and it is not. Say exactly that instead of the generic message.
+        templated = "placeholder" in state_error
         add("durable_state", False,
-            f"state backend: {state_backend} — REDIS_URL IS SET BUT UNREACHABLE ({state_error})",
-            "Redis is configured but the bot could not connect, so it silently fell back to process "
-            "memory — positions, trails, daily P&L and the kill switch will NOT survive a restart. "
-            "Verify the Redis host/port/password and that this server is allow-listed at the provider.")
+            f"state backend: {state_backend} — REDIS_URL IS "
+            f"{'A TEMPLATE' if templated else 'SET BUT UNREACHABLE'} ({state_error})",
+            ("REDIS_URL still has documentation placeholders in it, so it was never a real address — "
+             "state fell back to process memory. Copy the connection URL from your Redis provider's "
+             "dashboard and set REDIS_URL to that exact value, then redeploy.")
+            if templated else
+            ("Redis is configured but the bot could not connect, so it silently fell back to process "
+             "memory — positions, trails, daily P&L and the kill switch will NOT survive a restart. "
+             "Verify the Redis host/port/password and that this server is allow-listed at the provider."))
     else:
         add("durable_state", durable,
             f"state backend: {state_backend}",
@@ -6773,12 +6950,19 @@ def build_preflight(*,
     # what makes it survive a redeploy — without it a restart rebuilds the
     # "immutable" chain with 0 records and the learning loop starts blind.
     if db_error:
+        templated_db = "placeholder" in db_error
         add("durable_ledger", False,
-            f"database: {db_backend} — DATABASE_URL IS SET BUT UNUSABLE ({db_error})",
-            "Postgres is configured but the bot could not use it, so it fell back to SQLite on an "
-            "ephemeral disk. The trade ledger, E*TRADE tokens and durable state are all lost on the "
-            "next redeploy — which also forces a daily broker relink. Fix the connection string or "
-            "install asyncpg, then redeploy.")
+            f"database: {db_backend} — DATABASE_URL IS "
+            f"{'A TEMPLATE' if templated_db else 'SET BUT UNUSABLE'} ({db_error})",
+            ("DATABASE_URL still has documentation placeholders in it, so it could never have "
+             "resolved — the ledger fell back to SQLite on an ephemeral disk. Copy the URI from "
+             "Supabase → Project Settings → Database → Connection string, replace the password, "
+             "and set DATABASE_URL to that exact value, then redeploy.")
+            if templated_db else
+            ("Postgres is configured but the bot could not use it, so it fell back to SQLite on an "
+             "ephemeral disk. The trade ledger, E*TRADE tokens and durable state are all lost on the "
+             "next redeploy — which also forces a daily broker relink. Fix the connection string or "
+             "install asyncpg, then redeploy."))
     else:
         add("durable_ledger", db_backend == "postgres",
             f"database: {db_backend}",
