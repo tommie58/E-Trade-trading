@@ -303,6 +303,39 @@ class DistributedLock:
             finally: await lock.release()
     """
 
+    # REENTRANCY REGISTRY -- key -> (owning asyncio task, token, depth).
+    #
+    # One ticker's critical section is entered from nested call sites: the
+    # order path takes the position lock and then calls the re-arm helper,
+    # which takes it again. Without reentrancy that is a guaranteed
+    # self-deadlock against our own Redis key -- the outer hold can only be
+    # released by code that the inner acquire is blocking. Reentrancy is
+    # scoped to the OWNING TASK, so it never weakens mutual exclusion between
+    # concurrent workers (a different task still blocks normally); it only
+    # lets one task re-enter a section it already owns.
+    _owners: Dict[str, Tuple[Any, str, int]] = {}
+
+    @staticmethod
+    def _current_task() -> Any:
+        try:
+            return asyncio.current_task()
+        except RuntimeError:
+            return None
+
+    def _owner_entry(self) -> Optional[Tuple[Any, str, int]]:
+        """Live owner of this key, self-healing entries whose task is gone.
+        A crashed holder must not leave the key permanently 'owned' in-process
+        (Redis already expires the real lock via its TTL)."""
+        owner = DistributedLock._owners.get(self.key)
+        if owner is None:
+            return None
+        task = owner[0]
+        done = getattr(task, "done", None)
+        if task is not None and callable(done) and done():
+            DistributedLock._owners.pop(self.key, None)
+            return None
+        return owner
+
     def __init__(self, store: "StateStore", name: str, ttl_ms: int = 30_000,
                  wait_timeout: float = 10.0, retry_delay: float = 0.1) -> None:
         self._store = store
@@ -312,10 +345,22 @@ class DistributedLock:
         self.retry_delay = retry_delay
         self.token = uuid.uuid4().hex
         self.acquired = False
+        self.reentrant = False
 
     async def try_acquire(self) -> bool:
+        task = self._current_task()
+        owner = self._owner_entry()
+        if owner is not None and task is not None and owner[0] is task:
+            # Already ours on this task -- re-enter instead of deadlocking.
+            DistributedLock._owners[self.key] = (owner[0], owner[1], owner[2] + 1)
+            self.token = owner[1]
+            self.acquired = True
+            self.reentrant = True
+            return True
         ok = await self._store._set_raw(self.key, self.token, px=self.ttl_ms, nx=True)
         self.acquired = bool(ok)
+        if self.acquired and task is not None:
+            DistributedLock._owners[self.key] = (task, self.token, 1)
         return self.acquired
 
     async def acquire(self) -> None:
@@ -336,6 +381,18 @@ class DistributedLock:
         if not self.acquired:
             return
         self.acquired = False
+        owner = DistributedLock._owners.get(self.key)
+        if owner is not None and owner[1] == self.token:
+            depth = owner[2] - 1
+            if depth > 0:
+                # An INNER release: the outermost holder still owns this
+                # section. Dropping the Redis key here would expose the rest
+                # of the outer critical section to a concurrent worker.
+                DistributedLock._owners[self.key] = (owner[0], owner[1], depth)
+                return
+            DistributedLock._owners.pop(self.key, None)
+        if self.reentrant:
+            return
         await self._store._release_lock(self.key, self.token)
 
     async def __aenter__(self) -> "DistributedLock":
@@ -768,6 +825,10 @@ class StateStore:
         return await self._memory.lpop(key)
 
     # ---------------- positions ----------------
+    # Broker-truth fields a stale writer must never revert (see
+    # `_reconcile_stale_write`).
+    _TRUTH_FIELDS = ("entry", "entry_premium")
+
     @staticmethod
     def _pos_key(ticker: str) -> str:
         return f"open_positions:{ticker.upper()}"
@@ -797,8 +858,69 @@ class StateStore:
         if self._persistence is not None:
             await self._persist_set_members(index_key)
 
+    def _reconcile_stale_write(self, ticker: str, incoming: dict, current: dict) -> dict:
+        """Merge a write whose author never saw the newest record.
+
+        Last-writer-wins is fine for derived fields (watermarks, timestamps,
+        tier labels) -- the next pass recomputes them. It is NOT fine for two
+        classes of field, which this repairs:
+
+        1. ENTRY BASIS. `entry`/`entry_premium` start as the sanitized LIMIT
+           price and are replaced ONCE with the broker's real average fill.
+           A stale snapshot writes the pre-true-up price back, and every P&L
+           number downstream then measures from a price that never traded.
+        2. A SIZE THAT SHRANK. After a partial stop fill the position is
+           smaller. A stale writer resurrects the old larger size, and the bot
+           then tries to sell contracts it no longer holds.
+
+        Sizes are only ever carried forward DOWNWARD here: entry partials
+        legitimately grow a position, and those writes come from the guard
+        worker reading fresh state, so growth is never suppressed.
+        """
+        merged = dict(incoming)
+        reverted: List[str] = []
+        for field in self._TRUTH_FIELDS:
+            stored_val = current.get(field)
+            if stored_val is None or merged.get(field) == stored_val:
+                continue
+            merged[field] = stored_val
+            reverted.append(field)
+        for field in ("filled_qty", "qty"):
+            try:
+                stored_n = int(current.get(field) or 0)
+                incoming_n = int(merged.get(field) or 0)
+            except (TypeError, ValueError):
+                continue
+            if stored_n and incoming_n > stored_n:
+                merged[field] = stored_n
+                reverted.append(field)
+        if reverted:
+            logger.warning(
+                f"[STATE] {ticker} stale position write blocked from reverting "
+                f"{', '.join(reverted)} (rev {incoming.get('_rev')} -> {current.get('_rev')}) "
+                f"-- broker truth preserved"
+            )
+        return merged
+
     async def set_position(self, ticker: str, position: dict) -> None:
         ticker = ticker.upper()
+        position = dict(position)
+        # LOST-UPDATE GUARD. Every record carries a monotonic `_rev`. A caller
+        # that read the position, awaited a broker round-trip, then wrote back
+        # is holding a snapshot that may predate another worker's write; the
+        # per-ticker position lock is what prevents that interleaving, and this
+        # is the backstop that catches any writer not holding it.
+        current = await self.get_position(ticker)
+        stored_rev = int((current or {}).get("_rev") or 0)
+        base_rev = position.get("_rev")
+        if current is not None and base_rev is not None:
+            try:
+                is_stale = int(base_rev) < stored_rev
+            except (TypeError, ValueError):
+                is_stale = False
+            if is_stale:
+                position = self._reconcile_stale_write(ticker, position, current)
+        position["_rev"] = stored_rev + 1
         payload = _dumps(position)
         await self._set_raw(self._pos_key(ticker), payload)
         if self.redis is None and self._durable_kv(self._pos_key(ticker), None, None):
@@ -1009,6 +1131,25 @@ class StateStore:
     # ---------------- locks ----------------
     def lock(self, name: str, ttl_ms: int = 30_000, wait_timeout: float = 10.0) -> DistributedLock:
         return DistributedLock(self, name, ttl_ms=ttl_ms, wait_timeout=wait_timeout)
+
+    def position_lock(self, ticker: str, ttl_ms: int = 120_000,
+                      wait_timeout: float = 30.0) -> DistributedLock:
+        """THE per-ticker mutation lock. Every worker that reads a position,
+        talks to the broker, then writes the position back must hold this for
+        the whole read-modify-write -- the order path, the trailing ratchet and
+        the stop guard's mutations all serialize on this one key.
+
+        It is deliberately NOT the stop guard's `guard:{ticker}` lock. That one
+        elects a single guard worker per ticker and is held for the guard's
+        entire lifetime (minutes); reusing it as the mutation lock would either
+        make the order path wait minutes, or make a trail pass holding it cause
+        the guard worker's `try_acquire` to fail and skip guarding the ticker
+        altogether -- trading a lost update for an unprotected position.
+
+        Lock ordering is always `guard:{ticker}` -> `pos:{ticker}`; nothing
+        acquires them the other way round, so the pair cannot deadlock.
+        """
+        return self.lock(f"pos:{str(ticker).upper()}", ttl_ms=ttl_ms, wait_timeout=wait_timeout)
 
     # ---------------- legacy STATE_FILE migration ----------------
     async def migrate_from_file(self, path: Path) -> bool:
@@ -4477,6 +4618,7 @@ import asyncio
 import hashlib
 import hmac
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime, date, time as dtime, timezone
 from zoneinfo import ZoneInfo
@@ -4548,7 +4690,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.40.0-entry-pricing"
+BOT_VERSION = "5.43.0-position-locking"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -7426,6 +7568,10 @@ def _final_cancel_verdict(verdict: str, status: str, call_ok: bool, broker_answe
     """
     if verdict == "filled":
         return CANCEL_FILLED
+    # A partial fill is its own outcome: units were sold AND the order is gone,
+    # so the caller must both book the slice and re-protect the remainder.
+    if verdict == "partial":
+        return CANCEL_PARTIAL
     if verdict == "terminal":
         if str(status or "").upper() == "NOT_FOUND" and not (call_ok or broker_answered):
             return CANCEL_LIVE
@@ -7460,6 +7606,10 @@ _RETRYABLE_ERROR_MARKERS = (
     "timeout", "timed out", "connection", "temporarily", "unavailable",
     "reset by peer", "max retries", "401", "unauthorized",
 )
+# Structured equivalent of the numeric markers above, used whenever the
+# exception carries a real HTTP status. Mirrors etrade_async.RETRYABLE_STATUSES
+# plus 401 (tokens briefly 401 right after issue/renewal).
+_RETRYABLE_STATUSES = {401, 408, 429, 500, 502, 503, 504}
 
 
 def _backoff_delay(attempt: int, exact: bool = False) -> float:
@@ -7473,16 +7623,57 @@ def _backoff_delay(attempt: int, exact: bool = False) -> float:
     return delay * (0.5 + random.random() * 0.5)
 
 
+# A 429 that is genuinely an HTTP status, not a digit sequence inside an order
+# id, strike, quantity or price. `"429" in str(e)` matched order id 14293,
+# "strikePrice 429", quantity 4290 and "$1.429" — and since a throttle is the
+# ONE condition that lets a non-idempotent ORDER PLACEMENT retry, any such
+# rejection was re-sent up to 4 times, risking duplicate live positions.
+_THROTTLE_TEXT_RE = re.compile(
+    r"(?:\b(?:http|https|status|status_code|code|error|response)\W{0,3}429\b)"
+    r"|(?:\b429\b\W{0,3}(?:too\s+many|rate\s*limit|throttl))"
+    r"|(?:too\s+many\s+requests)"
+    r"|(?:rate\s*limit)",
+    re.IGNORECASE,
+)
+
+
+def _http_status_of(e: Exception) -> Optional[int]:
+    """HTTP status carried by the exception, when it has one.
+
+    `ETradeAPIError` (etrade_async) always carries `.status_code`; the sync
+    pyetrade paths raise plain exceptions that do not."""
+    code = getattr(e, "status_code", None)
+    if isinstance(code, bool):
+        return None
+    if isinstance(code, int) and 100 <= code <= 599:
+        return code
+    return None
+
+
 def _is_throttle(e: Exception) -> bool:
-    """429 rate-limit errors: the broker never processed the request, so a
-    retry is safe even for order placement."""
-    return "429" in str(e)
+    """True only for a real 429 rate-limit response.
+
+    The broker never processed a throttled request, which is why this is the
+    single exception to the exactly-once rule for order placement. It must
+    therefore be exact: prefer the structured status, and fall back to text
+    only for an unambiguous throttle phrasing."""
+    code = _http_status_of(e)
+    if code is not None:
+        return code == 429
+    return bool(_THROTTLE_TEXT_RE.search(str(e)))
 
 
 def _is_retryable_error(e: Exception) -> bool:
     """Transient broker failures worth retrying: throttles (429), 5xx, network
     drops, and 401s (E*TRADE tokens briefly 401 right after issue/renewal).
-    Validation rejections (1011/2040/2009, missing params) are NOT retried."""
+    Validation rejections (1011/2040/2009, missing params) are NOT retried.
+
+    Status-first for the same reason as `_is_throttle`: the bare numeric
+    markers below match digits anywhere in the message, so an order id or a
+    strike could disguise a hard validation rejection as a transient blip."""
+    code = _http_status_of(e)
+    if code is not None:
+        return code in _RETRYABLE_STATUSES
     text = str(e).lower()
     return any(marker in text for marker in _RETRYABLE_ERROR_MARKERS)
 
@@ -7641,7 +7832,7 @@ FUNDS_SAFETY_MARGIN = float(os.getenv("FUNDS_SAFETY_MARGIN", "0.95"))
 
 async def _place_entry_with_funds_clamp(
     kind: str, common: dict, tokens: Dict[str, str], unit_cost: Optional[float] = None,
-) -> Tuple[Any, int]:
+) -> Tuple[Any, int, str]:
     """Place an ENTRY order with three layers of funds protection:
 
     1. PRE-FLIGHT (proactive): when the per-unit cost is known, clamp the
@@ -7655,7 +7846,14 @@ async def _place_entry_with_funds_clamp(
        entries can't over-spend between broker balance refreshes.
 
     Never used for closes — a close must always cover the full position.
-    Returns (broker_response, quantity_actually_sent).
+
+    Returns (broker_response, quantity_actually_sent, effective_client_order_id).
+    The client id is returned because the clamped retry ROTATES it. The stop
+    guard is armed with whatever id it is handed, and `_order_state` falls back
+    to matching on clientOrderId whenever the numeric orderId is unreadable —
+    so handing it the original id made a clamped entry permanently unmatchable
+    ("NOT_FOUND"), and the guard then cancelled and deleted a position that may
+    well have been filled and live.
     """
     requested = int(common["quantity"])
     unit_name = "contract" if kind == "option" else "share"
@@ -7684,6 +7882,7 @@ async def _place_entry_with_funds_clamp(
             )
 
     placed_qty = requested
+    effective_client_id = str(common.get("clientOrderId") or "")
     try:
         final = await _place_order_smart(kind, common, tokens)
     except Exception as e:
@@ -7698,6 +7897,7 @@ async def _place_entry_with_funds_clamp(
         # A rejected order may still burn the clientOrderId — retry with a
         # fresh one (E*TRADE caps clientOrderId at 20 chars).
         retry["clientOrderId"] = (str(common["clientOrderId"])[:19] + "R")
+        effective_client_id = str(retry["clientOrderId"])
         logger.warning(
             f"💰 Insufficient funds for qty={requested} {common.get('symbol')} — "
             f"broker max ≈{max_qty}; retrying ONCE with clamped qty={clamped}"
@@ -7710,7 +7910,7 @@ async def _place_entry_with_funds_clamp(
             await state.adjust_balance(-float(unit_cost) * placed_qty)
         except Exception as e:
             logger.warning(f"balance debit failed (non-fatal): {e}")
-    return final, placed_qty
+    return final, placed_qty, effective_client_id
 
 
 async def _order_state(order_id: Optional[str], client_id: Optional[str]) -> Tuple[str, int]:
@@ -7899,6 +8099,35 @@ def plan_entry_reprice(app_limit, qty, real_price) -> Dict[str, Any]:
 # execution price and TRUES UP the tracked entry the moment a fill is seen.
 
 
+@asynccontextmanager
+async def _position_section(ticker: str, why: str, wait_timeout: float = 5.0):
+    """Best-effort per-ticker position lock that NEVER raises.
+
+    Some read-modify-writes sit inside error handlers whose `except` branch
+    undoes real broker state -- the stop-guard's placement block clears
+    `stop_order_id` when it catches an exception. A lock timeout raising into
+    that handler would disarm a stop that had actually been placed, so those
+    sites need a section that degrades instead of throwing. When the lock is
+    unavailable the write still proceeds: `set_position`'s revision guard is
+    the backstop that stops a stale snapshot reverting broker truth.
+    """
+    lock = state.position_lock(ticker, wait_timeout=wait_timeout)
+    held = False
+    try:
+        try:
+            await lock.acquire()
+            held = True
+        except LockNotAcquired:
+            logger.warning(
+                f"[STATE] {ticker} position lock busy for {why} — proceeding unlocked "
+                f"(the revision guard still protects broker truth)"
+            )
+        yield held
+    finally:
+        if held:
+            await lock.release()
+
+
 async def _true_up_entry_fill(ticker: str, guard: dict) -> bool:
     """Replace the position's booked entry (the sanitized LIMIT price) with the
     broker's ACTUAL average execution price for the entry order. Options true
@@ -7923,16 +8152,29 @@ async def _true_up_entry_fill(ticker: str, guard: dict) -> bool:
         return False
     if actual <= 0:
         return False
-    pos = await state.get_position(ticker)
-    if not pos:
-        return True  # price readable but nothing tracked — nothing to true up
-    is_option = bool(pos.get("contract"))
-    key = "entry_premium" if is_option else "entry"
-    booked = float(pos.get(key) or 0)
-    if booked > 0 and abs(actual - booked) / booked < 0.001:
-        return True  # already accurate
-    pos[key] = round(actual, 4)
-    await state.set_position(ticker, pos)
+    # The read-modify-write below must be atomic against the trailing ratchet,
+    # which reads a position, spends seconds on broker round-trips, then writes
+    # its snapshot back. Unlocked, that snapshot still carries the pre-true-up
+    # LIMIT price and silently reverts the real fill booked here.
+    try:
+        pos_lock = state.position_lock(ticker)
+        await pos_lock.acquire()
+    except LockNotAcquired:
+        logger.info(f"[ENTRY FILL] {ticker} position busy — truing up on the next poll")
+        return False
+    try:
+        pos = await state.get_position(ticker)
+        if not pos:
+            return True  # price readable but nothing tracked — nothing to true up
+        is_option = bool(pos.get("contract"))
+        key = "entry_premium" if is_option else "entry"
+        booked = float(pos.get(key) or 0)
+        if booked > 0 and abs(actual - booked) / booked < 0.001:
+            return True  # already accurate
+        pos[key] = round(actual, 4)
+        await state.set_position(ticker, pos)
+    finally:
+        await pos_lock.release()
     drift = round((actual - booked) / booked * 100.0, 2) if booked > 0 else None
     await trade_ledger.record("entry_fill_trued", {
         "ticker": ticker,
@@ -7959,6 +8201,13 @@ CANCEL_NONE = "none"
 CANCEL_CONFIRMED = "cancelled"
 CANCEL_FILLED = "filled"
 CANCEL_LIVE = "live"
+# A stop that filled SOME of its size and then died. Neither "the position is
+# flat" nor "nothing happened": part of the position was sold and the rest is
+# still held — with no protection resting behind it, because the order that
+# was protecting it is gone. Callers must book the sold slice and re-arm the
+# remainder; treating it as CANCEL_FILLED booked the WHOLE position closed and
+# left real contracts naked at the broker.
+CANCEL_PARTIAL = "partial"
 
 # Broker statuses that PROVE the order is no longer working AND that the broker
 # has released the shares/contracts it had pledged to it.
@@ -7973,22 +8222,43 @@ _CANCEL_PENDING_STATUSES = {"CANCEL_REQUESTED", "CANCEL_REQUEST", "CANCELLING"}
 _CANCEL_CONFIRMED_STATUSES = _CANCEL_TERMINAL_STATUSES | _CANCEL_PENDING_STATUSES
 
 
-def classify_cancel_status(status: Optional[str], filled: int) -> str:
+def classify_cancel_status(status: Optional[str], filled: int,
+                           ordered: Optional[int] = None) -> str:
     """Pure classification of a broker order status during a cancel.
 
-    Returns 'filled' | 'terminal' | 'pending' | 'working'.
+    Returns 'filled' | 'partial' | 'terminal' | 'pending' | 'working'.
 
     'terminal' is the ONLY verdict that means the broker has released the
     shares/contracts. 'pending' means the cancel was accepted but the allocation
     is still held — anything sent now races the broker and loses.
+
+    'partial' needs `ordered` (how many units the order was placed for). A stop
+    on 4 contracts that filled 1 and then cancelled used to return 'filled',
+    and every caller reads that as "the position is flat": the whole position
+    was booked closed and popped from state, while 3 real contracts stayed at
+    the broker with no stop, no trail and no risk accounting — surfacing much
+    later, if at all, as an `untracked_position` alert that never auto-closes.
+
+    When `ordered` is unknown the verdict is unchanged from before, so callers
+    that cannot supply it keep today's behaviour.
+
+    The ambiguity is resolved TOWARD 'partial' on purpose. Misreading a
+    complete fill as partial costs a rejected re-arm on a phantom remainder —
+    noisy, harmless. Misreading a partial as complete leaves live contracts
+    unprotected, which is the failure this exists to prevent.
     """
     s = str(status or "").upper().strip()
     try:
         filled_n = int(filled or 0)
     except (TypeError, ValueError):
         filled_n = 0
+    try:
+        ordered_n = int(ordered) if ordered is not None else 0
+    except (TypeError, ValueError):
+        ordered_n = 0
+    is_partial = 0 < filled_n < ordered_n
     if s == "EXECUTED" or (filled_n > 0 and s in _CANCEL_CONFIRMED_STATUSES):
-        return "filled"
+        return "partial" if is_partial else "filled"
     if s in _CANCEL_TERMINAL_STATUSES:
         return "terminal"
     if s in _CANCEL_PENDING_STATUSES:
@@ -7996,10 +8266,15 @@ def classify_cancel_status(status: Optional[str], filled: int) -> str:
     return "working"
 
 
-async def _await_cancel_settled(order_id: str) -> Tuple[str, int, str]:
+async def _await_cancel_settled(order_id: str,
+                                expected_qty: Optional[int] = None) -> Tuple[str, int, str]:
     """Poll the broker until a cancelled order reaches a TERMINAL status, so the
     allocation it held is provably released before we place anything against the
     same contract. Returns (verdict, filled, last_status).
+
+    `expected_qty` is how many units the order was placed for. The bot placed
+    the order itself, so the caller always knows this — and it is what lets a
+    PARTIAL fill be told apart from a complete one.
 
     Bounded by CANCEL_SETTLE_TIMEOUT_SECONDS — this sits in the trailing-ratchet
     and panic-exit paths, so it must never block them indefinitely.
@@ -8010,11 +8285,11 @@ async def _await_cancel_settled(order_id: str) -> Tuple[str, int, str]:
     while True:
         try:
             status, filled = await _order_state(str(order_id), None)
-            verdict = classify_cancel_status(status, filled)
+            verdict = classify_cancel_status(status, filled, expected_qty)
         except Exception as e:
             logger.warning(f"cancel verification unavailable for order {order_id}: {e}")
             verdict, status = "working", "UNKNOWN"
-        if verdict in ("filled", "terminal"):
+        if verdict in ("filled", "partial", "terminal"):
             return verdict, filled, status
         if time.time() >= deadline:
             return verdict, filled, status
@@ -8052,7 +8327,8 @@ async def _cancel_order_call(order_id: str) -> None:
     await _etrade_call(orders.cancel_order, acct_key, int(order_id), resp_format="json", source="cancel_order")
 
 
-async def _cancel_order_verified(order_id: Optional[str]) -> str:
+async def _cancel_order_verified(order_id: Optional[str],
+                                 expected_qty: Optional[int] = None) -> str:
     """Cancel a resting broker order and VERIFY the outcome against the
     broker's own order book. Returns one of:
 
@@ -8061,7 +8337,13 @@ async def _cancel_order_verified(order_id: Optional[str]) -> str:
                          or send a closing order
       CANCEL_FILLED    — the order EXECUTED (the stop triggered): the position
                          is already flat — never replace it, never sell again
+      CANCEL_PARTIAL   — the order filled SOME units and then died: book the
+                         sold slice, then re-protect / close the remainder
       CANCEL_LIVE      — not confirmed gone; assume it may still fill
+
+    Pass `expected_qty` (the size the order was placed for) to enable the
+    CANCEL_PARTIAL verdict. Without it a partial fill still reads as
+    CANCEL_FILLED, which books the whole position closed.
 
     Verification is what makes this trustworthy. The cancel *call* can fail for
     reasons that have nothing to do with the broker (empty body, dropped
@@ -8090,7 +8372,7 @@ async def _cancel_order_verified(order_id: Optional[str]) -> str:
     # Wait for the broker to actually retire the order. Returning on the first
     # CANCEL_REQUESTED is what caused every "not enough available contracts"
     # rejection: the order was dying, but its allocation was still held.
-    verdict, filled, status = await _await_cancel_settled(str(order_id))
+    verdict, filled, status = await _await_cancel_settled(str(order_id), expected_qty)
 
     outcome = _final_cancel_verdict(verdict, status, call_ok, broker_answered)
     if outcome == CANCEL_FILLED:
@@ -8099,6 +8381,13 @@ async def _cancel_order_verified(order_id: Optional[str]) -> str:
             f"(status={status}, filled={filled}) — treating as FILLED, not cancelled"
         )
         return CANCEL_FILLED
+    if outcome == CANCEL_PARTIAL:
+        logger.warning(
+            f"[CANCEL] order {order_id} PARTIALLY filled at the broker "
+            f"(status={status}, filled={filled} of {expected_qty}) — the sold slice must be "
+            f"booked and the remainder re-protected"
+        )
+        return CANCEL_PARTIAL
     if verdict == "terminal":
         if outcome == CANCEL_LIVE:
             # NOT_FOUND after a FAILED cancel call proves nothing — the order
@@ -8295,15 +8584,61 @@ async def _place_option_protective_stop(ticker: str, contract: dict, qty: int, s
     return {"order_id": order_id, "client_id": client_id, "qty": int(qty), "stop": stop_px}
 
 
+# Hard ceiling on replacement flattens. Past this the bot stops sending market
+# orders and escalates to a human: repeatedly re-selling a position it cannot
+# verify is how an unprotected long becomes a naked short.
+_MAX_FLATTEN_ATTEMPTS = 3
+
+
 async def _emergency_flatten(ticker: str, guard: dict, qty: int) -> Optional[str]:
     """LAST-RESORT market close of a filled-but-unprotected entry (stop
-    placement timeout). Certainty of fill beats price — always MARKET."""
+    placement timeout). Certainty of fill beats price — always MARKET.
+
+    IDEMPOTENT. The guard retries this on failure roughly once a second, and a
+    read timeout can raise AFTER the market sell already reached the broker.
+    Blindly minting a new clientOrderId each time turned one unprotected long
+    into a naked short — oversold by every retry. So: any previous attempt is
+    verified at the broker first, and a replacement only goes out when the
+    prior order is provably absent."""
+    prior_id = guard.get("flatten_order_id")
+    prior_client = guard.get("flatten_client_id")
+    if prior_id or prior_client:
+        # Never re-place while a prior flatten is unaccounted for. If the
+        # broker cannot be reached we must stay blocked: an unverified retry is
+        # exactly the oversell this guard is meant to prevent.
+        p_status, p_filled = await _order_state(prior_id, prior_client)
+        if p_filled > 0 or p_status not in _TERMINAL_ORDER_STATUSES:
+            # Filled, partially filled, or still working — this IS the flatten.
+            logger.warning(
+                f"[FLATTEN] {ticker} reusing in-flight flatten {prior_id} "
+                f"(status={p_status}, filled={p_filled}) — not re-placing"
+            )
+            return prior_id
+        if p_status == "EXECUTED":
+            return prior_id
+        attempts = int(guard.get("flatten_attempts") or 0)
+        if attempts >= _MAX_FLATTEN_ATTEMPTS:
+            raise Exception(
+                f"flatten for {ticker} abandoned after {attempts} attempts "
+                f"(last order {prior_id} ended {p_status}) — manual close required"
+            )
+        logger.error(
+            f"[FLATTEN] {ticker} prior flatten {prior_id} ended {p_status} unfilled "
+            f"— placing replacement (attempt {attempts + 1}/{_MAX_FLATTEN_ATTEMPTS})"
+        )
     tokens = load_tokens()
     if not tokens:
         raise Exception("E*TRADE tokens not set")
     acct_key = await _resolve_account_id_key(tokens)
     client_id = str(uuid.uuid4().int)[:18]
     is_option = str(guard.get("kind") or "equity") == "option"
+    # Record the attempt BEFORE sending: if the send raises after the order
+    # lands, the id must already be persisted or the retry cannot find it.
+    await state.update_guard(
+        ticker,
+        flatten_client_id=client_id,
+        flatten_attempts=int(guard.get("flatten_attempts") or 0) + 1,
+    )
     if is_option:
         contract = dict(guard.get("contract") or {})
         if not contract.get("right") or not contract.get("expiration"):
@@ -8339,7 +8674,9 @@ async def _emergency_flatten(ticker: str, guard: dict, qty: int) -> Optional[str
             allOrNone=False,
         )
         placed = await _place_order_smart("equity", common, tokens)
-    return _order_id_from_place(placed)
+    flatten_id = _order_id_from_place(placed)
+    await state.update_guard(ticker, flatten_order_id=flatten_id)
+    return flatten_id
 
 
 async def _place_option_market_close(ticker: str, contract: dict, qty: int) -> Optional[str]:
@@ -8415,9 +8752,30 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
     # naked short. CANCEL_FILLED means the stop beat us — the position is flat
     # and there is nothing left to scale.
     if stop_order_id:
-        outcome = await _cancel_order_verified(stop_order_id)
+        outcome = await _cancel_order_verified(stop_order_id, expected_qty=qty)
         if outcome == CANCEL_FILLED:
             logger.warning(f"[SCALE-OUT] {ticker} protective stop filled first — nothing to scale")
+            return False
+        if outcome == CANCEL_PARTIAL:
+            # The stop beat us to PART of the position. The split we computed
+            # above is now sized against contracts that no longer exist — book
+            # what sold, re-protect the rest, and let the next pass re-plan.
+            remaining = await _handle_partial_stop_fill(
+                ticker, stop_order_id, pos.get("stop_premium"), "scale_out_stop_partial",
+            )
+            if remaining > 0:
+                fresh = await state.get_position(ticker)
+                if fresh:
+                    try:
+                        await _reconcile_rearm_guard(ticker, dict(fresh))
+                    except Exception as e:
+                        logger.error(f"[SCALE-OUT] {ticker} re-arm after partial stop fill FAILED: {e}")
+                        await alerts.send(
+                            "critical", "partial_fill_unprotected",
+                            f"{ticker}: the protective stop filled part of the position and the "
+                            f"remaining {remaining} could NOT be re-protected — close them manually: {e}",
+                            dedupe_key=f"partial_unprotected:{ticker}",
+                        )
             return False
         if outcome != CANCEL_CONFIRMED:
             logger.warning(
@@ -8629,8 +8987,46 @@ async def _stop_guard_worker(ticker: str) -> None:
                     # Replace flow: only place a new stop if the old one is truly
                     # cancelled — never risk two live stops double-selling, and
                     # never re-arm behind a stop that already filled.
-                    replace_outcome = await _cancel_order_verified(guard.get("stop_order_id"))
+                    replace_outcome = await _cancel_order_verified(
+                        guard.get("stop_order_id"), expected_qty=guarded,
+                    )
                     can_place = replace_outcome == CANCEL_CONFIRMED
+                    if replace_outcome == CANCEL_PARTIAL:
+                        # The stop sold part of the position. The guard's model
+                        # (entry filled N, stop covers N) no longer describes
+                        # reality, and placing a stop for `filled` would
+                        # over-commit and be rejected 3004. Book the slice and
+                        # hand the remainder to the reconciler's re-arm path,
+                        # which sizes from the position itself.
+                        remaining = await _handle_partial_stop_fill(
+                            ticker, guard.get("stop_order_id"), guard.get("stop"),
+                            "guard_stop_partial",
+                        )
+                        if remaining <= 0:
+                            await _finish_guard(ticker, "closed_by_stop")
+                            return
+                        fresh = await state.get_position(ticker)
+                        try:
+                            if fresh:
+                                await _reconcile_rearm_guard(ticker, dict(fresh))
+                            await _finish_guard(ticker, "partial_fill_reprotected")
+                        except Exception as e:
+                            logger.error(
+                                f"[STOP GUARD] {ticker} re-arm after partial stop fill FAILED: {e}"
+                            )
+                            # Finish the guard anyway: while it stays un-done
+                            # `guard_owns_stop` keeps the reconciler's
+                            # UNPROTECTED sweep from touching this position,
+                            # and that sweep is the safety net that re-arms it.
+                            await _finish_guard(ticker, "partial_fill_unprotected")
+                            await alerts.send(
+                                "critical", "partial_fill_unprotected",
+                                f"{ticker}: the protective stop filled part of the position and the "
+                                f"remaining {remaining} could NOT be re-protected — the reconciler "
+                                f"will retry, but verify at your broker now: {e}",
+                                dedupe_key=f"partial_unprotected:{ticker}",
+                            )
+                        return
                     if replace_outcome == CANCEL_FILLED:
                         logger.warning(
                             f"[STOP GUARD] {ticker} protective stop already executed — position closed, "
@@ -8665,11 +9061,12 @@ async def _stop_guard_worker(ticker: str) -> None:
                             stop_order_id=stop_info["order_id"],
                             stop_client_id=stop_info["client_id"],
                         ) or guard
-                        pos = await state.get_position(ticker)
-                        if pos:
-                            pos["stop_order_id"] = stop_info["order_id"]
-                            pos["filled_qty"] = filled
-                            await state.set_position(ticker, pos)
+                        async with _position_section(ticker, "stop placement"):
+                            pos = await state.get_position(ticker)
+                            if pos:
+                                pos["stop_order_id"] = stop_info["order_id"]
+                                pos["filled_qty"] = filled
+                                await state.set_position(ticker, pos)
                         guarded = filled
                     except Exception as e:
                         # The OLD stop was already cancelled above and the new one
@@ -8681,10 +9078,11 @@ async def _stop_guard_worker(ticker: str) -> None:
                         # must describe what is ACTUALLY resting at the broker.
                         guard = await state.update_guard(ticker, stop_order_id=None,
                                                          stop_client_id=None) or guard
-                        pos = await state.get_position(ticker)
-                        if pos and pos.get("stop_order_id"):
-                            pos["stop_order_id"] = None
-                            await state.set_position(ticker, pos)
+                        async with _position_section(ticker, "stop id clear"):
+                            pos = await state.get_position(ticker)
+                            if pos and pos.get("stop_order_id"):
+                                pos["stop_order_id"] = None
+                                await state.set_position(ticker, pos)
                         logger.error(f"[STOP GUARD] {ticker} stop placement FAILED (will retry): {e}")
                         await alerts.send(
                             "critical", "stop_placement_failed",
@@ -8796,9 +9194,18 @@ async def _stop_guard_worker(ticker: str) -> None:
                 await state.update_guard(ticker, deadline_ts=time.time() + ENTRY_FILL_TIMEOUT_MIN * 60)
             # Poll faster while the stop deadline is live and unmet so the 60s
             # rule is enforced with tight granularity, not at the next 10s tick.
+            # Only tighten while the deadline is still AHEAD of us: once it has
+            # passed, `stop_deadline - now` goes negative and this pinned to a
+            # 1s loop, hammering the emergency-flatten retry every second.
             sleep_s = float(STOP_GUARD_POLL_SECONDS)
             if stop_deadline and not guard.get("stop_order_id"):
-                sleep_s = max(1.0, min(sleep_s, stop_deadline - time.time()))
+                remaining = stop_deadline - time.time()
+                if remaining > 0:
+                    sleep_s = max(1.0, min(sleep_s, remaining))
+                else:
+                    # Past the deadline: the flatten path owns this now and it
+                    # needs time to settle at the broker between attempts.
+                    sleep_s = max(float(STOP_GUARD_POLL_SECONDS), 5.0)
             await asyncio.sleep(sleep_s)
     finally:
         await lock.release()
@@ -9277,6 +9684,177 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         },
         dedupe_key=f"sellfill:{ticker}:{qty}:{round(exit_px, 2)}",
     )
+
+
+async def _filled_qty_of(order_id: Optional[str]) -> int:
+    """How many units an order actually filled, or 0 when unreadable.
+
+    Under-reporting is the safe direction: booking 0 leaves the dollars to the
+    reconciler's fill capture, whereas over-reporting would invent realized
+    P&L and shrink a position that still holds contracts.
+    """
+    if not order_id:
+        return 0
+    try:
+        _status, filled = await _order_state(str(order_id), None)
+        return max(0, int(filled or 0))
+    except Exception as e:
+        logger.warning(f"could not read filled quantity for order {order_id}: {e}")
+        return 0
+
+
+async def _handle_partial_stop_fill(
+    ticker: str,
+    stop_order_id: Optional[str],
+    fallback_price: Optional[float],
+    reason: str,
+) -> int:
+    """Shared CANCEL_PARTIAL handler: book the slice the stop sold and return
+    what is still held. Callers must then re-protect (or close) the remainder.
+
+    `fallback_price` is used only when the broker has not yet priced the fill —
+    normally the stop's own trigger level, which is what that slice sold at.
+    """
+    sold = await _filled_qty_of(stop_order_id)
+    fill = await _resolve_exit_fill(stop_order_id)
+    price = float(fill or fallback_price or 0)
+    return await _book_partial_stop_fill(ticker, sold, price, reason)
+
+
+async def _book_partial_stop_fill(
+    ticker: str,
+    filled_qty: int,
+    fill_price: Optional[float],
+    reason: str,
+) -> int:
+    """Book the slice a partially-filled protective stop actually sold, shrink
+    the tracked position to what is STILL HELD, and return that remainder.
+
+    A stop on 4 contracts that fills 1 and then cancels is neither a closed
+    position nor a non-event, and `_record_close` cannot express it: it pops
+    the position and books the ENTIRE size as exited. That is how three live
+    contracts ended up at the broker with no stop, no trail and no risk
+    accounting — invisible until an `untracked_position` alert hours later,
+    which never auto-closes anything.
+
+    Accounting mirrors `_record_close` exactly — same basis rules, same
+    account-level percent for the daily loss limit, same broker-verified-dollars
+    rule for the objective — but scoped to `filled_qty`. The position is
+    RESIZED rather than deleted and its dead stop id is cleared, so the caller
+    is responsible for re-arming protection over the remainder.
+
+    Returns the remaining quantity (0 when the fill in fact closed it out).
+    """
+    pos = await state.get_position(ticker)
+    if not pos:
+        logger.warning(
+            f"[PARTIAL] {ticker} partial stop fill with no tracked position — nothing to book"
+        )
+        return 0
+    try:
+        sold = max(0, int(filled_qty or 0))
+    except (TypeError, ValueError):
+        sold = 0
+    try:
+        held = int(pos.get("filled_qty") or pos.get("qty") or 0)
+    except (TypeError, ValueError):
+        held = 0
+    if sold <= 0 or held <= 0:
+        return max(0, held)
+    # Never book more than the position holds — a stale expected_qty must not
+    # be able to manufacture realized dollars out of contracts we never had.
+    sold = min(sold, held)
+    remaining = held - sold
+
+    direction = _entry_direction(pos, {"ticker": ticker, "intent": "close"})
+    is_option = bool(pos.get("contract"))
+    entry_premium = float(pos.get("entry_premium") or 0)
+    entry = float(pos.get("entry") or 0)
+    try:
+        exit_px = float(fill_price or 0)
+    except (TypeError, ValueError):
+        exit_px = 0.0
+
+    basis = "premium" if is_option else "underlying"
+    pnl_pct: Optional[float] = None
+    realized_usd: Optional[float] = None
+    if is_option and exit_px > 0 and entry_premium > 0:
+        pnl_pct = direction * ((exit_px - entry_premium) / entry_premium * 100.0)
+        realized_usd = direction * (exit_px - entry_premium) * 100.0 * sold
+    elif not is_option and exit_px > 0 and entry > 0:
+        pnl_pct = direction * ((exit_px - entry) / entry * 100.0)
+        realized_usd = direction * (exit_px - entry) * sold
+
+    # Same account-level conversion the full close uses: dollars over tracked
+    # balance, with the raw per-trade move as an over-braking fallback.
+    account_pct: Optional[float] = None
+    if pnl_pct is not None:
+        if realized_usd is not None:
+            balance = None
+            try:
+                balance = await state.tracked_balance()
+            except Exception:
+                balance = None
+            if balance and float(balance) > 0:
+                account_pct = realized_usd / float(balance) * 100.0
+        await state.add_realized_pnl(account_pct if account_pct is not None else pnl_pct)
+    if realized_usd is not None:
+        try:
+            await state.add_realized_usd(float(realized_usd))
+        except Exception as e:
+            logger.warning(f"[PARTIAL] {ticker} realized-USD accumulation failed (non-fatal): {e}")
+        try:
+            proceeds = exit_px * 100.0 * sold if is_option else exit_px * sold
+            await state.adjust_balance(proceeds)
+        except Exception as e:
+            logger.warning(f"[PARTIAL] {ticker} balance credit failed (non-fatal): {e}")
+
+    # Resize BEFORE alerting so any concurrent reader sees the true size.
+    pos["filled_qty"] = remaining
+    pos["qty"] = remaining
+    # The stop that filled is gone; nothing rests behind the remainder yet.
+    pos["stop_order_id"] = None
+    pos["partial_exits"] = int(pos.get("partial_exits") or 0) + 1
+    if remaining > 0:
+        await state.set_position(ticker, pos)
+    else:
+        await state.delete_position(ticker)
+
+    await trade_ledger.record("partial_stop_fill", {
+        "ticker": ticker,
+        "entry": (entry_premium if basis == "premium" else entry) or None,
+        "exit": exit_px or None,
+        "basis": basis,
+        "entry_action": "BUY" if direction > 0 else "SELL",
+        "sold_qty": sold,
+        "remaining_qty": remaining,
+        "realized_pnl_pct": round(pnl_pct, 4) if pnl_pct is not None else None,
+        "realized_pnl_usd": round(realized_usd, 2) if realized_usd is not None else None,
+        "account_pnl_pct": round(account_pct, 4) if account_pct is not None else None,
+        "reason": reason,
+    })
+    logger.warning(
+        f"[PARTIAL] {ticker} protective stop filled {sold} of {held} — booked the slice "
+        f"({basis} exit {exit_px or '?'}), {remaining} still held and now UNPROTECTED "
+        f"until the caller re-arms"
+    )
+    await _alert_fill(
+        {
+            "side": "SELL",
+            "ticker": ticker,
+            "contract": pos.get("contract"),
+            "qty": sold,
+            "price": exit_px,
+            "price_confirmed": exit_px > 0,
+            "entry_price": (entry_premium if basis == "premium" else entry) or None,
+            "realized_usd": round(realized_usd, 2) if realized_usd is not None else None,
+            "realized_pct": round(pnl_pct, 2) if pnl_pct is not None else None,
+            "remaining_qty": remaining,
+            "reason": reason,
+        },
+        dedupe_key=f"partialfill:{ticker}:{sold}:{round(exit_px, 2)}",
+    )
+    return remaining
 
 
 # ==================== DAILY P&L REPAIR (ledger replay) ====================
@@ -9892,7 +10470,7 @@ async def execute_live_order(payload: dict):
 
     # DISTRIBUTED CRITICAL SECTION — one worker at a time may place/close
     # orders for this ticker (prevents double-placement across instances).
-    order_lock = state.lock(f"order:{str(ticker).upper()}", ttl_ms=120_000, wait_timeout=30.0)
+    order_lock = state.position_lock(ticker, ttl_ms=120_000, wait_timeout=30.0)
     try:
         await order_lock.acquire()
     except LockNotAcquired:
@@ -9975,7 +10553,7 @@ async def execute_live_order(payload: dict):
                     common["quantity"] = quantity
                 opt_guard = await state.get_guard(sym_u) or {}
                 resting_stop_id = pos.get("stop_order_id") or opt_guard.get("stop_order_id")
-                stop_outcome = await _cancel_order_verified(resting_stop_id)
+                stop_outcome = await _cancel_order_verified(resting_stop_id, expected_qty=cover_qty)
                 if stop_outcome == CANCEL_FILLED:
                     await _finish_guard(sym_u, "closed_by_stop")
                     stop_fill = await _resolve_exit_fill(resting_stop_id)
@@ -9989,6 +10567,28 @@ async def execute_live_order(payload: dict):
                         "status": "success",
                         "response": {"note": "resting protective stop already executed at broker", "stop_order_id": resting_stop_id},
                     }
+                if stop_outcome == CANCEL_PARTIAL:
+                    # The stop sold part of the position on its way out. Book
+                    # that slice, then close only what is genuinely left —
+                    # sending the original quantity would oversell into a short.
+                    remaining = await _handle_partial_stop_fill(
+                        sym_u, resting_stop_id, pos.get("stop_premium"), "close_stop_partial",
+                    )
+                    if remaining <= 0:
+                        await _finish_guard(sym_u, "closed_by_stop")
+                        logger.info(f"[LIVE option CLOSE] {sym_u} fully closed by its resting stop")
+                        return {
+                            "status": "success",
+                            "response": {"note": "resting protective stop closed the position",
+                                         "stop_order_id": resting_stop_id},
+                        }
+                    logger.warning(
+                        f"[LIVE option CLOSE] {sym_u} resting stop partially filled — closing the "
+                        f"remaining {remaining} contract(s) instead of {quantity}"
+                    )
+                    quantity = remaining
+                    common["quantity"] = remaining
+                    pos = await state.get_position(sym_u) or {}
                 if stop_outcome == CANCEL_LIVE:
                     raise Exception(
                         f"could not cancel resting option stop {resting_stop_id} — refusing to double-sell {sym_u}"
@@ -10144,7 +10744,7 @@ async def execute_live_order(payload: dict):
                 # limit price (set from the real ask above); fall back to the
                 # raw ask for MARKET orders.
                 premium_ref = float(common.get("limitPrice") or 0) or float(real_ask or 0)
-                final, quantity = await _place_entry_with_funds_clamp(
+                final, quantity, client_order_id = await _place_entry_with_funds_clamp(
                     "option", common, tokens,
                     unit_cost=premium_ref * 100.0 if premium_ref > 0 else None,
                 )
@@ -10240,13 +10840,37 @@ async def execute_live_order(payload: dict):
                 pos = tracked_pos or {}
                 guard = await state.get_guard(symbol) or {}
                 stop_order_id = pos.get("stop_order_id") or guard.get("stop_order_id")
-                stop_outcome = await _cancel_order_verified(stop_order_id)
+                tracked_cover = int(pos.get("filled_qty") or pos.get("qty") or 0)
+                stop_outcome = await _cancel_order_verified(
+                    stop_order_id, expected_qty=tracked_cover or None,
+                )
                 already_closed_by_stop = stop_outcome == CANCEL_FILLED
                 if stop_outcome == CANCEL_LIVE:
                     raise Exception(
                         f"could not cancel resting stop {stop_order_id} — refusing to double-sell {symbol}"
                     )
-                await _finish_guard(symbol, "closed_by_app")
+                if stop_outcome == CANCEL_PARTIAL:
+                    # Part of the position was sold by the stop before we could
+                    # cancel it. Book that slice so the close below covers only
+                    # the shares still held — the full size would go short.
+                    remaining = await _handle_partial_stop_fill(
+                        symbol, stop_order_id, pos.get("stop"), "close_stop_partial",
+                    )
+                    await _finish_guard(symbol, "closed_by_app")
+                    if remaining <= 0:
+                        logger.info(f"[LIVE equity CLOSE] {symbol} fully closed by its resting stop")
+                        return {
+                            "status": "success",
+                            "response": {"note": "resting protective stop closed the position",
+                                         "stop_order_id": stop_order_id},
+                        }
+                    logger.warning(
+                        f"[LIVE equity CLOSE] {symbol} resting stop partially filled — closing the "
+                        f"remaining {remaining} share(s)"
+                    )
+                    pos = await state.get_position(symbol) or {}
+                else:
+                    await _finish_guard(symbol, "closed_by_app")
                 if already_closed_by_stop:
                     stop_fill = await _resolve_exit_fill(stop_order_id)
                     if stop_fill:
@@ -10390,7 +11014,7 @@ async def execute_live_order(payload: dict):
             # Per-share cost for the pre-flight funds clamp — the limit price
             # when set, otherwise the signal's entry estimate for MARKET orders.
             share_cost = float(common.get("limitPrice") or 0) or (entry_px if entry_px > 0 else 0)
-            final, quantity = await _place_entry_with_funds_clamp(
+            final, quantity, client_order_id = await _place_entry_with_funds_clamp(
                 "equity", common, tokens,
                 unit_cost=share_cost if share_cost > 0 else None,
             )
@@ -10731,7 +11355,30 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
 
     # Cancel/replace: never leave two live stops, and only place after the
     # cancel is confirmed against the broker's own order book.
-    outcome = await _cancel_order_verified(stop_order_id)
+    outcome = await _cancel_order_verified(stop_order_id, expected_qty=qty)
+    if outcome == CANCEL_PARTIAL:
+        # The stop sold PART of the position and then died. Booking the whole
+        # position here (what the CANCEL_FILLED branch below does) deleted a
+        # position that still held real contracts and left them unstopped.
+        remaining = await _handle_partial_stop_fill(
+            ticker, stop_order_id, plan["current_stop"], "trail_stop_partial",
+        )
+        if remaining > 0:
+            fresh = await state.get_position(ticker)
+            if fresh:
+                try:
+                    await _reconcile_rearm_guard(ticker, dict(fresh))
+                except Exception as e:
+                    logger.error(f"[TRAIL] {ticker} re-arm after partial stop fill FAILED: {e}")
+                    await alerts.send(
+                        "critical", "partial_fill_unprotected",
+                        f"{ticker}: the trailing stop filled part of the position and the "
+                        f"remaining {remaining} could NOT be re-protected — close them manually: {e}",
+                        dedupe_key=f"partial_unprotected:{ticker}",
+                    )
+        else:
+            await _finish_guard(ticker, "closed_by_stop")
+        return
     if outcome == CANCEL_FILLED:
         # The stop we were about to tighten already triggered — the position is
         # flat. Replacing it would rest a naked short; book the close instead.
@@ -10870,6 +11517,39 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         )
 
 
+async def _trail_ratchet_guarded(ticker: str) -> None:
+    """Run one ticker's ratchet inside that ticker's position lock.
+
+    Two things make this wrapper necessary rather than cosmetic:
+
+    1. MUTUAL EXCLUSION. `_trail_ratchet_one` reads a position, spends seconds
+       on quotes / cancel-verification / stop placement, then writes it back.
+       Concurrently the stop guard trues up the entry fill and the order path
+       books closes. Those writers now serialize on one key instead of racing
+       across three unrelated namespaces.
+    2. A FRESH SNAPSHOT. `_trail_pass` lists every position up front, so by the
+       time the Nth ticker is reached its snapshot is already old. Re-reading
+       under the lock means the ratchet always acts on current size and basis.
+    """
+    lock = state.position_lock(ticker, ttl_ms=120_000, wait_timeout=2.0)
+    try:
+        await lock.acquire()
+    except LockNotAcquired:
+        # Another worker owns this ticker right now (an entry guard truing up,
+        # or a close in flight). Skipping is correct: the next pass picks it up
+        # a few seconds later, and trailing on top of an in-flight mutation is
+        # exactly the race this lock exists to prevent.
+        logger.info(f"[TRAIL] {ticker} busy with another operation — deferring to the next pass")
+        return
+    try:
+        pos = await state.get_position(ticker)
+        if not pos:
+            return  # closed while the pass was walking the list
+        await _trail_ratchet_one(ticker, pos)
+    finally:
+        await lock.release()
+
+
 async def _trail_pass() -> None:
     """One trailing pass over every tracked position with a resting stop.
     Positions whose entry guard is still active are skipped — the guard owns
@@ -10891,7 +11571,7 @@ async def _trail_pass() -> None:
         if reconciliation.guard_owns_stop(guards.get(ticker), now):
             continue
         try:
-            await _trail_ratchet_one(ticker, pos)
+            await _trail_ratchet_guarded(ticker)
         except Exception as e:
             logger.warning(f"[TRAIL] {ticker} pass failed: {e}")
 
@@ -11913,8 +12593,29 @@ async def flatten(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secr
                 # because the close was never booked the ticker stayed in Redis
                 # forever — holding a slot against the position cap, blocking
                 # re-entry, and keeping the trailing engine working a dead symbol.
-                stop_outcome = await _cancel_order_verified(item["stop_order_id"])
-                if stop_outcome == CANCEL_FILLED:
+                stop_outcome = await _cancel_order_verified(
+                    item["stop_order_id"], expected_qty=item["qty"] or None,
+                )
+                if stop_outcome == CANCEL_PARTIAL:
+                    # The stop took part of the position as we cancelled it.
+                    # Book that slice and flatten only what is genuinely left —
+                    # market-selling the original size would open a short on
+                    # the exact position the panic button is trying to close.
+                    remaining = await _handle_partial_stop_fill(
+                        ticker, item["stop_order_id"], None, "flatten_stop_partial",
+                    )
+                    if remaining <= 0:
+                        await _finish_guard(ticker, "flattened_by_stop")
+                        logger.info(f"[FLATTEN] {ticker} fully closed by its resting stop")
+                        results.append({"ticker": ticker, "status": "already_flat",
+                                        "detail": "resting stop executed"})
+                        continue
+                    logger.warning(
+                        f"[FLATTEN] {ticker} resting stop partially filled — flattening the "
+                        f"remaining {remaining} instead of {item['qty']}"
+                    )
+                    item["qty"] = remaining
+                elif stop_outcome == CANCEL_FILLED:
                     # The stop filled while we were cancelling: the position is
                     # already flat, and selling again would open a short.
                     logger.info(f"[FLATTEN] {ticker} already closed by its resting stop")
