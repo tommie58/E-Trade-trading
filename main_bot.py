@@ -4690,7 +4690,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.43.0-position-locking"
+BOT_VERSION = "5.44.0-real-account-risk"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -4740,6 +4740,19 @@ COMMISSION_PER_CONTRACT = float(os.getenv("COMMISSION_PER_CONTRACT", "0.65"))
 MAX_ROUND_TRIP_COST_PCT = float(os.getenv("MAX_ROUND_TRIP_COST_PCT", "12.0"))
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
 PORTFOLIO_HEAT_PCT = float(os.getenv("PORTFOLIO_HEAT_PCT", "6.0"))
+# ---- Per-trade concentration ----
+# The largest share of ONE day's risk budget a SINGLE entry may commit.
+#
+# 2026-08-24 is the case this exists for. Account $5,719, so the 2% daily loss
+# limit is $114. The bot bought one GOOGL 347.5C at $5.10 behind a $4.00 stop:
+# $110 of risk — 96% of the entire day's budget in one contract. It stopped out
+# in five minutes, the day hit -2.07%, and the next THREE signals (GOOGL, GOOGL,
+# UBER) were all refused "daily loss limit". One ordinary loss ended the day.
+#
+# A budget that affords exactly one attempt is not a budget, it is a coin flip.
+# At a 39% win rate the chance of losing the first trade is 61% — so 61% of days
+# were structurally locked to a loss before the second setup ever printed.
+MAX_TRADE_RISK_FRACTION_OF_DAILY = float(os.getenv("MAX_TRADE_RISK_FRACTION_OF_DAILY", "0.5"))
 TICKER_COOLDOWN_MINUTES = int(os.getenv("TICKER_COOLDOWN_MINUTES", "15"))
 # ---- Daily profit objective ----
 # The standing minimum daily profit target, in REAL dollars. Once the ledger
@@ -5182,11 +5195,16 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     if ticker and ticker in open_positions:
         blocked.append(f"already in {ticker}")
 
-    account_ref = 50000.0
+    # The account every dollar gate below is measured against — REAL broker
+    # equity, not a static env default. See _risk_account_reference.
+    account_ref = await _risk_account_reference()
+    # What THIS entry actually risks, read from the contract in the payload.
+    # None when unmeasurable; the nominal figure is the floor either way.
+    actual_risk = estimate_entry_risk_usd(p)
     try:
-        account_ref = float(os.getenv("ACCOUNT_SIZE", "50000"))
         open_risk = sum(position_risk_usd(pos) for pos in open_positions.values())
-        new_risk = account_ref * (RISK_PER_TRADE_PCT / 100.0)
+        nominal_risk = account_ref * (RISK_PER_TRADE_PCT / 100.0)
+        new_risk = max(nominal_risk, actual_risk or 0.0)
         heat = (open_risk + new_risk) / max(account_ref, 1) * 100.0
         if heat > PORTFOLIO_HEAT_PCT:
             blocked.append(f"portfolio heat {heat:.2f}% > {PORTFOLIO_HEAT_PCT}%")
@@ -5204,13 +5222,30 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
             open_risk_usd=open_risk_usd,
             profit_lock_max_risk=(lock["max_risk_usd"] if lock["cushion_usd"] > 0 else None),
         )
-        requested_risk = account_ref * (RISK_PER_TRADE_PCT / 100.0)
+        nominal_risk = account_ref * (RISK_PER_TRADE_PCT / 100.0)
+        # Judge the budget against what the CONTRACT risks, not what the
+        # percentage wishes it risked. On 2026-08-24 those were $110 and $28.
+        requested_risk = max(nominal_risk, actual_risk or 0.0)
         if budget["remaining_usd"] < requested_risk * 0.25:
             blocked.append(
                 f"daily risk budget spent: ${budget['used_usd']:,.0f} of "
                 f"${budget['budget_usd']:,.0f} committed (realized losses + open risk) — "
                 f"${budget['remaining_usd']:,.0f} left against a ${requested_risk:,.0f} entry"
             )
+
+        # PER-TRADE CONCENTRATION — no single entry may eat the whole day.
+        # A budget that affords one attempt hands the day to the first coin
+        # flip; at a 39% win rate that loses 61% of days before the second
+        # setup prints. Measured against the BASE budget so a profitable day's
+        # expansion cannot be spent on one oversized swing either.
+        concentration = plan_trade_concentration(
+            actual_risk_usd=actual_risk,
+            base_budget_usd=budget["base_budget_usd"],
+        )
+        if concentration["blocked"]:
+            blocked.append(concentration["reason"])
+        elif concentration["reason"]:
+            logger.warning(f"⚠️ {ticker or 'entry'} concentration: {concentration['reason']}")
     except (TypeError, ValueError):
         pass
 
@@ -5222,6 +5257,114 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
         blocked.append(cost["reason"])
 
     return len(blocked) == 0, blocked
+
+
+async def _risk_account_reference() -> float:
+    """The account size every risk gate is measured against, in REAL dollars.
+
+    This used to be `os.getenv("ACCOUNT_SIZE", "50000")` — a static default that
+    was 8.7x the real balance. Every dollar-denominated gate inherited that lie:
+
+      * `plan_risk_budget` sized the day's budget at 2% of $50,000 = $1,000 when
+        the true limit was 2% of $5,719 = $114.
+      * portfolio heat divided real exposure by a notional $50,000, so a
+        position risking 2% of the account measured as 0.2% of "heat".
+      * `requested_risk` (RISK_PER_TRADE_PCT) came out $250 instead of $28.
+
+    Meanwhile the daily loss limit is a percentage of the REAL broker balance.
+    So the budget said "$1,000 left" at the exact moment the loss limit tripped
+    at -$114 — two gates, two different accounts, one of them imaginary.
+
+    Prefers live broker equity, falls back to the tracked snapshot, and only
+    then to the env default (loudly). Fails toward the SMALLER number: an
+    unmeasurable account must never read as a bigger one.
+    """
+    env_ref = 50000.0
+    try:
+        env_ref = float(os.getenv("ACCOUNT_SIZE", "50000"))
+    except (TypeError, ValueError):
+        env_ref = 50000.0
+    if not math.isfinite(env_ref) or env_ref <= 0:
+        env_ref = 50000.0
+
+    try:
+        live = await _live_equity()
+        if live is not None and math.isfinite(live) and live > 0:
+            return float(live)
+    except Exception as e:
+        logger.warning(f"risk account reference: live equity unavailable ({e})")
+
+    try:
+        tracked = await state.tracked_balance()
+        if tracked is not None and math.isfinite(tracked) and tracked > 0:
+            logger.warning(
+                f"risk account reference: broker equity unreadable — sizing risk gates off the "
+                f"tracked balance ${tracked:,.0f}"
+            )
+            return float(tracked)
+    except Exception as e:
+        logger.warning(f"risk account reference: tracked balance unavailable ({e})")
+
+    logger.warning(
+        f"risk account reference: no broker or tracked balance — falling back to ACCOUNT_SIZE "
+        f"${env_ref:,.0f}. Risk gates are only as true as this number."
+    )
+    return env_ref
+
+
+def estimate_entry_risk_usd(payload: dict) -> Optional[float]:
+    """REAL dollars this entry puts at risk, from the payload it dispatched.
+
+    The budget gate used to compare the day's remaining dollars against
+    `account_size * RISK_PER_TRADE_PCT` — a NOMINAL figure describing the risk
+    the bot would *like* to take, not the risk the contract in hand actually
+    carries. On 2026-08-24 those two numbers were $28 and $110. The gate
+    approved a $110 trade because it was thinking about a $28 one.
+
+    Options are priced on the premium and one contract controls 100 shares, so
+    the risk is `(premium - stop_premium) x 100 x qty`. Mirrors
+    `position_risk_usd`, but reads the pre-trade payload instead of a tracked
+    position.
+
+    Returns None when nothing is measurable — the caller must not invent a
+    number, and an unmeasurable risk must not silently read as zero.
+    """
+    def num(*keys: str) -> float:
+        for key in keys:
+            try:
+                value = float(payload.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value > 0:
+                return value
+        return 0.0
+
+    try:
+        qty = abs(int(float(payload.get("quantity") or payload.get("qty") or 0)))
+    except (TypeError, ValueError):
+        qty = 0
+    if qty < 1:
+        qty = 1
+
+    instrument = str(payload.get("instrument") or "").lower()
+    premium = num("limit_price", "limitPrice", "premium", "entry_premium", "option_price")
+    if instrument == "option" or premium > 0:
+        if premium <= 0:
+            return None
+        stop_premium = num("option_stop_price", "stop_premium")
+        if stop_premium > 0 and stop_premium < premium:
+            return (premium - stop_premium) * 100.0 * qty
+        # No usable premium stop: the bot will fall back to its percentage
+        # haircut, so that is the risk this entry really carries.
+        if OPTION_STOP_LOSS_PCT > 0:
+            return premium * (OPTION_STOP_LOSS_PCT / 100.0) * 100.0 * qty
+        return premium * 100.0 * qty
+
+    entry = num("entry", "entry_price", "price")
+    stop = num("stop", "stop_price")
+    if entry > 0 and stop > 0 and entry != stop:
+        return abs(entry - stop) * qty
+    return None
 
 
 def position_risk_usd(pos: dict) -> float:
@@ -7467,6 +7610,65 @@ def plan_risk_budget(account_size: Any, realized_usd: Any, open_risk_usd: Any,
             f"cap, dollars are the limit"
         ),
     }
+
+
+def plan_trade_concentration(actual_risk_usd: Any, base_budget_usd: Any,
+                             max_fraction: float = None) -> Dict[str, Any]:
+    """Refuse a single entry that would commit too much of one day's budget.
+
+    The 2026-08-24 failure in one line: a $110 contract against a $114 daily
+    budget. Every risk gate passed — the trade was inside the loss limit, inside
+    portfolio heat, inside the cost gate — because each one asked "is this trade
+    survivable?" and none asked "does the DAY survive this trade?". It did not:
+    the stop filled five minutes later and the next three signals were refused.
+
+    A day needs enough budget for the win rate to express itself. At 39% the
+    first trade loses 61% of the time, so a one-attempt day is a 61% loss rate
+    by construction, independent of edge.
+
+    Returns `{blocked, reason, fraction, ceiling_usd}`. Unmeasurable risk is
+    NOT blocked — this gate refuses trades it can price, and stays silent about
+    ones it cannot rather than guessing (the cost and budget gates still apply).
+    """
+    fraction_cap = float(max_fraction if max_fraction is not None else MAX_TRADE_RISK_FRACTION_OF_DAILY)
+    if not math.isfinite(fraction_cap) or fraction_cap <= 0:
+        fraction_cap = 0.5
+
+    def num(value: Any) -> Optional[float]:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    risk = num(actual_risk_usd)
+    budget = num(base_budget_usd)
+    if risk is None or risk <= 0 or budget is None or budget <= 0:
+        return {"blocked": False, "reason": "", "fraction": None, "ceiling_usd": None}
+
+    ceiling = budget * fraction_cap
+    fraction = risk / budget
+    if risk > ceiling:
+        attempts = budget / risk
+        return {
+            "blocked": True,
+            "reason": (
+                f"single-trade concentration: ${risk:,.0f} of risk is {fraction * 100:.0f}% of the "
+                f"${budget:,.0f} daily budget (ceiling {fraction_cap * 100:.0f}% = ${ceiling:,.0f}) — "
+                f"the day would afford only {attempts:.1f} attempts. Need a cheaper contract or a "
+                f"tighter premium stop."
+            ),
+            "fraction": round(fraction, 4),
+            "ceiling_usd": round(ceiling, 2),
+        }
+
+    note = ""
+    if fraction >= fraction_cap * 0.8:
+        note = (
+            f"${risk:,.0f} is {fraction * 100:.0f}% of the ${budget:,.0f} daily budget — "
+            f"close to the {fraction_cap * 100:.0f}% ceiling"
+        )
+    return {"blocked": False, "reason": note, "fraction": round(fraction, 4), "ceiling_usd": round(ceiling, 2)}
 
 
 def assess_entry_cost(payload: Dict[str, Any]) -> Dict[str, Any]:
