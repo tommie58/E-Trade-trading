@@ -3452,6 +3452,95 @@ def compute_trail_level(
     }
 
 
+def observe_water_mark(
+    position: Dict[str, Any],
+    mark: float,
+) -> Optional[Dict[str, Any]]:
+    """Advance a position's favourable water mark from a live mark.
+
+    INSTRUMENTATION, not control. `plan_ratchet` also reports an MFE, but only
+    as a by-product of producing a STOP PLAN: it returns None the moment the
+    basis is incomplete, and the caller skips it entirely on a scale-out pass.
+    Every one of those exits dropped the water mark on the floor, which is why
+    barely any closed loser carries a peak — and without a peak there is no way
+    to tell "the exit gave back a real move" from "the trade never worked",
+    which is the single most important question a losing book can be asked.
+
+    This runs on EVERY mark, owns nothing but the watermark fields, and is
+    monotonic — a water mark that retreats is a bug, not an observation.
+
+    It is also never fabricated. When the basis is incomplete the excursion
+    keys come back None so the caller writes NOTHING: a missing peak must stay
+    missing, because defaulting it to 0.0 would silently book "this trade never
+    went my way" for a trade nobody measured, and that lie lands in exactly the
+    never-alive statistic it would be corrupting.
+
+    Returns None when the mark itself is unusable; otherwise:
+
+      {"high_since", "low_since", "r_multiple" | None, "mfe_percent" | None}
+
+    `r_multiple` and `mfe_percent` are measured on the SAME basis `plan_ratchet`
+    trails on — the option PREMIUM for contracts, the underlying for equities —
+    so a peak may only ever be compared against a realized R booked on that
+    same basis.
+    """
+    mark_f = _finite(mark)
+    if mark_f is None or mark_f <= 0:
+        return None
+
+    is_option = bool((position.get("contract") or {}).get("right"))
+    if is_option:
+        # Long options only; exits are SELL_CLOSE (mirrors plan_ratchet).
+        is_buy = True
+        entry = _finite(position.get("entry_premium"))
+        initial = _finite(position.get("initial_stop") or position.get("stop_premium"))
+    else:
+        is_buy = str(position.get("action") or "BUY").upper() != "SELL"
+        entry = _finite(position.get("entry"))
+        initial = _finite(position.get("initial_stop") or position.get("stop"))
+
+    prev_high = _finite(position.get("trail_high"))
+    prev_low = _finite(position.get("trail_low"))
+    high = max(prev_high, mark_f) if prev_high is not None else mark_f
+    low = min(prev_low, mark_f) if prev_low is not None else mark_f
+
+    out: Dict[str, Any] = {
+        "high_since": _round2(high),
+        "low_since": _round2(low),
+        "r_multiple": None,
+        "mfe_percent": None,
+    }
+
+    prev_r = _finite(position.get("trail_r"))
+    prev_pct = _finite(position.get("trail_mfe_pct"))
+
+    if entry is None or entry <= 0:
+        # No basis to measure against — carry any peak already observed
+        # forward untouched rather than dropping or zeroing it.
+        out["r_multiple"] = prev_r
+        out["mfe_percent"] = prev_pct
+        return out
+
+    water_mark = max(entry, high) if is_buy else min(entry, low)
+    mfe = (water_mark - entry) if is_buy else (entry - water_mark)
+    if mfe < 0:
+        mfe = 0.0
+
+    mfe_percent = math.floor(mfe / entry * 10000 + 0.5) / 10000.0
+    out["mfe_percent"] = max(mfe_percent, prev_pct) if prev_pct is not None else mfe_percent
+
+    risk = abs(entry - initial) if initial is not None else 0.0
+    if risk > 0:
+        r_multiple = round(mfe / risk * 100) / 100.0
+        out["r_multiple"] = max(r_multiple, prev_r) if prev_r is not None else r_multiple
+    else:
+        # Percent excursion is measurable without a stop; R is not. Keep the
+        # prior R (possibly None) instead of inventing one from a zero risk.
+        out["r_multiple"] = prev_r
+
+    return out
+
+
 def plan_ratchet(
     position: Dict[str, Any],
     mark: float,
@@ -4690,7 +4779,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.44.0-real-account-risk"
+BOT_VERSION = "5.46.0-water-mark"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -4721,6 +4810,32 @@ ALLOWED_SETUPS = {
     for s in os.getenv("ALLOWED_SETUPS", "").split(",")
     if s.strip()
 }
+# SETUP EXPECTANCY VETO (5.45.0) — the bot had NO memory of which setups
+# actually make money. Every gate above judges a signal on how it LOOKS right
+# now (score, rvol, mtf); none asked the only question that settles the
+# argument: when this exact setup was traded before, what happened? So a setup
+# could lose 30 times and the 31st copy sailed through a green light, because
+# nothing on the server ever read the ledger it was writing.
+#
+# The bar is deliberately hard to trip: a setup is refused only when the 95%
+# Wilson UPPER bound on its win rate sits below a coin flip — i.e. even the
+# most generous reading of its record is worse than a coin. A thin ugly sample
+# (3 losses in 5) is UNCERTAIN, not condemned, and stays tradable. These are
+# the same constants the app's `setupPriors` uses; the two must not drift.
+SETUP_VETO_ENABLED = os.getenv("SETUP_VETO_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+SETUP_VETO_MIN_TRADES = int(os.getenv("SETUP_VETO_MIN_TRADES", "20"))
+SETUP_VETO_WIN_RATE = float(os.getenv("SETUP_VETO_WIN_RATE", "50"))
+# How much ledger history the veto reads. Bounded so the entry path never
+# walks an unbounded file while a signal is waiting.
+SETUP_VETO_LOOKBACK = int(os.getenv("SETUP_VETO_LOOKBACK", "1500"))
+# Evidence imported from the app's settled journal (see /setup/evidence). The
+# veto starts with no memory of its own, so without a seed it needs ~20 fresh
+# trades PER SETUP before it can refuse anything — a month of trading during
+# which the setups already known to lose keep getting funded. The app has been
+# keeping an attributed journal the whole time; this is that record, moved.
+SETUP_IMPORT_EVENT = "setup_evidence_imported"
+# One call may not write an unbounded number of ledger lines.
+SETUP_IMPORT_MAX_BATCH = int(os.getenv("SETUP_IMPORT_MAX_BATCH", "500"))
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "2.0"))
 # A daily TRADE COUNT is not a risk control and no longer gates entries. It let
@@ -5166,6 +5281,19 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
         setup = p.get("setup")
         if isinstance(setup, str) and setup.strip() and ALLOWED_SETUPS and setup.lower().strip() not in ALLOWED_SETUPS:
             blocked.append(f"setup '{setup}' not allowlisted")
+        # SETUP EXPECTANCY VETO — the only gate here that asks what actually
+        # HAPPENED the last times this setup was traded, instead of how good it
+        # looks right now. Reads the bot's own ledger; refuses only a setup
+        # whose record is settled AND whose optimistic case is still worse than
+        # a coin flip. Wrapped because a ledger read failure must never block a
+        # trade — an unreadable history is not evidence of a bad setup.
+        try:
+            verdict = assess_setup_veto(trade_ledger.recent(SETUP_VETO_LOOKBACK), setup)
+            if verdict["vetoed"]:
+                blocked.append(verdict["reason"])
+                logger.warning(f"📕 SETUP VETO — {verdict['reason']}")
+        except Exception as e:
+            logger.warning(f"setup expectancy veto unavailable (non-fatal, entry not blocked): {e}")
     else:
         logger.info("🧪 Connectivity test payload — quality gates skipped, risk gates still enforced")
 
@@ -7716,6 +7844,346 @@ def assess_entry_cost(payload: Dict[str, Any]) -> Dict[str, Any]:
             "reason": f"round-trip cost {total_pct:.1f}% of premium"}
 
 
+def wilson_bounds(wins: Any, n: Any) -> Tuple[float, float]:
+    """95% Wilson score interval for a win rate, returned as (low, high) percent.
+
+    A raw win rate is not evidence until you know how much of it is sample
+    noise: 2 wins in 5 and 200 in 500 are both "40%" and only one of them means
+    anything. The Wilson interval is what separates them, and it is why the
+    veto below can refuse a proven loser without also refusing every setup
+    having a bad week.
+
+    An empty sample returns the full (0, 100) — maximum uncertainty, which
+    reads as "unknown" to every caller and can never trigger a refusal.
+    """
+    try:
+        total = int(n)
+        won = int(wins)
+    except (TypeError, ValueError):
+        return (0.0, 100.0)
+    if total <= 0:
+        return (0.0, 100.0)
+    won = max(0, min(won, total))
+    z = 1.96
+    p = won / total
+    denom = 1.0 + (z * z) / total
+    centre = (p + (z * z) / (2.0 * total)) / denom
+    margin = (z * math.sqrt((p * (1.0 - p) / total) + (z * z) / (4.0 * total * total))) / denom
+    return (max(0.0, (centre - margin) * 100.0), min(100.0, (centre + margin) * 100.0))
+
+
+def _empty_setup_bucket() -> Dict[str, Any]:
+    return {"trades": 0, "wins": 0, "sum_pct": 0.0, "pct_samples": 0, "live": 0, "imported": 0}
+
+
+def import_outcome(data: dict) -> Optional[Tuple[bool, Optional[float]]]:
+    """Win/loss and (optional) percent move for one imported journal trade.
+
+    The R-multiple decides the outcome whenever it is present, because that is
+    the definition the app used when it settled the trade — reading the percent
+    instead would let the two systems disagree about whether the SAME trade won.
+    The percent is carried only for expectancy, and its absence costs the trade
+    nothing: a win/loss with no percent is still evidence about the win rate,
+    which is the only input the veto actually reads.
+    """
+    r_raw = data.get("r_multiple")
+    pct_raw = data.get("realized_pnl_pct")
+    r_val: Optional[float] = None
+    pct_val: Optional[float] = None
+    if isinstance(r_raw, (int, float)) and not isinstance(r_raw, bool) and math.isfinite(float(r_raw)):
+        r_val = float(r_raw)
+    if isinstance(pct_raw, (int, float)) and not isinstance(pct_raw, bool) and math.isfinite(float(pct_raw)):
+        pct_val = float(pct_raw)
+    if r_val is None and pct_val is None:
+        return None
+    won = (r_val > 0) if r_val is not None else (pct_val or 0.0) > 0
+    return (won, pct_val)
+
+
+def summarize_setup_performance(records: List[dict]) -> Dict[str, Dict[str, Any]]:
+    """Replay the trade ledger into a settled record per setup.
+
+    Records must be chronological (oldest first). A close carries its own
+    `setup` since 5.45.0; older closes are matched back to the last
+    `position_opened` for that ticker, which is the same pairing
+    `recompute_daily_pnl` already relies on. A close whose setup cannot be
+    resolved either way is SKIPPED rather than pooled into an "unknown"
+    bucket — attributing a loss to the wrong setup is worse than not counting
+    it, because it condemns an innocent setup and exonerates a guilty one.
+
+    Evidence imported from the app's journal (`SETUP_IMPORT_EVENT`) counts
+    alongside the bot's own closes and is deduped by `import_id`, so a repeated
+    push can never inflate a sample. Its provenance is preserved per setup
+    (`imported` vs `live`) because "20 trades" that are all imported is a
+    different claim than 20 the bot placed itself.
+
+    Each setup reports {trades, wins, win_rate, expectancy_pct, wilson_low,
+    wilson_high} where the percents are per-trade realized moves on whatever
+    basis the close was booked (premium for options).
+    """
+    open_setups: Dict[str, str] = {}
+    buckets: Dict[str, Dict[str, Any]] = {}
+    seen_imports: set = set()
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        data = rec.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        event = str(rec.get("event") or "")
+        ticker = str(data.get("ticker") or "").upper()
+        if event == "position_opened":
+            label = str(data.get("setup") or "").strip().lower()
+            if ticker and label:
+                open_setups[ticker] = label
+            continue
+        if event == SETUP_IMPORT_EVENT:
+            label = str(data.get("setup") or "").strip().lower()
+            import_id = str(data.get("import_id") or "").strip()
+            # An id-less or duplicate import is DROPPED rather than counted:
+            # the whole value of imported evidence is that it is the same
+            # trade exactly once.
+            if not label or not import_id or import_id in seen_imports:
+                continue
+            seen_imports.add(import_id)
+            outcome = import_outcome(data)
+            if outcome is None:
+                continue
+            won, pct = outcome
+            bucket = buckets.setdefault(label, _empty_setup_bucket())
+            bucket["trades"] += 1
+            bucket["imported"] += 1
+            if won:
+                bucket["wins"] += 1
+            if pct is not None:
+                bucket["sum_pct"] += pct
+                bucket["pct_samples"] += 1
+            continue
+        if event != "position_closed":
+            continue
+        label = str(data.get("setup") or "").strip().lower() or open_setups.pop(ticker, "")
+        open_setups.pop(ticker, None)
+        if not label:
+            continue
+        raw = data.get("realized_pnl_pct")
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            continue
+        pct = float(raw)
+        if not math.isfinite(pct):
+            continue
+        bucket = buckets.setdefault(label, _empty_setup_bucket())
+        bucket["trades"] += 1
+        bucket["live"] += 1
+        bucket["sum_pct"] += pct
+        bucket["pct_samples"] += 1
+        if pct > 0:
+            bucket["wins"] += 1
+    out: Dict[str, Dict[str, Any]] = {}
+    for label, bucket in buckets.items():
+        trades = int(bucket["trades"])
+        wins = int(bucket["wins"])
+        samples = int(bucket["pct_samples"])
+        low, high = wilson_bounds(wins, trades)
+        out[label] = {
+            "setup": label,
+            "trades": trades,
+            "wins": wins,
+            "live": int(bucket["live"]),
+            "imported": int(bucket["imported"]),
+            "win_rate": round(wins / trades * 100.0, 2) if trades else 0.0,
+            # Averaged over the trades that actually carried a percent, never
+            # over the whole sample — dividing by trades that reported no
+            # percent would silently drag every expectancy toward zero.
+            "expectancy_pct": round(bucket["sum_pct"] / samples, 4) if samples else 0.0,
+            "expectancy_samples": samples,
+            "wilson_low": round(low, 2),
+            "wilson_high": round(high, 2),
+        }
+    return out
+
+
+def assess_setup_veto(records: List[dict], setup: Any) -> Dict[str, Any]:
+    """Should a LIVE ENTRY in this setup be refused on its own settled record?
+
+    ENTRY SIDE ONLY. This must never be consulted on a close: a setup being a
+    proven loser is the strongest possible argument for letting the exit run,
+    and blocking a protective close would convert a measured bad setup into an
+    unbounded one.
+
+    Fails OPEN in every uncertain case — no label, no history, too few trades,
+    or a sample whose upper bound still allows a coin flip. The refusal fires
+    only on the narrow case the ledger has actually settled.
+    """
+    label = str(setup or "").strip().lower()
+    base: Dict[str, Any] = {"vetoed": False, "setup": label, "trades": 0, "reason": ""}
+    if not SETUP_VETO_ENABLED:
+        base["reason"] = "setup veto disabled"
+        return base
+    if not label:
+        base["reason"] = "payload carries no setup label — nothing to judge"
+        return base
+    stats = summarize_setup_performance(records).get(label)
+    if not stats:
+        base["reason"] = f"'{label}' has no settled trades on record yet"
+        return base
+    base.update({
+        "trades": stats["trades"],
+        "win_rate": stats["win_rate"],
+        "expectancy_pct": stats["expectancy_pct"],
+        "wilson_high": stats["wilson_high"],
+    })
+    if stats["trades"] < SETUP_VETO_MIN_TRADES:
+        base["reason"] = (
+            f"'{label}' has only {stats['trades']} settled trades — below the "
+            f"{SETUP_VETO_MIN_TRADES}-trade floor, so its {stats['win_rate']:.0f}% is not yet evidence"
+        )
+        return base
+    if stats["wilson_high"] >= SETUP_VETO_WIN_RATE:
+        base["reason"] = (
+            f"'{label}' measured {stats['win_rate']:.0f}% over {stats['trades']} trades "
+            f"(could still be {stats['wilson_high']:.0f}%) — not proven broken"
+        )
+        return base
+    base["vetoed"] = True
+    base["reason"] = (
+        f"setup '{label}' is a MEASURED loser: {stats['win_rate']:.0f}% win rate over "
+        f"{stats['trades']} settled trades ({stats['expectancy_pct']:+.2f}% per trade), and even "
+        f"the optimistic read of that record ({stats['wilson_high']:.0f}%) is worse than a coin flip"
+    )
+    return base
+
+
+def _iso_epoch(value: Any) -> Optional[float]:
+    """ISO-8601 (with `Z` or an offset, naive treated as UTC) → epoch seconds.
+
+    Returns None for anything unparseable. Callers must treat None as "unknown"
+    and never as "now" or "zero" — both of those turn a bad timestamp into a
+    confident and wrong ordering.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def setup_attribution_start(records: List[dict]) -> Optional[float]:
+    """When this bot first recorded a setup label of its own, in epoch seconds.
+
+    This is the boundary that makes importing the app's journal safe. Before
+    this instant the bot attributed nothing — its own closes are unlabelled and
+    contribute zero to `summarize_setup_performance` — so an imported trade from
+    that era cannot possibly be double counted. At and after it, the bot's own
+    records are the authority for the same trades the app also journals, and
+    importing them would count one trade as two.
+
+    Returns None when the bot has never labelled anything, which means the whole
+    history is free to import.
+    """
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        data = rec.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        if str(rec.get("event") or "") not in {"position_opened", "position_closed"}:
+            continue
+        if not str(data.get("setup") or "").strip():
+            continue
+        stamp = _iso_epoch(rec.get("ts"))
+        if stamp is not None:
+            return stamp
+    return None
+
+
+def plan_setup_import(
+    trades: Any,
+    known_ids: Any = None,
+    cutoff_epoch: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Decide which submitted journal trades may become bot evidence.
+
+    Pure, so the rules can be tested without a ledger. Every rejection is
+    reported with a reason rather than silently dropped — an import that
+    accepts 12 of 107 trades and says nothing looks exactly like one that
+    worked.
+
+    A trade is accepted only when it has a stable id (for idempotency), a setup
+    label (or it teaches nothing), a finite outcome, and a close that predates
+    `cutoff_epoch` — the moment the bot started attributing its own trades.
+    That last rule is what stops the bot from counting a trade twice: once from
+    its own ledger and once from the app's copy of it.
+    """
+    seen = {str(i).strip() for i in (known_ids or []) if str(i).strip()}
+    accepted: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+
+    def refuse(ident: Any, reason: str) -> None:
+        rejected.append({"import_id": str(ident or "")[:80], "reason": reason})
+
+    if not isinstance(trades, list):
+        return {"accepted": [], "rejected": [], "truncated": False,
+                "reason": "trades must be a list"}
+
+    truncated = len(trades) > SETUP_IMPORT_MAX_BATCH
+    for raw in trades[:SETUP_IMPORT_MAX_BATCH]:
+        if not isinstance(raw, dict):
+            refuse("", "not an object")
+            continue
+        import_id = str(raw.get("import_id") or "").strip()
+        if not import_id:
+            refuse("", "no import_id — cannot be deduped, so cannot be trusted")
+            continue
+        if import_id in seen:
+            refuse(import_id, "already imported")
+            continue
+        label = str(raw.get("setup") or "").strip().lower()
+        if not label:
+            refuse(import_id, "no setup label — teaches nothing")
+            continue
+        outcome = import_outcome(raw)
+        if outcome is None:
+            refuse(import_id, "no finite r_multiple or realized_pnl_pct")
+            continue
+        if cutoff_epoch is not None:
+            closed = _iso_epoch(raw.get("closed_at"))
+            if closed is None:
+                # Unknown close time against a live attribution boundary: it
+                # cannot be shown to predate the bot's own records, so it is
+                # skipped. Losing one trade of evidence is cheap; counting one
+                # trade twice corrupts the record the veto acts on.
+                refuse(import_id, "unreadable closed_at, cannot prove it predates bot attribution")
+                continue
+            if closed >= cutoff_epoch:
+                refuse(import_id, "the bot recorded this period itself — would double count")
+                continue
+        seen.add(import_id)
+        entry: Dict[str, Any] = {
+            "import_id": import_id,
+            "setup": label,
+            "symbol": str(raw.get("symbol") or "").upper()[:12] or None,
+            "closed_at": str(raw.get("closed_at") or "")[:40] or None,
+            "source": str(raw.get("source") or "app_journal")[:40],
+        }
+        won, pct = outcome
+        entry["won"] = won
+        r_raw = raw.get("r_multiple")
+        if isinstance(r_raw, (int, float)) and not isinstance(r_raw, bool):
+            entry["r_multiple"] = round(float(r_raw), 4)
+        if pct is not None:
+            entry["realized_pnl_pct"] = round(pct, 4)
+        accepted.append(entry)
+
+    return {"accepted": accepted, "rejected": rejected, "truncated": truncated, "reason": ""}
+
+
 def trail_exit_allowed(held_seconds: Any, is_hard_stop: bool) -> Tuple[bool, str]:
     """May a TRAILING exit fire yet? Hard stops are never delayed.
 
@@ -9703,7 +10171,12 @@ async def _alert_entry_fill(ticker: str, guard: dict, filled: int) -> None:
 # ==================== POSITION LEDGER (Redis-backed) ====================
 async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Optional[float],
                        target: Optional[float], contract: Optional[dict],
-                       action: str = "BUY") -> None:
+                       action: str = "BUY", setup: Optional[str] = None) -> None:
+    # The setup label rides on the position and into the ledger so the trade
+    # can be attributed when it settles. Without it the bot writes a history it
+    # can never learn from: every close lands in an anonymous pile and the
+    # question "does this setup make money?" stays permanently unanswerable.
+    setup_label = str(setup or "").strip() or None
     await state.set_position(ticker, {
         "qty": int(qty),
         "action": str(action or "BUY").upper(),
@@ -9712,6 +10185,7 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         "target": float(target) if target else None,
         "ts": _utcnow().isoformat(),
         "contract": contract,
+        "setup": setup_label,
     })
     await state.incr_trades_today()
     await trade_ledger.record("position_opened", {
@@ -9720,6 +10194,7 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         "stop": float(stop) if stop else None,
         "target": float(target) if target else None,
         "contract": contract,
+        "setup": setup_label,
     })
 
 
@@ -9745,6 +10220,24 @@ def _entry_direction(pos: Optional[dict], payload: dict) -> float:
     if action in {"EXIT", "CLOSE", "SELL"} or str(payload.get("intent") or "").lower() == "close":
         return 1.0  # closing an untracked position — assume it was long
     return 1.0 if action == "BUY" else -1.0
+
+
+def _peak_value(value: Any) -> Optional[float]:
+    """Coerce a recorded water-mark field to a finite float, or None.
+
+    None is a REAL answer here: it means the trail poller never observed this
+    position (a close that happened inside a single poll). It must never
+    collapse to 0.0 — a fabricated zero reads downstream as "this trade never
+    went my way" and would corrupt the exact never-alive / give-back statistics
+    the water mark exists to measure.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
 
 
 async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
@@ -9852,6 +10345,28 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         "account_pnl_pct": round(account_pct, 4) if account_pct is not None else None,
         "qty": qty or None,
         "reason": close_reason,
+        # Stamped from the tracked position so attribution survives even when
+        # the close arrives from a path that never saw the original signal
+        # (reconciler capture, protective stop fill, emergency flatten).
+        "setup": (str((pos or {}).get("setup") or "").strip() or None),
+        # WATER MARK — the best this position ever showed before the exit, as
+        # observed by the trail poller. This is what separates "the exit gave
+        # back a real move" from "the signal never worked": without it a losing
+        # book cannot tell whether to fix its exits or its entries.
+        #
+        # null when the peak was never observed (a close inside one poll).
+        # MISSING MUST STAY MISSING — a defaulted 0 would read as a trade that
+        # never went green and would quietly answer the question with a lie.
+        "peak_r": (lambda v: round(v, 2) if v is not None else None)(
+            _peak_value((pos or {}).get("trail_r"))),
+        "peak_mfe_pct": (lambda v: round(v, 4) if v is not None else None)(
+            _peak_value((pos or {}).get("trail_mfe_pct"))),
+        # UNIT DISCIPLINE. The trail measures options on the PREMIUM basis and
+        # equities on the underlying, which is not always the basis this close
+        # is booked on. Recording the peak's own basis lets the reader drop the
+        # peak when the two disagree instead of comparing a premium excursion
+        # against an underlying R (the −564.85R class of bug).
+        "peak_basis": "premium" if is_option else "underlying",
     })
     # SELL ALERT — every close path in the bot funnels through `_record_close`
     # (protective stop fill, signalled close, trailing exit, emergency flatten,
@@ -10980,7 +11495,7 @@ async def execute_live_order(payload: dict):
                 await _record_open(
                     str(symbol).upper(), quantity,
                     payload.get("entry"), payload.get("stop") or payload.get("stop_price"),
-                    payload.get("target"), contract, "BUY",
+                    payload.get("target"), contract, "BUY", payload.get("setup"),
                 )
                 # OPTION STOP PROTECTION — async guard task (state in Redis,
                 # survives restarts): poll the fill, then rest a SELL_CLOSE
@@ -11201,7 +11716,7 @@ async def execute_live_order(payload: dict):
                     logger.info(f"✅ ATOMIC OTOCO accepted for {symbol} — entry + protective stop in ONE request")
                     await _record_api_success()
                     await _record_open(symbol, quantity, entry_px or None, stop_px or None,
-                                       payload.get("target"), None, action)
+                                       payload.get("target"), None, action, payload.get("setup"))
                     return {"status": "success", "response": final, "otoco": True}
                 except OTOCOUnsupported as e:
                     logger.warning(
@@ -11223,7 +11738,8 @@ async def execute_live_order(payload: dict):
             logger.info(f"✅ LIVE EQUITY TRADE SUCCESS: {action} {quantity} {symbol}")
             await _record_api_success()
 
-            await _record_open(symbol, quantity, entry_px or None, stop_px or None, payload.get("target"), None, action)
+            await _record_open(symbol, quantity, entry_px or None, stop_px or None, payload.get("target"), None, action,
+                               payload.get("setup"))
             entry_order_id = _order_id_from_place(final)
             if stop_px > 0:
                 # Arm the stop guard: poll the entry fill, then rest a real STOP
@@ -11507,6 +12023,25 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     # a cancel/replace round-trip.
     spread = (ask - bid) if (ask > 0 and bid > 0 and ask >= bid) else None
 
+    # WATER MARK FIRST — instrumentation must never depend on the control path.
+    # Everything below this line can bail: the scale-out branch returns and
+    # hands the position to the next pass, and `plan_ratchet` returns None on an
+    # incomplete premium basis. Each of those exits used to lose the peak for
+    # that pass, so a trade that ran +1.2R and then died — precisely the trade
+    # the exit audit needs — recorded nothing at all.
+    observed = trailing_engine.observe_water_mark(pos, mark)
+    if observed is not None:
+        pos["trail_high"] = observed["high_since"]
+        pos["trail_low"] = observed["low_since"]
+        if observed["r_multiple"] is not None:
+            pos["trail_r"] = observed["r_multiple"]
+        if observed["mfe_percent"] is not None:
+            pos["trail_mfe_pct"] = observed["mfe_percent"]
+        pos["trail_checked_at"] = _utcnow().isoformat()
+        # Persisted BEFORE the branches below so the observation survives a
+        # scale-out return, a None plan, or a close booked by another path.
+        await state.set_position(ticker, pos)
+
     # CAPTURE: bank half at the first target BEFORE the trail is evaluated, so
     # the runner ratchets on its own (smaller) size from this pass onward. When
     # contracts were sold the position shape changed underneath us — re-read it
@@ -11525,9 +12060,14 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     pos["trail_high"] = plan["high_since"]
     pos["trail_low"] = plan["low_since"]
     pos["trail_tier"] = plan["trail"]["tier"]
-    pos["trail_r"] = plan["trail"]["r_multiple"]
+    # MONOTONIC. `compute_trail_level` degrades to 0.0R on degenerate inputs,
+    # so assigning the plan's MFE blind could ERASE a peak that was genuinely
+    # observed above. The water mark only ever moves in the trade's favour.
+    pos["trail_r"] = max(
+        float(plan["trail"]["r_multiple"]), _peak_value(pos.get("trail_r")) or 0.0)
     pos["breakeven_locked"] = plan["trail"]["breakeven_locked"]
-    pos["trail_mfe_pct"] = plan["trail"]["mfe_percent"]
+    pos["trail_mfe_pct"] = max(
+        float(plan["trail"]["mfe_percent"]), _peak_value(pos.get("trail_mfe_pct")) or 0.0)
     pos["trail_giveback"] = plan["trail"]["giveback_active"]
     pos["trail_checked_at"] = _utcnow().isoformat()
 
@@ -12081,6 +12621,37 @@ async def _recent_dispatch_verdicts(count: int = 20) -> List[dict]:
     return out
 
 
+def _setup_performance_safe() -> Dict[str, Any]:
+    """Per-setup settled record for `/status`, ranked worst expectancy first.
+
+    Reporting must never be able to take the server down, so a ledger failure
+    degrades to an explicit `available: false` rather than a 500 — and never
+    to a silent empty list, which would read as "every setup is fine".
+    """
+    try:
+        stats = summarize_setup_performance(trade_ledger.recent(SETUP_VETO_LOOKBACK))
+    except Exception as e:
+        logger.warning(f"setup performance read failed: {e}")
+        return {"available": False, "reason": str(e), "setups": []}
+    ranked = sorted(stats.values(), key=lambda s: s["expectancy_pct"])
+    for row in ranked:
+        row["vetoed"] = bool(
+            SETUP_VETO_ENABLED
+            and row["trades"] >= SETUP_VETO_MIN_TRADES
+            and row["wilson_high"] < SETUP_VETO_WIN_RATE
+        )
+    return {
+        "available": True,
+        "measured_from_trades": sum(r["trades"] for r in ranked),
+        # Provenance is reported, never averaged away: a veto standing entirely
+        # on trades the app imported is a weaker claim than one the bot placed
+        # and settled itself, and the operator is entitled to tell them apart.
+        "live_trades": sum(r["live"] for r in ranked),
+        "imported_trades": sum(r["imported"] for r in ranked),
+        "setups": ranked,
+    }
+
+
 # ==================== APP LINK — THE BOT'S EYES ON THE APP ====================
 # The bot has always been able to act completely alone: the scanner finds its
 # own setups and places real orders with no app involved. What it could never
@@ -12585,7 +13156,15 @@ async def status():
             "min_rvol": MIN_RVOL,
             "min_mtf": MIN_MTF,
             "allowed_setups": sorted(ALLOWED_SETUPS),
+            "setup_veto": {
+                "enabled": SETUP_VETO_ENABLED,
+                "min_trades": SETUP_VETO_MIN_TRADES,
+                "win_rate_floor": SETUP_VETO_WIN_RATE,
+            },
         },
+        # What the bot has actually LEARNED, exposed so the app and the AI can
+        # read the same settled record the veto enforces.
+        "setup_performance": _setup_performance_safe(),
     }
 
 
@@ -12644,6 +13223,72 @@ async def alerts_test(
         raise HTTPException(401, "invalid secret")
     result = await alerts.test_fire()
     return {**result, "config": await alerts.get_config()}
+
+
+@app.post("/setup/evidence")
+async def setup_evidence_import(
+    body: dict = Body(...),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Seed the setup veto from the app's settled journal.
+
+    The veto reads the bot's own ledger, which starts empty — so on a fresh
+    deploy it needs ~20 fresh trades per setup before it can refuse anything,
+    and until then the setups already known to lose keep being funded. The app
+    has an attributed record of trades that already happened; this endpoint
+    moves it across.
+
+    Idempotent by `import_id`, and bounded by the moment the bot began
+    attributing its own trades so the same trade is never counted twice.
+    Body: { "trades": [{import_id, setup, r_multiple, realized_pnl_pct,
+    closed_at, symbol}] }.
+    """
+    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
+        raise HTTPException(401, "invalid secret")
+
+    history = trade_ledger.recent(SETUP_VETO_LOOKBACK)
+    known = [
+        str((r.get("data") or {}).get("import_id") or "")
+        for r in history
+        if isinstance(r, dict) and str(r.get("event") or "") == SETUP_IMPORT_EVENT
+    ]
+    cutoff = setup_attribution_start(history)
+    before = summarize_setup_performance(history)
+
+    plan = plan_setup_import(body.get("trades"), known, cutoff)
+    if plan["reason"]:
+        raise HTTPException(422, plan["reason"])
+
+    for entry in plan["accepted"]:
+        await trade_ledger.record(SETUP_IMPORT_EVENT, entry)
+
+    after = summarize_setup_performance(trade_ledger.recent(SETUP_VETO_LOOKBACK))
+    newly_vetoed = sorted(
+        label for label, stats in after.items()
+        if stats["trades"] >= SETUP_VETO_MIN_TRADES
+        and stats["wilson_high"] < SETUP_VETO_WIN_RATE
+        and not (
+            (before.get(label, {}).get("trades", 0) >= SETUP_VETO_MIN_TRADES)
+            and before.get(label, {}).get("wilson_high", 100.0) < SETUP_VETO_WIN_RATE
+        )
+    )
+    logger.info(
+        f"[{BOT_VERSION}] setup evidence import — {len(plan['accepted'])} accepted, "
+        f"{len(plan['rejected'])} skipped, newly vetoed: {newly_vetoed or 'none'}"
+    )
+    return {
+        "ok": True,
+        "imported": len(plan["accepted"]),
+        "skipped": len(plan["rejected"]),
+        # Capped: the reasons are a diagnostic, not a second copy of the batch.
+        "skipped_detail": plan["rejected"][:25],
+        "truncated": plan["truncated"],
+        "attribution_cutoff": (
+            datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat() if cutoff else None
+        ),
+        "newly_vetoed": newly_vetoed,
+        "setup_performance": _setup_performance_safe(),
+    }
 
 
 @app.get("/scanner/status")
