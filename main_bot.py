@@ -4585,6 +4585,574 @@ class Scanner:
 
 ''')
 
+_bundle_load('study', r'''
+"""
+Study layer — makes the append-only ledger answerable in SQL.
+=============================================================
+
+WHAT WAS MISSING
+----------------
+The bot already STORES everything it needs to learn from: `bot_ledger` mirrors
+every hash-chained record to Postgres, and a `position_closed` record carries
+the full outcome (setup, exit reason, realized P&L, peak R, peak excursion,
+and the basis those percents are measured on).
+
+But it was stored as `line TEXT` — one opaque JSON string per row. Asking the
+single question the whole learning loop exists to answer ("which setups
+actually make money, and am I giving the moves back at the exit?") meant
+pulling every row over the wire and parsing it in Python. In SQL the data was
+inert. The bot could remember, but it could not study.
+
+THE APPROACH: DERIVE, NEVER DUPLICATE
+-------------------------------------
+Everything here is a VIEW over `bot_ledger`. Nothing is copied into a second
+table, for two reasons:
+
+  1. The ledger is hash-chained and append-only. It is the audit trail. A
+     parallel "analytics" table would be a second, unverified copy of the
+     truth that can silently drift from the chain it claims to summarize.
+  2. Views apply RETROACTIVELY. The moment they exist, all 346 records —
+     including every trade closed before this module was written — become
+     queryable. A new table would start empty and learn nothing from history.
+
+So the chain stays the only writer, and study is a pure read.
+
+TWO UNIT TRAPS THIS LAYER DISARMS
+---------------------------------
+1. FRACTION vs PERCENT. The ledger stores `peak_mfe_pct` as a FRACTION
+   (0.2484) while `realized_pnl_pct` is a PERCENT (-20.26). Subtracting them
+   raw to get "give-back" is off by 100x and looks plausible. The close view
+   therefore exposes `peak_mfe_frac` (raw, as stored) AND `peak_mfe_pct`
+   (x100, same unit as realized) so any comparison is apples-to-apples.
+
+2. PREMIUM vs UNDERLYING BASIS. A premium percent describes a levered option
+   contract; an underlying percent describes the stock. Averaging them
+   together produces a confident number that means nothing. Every P&L
+   aggregate here GROUPS BY `pnl_basis` so the two can never be pooled.
+
+   The one statistic that IS basis-free is win rate — won/lost is a count, not
+   a return. That is why `bot_setup_priors` (which blends live trades with
+   imported evidence of unknown basis) reports ONLY win rate and sample
+   counts, and never a percentage return.
+
+MISSING STAYS MISSING
+---------------------
+Every cast is a safe cast that yields NULL rather than raising, and every
+aggregate counts its own coverage (`peak_observed`, `labeled` ...). A trade
+that was never instrumented is excluded from the denominator, never defaulted
+to zero. A defaulted 0 peak reads as "this trade never went green" and would
+answer the give-back question with a lie.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("etrade-bot.study")
+
+_engine: Any = None
+
+# Ledger event names this layer reads.
+EVENT_CLOSED = "position_closed"
+EVENT_OPENED = "position_opened"
+EVENT_EVIDENCE = "setup_evidence_imported"
+
+
+# ---------------------------------------------------------------------------
+# DDL. Executed one statement at a time so a failure names the exact object
+# that broke instead of collapsing the whole batch into one opaque error.
+# CREATE OR REPLACE throughout — running this on every boot is a no-op.
+# ---------------------------------------------------------------------------
+
+_SAFE_CASTS = r"""
+create or replace function public.bot_num(v text)
+returns double precision
+language plpgsql immutable strict
+as $fn$
+begin
+  return v::double precision;
+exception when others then
+  return null;
+end;
+$fn$;
+"""
+
+_SAFE_TS = r"""
+create or replace function public.bot_ts(v text)
+returns timestamptz
+language plpgsql immutable strict
+as $fn$
+begin
+  return v::timestamptz;
+exception when others then
+  return null;
+end;
+$fn$;
+"""
+
+_SAFE_BOOL = r"""
+create or replace function public.bot_bool(v text)
+returns boolean
+language plpgsql immutable strict
+as $fn$
+begin
+  return v::boolean;
+exception when others then
+  return null;
+end;
+$fn$;
+"""
+
+_SAFE_JSON = r"""
+create or replace function public.bot_json(v text)
+returns jsonb
+language plpgsql immutable strict
+as $fn$
+begin
+  return v::jsonb;
+exception when others then
+  return null;
+end;
+$fn$;
+"""
+
+# The identity of an imported trade, for de-duplication.
+#
+# `import_id` is the app's own id for the settled trade, so it is what makes two
+# rows the SAME trade rather than two trades that merely resemble each other.
+# The (ticker, setup, closed_at) fallback exists only for rows written before
+# the id was carried through; it is a heuristic, and two genuinely distinct
+# trades sharing all three would collapse into one -- which is why it is the
+# fallback and not the key.
+_EVIDENCE_KEY_FN = r"""
+create or replace function public.bot_evidence_key(
+  import_id text, ticker text, setup text, closed_at timestamptz
+)
+returns text
+language sql immutable
+as $fn$
+  select coalesce(
+    nullif(btrim(import_id), ''),
+    coalesce(ticker, '') || '|' || lower(btrim(coalesce(setup, ''))) || '|'
+      || coalesce(closed_at::text, '')
+  );
+$fn$;
+"""
+
+# One row per ledger record, with the JSON parsed once. A single corrupt line
+# yields NULL here instead of erroring the whole view -- one bad row must never
+# blind the entire study layer.
+_EVENTS_VIEW = r"""
+create or replace view public.bot_ledger_events as
+select
+  l.seq,
+  public.bot_json(l.line)->>'event'      as event,
+  public.bot_json(l.line)->>'hash'       as ledger_hash,
+  public.bot_ts(public.bot_json(l.line)->>'ts') as at,
+  public.bot_json(l.line)->'data'        as data
+from public.bot_ledger l
+where public.bot_json(l.line) is not null;
+"""
+
+# Closed trades, typed. Laterally joined to the most recent PRIOR open for the
+# same ticker, which recovers two things the close record does not carry:
+#   - the UNDERLYING entry/stop/target (a close on premium basis records
+#     premiums in entry/exit, so underlying risk is otherwise unrecoverable);
+#   - the setup label, when it was stamped at open but not at close.
+_CLOSES_VIEW = r"""
+create or replace view public.bot_trade_closes as
+select
+  e.seq,
+  e.ledger_hash,
+  e.at                                              as closed_at,
+  e.data->>'ticker'                                 as ticker,
+  coalesce(nullif(e.data->>'setup', ''), o.open_setup) as setup,
+  nullif(e.data->>'reason', '')                     as exit_reason,
+  nullif(e.data->>'basis', '')                      as pnl_basis,
+  public.bot_num(e.data->>'realized_pnl_pct')       as realized_pnl_pct,
+  public.bot_num(e.data->>'realized_pnl_usd')       as realized_pnl_usd,
+  public.bot_num(e.data->>'account_pnl_pct')        as account_pnl_pct,
+  public.bot_num(e.data->>'peak_r')                 as peak_r,
+  public.bot_num(e.data->>'peak_mfe_pct')           as peak_mfe_frac,
+  public.bot_num(e.data->>'peak_mfe_pct') * 100.0   as peak_mfe_pct,
+  nullif(e.data->>'peak_basis', '')                 as peak_basis,
+  public.bot_num(e.data->>'entry')                  as entry_price,
+  public.bot_num(e.data->>'exit')                   as exit_price,
+  public.bot_num(e.data->>'qty')                    as qty,
+  o.opened_at,
+  o.underlying_entry,
+  o.underlying_stop,
+  o.underlying_target
+from public.bot_ledger_events e
+left join lateral (
+  select
+    oe.at                                  as opened_at,
+    nullif(oe.data->>'setup', '')          as open_setup,
+    public.bot_num(oe.data->>'entry')      as underlying_entry,
+    public.bot_num(oe.data->>'stop')       as underlying_stop,
+    public.bot_num(oe.data->>'target')     as underlying_target
+  from public.bot_ledger_events oe
+  where oe.event = 'position_opened'
+    and oe.data->>'ticker' = e.data->>'ticker'
+    and oe.seq < e.seq
+  order by oe.seq desc
+  limit 1
+) o on true
+where e.event = 'position_closed';
+"""
+
+# Setup evidence imported from the app's journal. Carries a setup label and a
+# won/lost verdict but NOT a basis, so its returns are never pooled with the
+# live premium-basis trades -- only its win/loss counts are used downstream.
+_EVIDENCE_VIEW = r"""
+create or replace view public.bot_setup_evidence as
+select
+  e.seq,
+  e.ledger_hash,
+  e.at                                          as imported_at,
+  e.data->>'symbol'                             as ticker,
+  nullif(e.data->>'setup', '')                  as setup,
+  public.bot_bool(e.data->>'won')               as won,
+  public.bot_num(e.data->>'r_multiple')         as r_multiple,
+  public.bot_num(e.data->>'realized_pnl_pct')   as realized_pnl_pct,
+  nullif(e.data->>'source', '')                 as source,
+  nullif(e.data->>'import_id', '')              as import_id,
+  public.bot_ts(e.data->>'closed_at')           as closed_at,
+  -- Appended LAST on purpose: CREATE OR REPLACE VIEW can only ADD columns at
+  -- the end, so a database already holding the previous definition upgrades in
+  -- place instead of needing a DROP ... CASCADE.
+  -- Null here means the app never sent a basis (older pushes did not), and it
+  -- must stay null: assuming 'premium' would let stock percentages be averaged
+  -- into option percentages and the result would still look authoritative.
+  nullif(e.data->>'pnl_basis', '')              as pnl_basis,
+  public.bot_num(e.data->>'peak_r')             as peak_r,
+  public.bot_num(e.data->>'peak_mfe_pct')       as peak_mfe_pct
+from public.bot_ledger_events e
+where e.event = 'setup_evidence_imported';
+"""
+
+# THE BRIDGE, expressed as one table. The bot's own closes and the app's
+# settled trades describe the same strategies from two sides, so this is where
+# they finally sit together -- but ONLY where each row carries the basis that
+# qualifies its percent. A row with an unknown basis is counted in
+# `bot_setup_priors` (win rate is a count, so it survives the missing basis)
+# and deliberately excluded here, because an expectancy is a mean and a mean
+# over mixed instruments is not a smaller truth, it is a wrong one.
+_EXPECTANCY_VIEW = r"""
+create or replace view public.bot_setup_expectancy as
+with unified as (
+  select lower(btrim(setup)) as setup_key, setup, pnl_basis,
+         realized_pnl_pct as pct, 'live'::text as src
+  from public.bot_trade_closes
+  where setup is not null and realized_pnl_pct is not null
+    and pnl_basis in ('premium', 'underlying')
+  union all
+  select lower(btrim(setup)) as setup_key, setup, pnl_basis,
+         realized_pnl_pct as pct, 'evidence'::text as src
+  from (
+    select distinct on (public.bot_evidence_key(import_id, ticker, setup, closed_at))
+           setup, pnl_basis, realized_pnl_pct
+    from public.bot_setup_evidence
+    where setup is not null and realized_pnl_pct is not null
+      and pnl_basis in ('premium', 'underlying')
+    order by public.bot_evidence_key(import_id, ticker, setup, closed_at), seq desc
+  ) deduped
+)
+select
+  setup_key,
+  (array_agg(setup order by setup))[1]                       as setup,
+  pnl_basis,
+  count(*)::int                                              as trades,
+  count(*) filter (where src = 'live')::int                  as live_trades,
+  count(*) filter (where src = 'evidence')::int              as evidence_trades,
+  count(*) filter (where pct > 0)::int                        as wins,
+  round((count(*) filter (where pct > 0))::numeric
+        * 100.0 / nullif(count(*), 0), 1)                    as win_rate_pct,
+  round(avg(pct)::numeric, 2)                                as expectancy_pct
+from unified
+group by setup_key, pnl_basis;
+"""
+
+# Per-setup P&L. GROUPED BY BASIS -- see the module docstring: pooling premium
+# and underlying percents produces a confident number that means nothing.
+_PERFORMANCE_VIEW = r"""
+create or replace view public.bot_setup_performance as
+select
+  setup,
+  pnl_basis,
+  count(*)::int                                                   as trades,
+  count(*) filter (where realized_pnl_pct > 0)::int               as wins,
+  count(*) filter (where realized_pnl_pct < 0)::int               as losses,
+  round((count(*) filter (where realized_pnl_pct > 0))::numeric
+        * 100.0 / nullif(count(*), 0), 1)                         as win_rate_pct,
+  round(avg(realized_pnl_pct)::numeric, 2)                        as avg_pnl_pct,
+  round(sum(realized_pnl_usd)::numeric, 2)                        as total_pnl_usd,
+  round(avg(peak_r)::numeric, 2)                                  as avg_peak_r,
+  -- Coverage, not a value: how many of these trades were actually instrumented
+  -- with a water mark. The give-back average below is over THESE trades only.
+  count(peak_mfe_pct)::int                                        as peak_observed,
+  -- Give-back: how much of the best excursion was handed back at the exit.
+  -- Both terms are percents here (peak_mfe_pct is already x100).
+  round(avg(peak_mfe_pct - realized_pnl_pct)::numeric, 2)         as avg_giveback_pct
+from public.bot_trade_closes
+where setup is not null
+group by setup, pnl_basis;
+"""
+
+# Which exit paths pay and which bleed. Also basis-grouped.
+_EXITS_VIEW = r"""
+create or replace view public.bot_exit_reasons as
+select
+  exit_reason,
+  pnl_basis,
+  count(*)::int                                                   as trades,
+  round((count(*) filter (where realized_pnl_pct > 0))::numeric
+        * 100.0 / nullif(count(*), 0), 1)                         as win_rate_pct,
+  round(avg(realized_pnl_pct)::numeric, 2)                        as avg_pnl_pct,
+  round(sum(realized_pnl_usd)::numeric, 2)                        as total_pnl_usd,
+  count(peak_mfe_pct)::int                                        as peak_observed,
+  round(avg(peak_mfe_pct - realized_pnl_pct)::numeric, 2)         as avg_giveback_pct
+from public.bot_trade_closes
+where exit_reason is not null
+group by exit_reason, pnl_basis;
+"""
+
+# Basis-free win-rate priors: live trades UNION imported evidence. Win rate is
+# a count, so the two sources are legitimately comparable here -- and ONLY
+# here. No return percentage is reported from this view by design.
+#
+# LABELS ARE MATCHED CASE- AND SPACE-INSENSITIVELY. The bot stamps its live
+# setups in title case ("VWAP Reclaim") while the imported journal evidence is
+# lower case ("vwap reclaim"). Grouping on the raw string split the SAME setup
+# into two rows -- one showing 13 samples at 23% and another showing 1 sample
+# at 0% -- which is the exact failure this layer exists to prevent: the live
+# trades never got to inherit the history that should have warned about them.
+# `setup` reports the most frequent spelling seen, so the output stays readable.
+#
+# Evidence is de-duplicated per `import_id` -- the app's own id for the settled
+# trade, which is what makes two rows the SAME trade rather than two trades that
+# merely look alike. Where an id is absent (only the earliest imports), it falls
+# back to (ticker, setup, closed_at). Highest `seq` wins, so a row re-pushed to
+# fill in a basis or a water mark supersedes the thinner original instead of
+# being counted beside it.
+_PRIORS_VIEW = r"""
+create or replace view public.bot_setup_priors as
+with live as (
+  select setup, (realized_pnl_pct > 0) as won
+  from public.bot_trade_closes
+  where setup is not null and realized_pnl_pct is not null
+),
+evidence as (
+  select distinct on (public.bot_evidence_key(import_id, ticker, setup, closed_at))
+         setup, won
+  from public.bot_setup_evidence
+  where setup is not null and won is not null
+  order by public.bot_evidence_key(import_id, ticker, setup, closed_at), seq desc
+),
+pooled as (
+  select setup, won, 'live'::text as src from live
+  union all
+  select setup, won, 'evidence'::text as src from evidence
+),
+keyed as (
+  select lower(btrim(setup)) as setup_key, setup, won, src from pooled
+)
+-- Column ORDER is deliberate: `setup_key` is appended LAST rather than placed
+-- beside `setup`. CREATE OR REPLACE VIEW can only ADD columns at the end, so
+-- keeping the original positions lets this ship to a database that already has
+-- the previous definition without a DROP (which would need CASCADE and would
+-- take any dependent view down with it).
+select
+  (array_agg(setup order by cnt desc))[1]             as setup,
+  sum(cnt)::int                                       as samples,
+  sum(win_cnt)::int                                   as wins,
+  round(sum(win_cnt)::numeric * 100.0
+        / nullif(sum(cnt), 0), 1)                     as win_rate_pct,
+  sum(live_cnt)::int                                  as live_trades,
+  sum(ev_cnt)::int                                    as evidence_trades,
+  setup_key
+from (
+  select
+    setup_key,
+    setup,
+    count(*)                                  as cnt,
+    count(*) filter (where won)               as win_cnt,
+    count(*) filter (where src = 'live')      as live_cnt,
+    count(*) filter (where src = 'evidence')  as ev_cnt
+  from keyed
+  group by setup_key, setup
+) spellings
+group by setup_key;
+"""
+
+_DDL: List[Tuple[str, str]] = [
+    ("bot_num", _SAFE_CASTS),
+    ("bot_ts", _SAFE_TS),
+    ("bot_bool", _SAFE_BOOL),
+    ("bot_json", _SAFE_JSON),
+    ("bot_evidence_key", _EVIDENCE_KEY_FN),
+    ("bot_ledger_events", _EVENTS_VIEW),
+    ("bot_trade_closes", _CLOSES_VIEW),
+    ("bot_setup_evidence", _EVIDENCE_VIEW),
+    ("bot_setup_performance", _PERFORMANCE_VIEW),
+    ("bot_exit_reasons", _EXITS_VIEW),
+    ("bot_setup_priors", _PRIORS_VIEW),
+    ("bot_setup_expectancy", _EXPECTANCY_VIEW),
+]
+
+
+def init(db_engine: Any) -> None:
+    """Attach the SQLAlchemy async engine. None disables the layer cleanly."""
+    global _engine
+    _engine = db_engine
+
+
+def is_available() -> bool:
+    return _engine is not None
+
+
+async def ensure_views() -> Dict[str, Any]:
+    """Create/refresh every study view. Idempotent, safe on every boot.
+
+    Never raises: a study layer that fails to build must not stop the bot from
+    trading. The failure is returned (and surfaced by GET /study) instead.
+    """
+    if _engine is None:
+        return {"ok": False, "created": 0, "error": "no database engine"}
+    created: List[str] = []
+    try:
+        async with _engine.begin() as conn:
+            for name, ddl in _DDL:
+                await conn.exec_driver_sql(ddl)
+                created.append(name)
+    except Exception as e:
+        logger.error(f"study views failed at {created[-1] if created else 'start'}: {e}")
+        return {
+            "ok": False,
+            "created": len(created),
+            "failed_at": _DDL[len(created)][0] if len(created) < len(_DDL) else None,
+            "error": f"{type(e).__name__}: {e}",
+        }
+    logger.info(f"study layer ready — {len(created)} view(s)/function(s) over the ledger")
+    return {"ok": True, "created": len(created), "error": None}
+
+
+async def _rows(sql: str) -> List[Dict[str, Any]]:
+    """Run a read-only query and return plain JSON-able dicts."""
+    if _engine is None:
+        return []
+    async with _engine.connect() as conn:
+        result = await conn.exec_driver_sql(sql)
+        cols = list(result.keys())
+        return [dict(zip(cols, row)) for row in result.fetchall()]
+
+
+async def setup_priors(min_samples: int = 1) -> List[Dict[str, Any]]:
+    """Win-rate priors per setup, best first. Basis-free (counts only)."""
+    return await _rows(
+        "select * from public.bot_setup_priors "
+        f"where samples >= {int(min_samples)} "
+        "order by win_rate_pct desc nulls last, samples desc"
+    )
+
+
+async def setup_performance() -> List[Dict[str, Any]]:
+    """Per-setup P&L, grouped by basis. Never pools premium with underlying."""
+    return await _rows(
+        "select * from public.bot_setup_performance "
+        "order by total_pnl_usd desc nulls last"
+    )
+
+
+async def setup_expectancy() -> List[Dict[str, Any]]:
+    """Live closes and the app's settled trades in one table, per basis.
+
+    Only basis-qualified rows appear. `live_trades` vs `evidence_trades` stays
+    visible because "20 trades" that are all the app's history is a different
+    claim from 20 the bot placed itself.
+    """
+    return await _rows(
+        "select * from public.bot_setup_expectancy "
+        "order by trades desc, setup"
+    )
+
+
+async def exit_reasons() -> List[Dict[str, Any]]:
+    """Which exit paths pay and which bleed."""
+    return await _rows(
+        "select * from public.bot_exit_reasons order by trades desc"
+    )
+
+
+async def recent_closes(limit: int = 25) -> List[Dict[str, Any]]:
+    """Most recent closed trades with their full decision/outcome context."""
+    return await _rows(
+        "select closed_at, ticker, setup, exit_reason, pnl_basis, "
+        "realized_pnl_pct, realized_pnl_usd, peak_r, peak_mfe_pct, "
+        "underlying_entry, underlying_stop "
+        "from public.bot_trade_closes "
+        f"order by seq desc limit {int(limit)}"
+    )
+
+
+async def coverage() -> Dict[str, Any]:
+    """How much of the book is actually STUDYABLE.
+
+    This is the honesty check, and it is the first thing to read. A setup
+    table computed over 1 labeled trade out of 24 is not a weak signal, it is
+    no signal — and without this it looks identical to a strong one.
+    """
+    rows = await _rows(
+        "select "
+        "  count(*)::int                                   as closes, "
+        "  count(setup)::int                               as labeled, "
+        "  count(peak_mfe_pct)::int                        as peak_instrumented, "
+        "  count(*) filter (where pnl_basis = 'premium')::int   as premium_basis, "
+        "  count(*) filter (where pnl_basis = 'underlying')::int as underlying_basis, "
+        "  min(closed_at)                                  as first_close, "
+        "  max(closed_at)                                  as last_close "
+        "from public.bot_trade_closes"
+    )
+    out: Dict[str, Any] = dict(rows[0]) if rows else {}
+    ev = await _rows(
+        "select count(*)::int as evidence_records, "
+        "count(distinct setup)::int as evidence_setups, "
+        "count(pnl_basis)::int as evidence_basis_qualified "
+        "from public.bot_setup_evidence where setup is not null"
+    )
+    if ev:
+        out.update(ev[0])
+    total = await _rows("select count(*)::int as ledger_records from public.bot_ledger")
+    if total:
+        out.update(total[0])
+    closes = int(out.get("closes") or 0)
+    labeled = int(out.get("labeled") or 0)
+    out["labeled_pct"] = round(labeled * 100.0 / closes, 1) if closes else None
+    # Say plainly whether the attribution question can be answered at all.
+    out["attribution_ready"] = labeled >= 5
+    return out
+
+
+async def summary(min_samples: int = 1, recent: int = 10) -> Dict[str, Any]:
+    """Everything the learning loop needs in one read."""
+    if _engine is None:
+        return {"available": False, "error": "no DATABASE_URL — study layer offline"}
+    try:
+        return {
+            "available": True,
+            "coverage": await coverage(),
+            "setup_priors": await setup_priors(min_samples),
+            "setup_performance": await setup_performance(),
+            "setup_expectancy": await setup_expectancy(),
+            "exit_reasons": await exit_reasons(),
+            "recent_closes": await recent_closes(recent),
+        }
+    except Exception as e:
+        logger.error(f"study summary failed: {e}")
+        return {"available": False, "error": f"{type(e).__name__}: {e}"}
+
+''')
+
 # =========================================================================
 # main_bot.py source follows (its `from x import y` calls resolve to the
 # embedded modules registered in sys.modules above).
@@ -4728,6 +5296,7 @@ try:  # package-style import (python -m bot.main_bot) or flat (uvicorn main_bot:
     from . import trade_ledger
     from . import trailing_engine
     from . import scanner as scanner_mod
+    from . import study
 except ImportError:
     from state_store import (
         StateStore, LockNotAcquired, sanitize_conn_url, unreplaced_placeholders,
@@ -4738,6 +5307,7 @@ except ImportError:
     import trade_ledger
     import trailing_engine
     import scanner as scanner_mod
+    import study
 
 load_dotenv()
 
@@ -4779,7 +5349,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.46.0-water-mark"
+BOT_VERSION = "5.48.0-ledger-amnesia-alert"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -7053,6 +7623,8 @@ class PgStatePersistence:
 
 
 _state_persistence: Optional[PgStatePersistence] = None
+# Result of the boot-time study-view build, surfaced by GET /study.
+_study_views: Optional[Dict[str, Any]] = None
 
 
 async def _init_durable_state() -> Optional[PgStatePersistence]:
@@ -7100,6 +7672,225 @@ async def _restore_ledger_from_db() -> None:
             trade_ledger.restore_lines(TRADE_LEDGER_FILE, lines)
     except Exception as e:
         logger.error(f"ledger restore from DB failed (non-fatal): {e}")
+
+
+def plan_ledger_memory(
+    db_configured: bool,
+    db_backend: Any,
+    db_error: Any,
+    mirrored_records: Optional[int],
+    local_records: int,
+    state_rows: Optional[int],
+    min_trades: int,
+) -> Dict[str, Any]:
+    """Does this process actually REMEMBER anything, and should we shout about it?
+
+    The ledger is the only record of what happened and the only thing the setup
+    veto learns from, yet it lives on an ephemeral disk. Every way it can be
+    silently empty looks identical in the logs today — one INFO line reading
+    `0 record(s)` — so a bot with total amnesia boots, reports healthy, and
+    trades on as if it had a history. This classifies the boot state so the
+    catastrophic cases can be said out loud.
+
+    The one case that must NOT alert is a genuine first boot: no history is not
+    the same failure as lost history. `state_rows` is the discriminator — the
+    `bot_state` table carries rows only once this bot has run before, so an
+    empty ledger beside a populated state table is evidence of LOSS, while both
+    empty is simply a new deployment.
+
+    Fails quiet on unmeasurable inputs (`mirrored_records is None`): an
+    uncounted mirror is not evidence that the mirror is empty, and crying wolf
+    on a transient count failure would train the operator to ignore the alarm
+    that matters.
+
+    Returns {status, alert, severity, event, message, detail, records,
+    mirrored, learning_armed}.
+    """
+    local = max(0, int(local_records or 0))
+    mirrored = None if mirrored_records is None else max(0, int(mirrored_records))
+    floor = max(0, int(min_trades or 0))
+    # Arithmetic possibility only: the veto needs `min_trades` settled trades in
+    # a SINGLE setup, so this is the most generous read of the record. If it is
+    # false the veto certainly cannot fire; true does not mean it will.
+    learning_armed = local >= floor and floor > 0
+    out: Dict[str, Any] = {
+        "status": "healthy",
+        "alert": False,
+        "severity": "info",
+        "event": "ledger_memory_ok",
+        "message": "",
+        "detail": "",
+        "records": local,
+        "mirrored": mirrored,
+        "learning_armed": learning_armed,
+    }
+    blind = (
+        "" if learning_armed else
+        f" The setup veto needs {floor} settled trades in a setup before it can refuse "
+        f"anything, so with {local} record(s) it is disarmed — every setup reads as unproven."
+    )
+
+    if not db_configured:
+        out.update({
+            "status": "not_durable",
+            "alert": True,
+            "severity": "warning",
+            "event": "ledger_not_durable",
+            "message": (
+                f"NO DURABLE LEDGER — DATABASE_URL is not set, so the {local} record(s) on "
+                f"disk die with this container. Every redeploy resets the bot's memory to zero."
+            ),
+            "detail": (
+                "Set DATABASE_URL to your Supabase Postgres URI (Project Settings → Database → "
+                "Connection string, session pooler) and redeploy." + blind
+            ),
+        })
+        return out
+
+    if db_error or str(db_backend or "").lower() != "postgres":
+        reason = str(db_error or f"fell back to backend '{db_backend}'")
+        out.update({
+            "status": "db_broken",
+            "alert": True,
+            "severity": "critical",
+            "event": "ledger_mirror_broken",
+            "message": (
+                f"LEDGER MIRROR BROKEN — DATABASE_URL is set but unusable ({reason}), so the "
+                f"{local} record(s) on disk are NOT being mirrored and will be lost on redeploy."
+            ),
+            "detail": (
+                "This is worse than having no database: the ledger looks durable and is not. "
+                "Fix the connection string (or install asyncpg) and redeploy." + blind
+            ),
+        })
+        return out
+
+    if mirrored is None:
+        out.update({
+            "status": "unknown",
+            "event": "ledger_memory_unknown",
+            "message": f"ledger mirror could not be counted — {local} record(s) on disk",
+            "detail": "Count failed; not treated as evidence of loss.",
+        })
+        return out
+
+    if mirrored == 0 and local == 0:
+        if state_rows is not None and state_rows > 0:
+            out.update({
+                "status": "amnesia",
+                "alert": True,
+                "severity": "critical",
+                "event": "ledger_amnesia",
+                "message": (
+                    "LEDGER AMNESIA — this bot has run before (durable state holds "
+                    f"{state_rows} key(s)) but the ledger mirror is EMPTY. Every trade ever "
+                    "placed has been forgotten: no P&L history, no setup evidence, no learning."
+                ),
+                "detail": (
+                    "The mirror was wiped, pointed at a different database, or never wrote. "
+                    "Do not treat today's results as a continuation of anything." + blind
+                ),
+            })
+            return out
+        out.update({
+            "status": "first_boot",
+            "event": "ledger_memory_new",
+            "message": "ledger is empty on a first boot — no history exists yet, none was lost",
+            "detail": blind.strip(),
+        })
+        return out
+
+    if local == 0 and mirrored > 0:
+        out.update({
+            "status": "restore_failed",
+            "alert": True,
+            "severity": "critical",
+            "event": "ledger_restore_failed",
+            "message": (
+                f"LEDGER RESTORE FAILED — the mirror holds {mirrored} record(s) but the local "
+                "chain came up EMPTY. The bot is trading with no memory of its own history."
+            ),
+            "detail": (
+                "restore_lines() did not rebuild the JSONL file. Check disk permissions and the "
+                "ledger path, then restart." + blind
+            ),
+        })
+        return out
+
+    if mirrored < local:
+        gap = local - mirrored
+        out.update({
+            "status": "mirror_lagging",
+            "alert": True,
+            "severity": "warning",
+            "event": "ledger_mirror_lagging",
+            "message": (
+                f"LEDGER MIRROR INCOMPLETE — {local} record(s) on disk but only {mirrored} "
+                f"mirrored. {gap} record(s) exist nowhere durable and die on the next redeploy."
+            ),
+            "detail": (
+                "Mirror writes are best-effort and some failed. The chain on disk is still "
+                "authoritative; the gap is what a redeploy would erase." + blind
+            ),
+        })
+        return out
+
+    out["message"] = f"ledger memory intact — {local} record(s) on disk, {mirrored} mirrored"
+    out["detail"] = blind.strip()
+    return out
+
+
+# Last boot verdict, surfaced on GET /ledger so the amnesia case is visible on
+# demand and not only in the one log line nobody was reading.
+_ledger_memory: Optional[Dict[str, Any]] = None
+
+
+async def _announce_ledger_memory() -> None:
+    """Count the mirror against the local chain at boot and alert when the bot
+    has lost (or never had) the record it learns from. Never raises."""
+    global _ledger_memory
+    try:
+        mirrored: Optional[int] = None
+        state_rows: Optional[int] = None
+        if engine is not None:
+            try:
+                async with engine.connect() as conn:
+                    mirrored = int((await conn.execute(
+                        sql_text("SELECT COUNT(*) FROM bot_ledger"))).scalar() or 0)
+                    state_rows = int((await conn.execute(
+                        sql_text("SELECT COUNT(*) FROM bot_state"))).scalar() or 0)
+            except Exception as e:
+                logger.warning(f"ledger memory: mirror count unavailable ({e})")
+        _, local_records, _ = trade_ledger.verify()
+        verdict = plan_ledger_memory(
+            db_configured=bool(DATABASE_URL),
+            db_backend=_db_backend,
+            db_error=_db_error,
+            mirrored_records=mirrored,
+            local_records=local_records,
+            state_rows=state_rows,
+            min_trades=SETUP_VETO_MIN_TRADES,
+        )
+        _ledger_memory = verdict
+        if verdict["alert"]:
+            logger.error(f"⛔ [ledger] {verdict['message']}")
+            await alerts.send(
+                verdict["severity"],
+                verdict["event"],
+                verdict["message"],
+                dedupe_key=verdict["event"],
+                data={k: verdict[k] for k in
+                      ("status", "records", "mirrored", "learning_armed", "detail")},
+                # A memory failure is discovered exactly once, at boot, and it
+                # invalidates every number the bot will report all session.
+                # It must never be filtered away by a severity floor.
+                force_deliver=True,
+                webhook_text=f"{verdict['message']}\n\n{verdict['detail']}",
+            )
+        else:
+            logger.info(f"[ledger] {verdict['message']}")
+    except Exception as e:
+        logger.error(f"ledger memory check failed (non-fatal): {e}")
 
 
 # ==================== ACCOUNT KEY RESOLUTION ====================
@@ -7799,6 +8590,148 @@ def plan_trade_concentration(actual_risk_usd: Any, base_budget_usd: Any,
     return {"blocked": False, "reason": note, "fraction": round(fraction, 4), "ceiling_usd": round(ceiling, 2)}
 
 
+def derive_armed_option_stop(explicit: Any, fill_ref: Any) -> Tuple[Optional[float], str]:
+    """The premium stop that will ACTUALLY rest at the broker after a fill.
+
+    One source of truth, because two callers need the same answer for opposite
+    reasons: the stop guard arms this level after the fill, and the pre-placement
+    risk gate has to know what it will be BEFORE the order goes in. While those
+    two disagreed, the gate priced a trade one way and the broker risked another.
+
+    Mirrors the guard exactly: an app-supplied premium stop is clamped into the
+    sanity band, otherwise the percentage haircut applies. Returns
+    `(stop, basis)`, or `(None, 'none')` when no protective level is derivable.
+    """
+    try:
+        fill = float(fill_ref)
+    except (TypeError, ValueError):
+        fill = 0.0
+    if not math.isfinite(fill) or fill <= 0:
+        fill = 0.0
+
+    stop: Optional[float] = None
+    basis = "pct_default"
+    try:
+        if explicit is not None and float(explicit) > 0:
+            stop = float(explicit)
+    except (TypeError, ValueError):
+        stop = None
+
+    if stop is not None:
+        stop, clamp_note = _clamp_option_stop_premium(stop, fill)
+        basis = "app_delta+clamped" if clamp_note else "app_delta"
+    if stop is None and fill > 0 and OPTION_STOP_LOSS_PCT > 0:
+        stop = fill * (1.0 - OPTION_STOP_LOSS_PCT / 100.0)
+        basis = "pct_default"
+    if stop is None or stop <= 0:
+        return None, "none"
+    return _round_to_option_tick(stop, "down"), basis
+
+
+def plan_priced_option_risk(premium: Any, qty: Any, stop_premium: Any,
+                            remaining_budget_usd: Any, base_budget_usd: Any,
+                            max_fraction: float = None) -> Dict[str, Any]:
+    """Re-judge an option entry once the REAL contract price is known.
+
+    `plan_trade_concentration` runs at dispatch, before the option chain is ever
+    quoted. At that moment the payload carries no premium, so
+    `estimate_entry_risk_usd` returns None, the concentration gate stays silent
+    by design, and the budget gate falls back to the NOMINAL per-trade risk.
+    Every option therefore passes on an estimate, never on the contract.
+
+    2026-08-28 is what that costs. MSFT was approved against ~$26 of nominal
+    risk; the contract then priced at 1.53 against a 1.25 stop — $112 of real
+    risk, 109% of the $103 daily budget, on one trade. It stopped out 2m37s
+    later and the day's next two signals (PLTR, NVDA) were refused outright.
+    Every gate passed. None of them had seen the actual contract.
+
+    So the same question is asked again here, after pricing and immediately
+    before placing, in the units the broker will actually use. Sizing down is
+    preferred to refusing: a smaller position still expresses the edge, while a
+    spent day expresses nothing.
+
+    Returns `{action, qty, risk_usd, per_contract_usd, ceiling_usd, reason}`,
+    action being `allow` | `shrink` | `reject`. Unmeasurable risk is allowed
+    through — this gate refuses what it can price and stays silent about what it
+    cannot, rather than inventing a number.
+    """
+    def num(value: Any) -> Optional[float]:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    try:
+        want_qty = abs(int(float(qty or 0)))
+    except (TypeError, ValueError):
+        want_qty = 0
+
+    silent = {"action": "allow", "qty": want_qty, "risk_usd": None,
+              "requested_risk_usd": None, "per_contract_usd": None,
+              "ceiling_usd": None, "reason": ""}
+
+    prem = num(premium)
+    stop = num(stop_premium)
+    base = num(base_budget_usd)
+    remaining = num(remaining_budget_usd)
+    if want_qty < 1 or prem is None or prem <= 0 or base is None or base <= 0:
+        return silent
+    if stop is None or stop <= 0 or stop >= prem:
+        # No protective level to measure against; the stop guard reports that.
+        return silent
+
+    fraction_cap = float(max_fraction if max_fraction is not None else MAX_TRADE_RISK_FRACTION_OF_DAILY)
+    if not math.isfinite(fraction_cap) or fraction_cap <= 0:
+        fraction_cap = 0.5
+
+    per_contract = (prem - stop) * 100.0
+    if per_contract <= 0:
+        return silent
+
+    # The day must survive this trade twice over: it may take neither more than
+    # its share of the base budget, nor more than the dollars actually left.
+    ceiling = base * fraction_cap
+    if remaining is not None and remaining >= 0:
+        ceiling = min(ceiling, remaining)
+
+    risk = per_contract * want_qty
+    if risk <= ceiling:
+        return {"action": "allow", "qty": want_qty, "risk_usd": round(risk, 2),
+                "requested_risk_usd": round(risk, 2),
+                "per_contract_usd": round(per_contract, 2),
+                "ceiling_usd": round(ceiling, 2), "reason": ""}
+
+    affordable = int(ceiling // per_contract)
+    if affordable >= 1:
+        return {
+            "action": "shrink", "qty": affordable,
+            # `risk_usd` is what will actually be placed; `requested_risk_usd`
+            # preserves what was asked for, so the ledger records the size that
+            # was refused rather than silently booking the smaller one.
+            "risk_usd": round(per_contract * affordable, 2),
+            "requested_risk_usd": round(risk, 2),
+            "per_contract_usd": round(per_contract, 2),
+            "ceiling_usd": round(ceiling, 2),
+            "reason": (
+                f"priced risk ${risk:,.0f} ({want_qty} x ${per_contract:,.0f}) exceeds the "
+                f"${ceiling:,.0f} this day can spend on one entry — sizing down to "
+                f"{affordable} contract(s), ${per_contract * affordable:,.0f}"
+            ),
+        }
+
+    return {
+        "action": "reject", "qty": 0, "risk_usd": round(risk, 2),
+        "requested_risk_usd": round(risk, 2),
+        "per_contract_usd": round(per_contract, 2),
+        "ceiling_usd": round(ceiling, 2),
+        "reason": (
+            f"one contract risks ${per_contract:,.0f} against ${ceiling:,.0f} of room — "
+            f"the entry cannot be sized without handing the whole day to a single trade"
+        ),
+    }
+
+
 def assess_entry_cost(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Round-trip trading cost for the payload's contract, as % of premium.
 
@@ -7873,7 +8806,37 @@ def wilson_bounds(wins: Any, n: Any) -> Tuple[float, float]:
 
 
 def _empty_setup_bucket() -> Dict[str, Any]:
-    return {"trades": 0, "wins": 0, "sum_pct": 0.0, "pct_samples": 0, "live": 0, "imported": 0}
+    # `by_basis` keeps premium and underlying percents in separate piles. They
+    # are different physical quantities -- a premium percent is a levered
+    # option move, an underlying percent is a stock move -- and one mean over
+    # both is a number with no referent.
+    return {"trades": 0, "wins": 0, "sum_pct": 0.0, "pct_samples": 0,
+            "live": 0, "imported": 0, "by_basis": {}}
+
+
+def _basis_of(data: dict, *keys: str) -> str:
+    """Normalized P&L basis for a ledger record, or 'unknown'.
+
+    'unknown' is a real bucket, not a synonym for premium. Guessing a basis is
+    indistinguishable from having measured one, and the guess would be averaged
+    into an expectancy that a human then reads as fact.
+    """
+    for key in keys:
+        value = str((data or {}).get(key) or "").strip().lower()
+        if value in ("premium", "underlying"):
+            return value
+    return "unknown"
+
+
+def _add_pct(bucket: Dict[str, Any], basis: str, pct: Optional[float]) -> None:
+    """Record one realized percent under the basis that qualifies it."""
+    if pct is None:
+        return
+    bucket["sum_pct"] += pct
+    bucket["pct_samples"] += 1
+    agg = bucket["by_basis"].setdefault(basis, {"sum": 0.0, "n": 0})
+    agg["sum"] += pct
+    agg["n"] += 1
 
 
 def import_outcome(data: dict) -> Optional[Tuple[bool, Optional[float]]]:
@@ -7923,8 +8886,21 @@ def summarize_setup_performance(records: List[dict]) -> Dict[str, Dict[str, Any]
     """
     open_setups: Dict[str, str] = {}
     buckets: Dict[str, Dict[str, Any]] = {}
-    seen_imports: set = set()
-    for rec in records or []:
+    # Which ledger line is the CURRENT truth for each imported trade. A trade
+    # may be re-pushed to fill in evidence it was missing (a basis, a water
+    # mark), which appends a superseding line rather than editing the old one --
+    # the ledger is a hash chain and cannot be rewritten. Counting the LAST line
+    # per id keeps the invariant that matters: one settled trade, one vote.
+    latest_import: Dict[str, int] = {}
+    for idx, rec in enumerate(records or []):
+        if not isinstance(rec, dict) or str(rec.get("event") or "") != SETUP_IMPORT_EVENT:
+            continue
+        data = rec.get("data") or {}
+        if isinstance(data, dict):
+            ident = str(data.get("import_id") or "").strip()
+            if ident:
+                latest_import[ident] = idx
+    for idx, rec in enumerate(records or []):
         if not isinstance(rec, dict):
             continue
         data = rec.get("data") or {}
@@ -7940,12 +8916,11 @@ def summarize_setup_performance(records: List[dict]) -> Dict[str, Dict[str, Any]
         if event == SETUP_IMPORT_EVENT:
             label = str(data.get("setup") or "").strip().lower()
             import_id = str(data.get("import_id") or "").strip()
-            # An id-less or duplicate import is DROPPED rather than counted:
+            # An id-less or superseded import is DROPPED rather than counted:
             # the whole value of imported evidence is that it is the same
             # trade exactly once.
-            if not label or not import_id or import_id in seen_imports:
+            if not label or not import_id or latest_import.get(import_id) != idx:
                 continue
-            seen_imports.add(import_id)
             outcome = import_outcome(data)
             if outcome is None:
                 continue
@@ -7955,9 +8930,7 @@ def summarize_setup_performance(records: List[dict]) -> Dict[str, Dict[str, Any]
             bucket["imported"] += 1
             if won:
                 bucket["wins"] += 1
-            if pct is not None:
-                bucket["sum_pct"] += pct
-                bucket["pct_samples"] += 1
+            _add_pct(bucket, _basis_of(data, "pnl_basis", "basis"), pct)
             continue
         if event != "position_closed":
             continue
@@ -7974,16 +8947,26 @@ def summarize_setup_performance(records: List[dict]) -> Dict[str, Dict[str, Any]
         bucket = buckets.setdefault(label, _empty_setup_bucket())
         bucket["trades"] += 1
         bucket["live"] += 1
-        bucket["sum_pct"] += pct
-        bucket["pct_samples"] += 1
+        _add_pct(bucket, _basis_of(data, "basis", "pnl_basis"), pct)
         if pct > 0:
             bucket["wins"] += 1
     out: Dict[str, Dict[str, Any]] = {}
     for label, bucket in buckets.items():
         trades = int(bucket["trades"])
         wins = int(bucket["wins"])
-        samples = int(bucket["pct_samples"])
         low, high = wilson_bounds(wins, trades)
+        # Expectancy is reported for ONE basis -- the best-evidenced one -- and
+        # never as a mean across bases. When every sample shares a basis (the
+        # common case) this is exactly the old number; when they do not, the
+        # alternative was a blend of option and stock percentages that looked
+        # just as authoritative and meant nothing.
+        by_basis = {
+            b: {"expectancy_pct": round(a["sum"] / a["n"], 4), "samples": int(a["n"])}
+            for b, a in bucket["by_basis"].items() if a["n"]
+        }
+        ranked_basis = sorted(by_basis.items(), key=lambda kv: (-kv[1]["samples"], kv[0]))
+        basis_label, basis_stats = ranked_basis[0] if ranked_basis else ("", None)
+        samples = int(basis_stats["samples"]) if basis_stats else 0
         out[label] = {
             "setup": label,
             "trades": trades,
@@ -7994,8 +8977,10 @@ def summarize_setup_performance(records: List[dict]) -> Dict[str, Dict[str, Any]
             # Averaged over the trades that actually carried a percent, never
             # over the whole sample — dividing by trades that reported no
             # percent would silently drag every expectancy toward zero.
-            "expectancy_pct": round(bucket["sum_pct"] / samples, 4) if samples else 0.0,
+            "expectancy_pct": basis_stats["expectancy_pct"] if basis_stats else 0.0,
             "expectancy_samples": samples,
+            "expectancy_basis": basis_label,
+            "expectancy_by_basis": by_basis,
             "wilson_low": round(low, 2),
             "wilson_high": round(high, 2),
         }
@@ -8120,8 +9105,17 @@ def plan_setup_import(
     `cutoff_epoch` — the moment the bot started attributing its own trades.
     That last rule is what stops the bot from counting a trade twice: once from
     its own ledger and once from the app's copy of it.
+
+    An id that was already imported is normally refused. The one exception is an
+    UPGRADE: `known_ids` may be the stored evidence rows themselves rather than
+    bare ids, and a re-push that fills in evidence a stored row lacks (a basis,
+    a water mark) while agreeing with it everywhere else supersedes it. See
+    `plan_evidence_upgrade` — that is what lets already-imported trades become
+    interpretable instead of staying inert forever.
     """
-    seen = {str(i).strip() for i in (known_ids or []) if str(i).strip()}
+    known_rows = _known_evidence(known_ids)
+    seen = set(known_rows)
+    in_batch: set = set()
     accepted: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
 
@@ -8141,8 +9135,8 @@ def plan_setup_import(
         if not import_id:
             refuse("", "no import_id — cannot be deduped, so cannot be trusted")
             continue
-        if import_id in seen:
-            refuse(import_id, "already imported")
+        if import_id in in_batch:
+            refuse(import_id, "duplicate inside this batch")
             continue
         label = str(raw.get("setup") or "").strip().lower()
         if not label:
@@ -8164,7 +9158,6 @@ def plan_setup_import(
             if closed >= cutoff_epoch:
                 refuse(import_id, "the bot recorded this period itself — would double count")
                 continue
-        seen.add(import_id)
         entry: Dict[str, Any] = {
             "import_id": import_id,
             "setup": label,
@@ -8179,9 +9172,118 @@ def plan_setup_import(
             entry["r_multiple"] = round(float(r_raw), 4)
         if pct is not None:
             entry["realized_pnl_pct"] = round(pct, 4)
+        # The basis that qualifies the percent, and the water mark that says how
+        # far the trade ran before the exit took it. Each is stored ONLY when the
+        # app actually sent it: a defaulted basis would let stock percentages be
+        # averaged with option percentages, and a defaulted 0 peak would claim a
+        # trade never went green, which is the opposite of an unknown.
+        basis = str(raw.get("pnl_basis") or "").strip().lower()
+        if basis in ("premium", "underlying"):
+            entry["pnl_basis"] = basis
+        for src_key, dst_key in (("peak_r", "peak_r"), ("peak_mfe_pct", "peak_mfe_pct")):
+            peak = raw.get(src_key)
+            if (isinstance(peak, (int, float)) and not isinstance(peak, bool)
+                    and math.isfinite(float(peak))):
+                entry[dst_key] = round(float(peak), 4)
+        if import_id in seen:
+            verdict = plan_evidence_upgrade(known_rows.get(import_id), entry)
+            if not verdict["upgrade"]:
+                refuse(import_id, verdict["reason"])
+                continue
+            # A superseding row is a SUPERSET of the one it replaces: anything
+            # the re-push omitted is carried forward, so filling in a basis can
+            # never cost a water mark that was already recorded.
+            entry.update(verdict["carry"])
+            entry["supersedes"] = import_id
+            entry["upgraded"] = list(verdict["fields"])
+        in_batch.add(import_id)
+        seen.add(import_id)
         accepted.append(entry)
 
     return {"accepted": accepted, "rejected": rejected, "truncated": truncated, "reason": ""}
+
+
+# The fields a re-push may FILL IN, and the ones it may never move. The split is
+# the whole safety argument: evidence that was never recorded can be supplied
+# later, but an outcome that was already settled is not up for revision.
+EVIDENCE_ENRICHABLE = ("pnl_basis", "peak_r", "peak_mfe_pct")
+EVIDENCE_IMMUTABLE = ("setup", "won", "r_multiple", "realized_pnl_pct", "closed_at")
+
+
+def _known_evidence(known: Any) -> Dict[str, Dict[str, Any]]:
+    """Normalize prior evidence into {import_id: stored row}.
+
+    Accepts bare ids (the original contract, still used by callers that only
+    need dedup) or the stored rows themselves. An id with no row behind it maps
+    to an empty dict: known to exist, contents unknown — which is precisely the
+    state in which an upgrade cannot be proven safe, so it is refused.
+
+    Later entries overwrite earlier ones, so replaying a chronological ledger
+    leaves the CURRENT version of each imported trade.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for item in known or []:
+        if isinstance(item, dict):
+            ident = str(item.get("import_id") or "").strip()
+            if ident:
+                prev = out.get(ident) or {}
+                merged = dict(prev)
+                merged.update({k: v for k, v in item.items() if v is not None})
+                out[ident] = merged
+        else:
+            ident = str(item).strip()
+            if ident:
+                out.setdefault(ident, {})
+    return out
+
+
+def plan_evidence_upgrade(prior: Any, entry: Dict[str, Any]) -> Dict[str, Any]:
+    """May a re-pushed trade SUPERSEDE the evidence already stored under its id?
+
+    Only to fill gaps. The evidence imported before the app sent a `pnl_basis`
+    carries a percent nobody can interpret — not premium, not underlying, just a
+    number. Those rows are inert: they count toward a win rate and are excluded
+    from every expectancy. A re-push that arrives carrying the basis converts
+    each into a usable sample, which is the entire point of allowing this.
+
+    What is refused is a re-push that CHANGES a settled outcome. Idempotency is
+    the whole safety story of a seed that can be replayed on every app launch,
+    and a push able to rewrite `won` or `r_multiple` can rewrite the record the
+    veto acts on, silently, any number of times. So an upgrade must AGREE with
+    the stored row everywhere that row already spoke, and may only add where it
+    was silent. A disagreement is not an upgrade — it means the two systems no
+    longer describe the same trade, and that is worth surfacing, not merging.
+
+    Returns {upgrade, reason, fields, carry} where `carry` holds prior values
+    the new push omitted, so the superseding row is always a SUPERSET of the one
+    it replaces and a re-push can never quietly delete evidence.
+    """
+    if not isinstance(prior, dict) or not prior:
+        # Known to exist, with nothing known about its contents — the caller
+        # passed bare ids. An upgrade cannot be shown to be safe, so it isn't one.
+        return {"upgrade": False, "reason": "already imported", "fields": [], "carry": {}}
+
+    def same(a: Any, b: Any) -> bool:
+        if isinstance(a, (int, float)) and not isinstance(a, bool) and \
+           isinstance(b, (int, float)) and not isinstance(b, bool):
+            return math.isfinite(float(a)) and math.isfinite(float(b)) and abs(float(a) - float(b)) <= 1e-6
+        return str(a) == str(b)
+
+    for key in EVIDENCE_IMMUTABLE:
+        old, new = prior.get(key), entry.get(key)
+        if old is None or new is None:
+            continue
+        if not same(old, new):
+            return {"upgrade": False, "fields": [], "carry": {},
+                    "reason": f"contradicts the settled record ({key}: {old!r} -> {new!r})"}
+
+    fields = [k for k in EVIDENCE_ENRICHABLE if prior.get(k) is None and entry.get(k) is not None]
+    if not fields:
+        return {"upgrade": False, "reason": "already imported — nothing new to add",
+                "fields": [], "carry": {}}
+    carry = {k: prior[k] for k in EVIDENCE_ENRICHABLE
+             if prior.get(k) is not None and entry.get(k) is None}
+    return {"upgrade": True, "reason": "", "fields": fields, "carry": carry}
 
 
 def trail_exit_allowed(held_seconds: Any, is_hard_stop: bool) -> Tuple[bool, str]:
@@ -11041,6 +12143,39 @@ def _clamp_option_stop_premium(candidate: float, fill_ref: float) -> tuple:
     return round(stop, 2), ""
 
 
+async def _priced_option_risk_gate(symbol: str, premium: Any, qty: Any,
+                                   stop_premium: Any) -> Dict[str, Any]:
+    """Rebuild the day's real risk budget and judge a PRICED option entry.
+
+    Thin async wrapper: it reassembles exactly the budget the dispatch gate uses
+    (broker equity, realized P&L, committed open risk, profit lock) and hands the
+    arithmetic to `plan_priced_option_risk`. Failure here never blocks a trade —
+    an unavailable budget is not evidence of an oversized one.
+    """
+    fallback = {"action": "allow", "qty": qty, "risk_usd": None,
+                "per_contract_usd": None, "ceiling_usd": None, "reason": ""}
+    try:
+        account_ref = await _risk_account_reference()
+        daily = await state.get_daily()
+        open_positions = await state.all_positions()
+        open_risk_usd = sum(position_risk_usd(pos) for pos in open_positions.values())
+        lock = plan_profit_lock(daily.get("realized_pnl_today_usd"))
+        budget = plan_risk_budget(
+            account_size=account_ref,
+            realized_usd=daily.get("realized_pnl_today_usd"),
+            open_risk_usd=open_risk_usd,
+            profit_lock_max_risk=(lock["max_risk_usd"] if lock["cushion_usd"] > 0 else None),
+        )
+        return plan_priced_option_risk(
+            premium=premium, qty=qty, stop_premium=stop_premium,
+            remaining_budget_usd=budget["remaining_usd"],
+            base_budget_usd=budget["base_budget_usd"],
+        )
+    except Exception as e:
+        logger.warning(f"priced-risk recheck unavailable for {symbol} (non-fatal, entry not blocked): {e}")
+        return fallback
+
+
 # ==================== CONTRACT SNAP ====================
 def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_put: str):
     """Snap a requested option expiry/strike to REAL listed contract values.
@@ -11440,6 +12575,61 @@ async def execute_live_order(payload: dict):
                     quantity = reprice["qty"]
                     common["quantity"] = quantity
 
+            if not is_exit:
+                # POST-PRICING RISK RECHECK — the last gate that sees the REAL
+                # contract. Every gate before this one judged an option payload
+                # that had no premium in it yet, so they measured a nominal
+                # percentage instead of the trade. Now the premium and the stop
+                # that will rest behind it are both known, so the day's budget
+                # question gets asked once more in broker dollars.
+                entry_premium_ref = float(common.get("limitPrice") or 0) or float(real_ask or 0)
+                armed_stop, _armed_basis = derive_armed_option_stop(
+                    payload.get("option_stop_price"), entry_premium_ref,
+                )
+                risk_check = await _priced_option_risk_gate(
+                    sym_u, entry_premium_ref, quantity, armed_stop,
+                )
+                if risk_check["action"] == "reject":
+                    logger.warning(f"⛔ {symbol} priced-risk recheck REJECTED entry: {risk_check['reason']}")
+                    await trade_ledger.record("entry_risk_rejected", {
+                        "ticker": sym_u,
+                        "premium": round(entry_premium_ref, 2),
+                        "stop_premium": armed_stop,
+                        "qty_requested": quantity,
+                        "risk_usd": risk_check["risk_usd"],
+                        "ceiling_usd": risk_check["ceiling_usd"],
+                    })
+                    await alerts.send(
+                        "warning", "entry_risk_rejected",
+                        f"{symbol}: entry REFUSED — {risk_check['reason']}.",
+                        dedupe_key=f"priced_risk_reject:{symbol}",
+                    )
+                    raise Exception(f"priced-risk recheck refused the entry — {risk_check['reason']}")
+                if risk_check["action"] == "shrink":
+                    logger.warning(
+                        f"⚖️ {symbol} priced-risk recheck resize: qty {quantity} → {risk_check['qty']} "
+                        f"({risk_check['reason']})"
+                    )
+                    await trade_ledger.record("entry_risk_resized", {
+                        "ticker": sym_u,
+                        "premium": round(entry_premium_ref, 2),
+                        "stop_premium": armed_stop,
+                        "qty_requested": quantity,
+                        "qty_placed": risk_check["qty"],
+                        "risk_usd": risk_check["risk_usd"],
+                        "requested_risk_usd": risk_check["requested_risk_usd"],
+                        "ceiling_usd": risk_check["ceiling_usd"],
+                    })
+                    await alerts.send(
+                        "warning", "entry_risk_resized",
+                        f"{symbol}: real contract risks more than the day can spend — "
+                        f"resized {quantity} → {risk_check['qty']} contract(s) "
+                        f"(≈${risk_check['risk_usd']:,.0f} of ${risk_check['ceiling_usd']:,.0f} room).",
+                        dedupe_key=f"priced_risk_resize:{symbol}",
+                    )
+                    quantity = int(risk_check["qty"])
+                    common["quantity"] = quantity
+
             logger.info(f"📤 Placing OPTION: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
             if is_exit:
                 # Closes must always cover the full tracked position — never clamp.
@@ -11501,28 +12691,21 @@ async def execute_live_order(payload: dict):
                 # survives restarts): poll the fill, then rest a SELL_CLOSE
                 # STOP on the same OCC contract.
                 entry_order_id = _order_id_from_place(final)
-                stop_premium: Optional[float] = None
-                stop_basis = "pct_default"
-                explicit = payload.get("option_stop_price")
-                try:
-                    if explicit is not None and float(explicit) > 0:
-                        stop_premium = float(explicit)
-                except (TypeError, ValueError):
-                    stop_premium = None
                 fill_ref = float(common.get("limitPrice") or 0)
-                if stop_premium is not None:
-                    # App-supplied premium stop (delta-derived). Clamp into the
-                    # sanity band so a bad number can never rest a stop inside
-                    # the noise or wider than the percentage stop it replaces.
-                    stop_premium, clamp_note = _clamp_option_stop_premium(stop_premium, fill_ref)
-                    stop_basis = str(payload.get("option_stop_basis") or "app_delta")
-                    if clamp_note:
-                        stop_basis = f"{stop_basis}+clamped"
+                # Same derivation the priced-risk gate used above, so the level
+                # the day was budgeted against is the level that actually rests.
+                explicit = payload.get("option_stop_price")
+                stop_premium, derived_basis = derive_armed_option_stop(explicit, fill_ref)
+                stop_basis = derived_basis
+                if derived_basis.startswith("app_delta"):
+                    app_basis = str(payload.get("option_stop_basis") or "app_delta")
+                    if derived_basis.endswith("+clamped"):
+                        stop_basis = f"{app_basis}+clamped"
+                        clamp_note = _clamp_option_stop_premium(explicit, fill_ref)[1]
                         logger.warning(f"⚠️ {symbol} app option stop {clamp_note}")
-                if stop_premium is None and fill_ref > 0 and OPTION_STOP_LOSS_PCT > 0:
-                    stop_premium = fill_ref * (1.0 - OPTION_STOP_LOSS_PCT / 100.0)
+                    else:
+                        stop_basis = app_basis
                 if stop_premium and stop_premium > 0:
-                    stop_premium = _round_to_option_tick(stop_premium, "down")
                     await _arm_stop_guard(
                         str(symbol).upper(), "BUY", stop_premium, entry_order_id, client_order_id,
                         kind="option", contract=contract,
@@ -12494,6 +13677,12 @@ async def on_startup():
     # must exist before the StateStore hydrates and before the ledger restores.
     await init_db()
     persistence = await _init_durable_state()
+    # STUDY LAYER — read-only views over the ledger mirror, so the bot can ask
+    # "which setups make money / where am I giving moves back" in SQL instead
+    # of parsing every JSONL record in Python. Idempotent; never fatal.
+    study.init(engine)
+    global _study_views
+    _study_views = await study.ensure_views()
     # State next — everything else reads through it. With no Redis, the
     # Postgres adapter makes memory mode restart-safe (positions, guards,
     # daily P&L, kill switch all hydrate back).
@@ -12510,6 +13699,10 @@ async def on_startup():
     trade_ledger.init(TRADE_LEDGER_FILE)
     if persistence is not None:
         trade_ledger.set_mirror(_ledger_mirror)
+    # Say out loud whether this process actually remembers anything. A ledger
+    # that comes up empty is indistinguishable from a healthy one in the logs,
+    # and it silently disarms the only mechanism that learns from past trades.
+    await _announce_ledger_memory()
     # Which account the user pinned from the app (survives restarts/redeploys).
     await _load_pinned_account()
     await preload_tokens()
@@ -13247,10 +14440,15 @@ async def setup_evidence_import(
         raise HTTPException(401, "invalid secret")
 
     history = trade_ledger.recent(SETUP_VETO_LOOKBACK)
+    # The stored ROWS, not just their ids: a re-push that fills in a basis the
+    # original import predates can only be judged safe by comparing it against
+    # what is already on record. See `plan_evidence_upgrade`.
     known = [
-        str((r.get("data") or {}).get("import_id") or "")
+        (r.get("data") or {})
         for r in history
         if isinstance(r, dict) and str(r.get("event") or "") == SETUP_IMPORT_EVENT
+        and isinstance(r.get("data"), dict)
+        and str((r.get("data") or {}).get("import_id") or "").strip()
     ]
     cutoff = setup_attribution_start(history)
     before = summarize_setup_performance(history)
@@ -13348,11 +14546,35 @@ async def ledger_tail(count: int = Query(100, ge=1, le=500), verify: bool = Quer
     """Tail of the immutable trade ledger (newest first). Pass ?verify=true to
     walk the FULL hash chain and prove no record was altered or removed."""
     out: Dict[str, Any] = {"records": trade_ledger.tail(count)}
+    if _ledger_memory is not None:
+        out["memory"] = _ledger_memory
     if verify:
         ok, checked, err = trade_ledger.verify()
         out["chain_ok"] = ok
         out["chain_records_checked"] = checked
         out["chain_error"] = err
+    return out
+
+
+@app.get("/study")
+async def study_endpoint(
+    min_samples: int = Query(1, ge=1, le=500),
+    recent: int = Query(10, ge=1, le=200),
+):
+    """What the ledger has actually taught this bot.
+
+    Read `coverage` FIRST. A setup table computed over a handful of labeled
+    trades is not a weak signal, it is no signal, and it looks identical to a
+    strong one until you check how many rows are behind it.
+
+    P&L stats are grouped by `pnl_basis` and must stay that way: a premium
+    percent describes a levered option contract, an underlying percent
+    describes the stock, and averaging the two produces a confident number
+    that means nothing.
+    """
+    out = await study.summary(min_samples=min_samples, recent=recent)
+    if _study_views is not None:
+        out["views"] = _study_views
     return out
 
 
