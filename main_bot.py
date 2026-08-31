@@ -2193,7 +2193,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 try:  # package-style import (python -m bot...) or flat (uvicorn main_bot:app)
@@ -2227,9 +2227,17 @@ COVERAGE_GRACE_SECONDS = 60
 # long as it is held. Past its own deadline plus this slack, audit it anyway.
 GUARD_TRUST_SLACK_SECONDS = 120
 # Ghost-resolution verdicts: the vanished position CLOSED (an executed closing
-# order with a readable fill was found) vs a true GHOST (no evidence of a fill).
+# order with a readable fill was found), EXPIRED WORTHLESS (an option past its
+# expiration with no closing order — the broker simply removes it), or is a
+# true GHOST (no evidence of an outcome either way).
 GHOST_CLOSED = "closed"
+GHOST_EXPIRED = "expired"
 GHOST_UNKNOWN = "ghost"
+# An option is only written off as expired once its expiration day is fully
+# over in ET. Expiration is a DATE, and the contract stays exercisable through
+# that afternoon, so treating "today is the expiry" as expired would book a
+# live position as a total loss while it is still trading.
+ET_UTC_OFFSET_HOURS = -4
 # An executed close must postdate the position's open (minus clock slack) —
 # otherwise a stale EXECUTED order from an EARLIER round-trip on the same
 # symbol would be booked as this position's exit at the wrong price.
@@ -2694,11 +2702,43 @@ def plan_protection_repair(
     }
 
 
+def contract_expiration(pos: dict) -> str:
+    """The tracked contract's expiration as YYYY-MM-DD, or "" when the position
+    is not an option or carries no readable expiration."""
+    contract = (pos or {}).get("contract")
+    if not isinstance(contract, dict):
+        return ""
+    raw = str(contract.get("expiration") or "").strip()
+    if len(raw) != 10 or raw[4] != "-" or raw[7] != "-":
+        return ""
+    try:
+        datetime.strptime(raw, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return ""
+    return raw
+
+
+def expiration_passed(pos: dict, now: Optional[float] = None) -> bool:
+    """True when this position is an option whose expiration day is FULLY over.
+
+    The comparison runs in ET because that is the calendar an expiration date
+    is written in: a contract expiring Friday is still alive all Friday, and a
+    UTC-based comparison would declare it dead at 20:00 ET Thursday.
+    """
+    expiry = contract_expiration(pos)
+    if not expiry:
+        return False
+    ts = time.time() if now is None else float(now)
+    et_now = datetime.utcfromtimestamp(ts) + timedelta(hours=ET_UTC_OFFSET_HOURS)
+    return et_now.date() > datetime.strptime(expiry, "%Y-%m-%d").date()
+
+
 def plan_ghost_resolution(
     ticker: str,
     pos: dict,
     all_orders: List[dict],
     opened_ts: float = 0.0,
+    now: Optional[float] = None,
 ) -> dict:
     """A tracked position has vanished at the broker. Decide whether it CLOSED
     — an EXECUTED closing order with a readable fill exists for it — or is a
@@ -2783,6 +2823,28 @@ def plan_ghost_resolution(
         if hit:
             hit["source"] = "closing_order"
             return hit
+
+    # EXPIRED WORTHLESS — the largest loss an option can produce, and the one
+    # with no closing order to find. Nothing executes when a contract expires
+    # out of the money: the broker just removes the position, which is exactly
+    # what an unresolved ghost looks like. Writing that off as "ghost removed"
+    # deleted a -100% outcome from the daily loss limit and from the learning
+    # stack, leaving a survivorship-filtered history where the worst tail of
+    # every setup is silently missing.
+    #
+    # This is an INFERENCE, not an observed fill, so it is only drawn when the
+    # position is an option whose expiration day is fully past. Anything else
+    # stays GHOST_UNKNOWN.
+    if expiration_passed(pos, now=now):
+        return {
+            "kind": GHOST_EXPIRED,
+            "order_id": "",
+            # Worthless is a MEASURED zero, not a missing value: the contract
+            # is gone and the premium paid for it is gone with it.
+            "exit_price": 0.0,
+            "basis": "premium",
+            "source": "expiration",
+        }
 
     return {"kind": GHOST_UNKNOWN}
 
@@ -2897,18 +2959,26 @@ async def reconcile_once(
             # protective stop filling at the broker is a real trade outcome:
             # it must be BOOKED (realized P&L, daily loss limit, ledger,
             # learning), not silently deleted.
-            resolution = plan_ghost_resolution(ticker, pos, all_orders, opened_ts=opened_ts)
+            resolution = plan_ghost_resolution(
+                ticker, pos, all_orders, opened_ts=opened_ts, now=now,
+            )
             if not auto_heal:
                 if resolution["kind"] == GHOST_CLOSED:
                     report["warnings"].append(
                         f"{ticker}: closed at broker (order {resolution['order_id']} filled "
                         f"@ {resolution['exit_price']}) — not booked, auto-heal off"
                     )
+                elif resolution["kind"] == GHOST_EXPIRED:
+                    report["warnings"].append(
+                        f"{ticker}: option expired worthless "
+                        f"({contract_expiration(pos)}) — not booked, auto-heal off"
+                    )
                 else:
                     report["warnings"].append(f"{ticker}: ghost position (not at broker)")
                 continue
-            if resolution["kind"] == GHOST_CLOSED and record_close is not None:
+            if resolution["kind"] in (GHOST_CLOSED, GHOST_EXPIRED) and record_close is not None:
                 booked = False
+                expired = resolution["kind"] == GHOST_EXPIRED
                 try:
                     # record_close pops the position from state itself so the
                     # close is booked exactly once.
@@ -2916,25 +2986,41 @@ async def reconcile_once(
                     booked = True
                 except Exception as e:
                     logger.error(
-                        f"[RECONCILE] fill-capture close for {ticker} failed: {e} — "
-                        f"falling back to ghost removal"
+                        f"[RECONCILE] {'expiry' if expired else 'fill-capture'} close for "
+                        f"{ticker} failed: {e} — falling back to ghost removal"
                     )
                 if booked:
                     guard = guards.get(ticker)
                     if guard and not guard.get("done"):
-                        await state.update_guard(ticker, done=True, result="reconciled_stop_filled")
-                    detail = (
-                        f"{ticker}: broker-side fill captured — closed @ "
-                        f"{resolution['exit_price']:.2f} ({resolution['basis']}, "
-                        f"order {resolution['order_id']}, {resolution['source']})"
-                    )
-                    report["healed"].append(detail)
-                    logger.warning(f"[RECONCILE] 💰 {detail}")
-                    await _alert("warning", "stop_fill_captured",
-                                 f"{ticker}: position closed at the broker — order "
-                                 f"{resolution['order_id']} filled @ {resolution['exit_price']}. "
-                                 f"Realized P&L booked; daily loss limit and learning updated.",
-                                 dedupe_key=f"fill_capture:{ticker}")
+                        await state.update_guard(
+                            ticker, done=True,
+                            result="reconciled_expired" if expired else "reconciled_stop_filled",
+                        )
+                    if expired:
+                        detail = (
+                            f"{ticker}: option EXPIRED WORTHLESS "
+                            f"({contract_expiration(pos)}) — booked as a total loss of premium"
+                        )
+                        report["healed"].append(detail)
+                        logger.warning(f"[RECONCILE] 🪦 {detail}")
+                        await _alert("critical", "option_expired_worthless",
+                                     f"{ticker}: the {contract_expiration(pos)} contract expired "
+                                     f"worthless — a TOTAL loss of the premium paid. Booked at 0.00; "
+                                     f"daily loss limit and learning updated.",
+                                     dedupe_key=f"expired:{ticker}:{contract_expiration(pos)}")
+                    else:
+                        detail = (
+                            f"{ticker}: broker-side fill captured — closed @ "
+                            f"{resolution['exit_price']:.2f} ({resolution['basis']}, "
+                            f"order {resolution['order_id']}, {resolution['source']})"
+                        )
+                        report["healed"].append(detail)
+                        logger.warning(f"[RECONCILE] 💰 {detail}")
+                        await _alert("warning", "stop_fill_captured",
+                                     f"{ticker}: position closed at the broker — order "
+                                     f"{resolution['order_id']} filled @ {resolution['exit_price']}. "
+                                     f"Realized P&L booked; daily loss limit and learning updated.",
+                                     dedupe_key=f"fill_capture:{ticker}")
                     continue
             await state.delete_position(ticker)
             guard = guards.get(ticker)
@@ -5349,7 +5435,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.48.0-ledger-amnesia-alert"
+BOT_VERSION = "5.49.0-live-entry-unblocked"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -5406,6 +5492,16 @@ SETUP_VETO_LOOKBACK = int(os.getenv("SETUP_VETO_LOOKBACK", "1500"))
 SETUP_IMPORT_EVENT = "setup_evidence_imported"
 # One call may not write an unbounded number of ledger lines.
 SETUP_IMPORT_MAX_BATCH = int(os.getenv("SETUP_IMPORT_MAX_BATCH", "500"))
+# Ledger events that RETRACT an optimistic `position_opened`. The open line is
+# written when the entry order is PLACED, so an order that is cancelled or dies
+# unfilled leaves a position that never existed behind it. These close that
+# line out for any replay that pairs opens with closes by ticker — without
+# them a phantom open donates its setup label to the next real close on the
+# same symbol, condemning a setup for a trade it never took.
+_ENTRY_ABANDONED_EVENTS = frozenset({
+    "stop_timeout_entry_cancelled",
+    "entry_abandoned",
+})
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "2.0"))
 # A daily TRADE COUNT is not a risk control and no longer gates entries. It let
@@ -8913,6 +9009,17 @@ def summarize_setup_performance(records: List[dict]) -> Dict[str, Dict[str, Any]
             if ticker and label:
                 open_setups[ticker] = label
             continue
+        # A CANCELLED ENTRY IS NOT A TRADE. `position_opened` is written
+        # optimistically when the order is PLACED, so an entry that never
+        # filled still leaves an open line behind. Left dangling, that label is
+        # handed to the next unrelated close on the same ticker by the
+        # fallback below — mis-attributing a real outcome to the setup of a
+        # trade that never happened (both live cases, AAPL and META, are
+        # repeat-traded tickers, which is exactly when this bites).
+        if event in _ENTRY_ABANDONED_EVENTS:
+            if ticker:
+                open_setups.pop(ticker, None)
+            continue
         if event == SETUP_IMPORT_EVENT:
             label = str(data.get("setup") or "").strip().lower()
             import_id = str(data.get("import_id") or "").strip()
@@ -10946,12 +11053,24 @@ async def _stop_guard_worker(ticker: str) -> None:
             if status in _TERMINAL_ORDER_STATUSES and status != "EXECUTED" and filled == 0:
                 await _finish_guard(ticker, f"entry_{status.lower()}_unfilled")
                 await state.delete_position(ticker)
+                # Retract the optimistic open — this entry died unfilled, so no
+                # position ever existed and no outcome may be attributed to it.
+                await trade_ledger.record("entry_abandoned", {
+                    "ticker": ticker,
+                    "entry_order_id": guard.get("entry_order_id"),
+                    "reason": f"entry_{status.lower()}_unfilled",
+                })
                 return
             if time.time() >= float(guard.get("deadline_ts") or 0):
                 if filled == 0:
                     await _cancel_order_safe(guard.get("entry_order_id"))
                     await _finish_guard(ticker, "entry_timeout_cancelled")
                     await state.delete_position(ticker)
+                    await trade_ledger.record("entry_abandoned", {
+                        "ticker": ticker,
+                        "entry_order_id": guard.get("entry_order_id"),
+                        "reason": "entry_timeout_cancelled",
+                    })
                     return
                 if guarded >= filled:
                     await _finish_guard(ticker, "partial_fill_protected")
@@ -11344,7 +11463,8 @@ def _peak_value(value: Any) -> Optional[float]:
 
 async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
                         exit_premium: Optional[float] = None,
-                        close_reason: Optional[str] = None) -> None:
+                        close_reason: Optional[str] = None,
+                        expired: bool = False) -> None:
     """Pop the position and feed realized pnl (signed by the ENTRY direction)
     into the daily loss-limit accounting — plus credit equity proceeds back
     into the tracked balance so wins/losses immediately update the funds
@@ -11357,7 +11477,13 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
     for equities means almost nothing for a levered contract. The ledger
     records `basis` so replays and the app know which unit `entry`/`exit` are
     in. `close_reason` tags how the close was detected (e.g. the reconciler's
-    fill capture) for the audit trail."""
+    fill capture) for the audit trail.
+
+    `expired` books an option that EXPIRED WORTHLESS. There is no fill to
+    quote — nothing executes when a contract dies out of the money — so this
+    is the one close whose exit price is a real, measured ZERO rather than a
+    missing number. It is passed explicitly (never inferred from a falsy exit)
+    so that an absent price can never masquerade as a total loss."""
     pos = await state.delete_position(ticker)
     entry = float((pos or {}).get("entry") or payload.get("entry") or 0)
     # NO GUESSED EXITS — exit_px is the caller's REAL fill or the payload's
@@ -11372,6 +11498,9 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
     pnl_pct: Optional[float] = None
     realized_usd: Optional[float] = None
     basis = "underlying"
+    # An expiry is only bookable as a premium total loss when the premium PAID
+    # is known; without it the loss has no size and stays missing.
+    expired_booked = bool(expired) and is_option
     if exit_premium is not None and is_option and float(exit_premium) > 0:
         basis = "premium"
         exit_px = float(exit_premium)
@@ -11379,6 +11508,23 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
             pnl_pct = direction * ((exit_px - entry_premium) / entry_premium * 100.0)
             if qty > 0:
                 realized_usd = direction * (exit_px - entry_premium) * 100.0 * qty
+    elif expired_booked:
+        # EXPIRED WORTHLESS. Deliberately the SAME arithmetic as any other
+        # premium close, with the exit set to its true value of 0 — which
+        # yields -100% for a long (the premium paid is gone) and +100% for a
+        # short (the premium collected is kept). Hard-coding -100 would have
+        # inverted the sign for every short.
+        basis = "premium"
+        exit_px = 0.0
+        if entry_premium > 0:
+            pnl_pct = direction * ((exit_px - entry_premium) / entry_premium * 100.0)
+            if qty > 0:
+                realized_usd = direction * (exit_px - entry_premium) * 100.0 * qty
+        else:
+            logger.warning(
+                f"[EXPIRY] {ticker} expired worthless but the entry premium is unknown — "
+                f"position closed with the loss left UNSIZED rather than guessed"
+            )
     elif entry > 0 and exit_px > 0:
         pnl_pct = direction * ((exit_px - entry) / entry * 100.0)
         if qty > 0 and not is_option:
@@ -11435,8 +11581,17 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         # On the premium basis, entry/exit are BOTH premiums so a replay
         # re-derives the same percent the daily counter was fed.
         "entry": (entry_premium if basis == "premium" else entry) or None,
-        "exit": exit_px or None,
+        # THE ONE ZERO THAT IS REAL. `or None` blanks a falsy exit because a 0
+        # normally means "no price was ever read" — but an expired contract's
+        # exit is genuinely zero, and blanking it would delete the single most
+        # important number in the row (and with it the biggest loss the book
+        # can produce). Every other path keeps the missing-stays-missing rule.
+        "exit": 0.0 if expired_booked else (exit_px or None),
         "basis": basis,
+        # Marks the close as an INFERENCE from a passed expiration rather than
+        # an observed fill, so readers can tell a real 0.00 print from a
+        # contract that simply died.
+        "expired": True if expired_booked else None,
         # The ENTRY side is recorded explicitly so a later replay of the ledger
         # can verify the P&L sign without having to hunt for the matching open.
         "entry_action": "BUY" if direction > 0 else "SELL",
@@ -11486,6 +11641,13 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         logger.info(
             f"[FILL ALERT] {ticker} close booked with no recorded quantity — no sale to announce"
         )
+        return
+    # An expiry is not a sale. Nothing was sold and nobody was on the other
+    # side, so a "SOLD n contracts @ $0.00" fill alert would describe an order
+    # that never existed. The reconciler raises its own critical alert naming
+    # the expiry for what it is.
+    if expired_booked:
+        logger.info(f"[FILL ALERT] {ticker} expired worthless — no sale to announce")
         return
     await _alert_fill(
         {
@@ -12348,6 +12510,13 @@ async def execute_live_order(payload: dict):
                 payload.get("option_right") or payload.get("call_put") or "CALL",
             )
             is_exit = order_action == "SELL_CLOSE"
+            # Normalized ticker for state/ledger/guard keys. Assigned ABOVE the
+            # exit/entry split because BOTH paths key off it (the close flow for
+            # the position and guard, the entry flow for the priced-risk gate).
+            # It used to be assigned inside the exit branch only, which made
+            # every live ENTRY raise UnboundLocalError at the priced-risk gate
+            # before an order could ever be placed.
+            sym_u = str(symbol).upper()
 
             if not strike or not expiry:
                 raise Exception(f"Missing strike or expiration for option order. Got strike={strike}, expiry={expiry}")
@@ -12392,7 +12561,6 @@ async def execute_live_order(payload: dict):
                 # CLOSE FLOW: cancel the broker-resting protective option stop
                 # FIRST (same discipline as equity) so the close can never
                 # double-sell against it.
-                sym_u = str(symbol).upper()
                 pos = await state.get_position(sym_u) or {}
                 # CLOSE QUANTITY TRUTH — cover what the account actually holds.
                 # The payload count is stale whenever the entry was resized.
@@ -13110,6 +13278,15 @@ async def _reconcile_record_close(ticker: str, pos: dict, resolution: dict) -> N
     option order IS the premium); equity fills on the underlying basis."""
     exit_price = float(resolution.get("exit_price") or 0)
     payload = {"ticker": ticker, "action": pos.get("action") or "BUY", "intent": "close"}
+    # EXPIRED WORTHLESS has no fill and no order id — it is booked from the
+    # calendar, not from an execution, so it takes the explicit `expired` route
+    # rather than being passed a 0 that every other path would read as missing.
+    if str(resolution.get("kind") or "") == reconciliation.GHOST_EXPIRED:
+        await _record_close(
+            ticker, None, payload,
+            close_reason="expired_worthless", expired=True,
+        )
+        return
     reason = f"fill_capture:{resolution.get('source') or 'unknown'}"
     if str(resolution.get("basis") or "") == "premium":
         await _record_close(ticker, None, payload, exit_premium=exit_price, close_reason=reason)
