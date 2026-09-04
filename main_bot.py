@@ -3852,12 +3852,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "mode": "shadow",
     "universe": list(DEFAULT_UNIVERSE),
     "interval_seconds": 60,
-    "min_score": 55,
+    # Mirrors main_bot's MIN_SCORE default — the app's Full Size score tier.
+    "min_score": 70,
     "min_rvol": 0.9,
     "max_spread_pct": 0.35,
     "min_price": 5.0,
     "max_signals_per_day": 3,
-    "risk_pct": 0.5,
+    "risk_pct": 2.0,
 }
 
 # Symbols may never exceed this — one pasted watchlist must not blow the
@@ -3874,13 +3875,16 @@ _SYMBOL_RE = re.compile(r"^[A-Z]{1,6}$")
 # rejected server-side — noise in the log, no trade, and a user staring at a
 # threshold the bot silently overrides. main_bot injects its REAL (env-aware)
 # gate here at wiring time; the defaults mirror main_bot's own defaults.
-ENTRY_GATE_FLOORS: Dict[str, float] = {"min_score": 55.0, "min_rvol": 0.9}
+ENTRY_GATE_FLOORS: Dict[str, float] = {"min_score": 70.0, "min_rvol": 0.9}
 
 # Floors this bot shipped BEFORE configs recorded their own provenance. A stored
 # value equal to one of these was almost certainly inherited from the gate of
 # the day rather than chosen, so it is allowed to follow the gate down once.
 LEGACY_GATE_FLOORS: Dict[str, Tuple[float, ...]] = {
-    "min_score": (75.0,),
+    # 75 was the pre-recalibration floor; 55 the recalibrated one. A stored
+    # value equal to either was inherited from the gate of the day, not chosen,
+    # so it follows the gate in both directions.
+    "min_score": (75.0, 55.0),
     "min_rvol": (1.5,),
 }
 
@@ -5526,7 +5530,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.51.0-unmeasured-expectancy-null"
+BOT_VERSION = "5.52.0-shared-policy"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -5541,8 +5545,14 @@ BOT_VERSION = "5.51.0-unmeasured-expectancy-null"
 # inside the real distribution — still filtering the bottom of the book,
 # no longer filtering the entire book. Tighten again via env once the
 # score distribution is re-measured against filled trades.
-MIN_SCORE = int(os.getenv("MIN_SCORE", "55"))
-MIN_SCORE_TRENDING = int(os.getenv("MIN_SCORE_TRENDING", "50"))
+#
+# 5.52.0 SHARED POLICY: the gate is raised to 70 — the app's Full Size
+# score tier (scoreSizingTiers.fullSize). One number now means one thing on
+# both sides: a trade the bot takes is a trade the app sizes at FULL risk,
+# and a score below 70 never reaches real money from either brain. The
+# trending floor keeps the historical −5 offset (65).
+MIN_SCORE = int(os.getenv("MIN_SCORE", "70"))
+MIN_SCORE_TRENDING = int(os.getenv("MIN_SCORE_TRENDING", "65"))
 MIN_RVOL = float(os.getenv("MIN_RVOL", "0.9"))
 MIN_MTF = int(os.getenv("MIN_MTF", "1"))
 # SETUP ALLOWLIST REMOVED (5.34.0). A name-matching allowlist was rejecting
@@ -5593,14 +5603,23 @@ _ENTRY_ABANDONED_EVENTS = frozenset({
     "stop_timeout_entry_cancelled",
     "entry_abandoned",
 })
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
-# The day-halt rule is FIXED at 20% (mirrors services/dayHalt.ts in the app): a
-# day down 20% of capital halts, six losing trades halts, nothing else does. The
+# 5.52.0 SHARED POLICY: 2% per trade, operator-set 2026-09 (was 0.5). Both
+# brains run the same number — the app's riskPerTradePct default was raised
+# to match, so its dollar-budget math and the bot's position sizing disagree
+# about nothing. At the shared 10% day halt the day's budget absorbs exactly
+# five full-risk losses before the capital rule fires; the six-loss count
+# rule remains the tighter of the two for small accounts.
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "2.0"))
+# The day-halt rule is FIXED at 10% of capital (mirrors services/dayHalt.ts in
+# the app — operator-set shared policy, 2026-09, was 20): a day down 10% of
+# capital halts, six losing trades halts, nothing else does. For scale, the
 # old 2.0 default made the day's ENTIRE risk budget $103 on a $5,159 account —
 # one ordinary option trade consumed it, and the per-trade ceiling
 # (MAX_TRADE_RISK_FRACTION_OF_DAILY × base) refused CRM/AVGO outright with
-# `entry_risk_rejected` before the session's second setup ever priced.
-DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "20.0"))
+# `entry_risk_rejected` before the session's second setup ever priced. At 10%
+# that budget is $516 there, and the per-trade ceiling (0.5 × base = 5%) sits
+# comfortably ABOVE the 2% per-trade policy instead of below it.
+DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "10.0"))
 # A daily TRADE COUNT is not a risk control and no longer gates entries. It let
 # 6 trades at 1% risk (6% of the account) through while refusing 20 at 0.25%
 # (5%) — exactly backwards — and it killed the 7th good setup on a day the first
