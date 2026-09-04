@@ -5530,7 +5530,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.52.0-shared-policy"
+BOT_VERSION = "5.53.0-policy-sync"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -5651,6 +5651,31 @@ PORTFOLIO_HEAT_PCT = float(os.getenv("PORTFOLIO_HEAT_PCT", "6.0"))
 # were structurally locked to a loss before the second setup ever printed.
 MAX_TRADE_RISK_FRACTION_OF_DAILY = float(os.getenv("MAX_TRADE_RISK_FRACTION_OF_DAILY", "0.5"))
 TICKER_COOLDOWN_MINUTES = int(os.getenv("TICKER_COOLDOWN_MINUTES", "15"))
+# ---- Shared policy sync (app → bot) ----
+# 5.53.0. Matching DEFAULTS is not the same as staying matched.
+#
+# The three shared numbers (entry gate, risk per trade, daily loss limit) live
+# on a settings screen the operator edits. The bot only ever learned them from
+# env at BOOT, so the moment that screen changed, the two brains disagreed —
+# and dispatch resolves disagreement with max(app, bot), silently, in favour
+# of whichever side is stricter. Raising the app's gate worked (the app refuses
+# first, in its own numbers); LOWERING it did nothing at all, because the bot
+# went on enforcing the old floor that no screen displayed. Aligning the
+# defaults in 5.52.0 fixed one moment in time; this makes the alignment hold.
+#
+# `/policy` lets the app push its configured policy and the bot ADOPT it — in
+# both directions — within a hard envelope no remote caller can talk it out of.
+# The envelope is the part that matters: a compromised or buggy client must not
+# be able to set risk to 90% of the account, so inbound values are clamped, and
+# every clamp is REPORTED back and republished on /status. A number the bot
+# silently declines to honour is the exact bug this whole mechanism exists to
+# kill, so a rejected value never disappears quietly.
+POLICY_HARD_MIN_SCORE = float(os.getenv("POLICY_HARD_MIN_SCORE", "40"))
+POLICY_HARD_MAX_RISK_PCT = float(os.getenv("POLICY_HARD_MAX_RISK_PCT", "5.0"))
+POLICY_HARD_MAX_DAILY_LOSS_PCT = float(os.getenv("POLICY_HARD_MAX_DAILY_LOSS_PCT", "25.0"))
+# Where the adopted policy is persisted. A restart that silently reverted to
+# env defaults would re-open the same invisible gap the sync just closed.
+POLICY_STATE_KEY = "policy:app"
 # ---- Daily profit objective ----
 # The standing minimum daily profit target, in REAL dollars. Once the ledger
 # proves it banked, the bot stops handing the day back: further entries are
@@ -6019,6 +6044,224 @@ def _is_connectivity_test(p: dict) -> bool:
     return bool(p.get("test")) is True
 
 
+def plan_policy_sync(current: Dict[str, Any], patch: Any) -> Dict[str, Any]:
+    """Fold an app-pushed policy patch into the bot's live shared policy.
+
+    Pure, so the envelope can be tested without a server. Three rules, each
+    paid for by a real failure:
+
+    1. THE APP MAY LOWER, NOT ONLY RAISE. Dispatch gates on max(app, bot), so a
+       bot that only ever accepted stricter values would ignore every attempt
+       to open the gate while the settings screen showed the looser number.
+       Both directions apply, or the sync is decorative.
+
+    2. A CLAMP IS NEVER SILENT. Values are bounded into the hard envelope, and
+       every bound value is returned in `clamped` so the caller can say "you
+       asked 12%, I enforce 5%". An unreported clamp is precisely the invisible
+       gate this mechanism exists to abolish.
+
+    3. JUNK IS IGNORED, NOT COERCED. A malformed number leaves the field at its
+       CURRENT value and is reported in `ignored`. Reading `None`/`"abc"` as 0
+       would turn a typo into an open gate (min_score 0) or a dead one
+       (risk 0%) — unmeasured is not zero, here as everywhere else.
+    """
+    order = ["min_score", "min_score_trending", "min_rvol", "min_mtf",
+             "daily_loss_limit_pct", "risk_per_trade_pct"]
+    bounds = {
+        "min_score": (POLICY_HARD_MIN_SCORE, 100.0),
+        "min_score_trending": (POLICY_HARD_MIN_SCORE, 100.0),
+        "min_rvol": (0.0, 10.0),
+        "min_mtf": (0.0, 5.0),
+        "daily_loss_limit_pct": (0.1, POLICY_HARD_MAX_DAILY_LOSS_PCT),
+        "risk_per_trade_pct": (0.05, POLICY_HARD_MAX_RISK_PCT),
+    }
+
+    def clean_setups(raw: Any) -> Optional[List[str]]:
+        if not isinstance(raw, (list, tuple, set, frozenset)):
+            return None
+        return sorted({str(s).strip().lower() for s in raw if str(s).strip()})
+
+    policy: Dict[str, Any] = {}
+    for key in order:
+        try:
+            value = float(current.get(key))
+        except (TypeError, ValueError):
+            value = None
+        policy[key] = value if (value is not None and math.isfinite(value)) else None
+    policy["allowed_setups"] = clean_setups(current.get("allowed_setups")) or []
+
+    changes: List[str] = []
+    clamped: List[str] = []
+    ignored: List[str] = []
+
+    if not isinstance(patch, dict):
+        return {"policy": policy, "changes": changes, "clamped": clamped,
+                "ignored": ["policy body was not an object — nothing applied"],
+                "accepted": False}
+
+    for key in order:
+        if key not in patch:
+            continue
+        raw = patch[key]
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            ignored.append(f"{key}: not a number ({raw!r}) — kept {policy[key]}")
+            continue
+        if not math.isfinite(value):
+            ignored.append(f"{key}: not finite — kept {policy[key]}")
+            continue
+        low, high = bounds[key]
+        if key == "risk_per_trade_pct":
+            # THE CEILING MUST NOT EAT THE POLICY. A per-trade risk above the
+            # per-trade concentration cap (fraction × the day's budget) can
+            # never actually be priced — every entry would die at
+            # `entry_risk_rejected` while the settings screen promised a size
+            # the bot could not place. Bound it to what is fundable.
+            day = policy["daily_loss_limit_pct"]
+            if isinstance(day, float) and day > 0:
+                high = min(high, day * MAX_TRADE_RISK_FRACTION_OF_DAILY)
+        bounded = min(max(value, low), high)
+        if abs(bounded - value) > 1e-9:
+            clamped.append(f"{key}: asked {value:g}, enforcing {bounded:g}")
+        if policy[key] is None or abs(bounded - policy[key]) > 1e-9:
+            before = "unset" if policy[key] is None else f"{policy[key]:g}"
+            changes.append(f"{key} {before} → {bounded:g}")
+        policy[key] = bounded
+
+    if "allowed_setups" in patch:
+        names = clean_setups(patch["allowed_setups"])
+        if names is None:
+            ignored.append("allowed_setups: not a list — kept the current allowlist")
+        else:
+            if names != policy["allowed_setups"]:
+                changes.append(
+                    f"allowed_setups {len(policy['allowed_setups'])} → {len(names)} "
+                    f"({'all setups' if not names else ', '.join(names[:4])})"
+                )
+            policy["allowed_setups"] = names
+
+    known = set(order) | {"allowed_setups"}
+    for key in sorted(k for k in patch if k not in known):
+        ignored.append(f"{key}: not a policy field")
+
+    return {"policy": policy, "changes": changes, "clamped": clamped,
+            "ignored": ignored, "accepted": True}
+
+
+# The LIVE shared policy. Seeded from env at boot and replaced wholesale by an
+# app push. Every gate below reads THIS, never the boot-time constant — a
+# constant read directly is a gate the app can no longer move.
+_LIVE_POLICY: Dict[str, Any] = {
+    "min_score": float(MIN_SCORE),
+    "min_score_trending": float(MIN_SCORE_TRENDING),
+    "min_rvol": float(MIN_RVOL),
+    "min_mtf": float(MIN_MTF),
+    "daily_loss_limit_pct": float(DAILY_LOSS_LIMIT_PCT),
+    "risk_per_trade_pct": float(RISK_PER_TRADE_PCT),
+    "allowed_setups": sorted(ALLOWED_SETUPS),
+}
+_POLICY_META: Dict[str, Any] = {
+    "source": "env",
+    "synced_at": None,
+    "clamped": [],
+    "ignored": [],
+}
+
+
+def live_policy(key: str) -> Any:
+    """Current effective value of a shared-policy field (app push wins over
+    env). Falls back to the env constant if a field somehow went missing, so a
+    corrupt stored policy can never read as an absent gate."""
+    value = _LIVE_POLICY.get(key)
+    if value is None:
+        return {
+            "min_score": float(MIN_SCORE),
+            "min_score_trending": float(MIN_SCORE_TRENDING),
+            "min_rvol": float(MIN_RVOL),
+            "min_mtf": float(MIN_MTF),
+            "daily_loss_limit_pct": float(DAILY_LOSS_LIMIT_PCT),
+            "risk_per_trade_pct": float(RISK_PER_TRADE_PCT),
+        }.get(key)
+    return value
+
+
+async def _persist_policy() -> None:
+    """Store the adopted policy so a restart resumes it. Without this the bot
+    silently reverts to env on every redeploy and the gap re-opens unannounced."""
+    try:
+        await state.set(POLICY_STATE_KEY, json.dumps({
+            "policy": _LIVE_POLICY,
+            "meta": {k: _POLICY_META[k] for k in ("source", "synced_at", "clamped", "ignored")},
+        }))
+    except Exception as e:
+        logger.warning(f"policy persist failed (live policy still applied): {e}")
+
+
+async def apply_policy_patch(patch: Any, source: str) -> Dict[str, Any]:
+    """Adopt an app-pushed policy: clamp it, apply it, rebind the scanner's
+    discovery floors to the new gate, persist it, and report exactly what was
+    taken and what was refused."""
+    global _LIVE_POLICY, _POLICY_META
+    result = plan_policy_sync(_LIVE_POLICY, patch)
+    _LIVE_POLICY = result["policy"]
+    _POLICY_META = {
+        "source": source if result["accepted"] else _POLICY_META.get("source", "env"),
+        "synced_at": _utcnow().isoformat() if result["accepted"] else _POLICY_META.get("synced_at"),
+        "clamped": result["clamped"],
+        "ignored": result["ignored"],
+    }
+    # The scanner's own floors must follow the gate, or its eyes stay shut on
+    # exactly the band the operator just opened (see set_entry_gate_floors).
+    try:
+        gate = scanner_mod.set_entry_gate_floors(
+            live_policy("min_score"), live_policy("min_rvol"),
+        )
+        if scanner is not None:
+            await scanner.set_config({})  # re-normalize stored config against the new floors
+        logger.info(
+            f"⚙️ Policy ← {source}: gate {gate['min_score']}/rvol {gate['min_rvol']}, "
+            f"risk {live_policy('risk_per_trade_pct')}%/trade, "
+            f"day halt {live_policy('daily_loss_limit_pct')}%"
+        )
+    except Exception as e:
+        logger.warning(f"scanner floor rebind failed after policy sync (gate still applied): {e}")
+    await _persist_policy()
+    if result["changes"]:
+        try:
+            await trade_ledger.record("policy_synced", {
+                "source": source,
+                "changes": result["changes"],
+                "clamped": result["clamped"],
+                "policy": _LIVE_POLICY,
+            })
+        except Exception as e:
+            logger.warning(f"policy ledger write failed (non-fatal): {e}")
+    return result
+
+
+async def restore_policy() -> None:
+    """Re-adopt the stored policy at boot. Re-clamped on the way in, so an
+    envelope tightened by a redeploy applies to a policy stored under the old
+    one instead of outliving it."""
+    try:
+        raw = await state.get(POLICY_STATE_KEY)
+    except Exception as e:
+        logger.warning(f"policy restore read failed — running env defaults: {e}")
+        return
+    if not raw:
+        return
+    try:
+        stored = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("stored policy is unreadable — running env defaults")
+        return
+    payload = stored.get("policy") if isinstance(stored, dict) else None
+    if not isinstance(payload, dict):
+        return
+    await apply_policy_patch(payload, "app (restored)")
+
+
 async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     """Server-side re-filter mirroring the Rork app's gating, evaluated against
     the reconciled Redis state (single source of truth). Quality checks apply
@@ -6041,27 +6284,31 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     if not is_probe:
         regime = str(p.get("regime") or "").lower()
         score = p.get("score")
+        # Every threshold below reads the LIVE policy, not the boot constant,
+        # so a gate the operator changes in the app binds this dispatch — not
+        # the one after the next redeploy.
         if isinstance(score, (int, float)):
-            required = MIN_SCORE_TRENDING if "trending" in regime else MIN_SCORE
+            required = live_policy("min_score_trending") if "trending" in regime else live_policy("min_score")
             if score < required:
-                blocked.append(f"score {score} < {required}")
+                blocked.append(f"score {score} < {required:g}")
         rvol = p.get("rvol")
         if rvol is None:
             # An absent RVOL means the app never MEASURED relative volume.
             # Silently waving that through would place real money on an
             # unverified decision input, so a live entry is refused outright.
             blocked.append("rvol not measured (volume feed gap) — live entry needs a real reading")
-        elif isinstance(rvol, (int, float)) and rvol < MIN_RVOL:
-            blocked.append(f"rvol {rvol} < {MIN_RVOL}")
+        elif isinstance(rvol, (int, float)) and rvol < live_policy("min_rvol"):
+            blocked.append(f"rvol {rvol} < {live_policy('min_rvol'):g}")
         mtf = p.get("mtf_alignment")
         if isinstance(mtf, str) and mtf.strip():
             try:
-                if int(mtf.split("/")[0]) < MIN_MTF:
-                    blocked.append(f"mtf {mtf} < {MIN_MTF}/5")
+                if int(mtf.split("/")[0]) < live_policy("min_mtf"):
+                    blocked.append(f"mtf {mtf} < {live_policy('min_mtf'):g}/5")
             except (ValueError, IndexError):
                 blocked.append("mtf_alignment unparseable")
         setup = p.get("setup")
-        if isinstance(setup, str) and setup.strip() and ALLOWED_SETUPS and setup.lower().strip() not in ALLOWED_SETUPS:
+        allowed_setups = set(_LIVE_POLICY.get("allowed_setups") or [])
+        if isinstance(setup, str) and setup.strip() and allowed_setups and setup.lower().strip() not in allowed_setups:
             blocked.append(f"setup '{setup}' not allowlisted")
         # SETUP EXPECTANCY VETO — the only gate here that asks what actually
         # HAPPENED the last times this setup was traded, instead of how good it
@@ -6081,8 +6328,11 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
 
     daily = await state.get_daily()
     open_positions = await state.all_positions()
-    if daily["realized_pnl_today_pct"] <= -abs(DAILY_LOSS_LIMIT_PCT):
-        blocked.append(f"daily loss limit ({daily['realized_pnl_today_pct']:.2f}%)")
+    if daily["realized_pnl_today_pct"] <= -abs(live_policy("daily_loss_limit_pct")):
+        blocked.append(
+            f"daily loss limit ({daily['realized_pnl_today_pct']:.2f}% ≤ "
+            f"-{abs(live_policy('daily_loss_limit_pct')):g}%)"
+        )
     # PROFIT LOCK — a banked day is not a licence to keep swinging. Once the
     # objective is proven met in broker-verified dollars, further entries are
     # refused while the cushion is too thin to absorb a full loss. Giving a made
@@ -6113,7 +6363,7 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     actual_risk = estimate_entry_risk_usd(p)
     try:
         open_risk = sum(position_risk_usd(pos) for pos in open_positions.values())
-        nominal_risk = account_ref * (RISK_PER_TRADE_PCT / 100.0)
+        nominal_risk = account_ref * (live_policy("risk_per_trade_pct") / 100.0)
         new_risk = max(nominal_risk, actual_risk or 0.0)
         heat = (open_risk + new_risk) / max(account_ref, 1) * 100.0
         if heat > PORTFOLIO_HEAT_PCT:
@@ -6131,8 +6381,9 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
             realized_usd=daily.get("realized_pnl_today_usd"),
             open_risk_usd=open_risk_usd,
             profit_lock_max_risk=(lock["max_risk_usd"] if lock["cushion_usd"] > 0 else None),
+            loss_limit_pct=live_policy("daily_loss_limit_pct"),
         )
-        nominal_risk = account_ref * (RISK_PER_TRADE_PCT / 100.0)
+        nominal_risk = account_ref * (live_policy("risk_per_trade_pct") / 100.0)
         # Judge the budget against what the CONTRACT risks, not what the
         # percentage wishes it risked. On 2026-08-24 those were $110 and $28.
         requested_risk = max(nominal_risk, actual_risk or 0.0)
@@ -12462,6 +12713,7 @@ async def _priced_option_risk_gate(symbol: str, premium: Any, qty: Any,
             realized_usd=daily.get("realized_pnl_today_usd"),
             open_risk_usd=open_risk_usd,
             profit_lock_max_risk=(lock["max_risk_usd"] if lock["cushion_usd"] > 0 else None),
+            loss_limit_pct=live_policy("daily_loss_limit_pct"),
         )
         return plan_priced_option_risk(
             premium=premium, qty=qty, stop_premium=stop_premium,
@@ -13142,7 +13394,7 @@ async def execute_live_order(payload: dict):
                 dist = abs(entry_px - stop_px)
                 equity_val = await _live_equity()
                 if equity_val and equity_val > 0 and dist > 0:
-                    quantity = int((equity_val * (RISK_PER_TRADE_PCT / 100.0)) // dist)
+                    quantity = int((equity_val * (live_policy("risk_per_trade_pct") / 100.0)) // dist)
                     logger.info(f"sized {symbol} from live equity {equity_val:.2f}: qty={quantity}")
                 if quantity < 1:
                     raise Exception(
@@ -14017,6 +14269,11 @@ async def on_startup():
     await _announce_ledger_memory()
     # Which account the user pinned from the app (survives restarts/redeploys).
     await _load_pinned_account()
+    # SHARED POLICY — re-adopt the gate/risk numbers the app last pushed. Env
+    # only seeds the very first boot; without this, every redeploy silently
+    # reverts to defaults while the settings screen keeps showing the
+    # operator's numbers, which is the drift the sync exists to end.
+    await restore_policy()
     await preload_tokens()
     # One-time migration of the legacy JSON STATE_FILE into Redis (skipped when
     # Redis already holds state; the file is renamed *.migrated afterwards).
@@ -14668,12 +14925,36 @@ async def status():
         "broker_linked": load_tokens() is not None,
         **_token_session_fields(),
         "scanner": await scanner.status() if scanner else None,
+        # THE GATE AS IT IS ACTUALLY ENFORCED. These are live-policy values, so
+        # a gate the app pushed reads back as the app's number; `policy` beside
+        # them names the source, the sync time, and anything the bot refused or
+        # clamped, because a threshold the app cannot see is one it cannot
+        # honour (the app diffs this in services/gateDrift.ts).
         "filters": {
-            "min_score": MIN_SCORE,
-            "min_score_trending": MIN_SCORE_TRENDING,
-            "min_rvol": MIN_RVOL,
-            "min_mtf": MIN_MTF,
-            "allowed_setups": sorted(ALLOWED_SETUPS),
+            "min_score": live_policy("min_score"),
+            "min_score_trending": live_policy("min_score_trending"),
+            "min_rvol": live_policy("min_rvol"),
+            "min_mtf": live_policy("min_mtf"),
+            "allowed_setups": sorted(_LIVE_POLICY.get("allowed_setups") or []),
+            "risk_per_trade_pct": live_policy("risk_per_trade_pct"),
+            "daily_loss_limit_pct": live_policy("daily_loss_limit_pct"),
+            "policy": {
+                **_POLICY_META,
+                "env_defaults": {
+                    "min_score": MIN_SCORE,
+                    "min_score_trending": MIN_SCORE_TRENDING,
+                    "min_rvol": MIN_RVOL,
+                    "min_mtf": MIN_MTF,
+                    "risk_per_trade_pct": RISK_PER_TRADE_PCT,
+                    "daily_loss_limit_pct": DAILY_LOSS_LIMIT_PCT,
+                },
+                "envelope": {
+                    "min_score_floor": POLICY_HARD_MIN_SCORE,
+                    "max_risk_per_trade_pct": POLICY_HARD_MAX_RISK_PCT,
+                    "max_daily_loss_pct": POLICY_HARD_MAX_DAILY_LOSS_PCT,
+                    "max_trade_risk_fraction_of_daily": MAX_TRADE_RISK_FRACTION_OF_DAILY,
+                },
+            },
             "setup_veto": {
                 "enabled": SETUP_VETO_ENABLED,
                 "min_trades": SETUP_VETO_MIN_TRADES,
@@ -14822,6 +15103,66 @@ async def scanner_status():
     if scanner is None:
         raise HTTPException(503, "scanner not initialized")
     return await scanner.status()
+
+
+@app.get("/policy")
+async def policy_get():
+    """The live shared policy, its source, and every value the bot declined to
+    take at face value."""
+    return {
+        "policy": _LIVE_POLICY,
+        "meta": _POLICY_META,
+        "envelope": {
+            "min_score_floor": POLICY_HARD_MIN_SCORE,
+            "max_risk_per_trade_pct": POLICY_HARD_MAX_RISK_PCT,
+            "max_daily_loss_pct": POLICY_HARD_MAX_DAILY_LOSS_PCT,
+            "max_trade_risk_fraction_of_daily": MAX_TRADE_RISK_FRACTION_OF_DAILY,
+        },
+        "env_defaults": {
+            "min_score": MIN_SCORE,
+            "min_score_trending": MIN_SCORE_TRENDING,
+            "min_rvol": MIN_RVOL,
+            "min_mtf": MIN_MTF,
+            "risk_per_trade_pct": RISK_PER_TRADE_PCT,
+            "daily_loss_limit_pct": DAILY_LOSS_LIMIT_PCT,
+        },
+    }
+
+
+@app.post("/policy")
+async def policy_set(
+    body: dict = Body(...),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Adopt the app's configured policy live — no redeploy.
+
+    Body (all fields optional): { "min_score": 70, "min_score_trending": 65,
+    "min_rvol": 0.9, "min_mtf": 1, "risk_per_trade_pct": 2,
+    "daily_loss_limit_pct": 10, "allowed_setups": ["orb", ...] }
+
+    The bot adopts these in BOTH directions — the app can open the gate as well
+    as tighten it — but only inside the hard envelope reported back in
+    `envelope`. Anything clamped or ignored comes back in `clamped`/`ignored`
+    and is republished on /status, so the app can show the number that is
+    really binding instead of the one it asked for."""
+    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
+        raise HTTPException(401, "invalid secret")
+    result = await apply_policy_patch(body or {}, "app")
+    if result["changes"]:
+        await alerts.send(
+            "info", "policy_synced",
+            "Shared policy updated from the app: " + "; ".join(result["changes"][:4])
+            + (f" (clamped: {'; '.join(result['clamped'])})" if result["clamped"] else ""),
+            dedupe_key="policy_sync",
+        )
+    return {
+        "policy": _LIVE_POLICY,
+        "meta": _POLICY_META,
+        "changes": result["changes"],
+        "clamped": result["clamped"],
+        "ignored": result["ignored"],
+        "accepted": result["accepted"],
+    }
 
 
 @app.post("/scanner/config")
