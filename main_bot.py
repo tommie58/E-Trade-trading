@@ -3331,12 +3331,29 @@ The ladder mirrors how a disciplined day trader manages a live position:
    option bought at $4.90 with a 30%-of-premium broker stop has R = $1.50, so
    +0.75R means the premium must run +23% before ANY protection tightens — a
    trade can run +20% and still round-trip to a full −30% loss. The give-back
-   cap works in PERCENT of the entry price instead of R: past +8% it surrenders
-   only a bounded fraction of the open profit, and it governs the trail whenever
-   it is tighter than the R tier.
-6. SPREAD FLOOR — the trail is never placed inside 1.5 × the round-trip bid/ask
+   cap works in PERCENT of the entry price instead of R: it surrenders only a
+   bounded fraction of the open profit, and it governs the trail whenever it is
+   tighter than the R tier.
+6. WORTH-TAKING FLOOR — the cap may only govern once the profit it LOCKS is
+   worth taking: at least MIN_GIVEBACK_LOCK_R of the risk AND at least
+   GIVEBACK_COST_MULT times the round-trip spread. This separates protecting a
+   position from harvesting it.
+7. SPREAD FLOOR — the trail is never placed inside 1.5 × the round-trip bid/ask
    spread (capped at 1R), so a wide option chain can't be stopped out by its
    own quote rather than by the market.
+
+Protection and harvesting are different jobs, and the cap was doing both.
+Measured on a real fill (UBER $1.54 premium, 30% stop => R = $0.46, $0.05
+spread), a winner that ran +10% parked the trail at $1.59 and booked +$5.00
+gross — $2.50 to cross the spread, $1.30 commission, net +$1.20. The same
+position going the other way lost −$46.00. The book's average win was +$1.00
+against −$10.87: keeping 33% of a 10% run banks 0.11R while the stop risks a
+full 1R, and 0.11R against 1R needs a 90% win rate to break even.
+
+The defect was units — risk in R, the give-back ladder in percent-of-entry, and
+nothing comparing them. Protection stays percent-denominated
+(BREAKEVEN_TRIGGER_PCT now engages at the same +8% where the cap used to start
+selling, so no band loses cover); the decision to SELL is R-denominated.
 
 Percent rungs are self-scaling: a 0.5% underlying swing never reaches the +8%
 give-back trigger, so equity/underlying trails are unchanged. They only bite on
@@ -3359,9 +3376,21 @@ BREAKEVEN_TRIGGER_R = 0.75
 # Fraction of ATR the trail must always leave for normal noise.
 ATR_NOISE_FLOOR = 0.45
 # MFE as a fraction of entry price that ALSO locks breakeven, independent of R.
-BREAKEVEN_TRIGGER_PCT = 0.12
+# Deliberately equal to GIVEBACK_TRIGGER_PCT: protection must begin no later
+# than the point the give-back ladder used to start SELLING, or the worth-taking
+# floor would open a band where a run got neither. Never raise it above.
+BREAKEVEN_TRIGGER_PCT = 0.08
 # MFE percent at which the give-back cap starts governing the trail.
 GIVEBACK_TRIGGER_PCT = 0.08
+# Minimum profit, in R, the give-back cap must LOCK before it may govern at all.
+# An exit booking W R against 1R of risk needs a 1/(1+W) win rate to pay for the
+# losers: 67% at 0.5R, 90% at the 0.11R the ungated cap was booking. The book's
+# measured win rate is ~50%, so under half an R is unsupportable.
+MIN_GIVEBACK_LOCK_R = 0.5
+# The locked profit must ALSO clear this multiple of the round-trip spread.
+# An exit whose gross profit is the width of the spread is a fee with extra
+# steps — the reason the journal recorded +$1.00 "wins".
+GIVEBACK_COST_MULT = 3
 # Multiple of the bid/ask spread the trail must always clear.
 SPREAD_FLOOR_MULT = 1.5
 
@@ -3460,6 +3489,7 @@ def compute_trail_level(
         "breakeven_locked": False,
         "mfe_percent": 0.0,
         "giveback_active": False,
+        "giveback_withheld": False,
     }
     if entry <= 0 or risk <= 0:
         return fallback
@@ -3493,13 +3523,31 @@ def compute_trail_level(
     # premiums, where R is a huge fraction of the entry price).
     distance = tier_distance
     giveback_active = False
+    giveback_withheld = False
     keep = giveback_keep_for(mfe_percent)
     if keep is not None and mfe > 0:
         giveback_distance = mfe * (1.0 - keep)
         if giveback_distance < distance:
-            distance = giveback_distance
-            giveback_active = True
-            tier = "giveback"
+            # Worth-taking floor. `mfe - giveback_distance` is what the trail
+            # would actually BOOK here, so this is the comparison that was
+            # missing: the exit measured against the risk it is paid to take,
+            # and against what the round trip costs. Both floors, not either.
+            locked_profit = mfe - giveback_distance
+            risk_floor = MIN_GIVEBACK_LOCK_R * risk
+            spread_pre = _finite(spread)
+            cost_floor = (
+                GIVEBACK_COST_MULT * spread_pre
+                if spread_pre is not None and spread_pre > 0
+                else 0.0
+            )
+            if locked_profit >= max(risk_floor, cost_floor):
+                distance = giveback_distance
+                giveback_active = True
+                tier = "giveback"
+            else:
+                # Stand down: the R-tier trail governs and the breakeven lock
+                # holds the downside to a scratch. The trade keeps running.
+                giveback_withheld = True
 
     # Spread floor LAST: nothing may rest inside the round-trip spread. If the
     # floor erases the give-back edge the tier label reverts to the R rung.
@@ -3535,6 +3583,7 @@ def compute_trail_level(
         "breakeven_locked": (trail >= entry) if is_buy else (trail <= entry),
         "mfe_percent": math.floor(mfe_percent * 10000 + 0.5) / 10000.0,
         "giveback_active": giveback_active,
+        "giveback_withheld": giveback_withheld,
     }
 
 
@@ -4961,6 +5010,26 @@ group by setup_key, pnl_basis;
 
 # Per-setup P&L. GROUPED BY BASIS -- see the module docstring: pooling premium
 # and underlying percents produces a confident number that means nothing.
+#
+# THE PEAK CARRIES ITS OWN BASIS, AND IT IS NOT ALWAYS THIS ROW'S BASIS.
+# `_record_close` measures the water mark on the PREMIUM for every option, but
+# books the close on the UNDERLYING whenever the exit premium was never seen (a
+# reconciler capture, a stop fill priced off the stock). Both facts land on the
+# same row: `peak_basis = 'premium'` beside `pnl_basis = 'underlying'`.
+#
+# The close path anticipated exactly this and recorded `peak_basis` so a reader
+# could drop the mismatch -- and then no reader ever did. `avg(peak_r)` pooled
+# premium-denominated peaks into the underlying group, and the give-back column
+# subtracted an underlying realized percent from a PREMIUM excursion. A premium
+# moves several times as far as the stock behind it, so that subtraction does
+# not add noise, it manufactures give-back: an exit that captured its move reads
+# as one that handed a fortune back, and the fix it argues for (trail tighter)
+# is the opposite of what such a book needs.
+#
+# Every peak aggregate below is therefore gated on the two bases AGREEING, with
+# both known -- a null basis cannot be shown to match, and an unverifiable peak
+# is dropped rather than assumed. `peak_dropped_basis` reports how many were
+# dropped, because a coverage number that quietly shrinks is its own lie.
 _PERFORMANCE_VIEW = r"""
 create or replace view public.bot_setup_performance as
 select
@@ -4973,13 +5042,26 @@ select
         * 100.0 / nullif(count(*), 0), 1)                         as win_rate_pct,
   round(avg(realized_pnl_pct)::numeric, 2)                        as avg_pnl_pct,
   round(sum(realized_pnl_usd)::numeric, 2)                        as total_pnl_usd,
-  round(avg(peak_r)::numeric, 2)                                  as avg_peak_r,
+  round(avg(peak_r) filter (where peak_basis is not null
+        and pnl_basis is not null and peak_basis = pnl_basis)::numeric, 2)
+                                                                  as avg_peak_r,
   -- Coverage, not a value: how many of these trades were actually instrumented
-  -- with a water mark. The give-back average below is over THESE trades only.
-  count(peak_mfe_pct)::int                                        as peak_observed,
+  -- with a water mark measured on THIS row's basis. The give-back average below
+  -- is over THESE trades only.
+  count(peak_mfe_pct) filter (where peak_basis is not null
+        and pnl_basis is not null and peak_basis = pnl_basis)::int
+                                                                  as peak_observed,
   -- Give-back: how much of the best excursion was handed back at the exit.
-  -- Both terms are percents here (peak_mfe_pct is already x100).
-  round(avg(peak_mfe_pct - realized_pnl_pct)::numeric, 2)         as avg_giveback_pct
+  -- Both terms are percents on the SAME basis here (peak_mfe_pct is already
+  -- x100); a cross-basis pair is excluded, not converted.
+  round(avg(peak_mfe_pct - realized_pnl_pct) filter (where peak_basis is not null
+        and pnl_basis is not null and peak_basis = pnl_basis)::numeric, 2)
+                                                                  as avg_giveback_pct,
+  -- Peaks that WERE observed but could not be compared to this row: measured on
+  -- the premium while the close was booked on the underlying, or missing a
+  -- basis entirely (older rows, recorded before the basis was stamped).
+  count(peak_mfe_pct) filter (where peak_basis is null
+        or pnl_basis is null or peak_basis <> pnl_basis)::int      as peak_dropped_basis
 from public.bot_trade_closes
 where setup is not null
 group by setup, pnl_basis;
@@ -4996,8 +5078,17 @@ select
         * 100.0 / nullif(count(*), 0), 1)                         as win_rate_pct,
   round(avg(realized_pnl_pct)::numeric, 2)                        as avg_pnl_pct,
   round(sum(realized_pnl_usd)::numeric, 2)                        as total_pnl_usd,
-  count(peak_mfe_pct)::int                                        as peak_observed,
-  round(avg(peak_mfe_pct - realized_pnl_pct)::numeric, 2)         as avg_giveback_pct
+  -- Same basis gate as bot_setup_performance: an exit reason is judged by the
+  -- give-back it caused, so comparing a premium excursion against an underlying
+  -- realized move would convict the wrong exit path.
+  count(peak_mfe_pct) filter (where peak_basis is not null
+        and pnl_basis is not null and peak_basis = pnl_basis)::int
+                                                                  as peak_observed,
+  round(avg(peak_mfe_pct - realized_pnl_pct) filter (where peak_basis is not null
+        and pnl_basis is not null and peak_basis = pnl_basis)::numeric, 2)
+                                                                  as avg_giveback_pct,
+  count(peak_mfe_pct) filter (where peak_basis is null
+        or pnl_basis is null or peak_basis <> pnl_basis)::int      as peak_dropped_basis
 from public.bot_trade_closes
 where exit_reason is not null
 group by exit_reason, pnl_basis;
@@ -5174,7 +5265,7 @@ async def recent_closes(limit: int = 25) -> List[Dict[str, Any]]:
     """Most recent closed trades with their full decision/outcome context."""
     return await _rows(
         "select closed_at, ticker, setup, exit_reason, pnl_basis, "
-        "realized_pnl_pct, realized_pnl_usd, peak_r, peak_mfe_pct, "
+        "realized_pnl_pct, realized_pnl_usd, peak_r, peak_mfe_pct, peak_basis, "
         "underlying_entry, underlying_stop "
         "from public.bot_trade_closes "
         f"order by seq desc limit {int(limit)}"
@@ -5435,7 +5526,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.49.0-live-entry-unblocked"
+BOT_VERSION = "5.51.0-unmeasured-expectancy-null"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -5503,7 +5594,13 @@ _ENTRY_ABANDONED_EVENTS = frozenset({
     "entry_abandoned",
 })
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
-DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "2.0"))
+# The day-halt rule is FIXED at 20% (mirrors services/dayHalt.ts in the app): a
+# day down 20% of capital halts, six losing trades halts, nothing else does. The
+# old 2.0 default made the day's ENTIRE risk budget $103 on a $5,159 account —
+# one ordinary option trade consumed it, and the per-trade ceiling
+# (MAX_TRADE_RISK_FRACTION_OF_DAILY × base) refused CRM/AVGO outright with
+# `entry_risk_rejected` before the session's second setup ever priced.
+DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "20.0"))
 # A daily TRADE COUNT is not a risk control and no longer gates entries. It let
 # 6 trades at 1% risk (6% of the account) through while refusing 20 at 0.25%
 # (5%) — exactly backwards — and it killed the 7th good setup on a day the first
@@ -8978,7 +9075,9 @@ def summarize_setup_performance(records: List[dict]) -> Dict[str, Dict[str, Any]
 
     Each setup reports {trades, wins, win_rate, expectancy_pct, wilson_low,
     wilson_high} where the percents are per-trade realized moves on whatever
-    basis the close was booked (premium for options).
+    basis the close was booked (premium for options). `expectancy_pct` is None
+    when nothing in the sample carried a percent — an unmeasured setup, not a
+    break-even one.
     """
     open_setups: Dict[str, str] = {}
     buckets: Dict[str, Dict[str, Any]] = {}
@@ -9084,7 +9183,14 @@ def summarize_setup_performance(records: List[dict]) -> Dict[str, Dict[str, Any]
             # Averaged over the trades that actually carried a percent, never
             # over the whole sample — dividing by trades that reported no
             # percent would silently drag every expectancy toward zero.
-            "expectancy_pct": basis_stats["expectancy_pct"] if basis_stats else 0.0,
+            #
+            # NULL, never 0.0, when no trade in the sample carried a percent at
+            # all. Zero is the value of a setup that traded exactly break-even;
+            # a setup nobody measured has no expectancy, and printing 0.0 for it
+            # makes the unmeasured look better than every measured loser and
+            # worse than every measured winner — a rank it did not earn.
+            # Readers must branch on `expectancy_samples == 0`.
+            "expectancy_pct": basis_stats["expectancy_pct"] if basis_stats else None,
             "expectancy_samples": samples,
             "expectancy_basis": basis_label,
             "expectancy_by_basis": by_basis,
@@ -9122,6 +9228,7 @@ def assess_setup_veto(records: List[dict], setup: Any) -> Dict[str, Any]:
         "trades": stats["trades"],
         "win_rate": stats["win_rate"],
         "expectancy_pct": stats["expectancy_pct"],
+        "expectancy_samples": stats["expectancy_samples"],
         "wilson_high": stats["wilson_high"],
     })
     if stats["trades"] < SETUP_VETO_MIN_TRADES:
@@ -9137,9 +9244,18 @@ def assess_setup_veto(records: List[dict], setup: Any) -> Dict[str, Any]:
         )
         return base
     base["vetoed"] = True
+    # The veto stands on the WIN RATE alone, so an unmeasured expectancy must
+    # neither block the refusal nor be invented to decorate it. Formatting None
+    # through %+.2f would raise inside the entry path — a reporting detail
+    # taking down a risk decision.
+    exp = stats["expectancy_pct"]
+    exp_phrase = (
+        f"{exp:+.2f}% per trade" if isinstance(exp, (int, float))
+        else "per-trade move never measured"
+    )
     base["reason"] = (
         f"setup '{label}' is a MEASURED loser: {stats['win_rate']:.0f}% win rate over "
-        f"{stats['trades']} settled trades ({stats['expectancy_pct']:+.2f}% per trade), and even "
+        f"{stats['trades']} settled trades ({exp_phrase}), and even "
         f"the optimistic read of that record ({stats['wilson_high']:.0f}%) is worse than a coin flip"
     )
     return base
@@ -14003,7 +14119,14 @@ def _setup_performance_safe() -> Dict[str, Any]:
     except Exception as e:
         logger.warning(f"setup performance read failed: {e}")
         return {"available": False, "reason": str(e), "setups": []}
-    ranked = sorted(stats.values(), key=lambda s: s["expectancy_pct"])
+    # Worst MEASURED expectancy first, with the unmeasured setups collected at
+    # the END rather than interleaved at a fabricated 0.0. Sorting an unknown
+    # into the middle of a ranked list is how "nobody measured this" comes to
+    # read as "this one is fine".
+    ranked = sorted(
+        stats.values(),
+        key=lambda s: (s["expectancy_pct"] is None, s["expectancy_pct"] or 0.0),
+    )
     for row in ranked:
         row["vetoed"] = bool(
             SETUP_VETO_ENABLED
@@ -14018,6 +14141,12 @@ def _setup_performance_safe() -> Dict[str, Any]:
         # and settled itself, and the operator is entitled to tell them apart.
         "live_trades": sum(r["live"] for r in ranked),
         "imported_trades": sum(r["imported"] for r in ranked),
+        # How much of the ranking is actually ranked. A reader (or the AI) that
+        # sees ten setups has no way to tell that four of them carry no
+        # expectancy at all unless the list says so out loud.
+        "expectancy_unmeasured_setups": sum(
+            1 for r in ranked if r["expectancy_pct"] is None
+        ),
         "setups": ranked,
     }
 
