@@ -3384,9 +3384,21 @@ BREAKEVEN_TRIGGER_PCT = 0.08
 GIVEBACK_TRIGGER_PCT = 0.08
 # Minimum profit, in R, the give-back cap must LOCK before it may govern at all.
 # An exit booking W R against 1R of risk needs a 1/(1+W) win rate to pay for the
-# losers: 67% at 0.5R, 90% at the 0.11R the ungated cap was booking. The book's
-# measured win rate is ~50%, so under half an R is unsupportable.
-MIN_GIVEBACK_LOCK_R = 0.5
+# losers: 67% at 0.5R, 90% at the 0.11R the ungated cap was booking.
+#
+# RAISED FROM 0.5 TO 1.0 IN 5.54.0. The journal shows what a 0.5 floor permits:
+# winners closed at +0.86R and +1.04R while the losers ran to the full stop —
+# average win +$0.87 against an average loss of -$9.40. A 0.5R floor still
+# needs a 67% win rate and the book posts 38%, so the trail was legally cashing
+# out winners at a size that loses money in aggregate. At 1.0R the requirement
+# is 50%, and every entry is now underwritten to a 1.5:1 payoff, so a winner
+# surrendered below 1R is a shape that was paid for at entry and thrown away.
+#
+# MUST STAY EQUAL to the app's trailingEngine.MIN_GIVEBACK_LOCK_R — the parity
+# test in expo/__tests__/trailParity.test.ts reads both files and fails if they
+# drift, because two engines trailing the same position to different levels is
+# how a position gets closed twice or not at all.
+MIN_GIVEBACK_LOCK_R = 1.0
 # The locked profit must ALSO clear this multiple of the round-trip spread.
 # An exit whose gross profit is the width of the spread is a fee with extra
 # steps — the reason the journal recorded +$1.00 "wins".
@@ -5530,7 +5542,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.53.0-policy-sync"
+BOT_VERSION = "5.54.0-payoff-inversion"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -5752,7 +5764,13 @@ ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", "300"))
 TRADE_LEDGER_FILE = Path(os.getenv("TRADE_LEDGER_FILE", "trade_ledger.jsonl"))
 # Option stop protection: when the app doesn't send an explicit option stop
 # premium, protect at this percent below the entry premium (0 disables).
-OPTION_STOP_LOSS_PCT = float(os.getenv("OPTION_STOP_LOSS_PCT", "30"))
+# 5.54.0: was 30. A 30% blind stop next to winners the journal books at +18.9%
+# and +23.0% is a payoff of 0.7 BEFORE the spread — a losing trade with a
+# disciplined-looking stop. 22 matches the app's MAX_PREMIUM_HAIRCUT_PCT and
+# the R-conversion in exitRecovery.OPTION_TYPICAL_STOP_PCT, so the stop that
+# rests at the broker, the risk the app sized, and the R the ledger reports
+# finally all describe the same trade.
+OPTION_STOP_LOSS_PCT = float(os.getenv("OPTION_STOP_LOSS_PCT", "22"))
 # Sanity band for an APP-SUPPLIED `option_stop_price` (delta-derived, premium
 # basis — see expo/services/optionStop.ts). The app owns the policy; these are
 # guardrails against a bad number, not a second policy. Tighter than MIN% of
@@ -5761,7 +5779,30 @@ OPTION_STOP_LOSS_PCT = float(os.getenv("OPTION_STOP_LOSS_PCT", "30"))
 # values are CLAMPED and logged, so systematic drift is visible instead of
 # silently resting a dangerous level.
 OPTION_STOP_MIN_HAIRCUT_PCT = float(os.getenv("OPTION_STOP_MIN_HAIRCUT_PCT", "8"))
-OPTION_STOP_MAX_HAIRCUT_PCT = float(os.getenv("OPTION_STOP_MAX_HAIRCUT_PCT", "45"))
+# 5.54.0: was 45. The live log shows what a 45% ceiling actually delivered:
+#
+#   NFLX app option stop 0.09 risks 84.2% of the 0.57 fill — tightened to 0.31
+#   option guard armed for NFLX at premium 0.30 (risk 47.4% of 0.57)
+#
+# "Tightened" to a stop risking 47% of the position, against winners that book
+# ~20%. The clamp was not protecting the trade, it was legalising a 0.4 payoff.
+# 25 is the widest stop that can still pay MIN_ENTRY_PAYOFF (1.5:1) against the
+# moves this book actually captures.
+OPTION_STOP_MAX_HAIRCUT_PCT = float(os.getenv("OPTION_STOP_MAX_HAIRCUT_PCT", "25"))
+# Relative entry drift above which an app-supplied stop LEVEL is rebuilt from
+# the haircut it was designed to express. See plan_intent_preserving_stop.
+STOP_INTENT_DRIFT_TOLERANCE = float(os.getenv("STOP_INTENT_DRIFT_TOLERANCE", "0.05"))
+
+# ---- Per-name risk ceiling (5.54.0) ----
+# The day's DOLLAR objective, and the largest share of it one name may risk.
+#
+# MAX_TRADE_RISK_FRACTION_OF_DAILY bounds a trade against the LOSS BUDGET,
+# which scales with the account: at $50k and a 10% day limit it permits $2,500
+# of risk in one contract — five days of objective on one strike. This bounds
+# it against the OBJECTIVE instead, so no single ARM or MSTR can spend the day.
+# Mirrors expo/services/payoffGate.ts (MAX_RISK_PCT_OF_OBJECTIVE).
+DAILY_OBJECTIVE_USD = float(os.getenv("DAILY_OBJECTIVE_USD", "500"))
+MAX_RISK_PCT_OF_OBJECTIVE = float(os.getenv("MAX_RISK_PCT_OF_OBJECTIVE", "10"))
 
 # ---- V5.2 hardening ----
 # Exponential backoff for ALL E*TRADE API calls. The same env vars configure
@@ -9053,7 +9094,86 @@ def plan_trade_concentration(actual_risk_usd: Any, base_budget_usd: Any,
     return {"blocked": False, "reason": note, "fraction": round(fraction, 4), "ceiling_usd": round(ceiling, 2)}
 
 
-def derive_armed_option_stop(explicit: Any, fill_ref: Any) -> Tuple[Optional[float], str]:
+def plan_intent_preserving_stop(planned_stop: Any, planned_entry: Any, real_entry: Any,
+                                max_haircut: float, tolerance: float = None) -> Dict[str, Any]:
+    """Rebuild a protective stop when the entry did not price where it was planned.
+
+    THE TRADE THIS EXISTS FOR, verbatim from the 2026-09-04 log:
+
+        App limit 0.13 outside real market [0.49, 0.57] - repricing to ask
+        NFLX app option stop 0.09 risks 84.2% of the 0.57 fill - tightened to 0.31
+        option guard armed for NFLX at premium 0.30 (risk 47.4% of 0.57)
+
+    The app planned a 0.09 stop against its own 0.13 estimate. That is a 31%
+    haircut - a perfectly sane trade. The contract filled at 0.57, and because
+    the stop travelled as an absolute LEVEL rather than as the 31% INTENT, it
+    arrived risking 84% of the position. The 45% clamp then "rescued" it into a
+    47% risk, which against winners this book books at ~20% is a payoff of 0.4.
+    Every trade priced this way is a loser with a good entry.
+
+    A percentage survives a reprice; a price level does not. So when the entry
+    drifts more than `tolerance`, the FRACTION is what carries forward, capped
+    by `max_haircut`. On the NFLX trade that yields 0.57 x (1 - 0.25) = 0.43
+    instead of 0.30 - the trade the app actually underwrote.
+
+    Pure. Returns `{stop, haircut, rescaled, reason}`; `stop` is None when
+    there is nothing usable to preserve, which leaves the existing clamp path
+    in charge exactly as before.
+    """
+    def num(value: Any) -> Optional[float]:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    silent = {"stop": None, "haircut": None, "rescaled": False, "reason": ""}
+
+    stop = num(planned_stop)
+    planned = num(planned_entry)
+    real = num(real_entry)
+    cap = num(max_haircut)
+    tol = num(tolerance)
+    if tol is None or tol < 0:
+        tol = STOP_INTENT_DRIFT_TOLERANCE
+    if cap is None or cap <= 0 or cap >= 1:
+        return silent
+    if real is None or real <= 0:
+        return silent
+    if stop is None or stop <= 0 or planned is None or planned <= 0 or stop >= planned:
+        return silent
+
+    intended = (planned - stop) / planned
+    drift = abs(real - planned) / planned
+
+    # Priced where it was expected: the level still means what it meant.
+    if drift <= tol:
+        haircut = (real - stop) / real
+        if 0 < haircut <= cap:
+            return {"stop": round(stop, 2), "haircut": round(haircut, 4),
+                    "rescaled": False, "reason": ""}
+
+    capped = min(intended, cap)
+    rescaled = round(real * (1.0 - capped), 2)
+    if not math.isfinite(rescaled) or rescaled <= 0 or rescaled >= real:
+        return silent
+
+    stale_risk = (real - stop) / real * 100.0
+    return {
+        "stop": rescaled,
+        "haircut": round(capped, 4),
+        "rescaled": True,
+        "reason": (
+            f"entry repriced {planned:.2f} -> {real:.2f} ({drift * 100:.0f}%) - stop rebuilt "
+            f"from the intended {intended * 100:.0f}% haircut ({capped * 100:.0f}% after the "
+            f"ceiling) instead of carrying the stale {stop:.2f} level, which would have risked "
+            f"{stale_risk:.0f}% of the real fill"
+        ),
+    }
+
+
+def derive_armed_option_stop(explicit: Any, fill_ref: Any,
+                             planned_entry: Any = None) -> Tuple[Optional[float], str]:
     """The premium stop that will ACTUALLY rest at the broker after a fill.
 
     One source of truth, because two callers need the same answer for opposite
@@ -9081,8 +9201,22 @@ def derive_armed_option_stop(explicit: Any, fill_ref: Any) -> Tuple[Optional[flo
         stop = None
 
     if stop is not None:
-        stop, clamp_note = _clamp_option_stop_premium(stop, fill)
-        basis = "app_delta+clamped" if clamp_note else "app_delta"
+        # INTENT FIRST, clamp second. The app's stop was designed against the
+        # app's own premium estimate; if the contract repriced, the level is
+        # stale and the HAIRCUT is the thing worth preserving. Only once the
+        # level means what it was meant to mean is it handed to the clamp.
+        intent = plan_intent_preserving_stop(
+            stop, planned_entry, fill, OPTION_STOP_MAX_HAIRCUT_PCT / 100.0,
+        )
+        if intent["rescaled"] and intent["stop"] is not None:
+            stop = intent["stop"]
+            basis = "app_delta+rescaled"
+            stop, clamp_note = _clamp_option_stop_premium(stop, fill)
+            if clamp_note:
+                basis = "app_delta+rescaled+clamped"
+        else:
+            stop, clamp_note = _clamp_option_stop_premium(stop, fill)
+            basis = "app_delta+clamped" if clamp_note else "app_delta"
     if stop is None and fill > 0 and OPTION_STOP_LOSS_PCT > 0:
         stop = fill * (1.0 - OPTION_STOP_LOSS_PCT / 100.0)
         basis = "pct_default"
@@ -9093,7 +9227,8 @@ def derive_armed_option_stop(explicit: Any, fill_ref: Any) -> Tuple[Optional[flo
 
 def plan_priced_option_risk(premium: Any, qty: Any, stop_premium: Any,
                             remaining_budget_usd: Any, base_budget_usd: Any,
-                            max_fraction: float = None) -> Dict[str, Any]:
+                            max_fraction: float = None,
+                            objective_usd: Any = None) -> Dict[str, Any]:
     """Re-judge an option entry once the REAL contract price is known.
 
     `plan_trade_concentration` runs at dispatch, before the option chain is ever
@@ -9132,7 +9267,7 @@ def plan_priced_option_risk(premium: Any, qty: Any, stop_premium: Any,
 
     silent = {"action": "allow", "qty": want_qty, "risk_usd": None,
               "requested_risk_usd": None, "per_contract_usd": None,
-              "ceiling_usd": None, "reason": ""}
+              "ceiling_usd": None, "ceiling_source": None, "reason": ""}
 
     prem = num(premium)
     stop = num(stop_premium)
@@ -9152,18 +9287,29 @@ def plan_priced_option_risk(premium: Any, qty: Any, stop_premium: Any,
     if per_contract <= 0:
         return silent
 
-    # The day must survive this trade twice over: it may take neither more than
-    # its share of the base budget, nor more than the dollars actually left.
+    # The day must survive this trade THREE ways over. It may take neither more
+    # than its share of the base budget, nor more than the dollars actually
+    # left, nor - 5.54.0 - more than one name's share of the day's objective.
     ceiling = base * fraction_cap
-    if remaining is not None and remaining >= 0:
-        ceiling = min(ceiling, remaining)
+    ceiling_source = "day-fraction"
+    if remaining is not None and remaining >= 0 and remaining < ceiling:
+        ceiling = remaining
+        ceiling_source = "remaining"
+    objective = num(objective_usd if objective_usd is not None else DAILY_OBJECTIVE_USD)
+    obj_pct = num(MAX_RISK_PCT_OF_OBJECTIVE)
+    if objective is not None and objective > 0 and obj_pct is not None and obj_pct > 0:
+        per_name = objective * (obj_pct / 100.0)
+        if per_name < ceiling:
+            ceiling = per_name
+            ceiling_source = "per-name"
 
     risk = per_contract * want_qty
     if risk <= ceiling:
         return {"action": "allow", "qty": want_qty, "risk_usd": round(risk, 2),
                 "requested_risk_usd": round(risk, 2),
                 "per_contract_usd": round(per_contract, 2),
-                "ceiling_usd": round(ceiling, 2), "reason": ""}
+                "ceiling_usd": round(ceiling, 2),
+                "ceiling_source": ceiling_source, "reason": ""}
 
     affordable = int(ceiling // per_contract)
     if affordable >= 1:
@@ -9176,10 +9322,15 @@ def plan_priced_option_risk(premium: Any, qty: Any, stop_premium: Any,
             "requested_risk_usd": round(risk, 2),
             "per_contract_usd": round(per_contract, 2),
             "ceiling_usd": round(ceiling, 2),
+            "ceiling_source": ceiling_source,
             "reason": (
                 f"priced risk ${risk:,.0f} ({want_qty} x ${per_contract:,.0f}) exceeds the "
-                f"${ceiling:,.0f} this day can spend on one entry — sizing down to "
-                f"{affordable} contract(s), ${per_contract * affordable:,.0f}"
+                + (f"${ceiling:,.0f} one NAME may risk "
+                   f"({MAX_RISK_PCT_OF_OBJECTIVE:.0f}% of the day's objective)"
+                   if ceiling_source == "per-name"
+                   else f"${ceiling:,.0f} this day can spend on one entry")
+                + f" — sizing down to {affordable} contract(s), "
+                f"${per_contract * affordable:,.0f}"
             ),
         }
 
@@ -9188,9 +9339,12 @@ def plan_priced_option_risk(premium: Any, qty: Any, stop_premium: Any,
         "requested_risk_usd": round(risk, 2),
         "per_contract_usd": round(per_contract, 2),
         "ceiling_usd": round(ceiling, 2),
+        "ceiling_source": ceiling_source,
         "reason": (
-            f"one contract risks ${per_contract:,.0f} against ${ceiling:,.0f} of room — "
-            f"the entry cannot be sized without handing the whole day to a single trade"
+            f"one contract risks ${per_contract:,.0f} against ${ceiling:,.0f} of "
+            + (f"per-name room ({MAX_RISK_PCT_OF_OBJECTIVE:.0f}% of the day's objective)"
+               if ceiling_source == "per-name" else "room")
+            + " — the entry cannot be sized without handing the whole day to a single trade"
         ),
     }
 
@@ -12719,6 +12873,7 @@ async def _priced_option_risk_gate(symbol: str, premium: Any, qty: Any,
             premium=premium, qty=qty, stop_premium=stop_premium,
             remaining_budget_usd=budget["remaining_usd"],
             base_budget_usd=budget["base_budget_usd"],
+            objective_usd=DAILY_OBJECTIVE_USD,
         )
     except Exception as e:
         logger.warning(f"priced-risk recheck unavailable for {symbol} (non-fatal, entry not blocked): {e}")
@@ -13138,8 +13293,11 @@ async def execute_live_order(payload: dict):
                 # that will rest behind it are both known, so the day's budget
                 # question gets asked once more in broker dollars.
                 entry_premium_ref = float(common.get("limitPrice") or 0) or float(real_ask or 0)
+                # The app's ESTIMATE is passed as the planned entry so a stop
+                # designed against 0.13 is not measured against a 0.57 fill.
                 armed_stop, _armed_basis = derive_armed_option_stop(
                     payload.get("option_stop_price"), entry_premium_ref,
+                    payload.get("option_limit_price"),
                 )
                 risk_check = await _priced_option_risk_gate(
                     sym_u, entry_premium_ref, quantity, armed_stop,
@@ -13250,11 +13408,24 @@ async def execute_live_order(payload: dict):
                 # Same derivation the priced-risk gate used above, so the level
                 # the day was budgeted against is the level that actually rests.
                 explicit = payload.get("option_stop_price")
-                stop_premium, derived_basis = derive_armed_option_stop(explicit, fill_ref)
+                planned_entry = payload.get("option_limit_price")
+                stop_premium, derived_basis = derive_armed_option_stop(
+                    explicit, fill_ref, planned_entry,
+                )
                 stop_basis = derived_basis
                 if derived_basis.startswith("app_delta"):
                     app_basis = str(payload.get("option_stop_basis") or "app_delta")
-                    if derived_basis.endswith("+clamped"):
+                    if "+rescaled" in derived_basis:
+                        stop_basis = derived_basis.replace("app_delta", app_basis, 1)
+                        intent_note = plan_intent_preserving_stop(
+                            explicit, planned_entry, fill_ref,
+                            OPTION_STOP_MAX_HAIRCUT_PCT / 100.0,
+                        )["reason"]
+                        # Loud on purpose: a rescale means the app's premium
+                        # estimate was wrong enough to invalidate its own stop,
+                        # which is a calibration problem worth seeing.
+                        logger.warning(f"⚖️ {symbol} option stop intent preserved — {intent_note}")
+                    elif derived_basis.endswith("+clamped"):
                         stop_basis = f"{app_basis}+clamped"
                         clamp_note = _clamp_option_stop_premium(explicit, fill_ref)[1]
                         logger.warning(f"⚠️ {symbol} app option stop {clamp_note}")
@@ -14953,6 +15124,12 @@ async def status():
                     "max_risk_per_trade_pct": POLICY_HARD_MAX_RISK_PCT,
                     "max_daily_loss_pct": POLICY_HARD_MAX_DAILY_LOSS_PCT,
                     "max_trade_risk_fraction_of_daily": MAX_TRADE_RISK_FRACTION_OF_DAILY,
+                    "daily_objective_usd": DAILY_OBJECTIVE_USD,
+                    "max_risk_pct_of_objective": MAX_RISK_PCT_OF_OBJECTIVE,
+                    "per_name_risk_ceiling_usd": round(
+                        DAILY_OBJECTIVE_USD * (MAX_RISK_PCT_OF_OBJECTIVE / 100.0), 2
+                    ),
+                    "option_stop_max_haircut_pct": OPTION_STOP_MAX_HAIRCUT_PCT,
                 },
             },
             "setup_veto": {
@@ -15117,6 +15294,12 @@ async def policy_get():
             "max_risk_per_trade_pct": POLICY_HARD_MAX_RISK_PCT,
             "max_daily_loss_pct": POLICY_HARD_MAX_DAILY_LOSS_PCT,
             "max_trade_risk_fraction_of_daily": MAX_TRADE_RISK_FRACTION_OF_DAILY,
+            "daily_objective_usd": DAILY_OBJECTIVE_USD,
+            "max_risk_pct_of_objective": MAX_RISK_PCT_OF_OBJECTIVE,
+            "per_name_risk_ceiling_usd": round(
+                DAILY_OBJECTIVE_USD * (MAX_RISK_PCT_OF_OBJECTIVE / 100.0), 2
+            ),
+            "option_stop_max_haircut_pct": OPTION_STOP_MAX_HAIRCUT_PCT,
         },
         "env_defaults": {
             "min_score": MIN_SCORE,
