@@ -5766,6 +5766,14 @@ SCANNER_MODE = os.getenv("SCANNER_MODE", "shadow").lower()
 SCANNER_ALLOW_AUTONOMOUS_ENTRY = (
     os.getenv("SCANNER_ALLOW_AUTONOMOUS_ENTRY", "false").lower() == "true"
 )
+# Every signal carries WHO asked for it, stamped server-side at the point of
+# entry into the bot. Demoting the scanner's mode removes the only origination
+# path that exists TODAY; this field enforces the rule itself, on every order,
+# at the last gate before the broker — so a future code path that dispatches a
+# signal is refused by default instead of inheriting authority by accident.
+DISPATCH_ORIGIN_FIELD = "_origin"
+DISPATCH_ORIGIN_APP = "app"
+DISPATCH_ORIGIN_SCANNER = "scanner"
 SCANNER_UNIVERSE = os.getenv("SCANNER_UNIVERSE", "")
 SCANNER_INTERVAL_SECONDS = int(os.getenv("SCANNER_INTERVAL_SECONDS", "60"))
 SCANNER_MAX_SIGNALS_PER_DAY = int(os.getenv("SCANNER_MAX_SIGNALS_PER_DAY", "3"))
@@ -6089,6 +6097,53 @@ async def _replay_parked_signals() -> None:
                 f"{ticker} {pd.get('action')}: replay after relink failed: {e}",
                 dedupe_key=f"parked:{ticker}",
             )
+
+
+def entry_origin_permitted(
+    origin: Any, is_close: bool, allow_autonomous: bool
+) -> Tuple[bool, str]:
+    """May a signal from `origin` reach the broker?
+
+    The operator's rule: the bot may never ORIGINATE a trade. Entries come from
+    the app's dispatch or they do not happen.
+
+    Two deliberate exemptions:
+
+    * CLOSES always pass. A protective exit reduces risk, and a bot that cannot
+      close a position it already holds is far more dangerous than one that
+      cannot open a new one. The broker-side stop, trail engine, reconciler and
+      flatten/kill paths never call this at all — they do not go through signal
+      dispatch — but an app-dispatched SELL_CLOSE arriving unlabeled must not
+      be refused either.
+    * An explicit `allow_autonomous` grant restores the old behaviour for an
+      operator who deliberately turns it on.
+
+    UNLABELED ENTRIES ARE REFUSED. This inverts the usual "fail open on
+    unlabeled provenance" rule on purpose: elsewhere an unlabeled row is a
+    measurement we must not silently drop, but here the unlabeled thing is a
+    request to spend real money, and "nobody can prove who asked for this" is
+    the exact condition that cost money on 2026-09-09. Authority is proven, not
+    assumed. The cost of being wrong is one refused entry, logged loudly; the
+    cost of the opposite default is an unauthorized position.
+
+    Pure: no I/O, fully unit-testable.
+    """
+    if is_close:
+        return True, ""
+    src = str(origin or "").lower().strip()
+    if src == DISPATCH_ORIGIN_APP:
+        return True, ""
+    if allow_autonomous:
+        return True, ""
+    if not src:
+        return False, (
+            "origination refused: entry carries no dispatch origin — "
+            "entries must come from an app (AI Autopilot) dispatch"
+        )
+    return False, (
+        f"origination refused: entry originated by '{src}', not the app — "
+        "entries must come from an app (AI Autopilot) dispatch"
+    )
 
 
 def _is_close_payload(p: dict) -> bool:
@@ -13336,6 +13391,31 @@ async def execute_live_order(payload: dict):
     # A queued job may execute after conditions changed — re-check the hard
     # gates for ENTRIES here too (closes always pass: they reduce risk).
     is_close = _is_close_payload(payload)
+
+    # ORIGIN GATE — the last gate before the broker, and the one that enforces
+    # "the bot never originates a trade" as a property of every order rather
+    # than a setting held somewhere else. Placed here because all three paths
+    # that can place an order (direct, queue worker, parked-signal replay) come
+    # through this function, and the payload carries its origin across the
+    # Redis queue and the park/replay buffer with it.
+    origin_ok, origin_reason = entry_origin_permitted(
+        payload.get(DISPATCH_ORIGIN_FIELD), is_close, SCANNER_ALLOW_AUTONOMOUS_ENTRY
+    )
+    if not origin_ok:
+        logger.error(f"🔒 {ticker} {action} — {origin_reason}")
+        await trade_ledger.record("entry_refused_origin", {
+            "ticker": ticker,
+            "action": action,
+            "origin": str(payload.get(DISPATCH_ORIGIN_FIELD) or "") or None,
+            "reason": origin_reason,
+        })
+        await alerts.send(
+            "critical", "entry_refused_origin",
+            f"{ticker} {action}: {origin_reason}",
+            dedupe_key=f"origin:{ticker}",
+        )
+        return {"status": "refused", "reason": origin_reason}
+
     await check_risk_limits(is_close=is_close)
 
     if not is_close:
@@ -14691,6 +14771,10 @@ async def _scanner_dispatch(payload: Dict[str, Any]) -> Dict[str, Any]:
     except ValidationError as e:
         return {"status": "invalid", "reason": str(e.errors()[:2])}
     pd.pop("secret", None)
+    # Labeled as what it is. The origin gate in execute_live_order refuses this
+    # entry unless the operator has explicitly granted autonomous origination,
+    # so the scanner cannot open a position even if it is somehow running live.
+    pd[DISPATCH_ORIGIN_FIELD] = DISPATCH_ORIGIN_SCANNER
     return await process_signal(pd)
 
 
@@ -14907,7 +14991,11 @@ async def _record_dispatch_verdict(pd: dict, verdict: str, reason: str = "") -> 
     ticker = str(pd.get("ticker") or "?").upper()
     action = str(pd.get("action") or "?").upper()
     mode = str(pd.get("mode") or "paper").lower()
-    line = f"📨 Dispatch verdict: {verdict.upper()} — {ticker} {action} mode={mode}"
+    origin = str(pd.get(DISPATCH_ORIGIN_FIELD) or "") or "unlabeled"
+    line = (
+        f"📨 Dispatch verdict: {verdict.upper()} — {ticker} {action} "
+        f"mode={mode} origin={origin}"
+    )
     if reason:
         line += f" — {reason}"
     if verdict in ("rejected", "failed", "error", "parked"):
@@ -14919,6 +15007,7 @@ async def _record_dispatch_verdict(pd: dict, verdict: str, reason: str = "") -> 
         "ticker": ticker,
         "action": action,
         "mode": mode,
+        "origin": origin,
         "verdict": verdict,
         "reason": reason or None,
     }
@@ -15290,6 +15379,10 @@ async def webhook(
 
     pd = payload.dict()
     pd.pop("secret", None)  # never persist/queue the shared secret
+    # Provenance is stamped SERVER-SIDE, by plain assignment, so a body field
+    # named "_origin" is overwritten rather than trusted. Reaching this handler
+    # already required the webhook secret/HMAC, so this IS an app dispatch.
+    pd[DISPATCH_ORIGIN_FIELD] = DISPATCH_ORIGIN_APP
     return await process_signal(pd)
 
 
