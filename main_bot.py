@@ -5542,7 +5542,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.54.0-payoff-inversion"
+BOT_VERSION = "5.56.0-no-per-name-room"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -5793,40 +5793,25 @@ OPTION_STOP_MAX_HAIRCUT_PCT = float(os.getenv("OPTION_STOP_MAX_HAIRCUT_PCT", "25
 # the haircut it was designed to express. See plan_intent_preserving_stop.
 STOP_INTENT_DRIFT_TOLERANCE = float(os.getenv("STOP_INTENT_DRIFT_TOLERANCE", "0.05"))
 
-# ---- Per-name risk ceiling (5.54.0) ----
-# The day's DOLLAR objective, and the largest share of it one name may risk.
+# ---- Per-name risk ceiling: REMOVED 2026-09-09 ----
+# `MAX_RISK_PCT_OF_OBJECTIVE` (10) and `per_name_risk_room()` stood here and
+# bounded one ticker to a share of the day's DOLLAR objective: $50 against a
+# $500 day. Priced option risk is (premium - stop) x 100, so $50 funded a single
+# lot only when premium minus stop stayed under $0.50. Above that
+# floor(50 / per_contract) == 0, so the rule could not even size down - it
+# rejected outright. It refused GOOGL ($60), and TSLA ($145) and MSFT ($110)
+# before it. Removed at the operator's request rather than retuned.
 #
-# MAX_TRADE_RISK_FRACTION_OF_DAILY bounds a trade against the LOSS BUDGET,
-# which scales with the account: at $50k and a 10% day limit it permits $2,500
-# of risk in one contract — five days of objective on one strike. This bounds
-# it against the OBJECTIVE instead, so no single ARM or MSTR can spend the day.
-# Mirrors expo/services/payoffGate.ts (MAX_RISK_PCT_OF_OBJECTIVE).
+# WHAT STILL BOUNDS ONE ENTRY: MAX_TRADE_RISK_FRACTION_OF_DAILY (50% of the
+# day's base loss budget) and the dollars actually remaining in that budget.
+# Both scale with the ACCOUNT rather than the objective, so at $50k with a 10%
+# day limit the day-fraction ceiling alone permits $2,500 of risk in ONE
+# contract - five days of objective on a single strike. Nothing now caps a name
+# against the day's profit target. Mirrors expo/services/payoffGate.ts.
+#
+# DAILY_OBJECTIVE_USD stays: it is still the pace engine's target and is still
+# reported in /status. It simply no longer gates an entry's size.
 DAILY_OBJECTIVE_USD = float(os.getenv("DAILY_OBJECTIVE_USD", "500"))
-MAX_RISK_PCT_OF_OBJECTIVE = float(os.getenv("MAX_RISK_PCT_OF_OBJECTIVE", "10"))
-
-
-def per_name_risk_room(objective_usd: Any = None) -> Optional[float]:
-    """Dollars one name may risk: its share of the day's objective.
-
-    Returns None when the objective is unreadable - never a silent 0 that would
-    refuse every entry, nor an unbounded ceiling that would refuse none.
-
-    Carries its own coercion rather than calling `num`: every `num` in this file
-    is a nested helper inside another function, so a module-level reference to
-    it would raise NameError the first time an entry was priced.
-    """
-    def num(value: Any) -> Optional[float]:
-        try:
-            out = float(value)
-        except (TypeError, ValueError):
-            return None
-        return out if math.isfinite(out) else None
-
-    objective = num(objective_usd if objective_usd is not None else DAILY_OBJECTIVE_USD)
-    obj_pct = num(MAX_RISK_PCT_OF_OBJECTIVE)
-    if objective is None or objective <= 0 or obj_pct is None or obj_pct <= 0:
-        return None
-    return objective * (obj_pct / 100.0)
 
 # ---- V5.2 hardening ----
 # Exponential backoff for ALL E*TRADE API calls. The same env vars configure
@@ -9333,8 +9318,7 @@ def derive_armed_option_stop(explicit: Any, fill_ref: Any,
 
 def plan_priced_option_risk(premium: Any, qty: Any, stop_premium: Any,
                             remaining_budget_usd: Any, base_budget_usd: Any,
-                            max_fraction: float = None,
-                            objective_usd: Any = None) -> Dict[str, Any]:
+                            max_fraction: float = None) -> Dict[str, Any]:
     """Re-judge an option entry once the REAL contract price is known.
 
     `plan_trade_concentration` runs at dispatch, before the option chain is ever
@@ -9393,18 +9377,15 @@ def plan_priced_option_risk(premium: Any, qty: Any, stop_premium: Any,
     if per_contract <= 0:
         return silent
 
-    # The day must survive this trade THREE ways over. It may take neither more
+    # The day must survive this trade TWO ways over: it may take neither more
     # than its share of the base budget, nor more than the dollars actually
-    # left, nor - 5.54.0 - more than one name's share of the day's objective.
+    # left. A third ceiling - one name's share of the day's objective - was
+    # removed 2026-09-09; see the note at DAILY_OBJECTIVE_USD.
     ceiling = base * fraction_cap
     ceiling_source = "day-fraction"
     if remaining is not None and remaining >= 0 and remaining < ceiling:
         ceiling = remaining
         ceiling_source = "remaining"
-    per_name = per_name_risk_room(objective_usd)
-    if per_name is not None and per_name < ceiling:
-        ceiling = per_name
-        ceiling_source = "per-name"
 
     risk = per_contract * want_qty
     if risk <= ceiling:
@@ -9428,11 +9409,8 @@ def plan_priced_option_risk(premium: Any, qty: Any, stop_premium: Any,
             "ceiling_source": ceiling_source,
             "reason": (
                 f"priced risk ${risk:,.0f} ({want_qty} x ${per_contract:,.0f}) exceeds the "
-                + (f"${ceiling:,.0f} one NAME may risk "
-                   f"({MAX_RISK_PCT_OF_OBJECTIVE:.0f}% of the day's objective)"
-                   if ceiling_source == "per-name"
-                   else f"${ceiling:,.0f} this day can spend on one entry")
-                + f" — sizing down to {affordable} contract(s), "
+                f"${ceiling:,.0f} this day can spend on one entry"
+                f" — sizing down to {affordable} contract(s), "
                 f"${per_contract * affordable:,.0f}"
             ),
         }
@@ -9444,10 +9422,8 @@ def plan_priced_option_risk(premium: Any, qty: Any, stop_premium: Any,
         "ceiling_usd": round(ceiling, 2),
         "ceiling_source": ceiling_source,
         "reason": (
-            f"one contract risks ${per_contract:,.0f} against ${ceiling:,.0f} of "
-            + (f"per-name room ({MAX_RISK_PCT_OF_OBJECTIVE:.0f}% of the day's objective)"
-               if ceiling_source == "per-name" else "room")
-            + " — the entry cannot be sized without handing the whole day to a single trade"
+            f"one contract risks ${per_contract:,.0f} against ${ceiling:,.0f} of room"
+            " — the entry cannot be sized without handing the whole day to a single trade"
         ),
     }
 
@@ -13216,7 +13192,6 @@ async def _priced_option_risk_gate(symbol: str, premium: Any, qty: Any,
             premium=premium, qty=qty, stop_premium=stop_premium,
             remaining_budget_usd=budget["remaining_usd"],
             base_budget_usd=budget["base_budget_usd"],
-            objective_usd=DAILY_OBJECTIVE_USD,
         )
     except Exception as e:
         logger.warning(f"priced-risk recheck unavailable for {symbol} (non-fatal, entry not blocked): {e}")
@@ -15478,11 +15453,10 @@ async def status():
                     "max_daily_loss_pct": POLICY_HARD_MAX_DAILY_LOSS_PCT,
                     "max_trade_risk_fraction_of_daily": MAX_TRADE_RISK_FRACTION_OF_DAILY,
                     "daily_objective_usd": DAILY_OBJECTIVE_USD,
-                    "max_risk_pct_of_objective": MAX_RISK_PCT_OF_OBJECTIVE,
-                    "per_name_risk_ceiling_usd": (
-                        round(per_name_risk_room(), 2)
-                        if per_name_risk_room() is not None else None
-                    ),
+                    # per_name_risk_ceiling_usd / max_risk_pct_of_objective were
+                    # reported here until 2026-09-09. The rule is gone, so the
+                    # keys are gone: a ceiling reported but never applied is
+                    # worse than one that was never mentioned.
                     "option_stop_max_haircut_pct": OPTION_STOP_MAX_HAIRCUT_PCT,
                 },
             },
@@ -15649,11 +15623,8 @@ async def policy_get():
             "max_daily_loss_pct": POLICY_HARD_MAX_DAILY_LOSS_PCT,
             "max_trade_risk_fraction_of_daily": MAX_TRADE_RISK_FRACTION_OF_DAILY,
             "daily_objective_usd": DAILY_OBJECTIVE_USD,
-            "max_risk_pct_of_objective": MAX_RISK_PCT_OF_OBJECTIVE,
-            "per_name_risk_ceiling_usd": (
-                round(per_name_risk_room(), 2)
-                if per_name_risk_room() is not None else None
-            ),
+            # See the /status envelope above: the per-name ceiling keys were
+            # removed with the rule itself on 2026-09-09.
             "option_stop_max_haircut_pct": OPTION_STOP_MAX_HAIRCUT_PCT,
         },
         "env_defaults": {
