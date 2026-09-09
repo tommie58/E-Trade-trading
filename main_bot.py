@@ -5753,6 +5753,19 @@ TRAIL_MIN_STEP_FRAC = float(os.getenv("TRAIL_MIN_STEP_FRAC", "0.10"))
 # until the user explicitly promotes it to "live".
 SCANNER_ENABLED = os.getenv("SCANNER_ENABLED", "true").lower() == "true"
 SCANNER_MODE = os.getenv("SCANNER_MODE", "shadow").lower()
+# AUTHORITY (2026-09-09, operator directive): the bot may never ORIGINATE a
+# trade. Entries come from the app's dispatch or they do not happen.
+#
+# The scanner is the only server-side code that can start a position nobody
+# asked for, and its mode lives in the STATE STORE, not here - so a single
+# POST /scanner/config with mode=live grants the bot origination authority
+# permanently, across every restart, with the env var below still reading
+# "shadow". That is not a setting anyone can hold in their head. This flag is
+# the ceiling that outranks stored config: unless it is explicitly true, a
+# stored "live" is demoted at boot and the scanner may only measure.
+SCANNER_ALLOW_AUTONOMOUS_ENTRY = (
+    os.getenv("SCANNER_ALLOW_AUTONOMOUS_ENTRY", "false").lower() == "true"
+)
 SCANNER_UNIVERSE = os.getenv("SCANNER_UNIVERSE", "")
 SCANNER_INTERVAL_SECONDS = int(os.getenv("SCANNER_INTERVAL_SECONDS", "60"))
 SCANNER_MAX_SIGNALS_PER_DAY = int(os.getenv("SCANNER_MAX_SIGNALS_PER_DAY", "3"))
@@ -14685,6 +14698,33 @@ def _scanner_now_et() -> datetime:
     return _utcnow().astimezone(_ET_ZONE)
 
 
+def permitted_scanner_mode(stored_mode: Any, allow_autonomous: bool) -> Tuple[str, bool]:
+    """The mode the scanner is ALLOWED to run, and whether it was demoted.
+
+    Only "live" lets the scanner dispatch; "off" and "shadow" measure and
+    report. Origination authority is therefore exactly the right to be "live",
+    and this is the one place it is decided.
+
+    Why a demotion instead of a refusal to boot: the scanner's OTHER job is
+    measurement, and the stop guard, trail engine and reconciler all live in
+    this same process. Refusing to start would take protective management down
+    with it - a bot that cannot manage an open position is far more dangerous
+    than one that cannot open a new one. So it keeps watching and loses only
+    the right to act.
+
+    An unreadable mode is treated as "shadow", never as "live": authority is
+    never inferred from a value nobody can parse.
+
+    Pure: no I/O, fully unit-testable.
+    """
+    mode = str(stored_mode or "").lower().strip()
+    if mode not in ("off", "shadow", "live"):
+        mode = "shadow"
+    if mode == "live" and not allow_autonomous:
+        return "shadow", True
+    return mode, False
+
+
 async def _start_scanner() -> None:
     global scanner
     # Bind the scanner's configurable floors to THIS bot's live entry gate.
@@ -14716,9 +14756,30 @@ async def _start_scanner() -> None:
         if SCANNER_UNIVERSE.strip():
             seed["universe"] = SCANNER_UNIVERSE
         stored = await scanner.set_config(seed)
+    # Enforce the origination ceiling BEFORE the scanner's loop is started, so
+    # a stored "live" cannot dispatch even once on the way to being noticed.
+    allowed_mode, demoted = permitted_scanner_mode(
+        stored.get("mode"), SCANNER_ALLOW_AUTONOMOUS_ENTRY
+    )
+    if demoted:
+        stored = await scanner.set_config({"mode": allowed_mode})
+        logger.error(
+            "🔒 SCANNER DEMOTED live → shadow — stored config granted this bot "
+            "authority to originate its own trades, which the operator has not "
+            "enabled (SCANNER_ALLOW_AUTONOMOUS_ENTRY=false). It will keep "
+            "measuring and reporting; entries now come only from app dispatch."
+        )
+        asyncio.create_task(alerts.send(
+            "critical", "scanner_demoted",
+            "Server-side scanner was set to LIVE and could open positions the app "
+            "never dispatched. It has been demoted to shadow (measure-only) at boot. "
+            "Protective exits are unaffected.",
+            dedupe_key="scanner_demoted",
+        ))
     logger.info(
         f"🔭 Scanner wired — mode={stored['mode']}, {len(stored['universe'])} symbols, "
         f"every {stored['interval_seconds']}s, budget {stored['max_signals_per_day']}/day"
+        f"{'' if SCANNER_ALLOW_AUTONOMOUS_ENTRY else ' — origination locked to app dispatch'}"
     )
     asyncio.create_task(scanner.run())
 
