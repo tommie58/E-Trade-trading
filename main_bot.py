@@ -5803,28 +5803,10 @@ STOP_INTENT_DRIFT_TOLERANCE = float(os.getenv("STOP_INTENT_DRIFT_TOLERANCE", "0.
 # Mirrors expo/services/payoffGate.ts (MAX_RISK_PCT_OF_OBJECTIVE).
 DAILY_OBJECTIVE_USD = float(os.getenv("DAILY_OBJECTIVE_USD", "500"))
 MAX_RISK_PCT_OF_OBJECTIVE = float(os.getenv("MAX_RISK_PCT_OF_OBJECTIVE", "10"))
-# Least per-name room the ceiling may ever express, in dollars (2026-09-08).
-#
-# 10% of a $500 objective is $50. A contract's priced risk is
-# (premium - stop) x 100, so $50 funds one lot only when premium minus stop is
-# under $0.50 - roughly a $2.70 premium at a normal ~19% stop. Every liquid
-# weekly priced above that refused at $110-$145 of risk, and since
-# floor(50 / 110) == 0 the rule could not even size down: it rejected outright.
-# On 2026-09-08 that refused TSLA ($145) and MSFT ($110) on a flat $6,698
-# account holding $670 of untouched budget - the account was never asked.
-#
-# A ceiling that cannot fund one contract is not risk management, it is a ban.
-# This floor lifts ONLY the per-name term; the day-fraction and remaining
-# ceilings are untouched and still bind first when tighter, so a spent day is
-# never loosened by it. Kept separate from DAILY_OBJECTIVE_USD on purpose:
-# inflating the objective to buy room would also move the pace engine's target
-# and make it hunt harder. Mirrors expo/services/payoffGate.ts
-# (PER_NAME_RISK_ROOM_FLOOR_USD).
-PER_NAME_RISK_ROOM_FLOOR_USD = float(os.getenv("PER_NAME_RISK_ROOM_FLOOR_USD", "150"))
 
 
 def per_name_risk_room(objective_usd: Any = None) -> Optional[float]:
-    """Dollars one name may risk: the objective share, lifted by the floor.
+    """Dollars one name may risk: its share of the day's objective.
 
     Returns None when the objective is unreadable - never a silent 0 that would
     refuse every entry, nor an unbounded ceiling that would refuse none.
@@ -5844,11 +5826,7 @@ def per_name_risk_room(objective_usd: Any = None) -> Optional[float]:
     obj_pct = num(MAX_RISK_PCT_OF_OBJECTIVE)
     if objective is None or objective <= 0 or obj_pct is None or obj_pct <= 0:
         return None
-    room = objective * (obj_pct / 100.0)
-    floor_usd = num(PER_NAME_RISK_ROOM_FLOOR_USD)
-    if floor_usd is not None and floor_usd > room:
-        room = floor_usd
-    return room
+    return objective * (obj_pct / 100.0)
 
 # ---- V5.2 hardening ----
 # Exponential backoff for ALL E*TRADE API calls. The same env vars configure
@@ -15419,7 +15397,6 @@ async def status():
                     "max_trade_risk_fraction_of_daily": MAX_TRADE_RISK_FRACTION_OF_DAILY,
                     "daily_objective_usd": DAILY_OBJECTIVE_USD,
                     "max_risk_pct_of_objective": MAX_RISK_PCT_OF_OBJECTIVE,
-                    "per_name_risk_room_floor_usd": PER_NAME_RISK_ROOM_FLOOR_USD,
                     "per_name_risk_ceiling_usd": (
                         round(per_name_risk_room(), 2)
                         if per_name_risk_room() is not None else None
@@ -15591,7 +15568,6 @@ async def policy_get():
             "max_trade_risk_fraction_of_daily": MAX_TRADE_RISK_FRACTION_OF_DAILY,
             "daily_objective_usd": DAILY_OBJECTIVE_USD,
             "max_risk_pct_of_objective": MAX_RISK_PCT_OF_OBJECTIVE,
-            "per_name_risk_room_floor_usd": PER_NAME_RISK_ROOM_FLOOR_USD,
             "per_name_risk_ceiling_usd": (
                 round(per_name_risk_room(), 2)
                 if per_name_risk_room() is not None else None
