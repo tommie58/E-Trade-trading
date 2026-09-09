@@ -7669,6 +7669,88 @@ async def get_quotes(symbols: str = Query(...)):
         raise HTTPException(500, detail=str(e))
 
 
+@app.get("/etrade/option-quote")
+async def get_option_quote(
+    symbol: str = Query(...),
+    expiry: str = Query(...),
+    strike: float = Query(...),
+    right: str = Query("CALL"),
+):
+    """The REAL premium of ONE option contract, straight from E*TRADE's chain.
+
+    THE GAP THIS CLOSES (2026-09-09 IWM): the app sizes a trade against a
+    premium it models from the stock price, while this server reprices every
+    entry to the true ask before sending it. Those are two different numbers
+    and only one of them is the market's. On the IWM refusal the app priced
+    the 2026-09-11 292.0 CALL at 2.14 while E*TRADE's book said ask=2.23 - a
+    4% error in the exact quantity per-name risk room is measured in. The app
+    sized one contract at $44 of risk, this server recomputed $53 against $50
+    of room, and refused. The app could not have known before dispatching:
+    the only process holding the real book was this one.
+
+    /etrade/quote cannot answer this - it takes equity symbols and returns
+    lastTrade on the UNDERLYING. An option's premium lives in the chain.
+
+    Deliberately reuses _snap_option_contract, the SAME helper the live order
+    path calls, so the quote returned here is the quote the order will be
+    priced against, including expiry/strike snapping. Asking a different code
+    path for 'the real premium' would relocate the disagreement, not end it.
+
+    A missing or one-sided book returns quoted=false with bid/ask omitted
+    rather than zeros. A $0.00 premium reads as a free contract and would
+    size infinitely; the caller must fall back to its estimate and say so.
+    """
+    tokens = load_tokens()
+    if not tokens:
+        raise HTTPException(401, "E*TRADE account not linked")
+
+    call_put = "PUT" if str(right).upper() == "PUT" else "CALL"
+    market = pyetrade.ETradeMarket(
+        CONSUMER_KEY, CONSUMER_SECRET,
+        tokens["oauth_token"], tokens["oauth_token_secret"],
+        dev=is_sandbox,
+    )
+    try:
+        snapped_expiry, snapped_strike, real_bid, real_ask = await asyncio.to_thread(
+            _snap_option_contract, market, symbol, expiry, float(strike), call_put
+        )
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+    quoted = real_bid > 0 and real_ask > 0 and real_ask >= real_bid
+    body = {
+        "symbol": str(symbol).upper(),
+        "right": call_put,
+        "expiry": snapped_expiry,
+        "strike": snapped_strike,
+        "snapped": (
+            snapped_expiry != str(expiry)[:10]
+            or abs(snapped_strike - float(strike)) > 1e-9
+        ),
+        "quoted": quoted,
+        # The chain carries no per-leg print time, so the honest stamp is when
+        # THIS server read it - never presented as an exchange timestamp. A
+        # caller aging a quote must age a time it can actually trust.
+        "fetched_at": _utcnow().isoformat(),
+    }
+    if quoted:
+        body["bid"] = round(real_bid, 4)
+        body["ask"] = round(real_ask, 4)
+        body["mid"] = round((real_bid + real_ask) / 2, 4)
+        body["spread"] = round(real_ask - real_bid, 4)
+        body["spread_pct"] = round(((real_ask - real_bid) / real_ask) * 100, 4)
+    else:
+        body["error"] = (
+            "E*TRADE returned no two-sided quote for this contract "
+            f"(bid={real_bid} ask={real_ask})"
+        )
+    logger.info(
+        f"Option quote served: {body['symbol']} {snapped_expiry} {snapped_strike} "
+        f"{call_put} -> " + (f"bid={real_bid} ask={real_ask}" if quoted else "NO TWO-SIDED QUOTE")
+    )
+    return body
+
+
 @app.get("/etrade/positions")
 async def get_etrade_positions(refresh: bool = Query(False)):
     """THE ACCOUNT ITSELF — what E*TRADE holds, not what the bot remembers.
