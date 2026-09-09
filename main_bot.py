@@ -5803,6 +5803,52 @@ STOP_INTENT_DRIFT_TOLERANCE = float(os.getenv("STOP_INTENT_DRIFT_TOLERANCE", "0.
 # Mirrors expo/services/payoffGate.ts (MAX_RISK_PCT_OF_OBJECTIVE).
 DAILY_OBJECTIVE_USD = float(os.getenv("DAILY_OBJECTIVE_USD", "500"))
 MAX_RISK_PCT_OF_OBJECTIVE = float(os.getenv("MAX_RISK_PCT_OF_OBJECTIVE", "10"))
+# Least per-name room the ceiling may ever express, in dollars (2026-09-08).
+#
+# 10% of a $500 objective is $50. A contract's priced risk is
+# (premium - stop) x 100, so $50 funds one lot only when premium minus stop is
+# under $0.50 - roughly a $2.70 premium at a normal ~19% stop. Every liquid
+# weekly priced above that refused at $110-$145 of risk, and since
+# floor(50 / 110) == 0 the rule could not even size down: it rejected outright.
+# On 2026-09-08 that refused TSLA ($145) and MSFT ($110) on a flat $6,698
+# account holding $670 of untouched budget - the account was never asked.
+#
+# A ceiling that cannot fund one contract is not risk management, it is a ban.
+# This floor lifts ONLY the per-name term; the day-fraction and remaining
+# ceilings are untouched and still bind first when tighter, so a spent day is
+# never loosened by it. Kept separate from DAILY_OBJECTIVE_USD on purpose:
+# inflating the objective to buy room would also move the pace engine's target
+# and make it hunt harder. Mirrors expo/services/payoffGate.ts
+# (PER_NAME_RISK_ROOM_FLOOR_USD).
+PER_NAME_RISK_ROOM_FLOOR_USD = float(os.getenv("PER_NAME_RISK_ROOM_FLOOR_USD", "150"))
+
+
+def per_name_risk_room(objective_usd: Any = None) -> Optional[float]:
+    """Dollars one name may risk: the objective share, lifted by the floor.
+
+    Returns None when the objective is unreadable - never a silent 0 that would
+    refuse every entry, nor an unbounded ceiling that would refuse none.
+
+    Carries its own coercion rather than calling `num`: every `num` in this file
+    is a nested helper inside another function, so a module-level reference to
+    it would raise NameError the first time an entry was priced.
+    """
+    def num(value: Any) -> Optional[float]:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    objective = num(objective_usd if objective_usd is not None else DAILY_OBJECTIVE_USD)
+    obj_pct = num(MAX_RISK_PCT_OF_OBJECTIVE)
+    if objective is None or objective <= 0 or obj_pct is None or obj_pct <= 0:
+        return None
+    room = objective * (obj_pct / 100.0)
+    floor_usd = num(PER_NAME_RISK_ROOM_FLOOR_USD)
+    if floor_usd is not None and floor_usd > room:
+        room = floor_usd
+    return room
 
 # ---- V5.2 hardening ----
 # Exponential backoff for ALL E*TRADE API calls. The same env vars configure
@@ -9295,13 +9341,10 @@ def plan_priced_option_risk(premium: Any, qty: Any, stop_premium: Any,
     if remaining is not None and remaining >= 0 and remaining < ceiling:
         ceiling = remaining
         ceiling_source = "remaining"
-    objective = num(objective_usd if objective_usd is not None else DAILY_OBJECTIVE_USD)
-    obj_pct = num(MAX_RISK_PCT_OF_OBJECTIVE)
-    if objective is not None and objective > 0 and obj_pct is not None and obj_pct > 0:
-        per_name = objective * (obj_pct / 100.0)
-        if per_name < ceiling:
-            ceiling = per_name
-            ceiling_source = "per-name"
+    per_name = per_name_risk_room(objective_usd)
+    if per_name is not None and per_name < ceiling:
+        ceiling = per_name
+        ceiling_source = "per-name"
 
     risk = per_contract * want_qty
     if risk <= ceiling:
@@ -10455,6 +10498,26 @@ async def _defer_close_to_reconciler(ticker: str, close_order_id, note: str) -> 
 ENTRY_REPRICE_DRIFT_PCT = 10.0
 ENTRY_MAX_OVERSPEND_FACTOR = 1.25
 
+# ---- Entry chase -------------------------------------------------------------
+# A MARKETABLE LIMIT IS NOT A GUARANTEED FILL.
+#
+# The dispatch path lifts a stale app estimate to the real ask, so entries leave
+# marketable. That is still not a fill: between the quote and the placement the
+# offer can lift, and a GOOD_FOR_DAY limit that misses the market by one tick
+# rests untouched for the whole session. 09/04/26 is the proof — a 4-lot SMCI
+# $39.50 call (0DTE) was ACCEPTED by E*TRADE, never filled, and EXPIRED.
+#
+# Nothing here ever revisited a RESTING entry's price; the stop guard only
+# cancelled it at the deadline. So every entry was "fill instantly or not at
+# all", and a missed fill is indistinguishable from a refused trade in every
+# downstream number — the app cannot report edge it never got to take.
+ENTRY_CHASE_SECONDS = float(os.getenv("ENTRY_CHASE_SECONDS", "20"))
+ENTRY_CHASE_MAX_REPRICES = int(os.getenv("ENTRY_CHASE_MAX_REPRICES", "2"))
+# Hard cap on the WHOLE chase, percent of the placed limit. Mirrors the app's
+# MAX_CHASE_PCT (services/executionQuality.ts): an unbounded chase is how a
+# planned 2% cost becomes an 8% cost by buying the top of the move.
+ENTRY_CHASE_MAX_PCT = float(os.getenv("ENTRY_CHASE_MAX_PCT", "3.0"))
+
 
 def plan_entry_reprice(app_limit, qty, real_price) -> Dict[str, Any]:
     """Pure sizing decision for a repriced option entry.
@@ -10504,6 +10567,87 @@ def plan_entry_reprice(app_limit, qty, real_price) -> Dict[str, Any]:
                 "intended_usd": intended, "actual_unit_usd": unit}
     return {"action": "resize", "qty": resized, "drift_pct": round(drift_pct, 2),
             "intended_usd": intended, "actual_unit_usd": unit}
+
+
+def plan_entry_chase(placed_limit, ceiling_pct, attempts, max_reprices,
+                     elapsed_s, chase_seconds, filled, status) -> Dict[str, Any]:
+    """Pure decision for repricing a RESTING, UNFILLED entry limit.
+
+    Returns {action, next_limit, ceiling, reason}:
+      hold      — never touch this order;
+      wait      — the next step is not due yet;
+      chase     — cancel and replace at `next_limit`;
+      exhausted — ceiling or attempt budget spent; the existing entry deadline
+                  cancels it.
+
+    A PARTIAL FILL IS SACRED. Cancel/replace on a partly filled entry is how one
+    long becomes two — the same oversell `_emergency_flatten` exists to prevent
+    — so ANY fill returns `hold` and the stop guard takes over.
+
+    The app PROPOSES the chase width; the bot owns the hard cap. An absent or
+    oversized ceiling is clamped to ENTRY_CHASE_MAX_PCT rather than trusted, so
+    a bad payload can only ever chase LESS than the bot's own limit.
+    """
+    def _f(value, default=0.0):
+        try:
+            out = float(value)
+            return out if out == out else default  # NaN guard
+        except (TypeError, ValueError):
+            return default
+
+    def _i(value, default=0):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    if _i(filled) > 0:
+        return {"action": "hold", "next_limit": None, "ceiling": None,
+                "reason": "entry is partially filled — never cancel/replace a live fill"}
+    if str(status or "").upper() in _TERMINAL_ORDER_STATUSES:
+        return {"action": "hold", "next_limit": None, "ceiling": None,
+                "reason": f"order is already terminal ({status})"}
+    limit = _f(placed_limit)
+    if limit <= 0:
+        return {"action": "hold", "next_limit": None, "ceiling": None,
+                "reason": "no price intent to chase (MARKET entry)"}
+
+    budget = _i(max_reprices, ENTRY_CHASE_MAX_REPRICES)
+    if budget < 1:
+        return {"action": "hold", "next_limit": None, "ceiling": None,
+                "reason": "chase disabled (no reprices allowed)"}
+
+    pct = _f(ceiling_pct, ENTRY_CHASE_MAX_PCT)
+    if pct <= 0:
+        pct = ENTRY_CHASE_MAX_PCT
+    pct = min(pct, ENTRY_CHASE_MAX_PCT)
+    ceiling = round(limit * (1.0 + pct / 100.0), 2)
+
+    done = _i(attempts)
+    if done >= budget:
+        return {"action": "exhausted", "next_limit": None, "ceiling": ceiling,
+                "reason": f"chase budget spent ({done}/{budget} reprices)"}
+
+    every = _f(chase_seconds, ENTRY_CHASE_SECONDS)
+    if every <= 0:
+        every = ENTRY_CHASE_SECONDS
+    due_at = every * (done + 1)
+    waited = _f(elapsed_s)
+    if waited < due_at:
+        return {"action": "wait", "next_limit": None, "ceiling": ceiling,
+                "reason": f"{waited:.0f}s resting, next reprice due at {due_at:.0f}s"}
+
+    step = (ceiling - limit) / budget
+    nxt = round(min(ceiling, limit + step * (done + 1)), 2)
+    if nxt <= limit:
+        # The ceiling rounds back onto the placed limit (a penny contract on a
+        # 3% chase). There is no higher tradable price inside the cap, so this
+        # is SPENT rather than pending — returning "wait" would loop forever.
+        return {"action": "exhausted", "next_limit": None, "ceiling": ceiling,
+                "reason": f"ceiling {ceiling:.2f} rounds back onto the placed limit {limit:.2f}"}
+    return {"action": "chase", "next_limit": nxt, "ceiling": ceiling,
+            "reason": (f"unfilled after {waited:.0f}s — reprice {done + 1}/{budget} "
+                       f"from {limit:.2f} to {nxt:.2f} (ceiling {ceiling:.2f})")}
 
 
 # ---- Entry-fill truth --------------------------------------------------------
@@ -11125,6 +11269,44 @@ async def _place_option_market_close(ticker: str, contract: dict, qty: int) -> O
     return _order_id_from_place(placed)
 
 
+async def _place_option_limit_entry(ticker: str, contract: dict, qty: int,
+                                    limit: float, client_id: str) -> Optional[str]:
+    """BUY_OPEN LIMIT for `qty` contracts — the entry-chase replacement order.
+
+    Deliberately mirrors `_place_option_market_close` instead of reusing the
+    dispatch path: that path re-runs sizing, drift and funds gates against a
+    fresh quote, and this is NOT a new trade. It is the same already-approved
+    entry at a price `plan_entry_chase` has already bounded.
+
+    The limit rounds DOWN to a tradable tick, because a ceiling that rounds up
+    is not a ceiling (see `floorPremium` in the app's executionQuality.ts).
+    """
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("E*TRADE tokens not set")
+    if not contract or not contract.get("right") or not contract.get("expiration"):
+        raise Exception(f"cannot reprice {ticker} — option contract details missing")
+    acct_key = await _resolve_account_id_key(tokens)
+    common = dict(
+        resp_format="json",
+        accountIdKey=acct_key,
+        symbol=ticker,
+        orderAction="BUY_OPEN",
+        clientOrderId=client_id,
+        priceType="LIMIT",
+        limitPrice=_round_to_option_tick(float(limit), "down"),
+        quantity=int(qty),
+        orderTerm="GOOD_FOR_DAY",
+        marketSession="REGULAR",
+        allOrNone=False,
+        callPut=str(contract["right"]).upper(),
+        strikePrice=float(contract["strike"]),
+        expiryDate=str(contract["expiration"])[:10],
+    )
+    placed = await _place_order_smart("option", common, tokens)
+    return _order_id_from_place(placed)
+
+
 async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
     """Bank half the position at the first target and let the rest run.
 
@@ -11511,6 +11693,90 @@ async def _stop_guard_worker(ticker: str) -> None:
 
             guard = await state.update_guard(ticker, last_filled=filled, last_status=status) or guard
 
+            # ENTRY CHASE — reprice a resting, UNFILLED entry toward its ceiling
+            # instead of letting it sit until the deadline. Options only: an
+            # option limit on a thin or 0DTE contract misses in a way an equity
+            # entry does not. `plan_entry_chase` refuses to act the moment
+            # anything has filled, so this can never touch a live position.
+            if filled == 0 and is_option and not guard.get("stop_order_id"):
+                chase = plan_entry_chase(
+                    guard.get("entry_limit"),
+                    guard.get("chase_ceiling_pct"),
+                    guard.get("chase_attempts"),
+                    guard.get("chase_max_reprices"),
+                    time.time() - float(guard.get("placed_ts") or guard.get("armed_ts") or time.time()),
+                    guard.get("chase_seconds"),
+                    filled, status,
+                )
+                if chase["action"] == "chase":
+                    chase_qty = int(guard.get("qty") or 0)
+                    if chase_qty < 1:
+                        logger.warning(f"[ENTRY CHASE] {ticker} skipped — guard carries no entry quantity")
+                    else:
+                        # CANCEL FIRST, VERIFIED. Placing behind an order that is
+                        # still live doubles the position. Anything other than a
+                        # confirmed cancel means a fill may have raced us, so we
+                        # stand down and let the next poll see it.
+                        outcome = await _cancel_order_verified(
+                            guard.get("entry_order_id"), expected_qty=chase_qty,
+                        )
+                        if outcome != CANCEL_CONFIRMED:
+                            logger.warning(
+                                f"[ENTRY CHASE] {ticker} stand down — entry cancel returned "
+                                f"{outcome} (a fill may have raced the reprice)"
+                            )
+                        else:
+                            attempt = int(guard.get("chase_attempts") or 0) + 1
+                            new_client = str(uuid.uuid4().int)[:18]
+                            # Bank the ATTEMPT before placing. If the place call
+                            # times out AFTER reaching the broker, the next poll
+                            # must not re-chase from the same attempt count and
+                            # spend the budget twice on one step.
+                            guard = await state.update_guard(
+                                ticker, chase_attempts=attempt, chase_client_id=new_client,
+                            ) or guard
+                            try:
+                                new_id = await _place_option_limit_entry(
+                                    ticker, dict(guard.get("contract") or {}),
+                                    chase_qty, float(chase["next_limit"]), new_client,
+                                )
+                                guard = await state.update_guard(
+                                    ticker, entry_order_id=new_id, entry_client_id=new_client,
+                                    entry_limit=float(chase["next_limit"]), last_status="OPEN",
+                                ) or guard
+                                logger.info(f"[ENTRY CHASE] {ticker} {chase['reason']} — order {new_id}")
+                                await trade_ledger.record("entry_chased", {
+                                    "ticker": ticker, "attempt": attempt,
+                                    "new_limit": float(chase["next_limit"]),
+                                    "ceiling": chase.get("ceiling"),
+                                    "entry_order_id": new_id, "qty": chase_qty,
+                                })
+                            except Exception as e:
+                                # The old order is provably cancelled and the new
+                                # one never went out, so there is no position and
+                                # no exposure. Loud anyway: a signal was accepted
+                                # and now has NOTHING working at the broker.
+                                logger.error(f"[ENTRY CHASE] {ticker} reprice FAILED after cancel: {e}")
+                                await alerts.send(
+                                    "critical", "entry_chase_failed",
+                                    f"{ticker}: the entry was cancelled to reprice at "
+                                    f"{float(chase['next_limit']):.2f} and the replacement FAILED ({e}) — "
+                                    f"no order is working at the broker and no position was opened.",
+                                    dedupe_key=f"entry_chase_failed:{ticker}",
+                                )
+                                await _finish_guard(ticker, "entry_chase_failed")
+                                await state.delete_position(ticker)
+                                await trade_ledger.record("entry_abandoned", {
+                                    "ticker": ticker,
+                                    "entry_order_id": guard.get("entry_order_id"),
+                                    "reason": "entry_chase_replacement_failed",
+                                })
+                                return
+                elif chase["action"] == "exhausted" and not guard.get("chase_spent_logged"):
+                    # Once, not every poll: the entry deadline owns it from here.
+                    guard = await state.update_guard(ticker, chase_spent_logged=True) or guard
+                    logger.info(f"[ENTRY CHASE] {ticker} {chase['reason']} — leaving it to the entry deadline")
+
             # STOP PLACEMENT TIMEOUT CIRCUIT BREAKER — the bracket must be
             # complete (a protective stop RESTING at the broker) within
             # STOP_PLACEMENT_TIMEOUT_SECONDS. The clock starts at entry
@@ -11648,10 +11914,16 @@ def _spawn_guard(ticker: str) -> None:
 
 async def _arm_stop_guard(ticker: str, action: str, stop_price: float,
                           entry_order_id: Optional[str], entry_client_id: str,
-                          kind: str = "equity", contract: Optional[dict] = None) -> None:
+                          kind: str = "equity", contract: Optional[dict] = None,
+                          qty: int = 0, entry_limit: Optional[float] = None,
+                          chase: Optional[dict] = None) -> None:
     """Persist guard state to Redis (restart-safe) and spawn the watcher task.
     kind='option' guards rest a SELL_CLOSE STOP on the same OCC contract;
-    `stop_price` is then the protective PREMIUM trigger."""
+    `stop_price` is then the protective PREMIUM trigger.
+
+    `qty`, `entry_limit` and `chase` feed the ENTRY CHASE. Without the quantity
+    and the placed limit a resting entry could only ever be CANCELLED, never
+    repriced — there was nothing in guard state to rebuild the order from."""
     await state.set_guard(ticker, {
         "ticker": ticker,
         "kind": kind,
@@ -11672,6 +11944,17 @@ async def _arm_stop_guard(ticker: str, action: str, stop_price: float,
         # so protection always gets the full window after the fill.
         "stop_deadline_ts": (time.time() + STOP_PLACEMENT_TIMEOUT_SECONDS) if STOP_PLACEMENT_TIMEOUT_SECONDS > 0 else 0,
         "fill_detected_ts": None,
+        # ENTRY CHASE state. `placed_ts` is the chase clock (kept separate from
+        # `armed_ts` so a guard resumed after a restart doesn't read as fresh).
+        "qty": int(qty or 0),
+        "entry_limit": round(float(entry_limit), 2) if entry_limit else None,
+        "placed_ts": time.time(),
+        "chase_attempts": 0,
+        "chase_client_id": None,
+        "chase_spent_logged": False,
+        "chase_ceiling_pct": (chase or {}).get("ceiling_pct"),
+        "chase_seconds": (chase or {}).get("seconds"),
+        "chase_max_reprices": (chase or {}).get("max_reprices"),
         "done": False,
         "result": None,
     })
@@ -13435,6 +13718,16 @@ async def execute_live_order(payload: dict):
                     await _arm_stop_guard(
                         str(symbol).upper(), "BUY", stop_premium, entry_order_id, client_order_id,
                         kind="option", contract=contract,
+                        # Everything the entry chase needs to rebuild THIS order
+                        # at a better price, plus the app's proposed chase width
+                        # (clamped by the bot's own ENTRY_CHASE_MAX_PCT).
+                        qty=int(common.get("quantity") or 0),
+                        entry_limit=float(common.get("limitPrice") or 0) or None,
+                        chase={
+                            "ceiling_pct": payload.get("option_chase_ceiling_pct"),
+                            "seconds": payload.get("option_chase_seconds"),
+                            "max_reprices": payload.get("option_max_reprices"),
+                        },
                     )
                     pos_rec = await state.get_position(str(symbol).upper())
                     if pos_rec is not None:
@@ -15126,8 +15419,10 @@ async def status():
                     "max_trade_risk_fraction_of_daily": MAX_TRADE_RISK_FRACTION_OF_DAILY,
                     "daily_objective_usd": DAILY_OBJECTIVE_USD,
                     "max_risk_pct_of_objective": MAX_RISK_PCT_OF_OBJECTIVE,
-                    "per_name_risk_ceiling_usd": round(
-                        DAILY_OBJECTIVE_USD * (MAX_RISK_PCT_OF_OBJECTIVE / 100.0), 2
+                    "per_name_risk_room_floor_usd": PER_NAME_RISK_ROOM_FLOOR_USD,
+                    "per_name_risk_ceiling_usd": (
+                        round(per_name_risk_room(), 2)
+                        if per_name_risk_room() is not None else None
                     ),
                     "option_stop_max_haircut_pct": OPTION_STOP_MAX_HAIRCUT_PCT,
                 },
@@ -15296,8 +15591,10 @@ async def policy_get():
             "max_trade_risk_fraction_of_daily": MAX_TRADE_RISK_FRACTION_OF_DAILY,
             "daily_objective_usd": DAILY_OBJECTIVE_USD,
             "max_risk_pct_of_objective": MAX_RISK_PCT_OF_OBJECTIVE,
-            "per_name_risk_ceiling_usd": round(
-                DAILY_OBJECTIVE_USD * (MAX_RISK_PCT_OF_OBJECTIVE / 100.0), 2
+            "per_name_risk_room_floor_usd": PER_NAME_RISK_ROOM_FLOOR_USD,
+            "per_name_risk_ceiling_usd": (
+                round(per_name_risk_room(), 2)
+                if per_name_risk_room() is not None else None
             ),
             "option_stop_max_haircut_pct": OPTION_STOP_MAX_HAIRCUT_PCT,
         },
