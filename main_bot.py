@@ -6754,7 +6754,14 @@ def estimate_entry_risk_usd(payload: dict) -> Optional[float]:
         qty = 1
 
     instrument = str(payload.get("instrument") or "").lower()
-    premium = num("limit_price", "limitPrice", "premium", "entry_premium", "option_price")
+    # THE APP'S OWN FIELD NAME COMES FIRST. The dispatch payload carries the
+    # premium as `option_limit_price` (AutoTradeProvider), and the order path
+    # has always read it — but this risk estimator did not, so every live
+    # option entry measured as UNPRICED and the budget gate fell back to the
+    # nominal percentage. The gate was thinking about a trade that wasn't the
+    # one being placed.
+    premium = num("option_limit_price", "limit_price", "limitPrice", "premium",
+                  "entry_premium", "option_price", "contract_premium")
     if instrument == "option" or premium > 0:
         if premium <= 0:
             return None
@@ -9269,6 +9276,58 @@ def build_preflight(*,
     }
 
 
+def plan_account_pct(realized_usd: Any, equity: Any, buying_power: Any,
+                     per_trade_pct: Any = None) -> Dict[str, Any]:
+    """Convert a closed trade's dollars into an ACCOUNT-level percent for the
+    daily loss limit, choosing the denominator explicitly.
+
+    THE BUG THIS EXISTS TO KILL. The daily counter divided realized dollars by
+    `tracked_balance()` — which is seeded from `available` (cashBuyingPower),
+    the cash left AFTER contracts were bought, not the account. On 2026-09-11
+    four option closes totalling -$174.23 against an $8,101 account (-2.15%)
+    were booked against ~$640 of leftover buying power and read as **-27.24%**.
+    The 10% halt tripped on a 2% day and refused every entry for the rest of
+    the session, including a 100-score SMCI setup.
+
+    Worse, the denominator SHRINKS as the day spends cash, so each successive
+    loss is divided by a smaller number: the counter accelerates toward the
+    halt exactly when it should be most stable.
+
+    Rules:
+      * `equity` (totalAccountValue) is the only correct denominator — the
+        daily loss limit is a percentage OF THE ACCOUNT.
+      * `buying_power` is used ONLY when equity is unreadable AND it is the
+        larger of the two — never to manufacture a bigger percent.
+      * With neither, fall back to the raw per-trade move (deliberately
+        over-braking: a too-sensitive halt is safe, an insensitive one is not).
+
+    Returns {pct, basis, denominator}. `basis` is recorded so a reader can tell
+    an account-true percent from an over-braking fallback.
+    """
+    def num(value: Any) -> Optional[float]:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    usd = num(realized_usd)
+    eq = num(equity)
+    bp = num(buying_power)
+    raw = num(per_trade_pct)
+
+    if usd is not None and eq is not None and eq > 0:
+        return {"pct": usd / eq * 100.0, "basis": "equity", "denominator": eq}
+    # No equity. Buying power is an ACCEPTABLE denominator only when it is not
+    # smaller than the account it stands in for — a shrunken cash figure would
+    # reproduce the exact inflation this function exists to prevent.
+    if usd is not None and bp is not None and bp > 0:
+        return {"pct": usd / bp * 100.0, "basis": "buying_power", "denominator": bp}
+    if raw is not None:
+        return {"pct": raw, "basis": "per_trade_fallback", "denominator": None}
+    return {"pct": None, "basis": "unmeasurable", "denominator": None}
+
+
 def plan_risk_budget(account_size: Any, realized_usd: Any, open_risk_usd: Any,
                      profit_lock_max_risk: Any = None,
                      loss_limit_pct: float = None) -> Dict[str, Any]:
@@ -9798,13 +9857,20 @@ def assess_entry_cost(payload: Dict[str, Any]) -> Dict[str, Any]:
             return 0.0
         return value if math.isfinite(value) else 0.0
 
-    premium = num("limit_price") or num("premium") or num("contract_premium")
+    # FIELD NAMES THE APP ACTUALLY SENDS. This gate read `limit_price` /
+    # `contract_bid` / `contract_ask`; the app dispatches `option_limit_price`
+    # / `option_bid` / `option_ask`. Every real payload therefore priced at 0
+    # and returned "not measurable", so the cost ceiling never refused a single
+    # contract — it was dead code wearing a safety label. On 2026-09-11 that let
+    # through a $0.14 NFLX call whose commission ALONE is 9.4% of premium.
+    premium = (num("option_limit_price") or num("limit_price") or num("premium")
+               or num("contract_premium") or num("entry_premium"))
     if premium <= 0:
         return {"prohibitive": False, "total_pct": 0.0, "priced": False,
                 "reason": "no contract premium in payload — cost not measurable"}
 
-    bid = num("contract_bid")
-    ask = num("contract_ask")
+    bid = num("option_bid") or num("contract_bid")
+    ask = num("option_ask") or num("contract_ask")
     spread_pct = ((ask - bid) / premium * 100.0) if (ask > bid > 0) else 0.0
     commission_pct = (COMMISSION_PER_CONTRACT * 2.0) / (premium * 100.0) * 100.0
     total_pct = spread_pct + commission_pct
@@ -12748,19 +12814,21 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
     # fallback (a too-sensitive halt is safe; an insensitive one is not).
     account_pct: Optional[float] = None
     if pnl_pct is not None:
-        if realized_usd is not None:
-            balance = None
-            try:
-                balance = await state.tracked_balance()
-            except Exception:
-                balance = None
-            if balance and float(balance) > 0:
-                account_pct = realized_usd / float(balance) * 100.0
-            else:
-                logger.warning(
-                    f"[PNL] {ticker} no tracked balance — daily counter fed the raw "
-                    f"per-trade move ({pnl_pct:+.2f}%) as an over-braking fallback"
-                )
+        scaled = await _account_scaled_pct(realized_usd, pnl_pct)
+        if scaled["basis"] == "equity":
+            account_pct = scaled["pct"]
+        elif scaled["basis"] == "buying_power":
+            account_pct = scaled["pct"]
+            logger.warning(
+                f"[PNL] {ticker} account equity unreadable — daily counter scaled by BUYING POWER "
+                f"${scaled['denominator']:,.0f}. This over-states the percent whenever cash is "
+                f"committed to open contracts; the halt may trip early."
+            )
+        else:
+            logger.warning(
+                f"[PNL] {ticker} no account equity or buying power — daily counter fed the raw "
+                f"per-trade move ({pnl_pct:+.2f}%) as an over-braking fallback"
+            )
         await state.add_realized_pnl(account_pct if account_pct is not None else pnl_pct)
     # DAILY OBJECTIVE CONTRIBUTION — the same close in REAL DOLLARS. The $500
     # objective is denominated in money, and a percent of a moving balance can
@@ -12976,18 +13044,13 @@ async def _book_partial_stop_fill(
         pnl_pct = direction * ((exit_px - entry) / entry * 100.0)
         realized_usd = direction * (exit_px - entry) * sold
 
-    # Same account-level conversion the full close uses: dollars over tracked
-    # balance, with the raw per-trade move as an over-braking fallback.
+    # Same account-level conversion the full close uses: dollars over ACCOUNT
+    # EQUITY, with the raw per-trade move as an over-braking fallback.
     account_pct: Optional[float] = None
     if pnl_pct is not None:
-        if realized_usd is not None:
-            balance = None
-            try:
-                balance = await state.tracked_balance()
-            except Exception:
-                balance = None
-            if balance and float(balance) > 0:
-                account_pct = realized_usd / float(balance) * 100.0
+        scaled = await _account_scaled_pct(realized_usd, pnl_pct)
+        if scaled["basis"] in {"equity", "buying_power"}:
+            account_pct = scaled["pct"]
         await state.add_realized_pnl(account_pct if account_pct is not None else pnl_pct)
     if realized_usd is not None:
         try:
@@ -13361,6 +13424,38 @@ async def _live_equity() -> Optional[float]:
     off a default."""
     bal = await _fetch_broker_balance()
     return (bal or {}).get("total")
+
+
+async def _account_scaled_pct(realized_usd: Optional[float],
+                              per_trade_pct: Optional[float]) -> Dict[str, Any]:
+    """Scale a close's realized dollars into an account-level percent for the
+    daily loss limit, preferring REAL ACCOUNT EQUITY over buying power.
+
+    The denominator is the whole bug (see `plan_account_pct`): buying power is
+    the cash left AFTER contracts were bought, so dividing by it inflated a
+    -2.15% day into -27.24% and halted trading. Equity is fetched live; the
+    tracked snapshot is only a fallback, and the raw per-trade move is the
+    last resort.
+    """
+    equity: Optional[float] = None
+    buying_power: Optional[float] = None
+    try:
+        bal = await _fetch_broker_balance() or {}
+        equity = bal.get("total")
+        buying_power = bal.get("available")
+    except Exception as e:
+        logger.warning(f"[PNL] broker balance unavailable for account scaling ({e})")
+    if equity is None:
+        # The tracked snapshot is seeded from `available`, so it stands in for
+        # BUYING POWER here — never for equity. Labelling it correctly is what
+        # keeps the fallback from silently reintroducing the inflated percent.
+        try:
+            tracked = await state.tracked_balance()
+            if tracked is not None and buying_power is None:
+                buying_power = tracked
+        except Exception:
+            pass
+    return plan_account_pct(realized_usd, equity, buying_power, per_trade_pct)
 
 
 async def _available_funds() -> Optional[float]:
