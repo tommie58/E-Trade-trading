@@ -2370,6 +2370,63 @@ def broker_qty_for(record: Optional[dict], is_option: bool) -> int:
         return 0
 
 
+UNTRACKED_SYMBOL = "untracked_symbol"
+UNTRACKED_LEG = "untracked_leg"
+
+
+def plan_untracked_exposure(
+    broker_positions: Dict[str, dict],
+    tracked: Dict[str, dict],
+) -> List[dict]:
+    """Broker exposure no tracked position accounts for, counted PER LEG.
+
+    The old detector skipped any symbol present in `tracked` and then reported
+    the BLENDED `qty` under a single `security_type`. Both halves were wrong in
+    the same direction — toward silence:
+
+      A TRACKED CALL HID REAL SHARES. 100 AAPL shares bought by hand, sitting
+        next to a bot-tracked 2-lot AAPL call, were skipped entirely: the symbol
+        was "tracked", so the loop moved on. Those shares had no stop, no trail
+        and no heat accounting, and nothing would ever say so.
+
+      THE COUNT WAS ON THE WRONG BASIS. When it did fire for a symbol holding
+        both legs, it printed the blended total under whichever type it saw last
+        — "106 contract(s)" for 100 shares plus 6 contracts. A number that size
+        on the wrong unit is not a warning, it is misinformation: acting on it
+        means trying to close 106 contracts that do not exist.
+
+    Each leg is therefore audited against a tracked position ON ITS OWN BASIS,
+    in its own unit, and reported separately. Pure: no I/O, fully unit-testable.
+    """
+    out: List[dict] = []
+    for symbol, record in sorted(broker_positions.items()):
+        if not isinstance(record, dict):
+            continue
+        pos = tracked.get(symbol)
+        # Legacy records (written before the eq/optn split) carry only the
+        # blended `qty`. Auditing both legs off that value would count the same
+        # position twice, so such a record is read once, on the basis it claims.
+        if "optn_qty" in record or "eq_qty" in record:
+            legs = (True, False)
+        else:
+            legs = (str(record.get("security_type") or "EQ").upper() == "OPTN",)
+        for is_option in legs:
+            broker_qty = abs(broker_qty_for(record, is_option))
+            if broker_qty <= 0:
+                continue
+            # A tracked position only accounts for exposure on its OWN basis.
+            if pos is not None and position_is_option(pos) == is_option:
+                continue
+            out.append({
+                "symbol": symbol,
+                "is_option": is_option,
+                "qty": broker_qty,
+                "unit": "contract" if is_option else "share",
+                "kind": UNTRACKED_LEG if pos is not None else UNTRACKED_SYMBOL,
+            })
+    return out
+
+
 def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
     """Flatten an OrdersResponse into order records (live AND terminal):
     {order_id, symbol, status, price_type, order_action, filled, ordered,
@@ -3169,23 +3226,28 @@ async def reconcile_once(
     #         Real paths here: process death between placement and recording,
     #         a guard timeout that deleted the position before the entry
     #         filled, a partial close remainder, or a manual trade.
-    for symbol, record in broker_positions.items():
-        if symbol in tracked:
-            continue
-        try:
-            qty_untracked = abs(int(record.get("qty") or 0))
-        except (TypeError, ValueError):
-            qty_untracked = 0
-        if qty_untracked <= 0:
-            continue
-        sec = str(record.get("security_type") or "EQ")
-        msg = (f"{symbol}: UNTRACKED position at broker ({qty_untracked} "
-               f"{'contract(s)' if sec == 'OPTN' else 'share(s)'}) — no stop, no trail, "
-               f"no risk accounting. Close it at E*TRADE or re-enter it through the bot.")
+    for exposure in plan_untracked_exposure(broker_positions, tracked):
+        symbol = exposure["symbol"]
+        qty_untracked = exposure["qty"]
+        unit = f"{exposure['unit']}(s)"
+        leg = "option" if exposure["is_option"] else "equity"
+        if exposure["kind"] == UNTRACKED_LEG:
+            # The bot tracks the OTHER leg of this symbol, which is exactly why
+            # this one went unreported for so long — say so, or it reads as a
+            # duplicate of a position the operator knows about.
+            context = (f" The tracked {'equity' if exposure['is_option'] else 'option'} "
+                       f"position on {symbol} does NOT cover it.")
+        else:
+            context = ""
+        msg = (f"{symbol}: UNTRACKED {leg} position at broker ({qty_untracked} {unit}) "
+               f"— no stop, no trail, no risk accounting.{context} "
+               f"Close it at E*TRADE or re-enter it through the bot.")
         report["warnings"].append(msg)
         logger.error(f"[RECONCILE] 🚨 {msg}")
+        # Keyed per LEG: a symbol holding both an untracked lot and untracked
+        # contracts must raise both, not have the second suppressed as a dupe.
         await _alert("critical", "untracked_position", msg,
-                     dedupe_key=f"untracked:{symbol}")
+                     dedupe_key=f"untracked:{symbol}:{leg}")
 
     # --- 2) orphaned protective stops (stop order live, no tracked position,
     #        no broker position) ---
@@ -5542,7 +5604,7 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.56.0-no-per-name-room"
+BOT_VERSION = "5.57.0-app-exit-authority"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -5813,6 +5875,42 @@ OPTION_STOP_MAX_HAIRCUT_PCT = float(os.getenv("OPTION_STOP_MAX_HAIRCUT_PCT", "25
 # Relative entry drift above which an app-supplied stop LEVEL is rebuilt from
 # the haircut it was designed to express. See plan_intent_preserving_stop.
 STOP_INTENT_DRIFT_TOLERANCE = float(os.getenv("STOP_INTENT_DRIFT_TOLERANCE", "0.05"))
+
+# ---- EXIT AUTHORITY: the app has eyes, the broker stop is a backstop -------
+# 2026-09-09 (AAPL 310C): the app dispatched with stop=311.69 against a 312.78
+# entry. The bot converted that to a PREMIUM stop of 4.80 (basis=app_delta) and
+# rested it at E*TRADE. It filled at 4.75 eight minutes later, then AAPL ran to
+# 319.15 - the contract would have been deep ITM.
+#
+# Two different statements got conflated. The app said "exit if AAPL loses
+# 311.69". What rested at the broker said "exit if this premium prints 4.80" -
+# and a premium prints on the BID, so a spread widening or an IV blip triggers
+# it while the underlying is nowhere near the level. On a 0.25-wide spread
+# against a 5.30 fill, that is a fraction of the noise band. A resting premium
+# stop is a blind instrument: it cannot see the chart, the regime, or that the
+# signal itself was tagged "Choppy" with ADX 15.
+#
+# So exit authority moves to the side that can SEE. While the app is connected
+# it owns the tactical exit (it watches the underlying and dispatches
+# SELL_CLOSE). The broker keeps a stop resting at all times - never naked - but
+# at a CATASTROPHIC level whose only job is to bound a disaster the app cannot
+# react to (crash, halt, phone dead mid-move).
+#
+# The moment the app stops sending heartbeats, nobody is watching, and the
+# broker stop is re-tightened to the app's tactical level (see
+# `_app_eyes_pass`). Authority follows the eyes.
+APP_EXIT_AUTHORITY = os.getenv("APP_EXIT_AUTHORITY", "true").lower() == "true"
+# Deliberately WIDER than OPTION_STOP_MAX_HAIRCUT_PCT: that clamp bounds a
+# tactical stop meant to pay 1.5:1, while this is the disaster floor and is not
+# supposed to be reachable by noise.
+OPTION_BACKSTOP_HAIRCUT_PCT = float(os.getenv("OPTION_BACKSTOP_HAIRCUT_PCT", "55"))
+# How often to check whether the app still has eyes on the position.
+APP_EYES_INTERVAL_SECONDS = int(os.getenv("APP_EYES_INTERVAL_SECONDS", "30"))
+# How long a freshly armed position may hold the backstop tier before the app
+# has to PROVE it is guarding it. Must exceed the app's heartbeat interval (and
+# APP_LINK_STALE_SECONDS) or every entry would demote itself before the first
+# report could arrive.
+APP_GUARD_PROOF_GRACE_SECONDS = int(os.getenv("APP_GUARD_PROOF_GRACE_SECONDS", "240"))
 
 # ---- Per-name risk ceiling: REMOVED 2026-09-09 ----
 # `MAX_RISK_PCT_OF_OBJECTIVE` (10) and `per_name_risk_room()` stood here and
@@ -6153,6 +6251,36 @@ def _is_close_payload(p: dict) -> bool:
     if str(p.get("order_action") or "").upper() == "SELL_CLOSE":
         return True
     return str(p.get("action") or "").upper() in {"EXIT", "CLOSE"}
+
+
+def describe_dispatch_route(pd: dict) -> Tuple[str, str]:
+    """(intent, routed_side) — what this payload will ACTUALLY send to the broker.
+
+    The dispatch log used to print the payload's raw `action` verb. That verb is
+    not the order: routing goes by INTENT (`plan_option_route`), so a close
+    carrying `intent="close"` with `action="BUY"` — exactly how the app's
+    Auto-Exit dispatches a long option exit — was logged as `IWM BUY` and read
+    as an ENTRY in `/status.recent_dispatches`. Auditing the day's real exits
+    against that log was impossible, and a close refused for an entry-only
+    reason looked like a refused entry.
+
+    Equity closes route SELL because this bot refuses short equity entries
+    outright (bearish exposure goes through long PUTs), so a tracked equity
+    position is always long. Pure: no I/O, no state read.
+    """
+    is_close = _is_close_payload(pd)
+    intent = "close" if is_close else "entry"
+    action = str(pd.get("action") or "?").upper()
+    instrument = str(pd.get("instrument") or "stock").lower()
+    if instrument == "option":
+        routed, _right = plan_option_route(
+            action, is_close,
+            pd.get("option_right") or pd.get("call_put") or "CALL",
+        )
+        return intent, routed
+    if is_close or action in {"EXIT", "CLOSE"}:
+        return "close", "SELL"
+    return intent, action
 
 
 # ==================== ENTRY FILTERS (live entries only) ====================
@@ -7898,6 +8026,13 @@ async def app_heartbeat(data: dict = Body(default={})):
         "ts": _utcnow().isoformat(),
         "received_epoch": time.time(),
         "armed": bool(data.get("armed")) if isinstance(data.get("armed"), bool) else None,
+        # EXIT-ENGINE state, which is NOT the same claim as `armed` (that one is
+        # about ENTRIES). The broker widens its stop to a disaster floor only
+        # while the app can prove it is managing exits, so these two fields are
+        # load-bearing for money, not diagnostics.
+        "exit_armed": bool(data.get("exit_armed")) if isinstance(data.get("exit_armed"), bool) else None,
+        "guarding": data.get("guarding") if isinstance(data.get("guarding"), list) else None,
+        "guarding_truncated": data.get("guarding_truncated") is True,
         "mode": str(data.get("mode") or "").lower() or None,
         "app_version": str(data.get("app_version") or "") or None,
         "open_positions": data.get("open_positions"),
@@ -9382,6 +9517,154 @@ def derive_armed_option_stop(explicit: Any, fill_ref: Any,
     if stop is None or stop <= 0:
         return None, "none"
     return _round_to_option_tick(stop, "down"), basis
+
+
+def plan_broker_stop_placement(
+    tactical_premium: Any,
+    entry_premium: Any,
+    app_has_eyes: bool,
+    backstop_haircut_pct: float,
+    app_authority: bool = True,
+) -> Dict[str, Any]:
+    """WHERE the broker-side protective stop should rest — tactical or backstop.
+
+    `tactical_premium` is the app's intended level (delta-derived from its
+    underlying stop). Two tiers, and the choice is about who can SEE:
+
+    * TACTICAL — the app's own level rests at the broker. Correct whenever the
+      app is NOT watching, because a blind level beats no level at all.
+    * BACKSTOP — a catastrophic level far outside the noise band. Correct while
+      the app IS watching: it owns the tactical exit (it can read the chart,
+      the regime and the spread), and the broker only bounds a disaster nobody
+      could react to.
+
+    A stop ALWAYS rests. There is no tier that leaves a position naked, because
+    the failure this protects against (gap, halt, dead phone) is exactly when
+    no software of ours gets a vote.
+
+    The backstop is never allowed to be TIGHTER than the tactical level — if a
+    misconfigured haircut inverted them, resting the tighter one under the name
+    "backstop" would silently reintroduce the stop-out this exists to prevent.
+
+    Pure: no I/O, fully unit-testable.
+    """
+    def _num(v: Any) -> float:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return 0.0
+        return f if math.isfinite(f) and f > 0 else 0.0
+
+    tactical = _num(tactical_premium)
+    entry = _num(entry_premium)
+
+    if tactical <= 0:
+        # Nothing derivable to rest. The caller already treats this as "no
+        # protective level", and inventing one here would hide that.
+        return {"level": None, "tier": "none", "basis": "none",
+                "reason": "no protective level derivable"}
+
+    if not app_authority or not app_has_eyes:
+        why = ("app exit authority disabled" if not app_authority
+               else "app is dark — no eyes on this position")
+        return {"level": tactical, "tier": "tactical", "basis": "app_tactical",
+                "reason": f"{why}; resting the app's own stop level"}
+
+    if entry <= 0 or not (0 < backstop_haircut_pct < 100):
+        return {"level": tactical, "tier": "tactical", "basis": "app_tactical",
+                "reason": "no usable entry premium for a backstop; resting the tactical stop"}
+
+    backstop = _round_to_option_tick(entry * (1.0 - backstop_haircut_pct / 100.0), "down")
+    if not backstop or backstop <= 0 or backstop >= tactical:
+        return {"level": tactical, "tier": "tactical", "basis": "app_tactical",
+                "reason": "backstop would sit at/inside the tactical stop; resting the tactical stop"}
+
+    return {
+        "level": backstop,
+        "tier": "backstop",
+        "basis": "catastrophic_backstop",
+        "reason": (
+            f"app has eyes — it owns the exit; broker holds a disaster stop at "
+            f"{backstop:.2f} ({backstop_haircut_pct:.0f}% below {entry:.2f})"
+        ),
+    }
+
+
+def assess_guard_proof(
+    link: Any,
+    ticker: str,
+    armed_at: Any,
+    now: float,
+    grace_seconds: int = APP_GUARD_PROOF_GRACE_SECONDS,
+) -> Dict[str, Any]:
+    """Is the app PROVABLY managing the exit for THIS position right now?
+
+    A heartbeat proves the app is REACHABLE. It does not prove the exit engine
+    is watching this position, and those are not the same claim. The gap between
+    them is where money sits: the broker only widens its stop to a disaster
+    floor because something else is supposed to be doing the tactical work, so
+    "reachable" is not a good enough licence to carry that much risk.
+
+    Three states pass a naive `connected and not stale` test while NOTHING is
+    managing the exit:
+
+    * the operator turned the auto-exit engine off;
+    * the KILL SWITCH is on -- which blocks every outbound exit order, so a
+      safety control would have silently WIDENED the broker stop;
+    * the position fell out of the app's watch list (its opening dispatch row
+      was evicted from the log), a state the app itself reports as
+      "NO LONGER GUARDED".
+
+    So the app must name the tickers it is actually guarding, and this function
+    requires that proof per position. Grace covers only the window between an
+    entry filling and the app's first heartbeat that can mention it -- without
+    it every new position would demote itself before it could be reported.
+
+    Absence of proof resolves to NOT guarded, which re-tightens the broker stop.
+    That is the conservative direction: the cost of being wrong is the ordinary
+    tight stop this system used before, while the cost of the opposite mistake
+    is an unmanaged position behind a disaster-only floor.
+
+    Pure: no I/O, fully unit-testable.
+    """
+    if not isinstance(link, dict) or not link:
+        return {"guarded": False, "reason": "no app link"}
+    if not link.get("connected") or link.get("stale"):
+        return {"guarded": False, "reason": "app is dark — no heartbeat"}
+
+    exit_armed = link.get("exit_armed")
+    if exit_armed is False:
+        return {"guarded": False,
+                "reason": "the app's exit engine is disarmed (switched off or kill switch active)"}
+    if exit_armed is not True:
+        # A legacy app cannot make this claim at all. Unmeasured is not zero,
+        # but it is also not proof, and this tier requires proof.
+        return {"guarded": False,
+                "reason": "the app is too old to report exit-engine state"}
+
+    symbol = str(ticker or "").strip().upper()
+    guarding = link.get("guarding")
+    named = {str(s or "").strip().upper() for s in guarding} if isinstance(guarding, list) else set()
+    if symbol and symbol in named:
+        return {"guarded": True, "reason": "the app reports it is guarding this position"}
+
+    try:
+        armed_ts = float(armed_at)
+    except (TypeError, ValueError):
+        armed_ts = 0.0
+    if armed_ts > 0 and (now - armed_ts) < max(0, grace_seconds):
+        return {"guarded": True,
+                "reason": "just armed — awaiting the app's first guard report"}
+
+    if link.get("guarding_truncated") is True:
+        # The app capped its list, so absence is not evidence of absence. We
+        # still cannot PROVE this position is covered, and an unproven position
+        # may not keep a disaster-only stop.
+        return {"guarded": False,
+                "reason": "the app's guard list was truncated — coverage unprovable"}
+
+    return {"guarded": False,
+            "reason": "the app is running but is NOT guarding this position"}
 
 
 def plan_priced_option_risk(premium: Any, qty: Any, stop_premium: Any,
@@ -13843,8 +14126,25 @@ async def execute_live_order(payload: dict):
                     else:
                         stop_basis = app_basis
                 if stop_premium and stop_premium > 0:
+                    # WHERE the stop rests depends on who can see. While the app
+                    # is connected it owns the tactical exit and the broker only
+                    # holds a disaster floor; if the app is dark the app's own
+                    # level rests instead. A stop always rests either way.
+                    eyes = await _app_link_snapshot()
+                    armed_at = time.time()
+                    # Reachable is not the same as watching: require the app's
+                    # exit engine to be armed, and give it grace to report this
+                    # brand-new ticker before `_app_eyes_pass` demands proof.
+                    app_has_eyes = bool(assess_guard_proof(
+                        eyes, str(symbol).upper(), armed_at, armed_at,
+                    )["guarded"])
+                    placement = plan_broker_stop_placement(
+                        stop_premium, fill_ref, app_has_eyes,
+                        OPTION_BACKSTOP_HAIRCUT_PCT, APP_EXIT_AUTHORITY,
+                    )
+                    resting_premium = float(placement["level"] or stop_premium)
                     await _arm_stop_guard(
-                        str(symbol).upper(), "BUY", stop_premium, entry_order_id, client_order_id,
+                        str(symbol).upper(), "BUY", resting_premium, entry_order_id, client_order_id,
                         kind="option", contract=contract,
                         # Everything the entry chase needs to rebuild THIS order
                         # at a better price, plus the app's proposed chase width
@@ -13859,17 +14159,31 @@ async def execute_live_order(payload: dict):
                     )
                     pos_rec = await state.get_position(str(symbol).upper())
                     if pos_rec is not None:
-                        pos_rec["stop_premium"] = stop_premium
+                        pos_rec["stop_premium"] = resting_premium
+                        # The app's intended level is remembered separately so
+                        # `_app_eyes_pass` can re-tighten to it the moment the
+                        # app goes dark, and so the reconciler's re-arm path
+                        # never loses the tier distinction.
+                        pos_rec["tactical_stop_premium"] = stop_premium
+                        pos_rec["stop_tier"] = placement["tier"]
+                        # Start of the proof grace window.
+                        pos_rec["stop_armed_at"] = armed_at
                         # Premium basis for the server-side trailing engine —
                         # without it an option position cannot be trailed.
                         if fill_ref > 0:
                             pos_rec["entry_premium"] = round(fill_ref, 2)
                         await state.set_position(str(symbol).upper(), pos_rec)
-                    risk_pct = ((fill_ref - stop_premium) / fill_ref * 100.0) if fill_ref > 0 else 0.0
+                    risk_pct = ((fill_ref - resting_premium) / fill_ref * 100.0) if fill_ref > 0 else 0.0
                     logger.info(
-                        f"[STOP GUARD] option guard armed for {symbol} at premium {stop_premium:.2f} "
-                        f"(risk {risk_pct:.1f}% of {fill_ref:.2f}, basis={stop_basis}, entry order={entry_order_id})"
+                        f"[STOP GUARD] option guard armed for {symbol} at premium {resting_premium:.2f} "
+                        f"(risk {risk_pct:.1f}% of {fill_ref:.2f}, basis={stop_basis}, "
+                        f"tier={placement['tier']}, entry order={entry_order_id})"
                     )
+                    if placement["tier"] == "backstop":
+                        logger.info(
+                            f"[EXIT AUTHORITY] {symbol} — {placement['reason']}; "
+                            f"app tactical level {stop_premium:.2f} is NOT resting at the broker"
+                        )
                 else:
                     logger.warning(f"⚠️ {symbol} option entry has no derivable stop premium — no broker-side stop armed")
             return {"status": "success", "response": final}
@@ -14681,6 +14995,109 @@ async def trailing_worker():
         await asyncio.sleep(TRAIL_INTERVAL_SECONDS)
 
 
+async def _app_eyes_pass() -> None:
+    """Hand exit authority back to the broker the moment the app stops looking.
+
+    While the app is connected it owns the tactical exit and the broker holds
+    only a disaster floor. That trade is only sound while somebody is watching
+    — so when the heartbeat goes stale, every backstop-tier stop is re-tightened
+    to the app's own tactical level. One-way on purpose: this pass tightens, it
+    never loosens a stop back out, so a flapping heartbeat cannot widen risk.
+    """
+    eyes = await _app_link_snapshot()
+    now = time.time()
+    try:
+        positions = await state.all_positions()
+    except Exception as e:
+        logger.warning(f"[EXIT AUTHORITY] position read failed: {e}")
+        return
+    for ticker, pos in (positions or {}).items():
+        if str(pos.get("stop_tier") or "") != "backstop":
+            continue
+        # Per POSITION, not per app: a reachable app that is not guarding THIS
+        # ticker (engine off, kill switch on, position dropped from its watch
+        # list) is exactly as blind as a dead one.
+        proof = assess_guard_proof(eyes, ticker, pos.get("stop_armed_at"), now)
+        if proof["guarded"]:
+            continue
+        lapse = proof["reason"]
+        tactical = float(pos.get("tactical_stop_premium") or 0)
+        contract = pos.get("contract")
+        qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
+        if tactical <= 0 or not contract or qty < 1:
+            continue
+        # Same per-ticker lock the stop guard uses — never race a replace.
+        lock = state.lock(f"guard:{ticker}", ttl_ms=60_000, wait_timeout=0.5)
+        if not await lock.try_acquire():
+            continue
+        try:
+            outcome = await _cancel_order_verified(
+                pos.get("stop_order_id"), expected_qty=qty,
+            )
+            if outcome != CANCEL_CONFIRMED:
+                # FILLED means the position already closed (the reconciler books
+                # it); anything else means the old stop may still be live and a
+                # second one would double-sell.
+                continue
+            stop_info = await _place_option_protective_stop(
+                ticker, dict(contract), qty, tactical,
+            )
+            pos["stop_order_id"] = stop_info["order_id"]
+            pos["stop_premium"] = tactical
+            pos["stop_tier"] = "tactical"
+            await state.set_position(ticker, pos)
+            logger.warning(
+                f"[EXIT AUTHORITY] 👁️ {ticker} — {lapse}; broker stop re-tightened "
+                f"to the app's tactical level {tactical:.2f} (order={stop_info['order_id']})"
+            )
+            await alerts.send(
+                "warning", "exit_authority_reverted",
+                f"{ticker}: {lapse}, so it can no longer manage this exit — the "
+                f"protective stop was re-tightened to {tactical:.2f} at the broker.",
+                dedupe_key=f"eyes:{ticker}",
+            )
+        except Exception as e:
+            logger.error(f"[EXIT AUTHORITY] {ticker} re-tighten FAILED: {e}")
+            await alerts.send(
+                "critical", "exit_authority_retighten_failed",
+                f"{ticker}: {lapse} and the protective stop could NOT be "
+                f"re-tightened to {tactical:.2f} — verify at your broker now: {e}",
+                dedupe_key=f"eyes_fail:{ticker}",
+            )
+        finally:
+            await lock.release()
+
+
+async def app_eyes_worker():
+    """Watches the watcher: polls whether the app still has eyes on open
+    positions and restores broker-side protection when it does not."""
+    if not APP_EXIT_AUTHORITY:
+        logger.info(
+            "[EXIT AUTHORITY] DISABLED — the broker rests the app's tactical stop "
+            "directly (APP_EXIT_AUTHORITY=false)"
+        )
+        return
+    logger.info(
+        f"[EXIT AUTHORITY] app owns tactical exits — broker backstop "
+        f"{OPTION_BACKSTOP_HAIRCUT_PCT:.0f}% below entry premium; eyes checked every "
+        f"{APP_EYES_INTERVAL_SECONDS}s"
+    )
+    while not _worker_stop:
+        try:
+            if _is_market_open() and load_tokens() is not None:
+                lock = state.lock(
+                    "app_eyes", ttl_ms=max(60_000, APP_EYES_INTERVAL_SECONDS * 2000),
+                )
+                if await lock.try_acquire():
+                    try:
+                        await _app_eyes_pass()
+                    finally:
+                        await lock.release()
+        except Exception as e:
+            logger.error(f"[EXIT AUTHORITY] loop error: {e}")
+        await asyncio.sleep(APP_EYES_INTERVAL_SECONDS)
+
+
 async def _startup_reconcile() -> None:
     """BLOCKING broker reconciliation at boot — sync Redis truth with E*TRADE
     BEFORE the placement worker accepts any job. Closes the biggest cold-start
@@ -14873,6 +15290,7 @@ async def start_worker():
     _worker_task = asyncio.create_task(placement_worker())
     asyncio.create_task(token_keepalive_worker())
     asyncio.create_task(trailing_worker())
+    asyncio.create_task(app_eyes_worker())
     await _start_scanner()
 
 
@@ -14992,9 +15410,15 @@ async def _record_dispatch_verdict(pd: dict, verdict: str, reason: str = "") -> 
     action = str(pd.get("action") or "?").upper()
     mode = str(pd.get("mode") or "paper").lower()
     origin = str(pd.get(DISPATCH_ORIGIN_FIELD) or "") or "unlabeled"
+    # Log the ROUTED side, not the payload verb — a close dispatched as
+    # action=BUY is an exit, and logging it as BUY made every app-side exit
+    # read as an entry. The raw verb is kept alongside (never replaced) so a
+    # payload/routing mismatch stays visible instead of being tidied away.
+    intent, routed = describe_dispatch_route(pd)
+    side = routed if routed == action else f"{routed} (action={action})"
     line = (
-        f"📨 Dispatch verdict: {verdict.upper()} — {ticker} {action} "
-        f"mode={mode} origin={origin}"
+        f"📨 Dispatch verdict: {verdict.upper()} — {ticker} {side} "
+        f"intent={intent} mode={mode} origin={origin}"
     )
     if reason:
         line += f" — {reason}"
@@ -15006,6 +15430,8 @@ async def _record_dispatch_verdict(pd: dict, verdict: str, reason: str = "") -> 
         "ts": _utcnow().isoformat(),
         "ticker": ticker,
         "action": action,
+        "routed_action": routed,
+        "intent": intent,
         "mode": mode,
         "origin": origin,
         "verdict": verdict,
@@ -15223,6 +15649,9 @@ def assess_app_link(
         "mode": None,
         "app_version": None,
         "last_seen": None,
+        "exit_armed": None,
+        "guarding": [],
+        "guarding_truncated": False,
         "divergences": [],
     }
     open_count = len(tracked)
@@ -15265,6 +15694,16 @@ def assess_app_link(
         "mode": mode,
         "app_version": heartbeat.get("app_version"),
         "last_seen": heartbeat.get("ts"),
+        # Exit-engine proof. Distinct from `armed` (entries) on purpose: the
+        # broker's stop tier is decided from THIS, not from reachability.
+        "exit_armed": (heartbeat.get("exit_armed")
+                       if isinstance(heartbeat.get("exit_armed"), bool) else None),
+        "guarding": sorted({
+            str(s or "").strip().upper()
+            for s in (heartbeat.get("guarding") or [])
+            if str(s or "").strip()
+        }) if isinstance(heartbeat.get("guarding"), list) else [],
+        "guarding_truncated": heartbeat.get("guarding_truncated") is True,
     })
 
     if stale and open_count > 0 and not killed:
