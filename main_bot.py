@@ -5604,7 +5604,15 @@ is_sandbox = ENV == "sandbox"
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
-BOT_VERSION = "5.57.0-app-exit-authority"
+#
+# 5.58.0: seven fixes shipped under the 5.57.0 string without bumping it, so a
+# redeploy reported the same version as the container it replaced — the one
+# question a version marker exists to answer. A string a human has to remember
+# to bump is not a verification mechanism, so /healthz now ALSO echoes the live
+# cost model (see the healthz handler). That part is self-proving: it reports
+# what the running process will actually charge, whether or not anyone
+# remembered to touch this line.
+BOT_VERSION = "5.58.0-measured-cost-truth"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -16118,8 +16126,28 @@ async def preflight():
 
 @app.get("/healthz")
 async def healthz():
-    """Lightweight liveness probe polled by the app's System Monitor."""
-    return {"ok": True, "ts": _utcnow().isoformat(), "version": BOT_VERSION}
+    """Lightweight liveness probe polled by the app's System Monitor.
+
+    Also reports the live COST MODEL. A version string only proves a deploy
+    landed if someone remembered to bump it, and seven fixes once shipped under
+    an unchanged one — so a redeploy could not be told apart from the container
+    it replaced. These values are read off the running process at request time,
+    including any env override, so they answer "what will this bot actually
+    charge me?" rather than "what did a human claim it would?".
+
+    `commission_per_contract` is the number that diverged between app and bot
+    (0.65 assumed here vs 0.52 measured from broker receipts). Echoing it makes
+    the disagreement visible from outside instead of only in source review.
+    """
+    return {
+        "ok": True,
+        "ts": _utcnow().isoformat(),
+        "version": BOT_VERSION,
+        "cost_model": {
+            "commission_per_contract": COMMISSION_PER_CONTRACT,
+            "max_round_trip_cost_pct": MAX_ROUND_TRIP_COST_PCT,
+        },
+    }
 
 
 @app.get("/status")
