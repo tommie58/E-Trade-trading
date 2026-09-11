@@ -5703,10 +5703,29 @@ DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "10.0"))
 RUNAWAY_TRADE_CIRCUIT_BREAKER = int(os.getenv("RUNAWAY_TRADE_CIRCUIT_BREAKER", "60"))
 # ---- Execution cost ----
 # The edge must survive the round trip. E*TRADE charges per contract each way,
-# which is brutal on cheap options: $0.65 on a $0.30 contract is 2.2% each way
+# which is brutal on cheap options: $0.52 on a $0.30 contract is 1.7% each way
 # before the spread. A gross edge smaller than the cost of capturing it is a fee
 # generator that looks profitable on a chart.
-COMMISSION_PER_CONTRACT = float(os.getenv("COMMISSION_PER_CONTRACT", "0.65"))
+#
+# MEASURED, not assumed. This was $0.65 — a number no fill in this repo ever
+# supported — while the app measured $0.52 from four broker-confirmed 09/04/26
+# receipts (E*TRADE's $0.50 per contract plus per-contract regulatory fees):
+#
+#   NFLX  buy  1 @ 0.53  gross  53.00  charged  53.51  -> 0.51
+#   NFLX  sell 1 @ 0.45  gross  45.00  received 44.48  -> 0.52
+#   MSTR  sell 2 @ 0.57  gross 114.00  received 112.95 -> 0.525 each
+#   MSTR  sell 1 @ 0.75  gross  75.00  received 74.48  -> 0.52
+#
+# The bot and the app were pricing the SAME round trip differently, so a
+# contract the app sized as fine could be refused here on a fee the broker
+# never charged. Must stay equal to OPTION_FEE_PER_CONTRACT / COMMISSION_PER_
+# CONTRACT in the app (tradeEconomics.ts, executionQuality.ts); the parity is
+# guarded by a cross-boundary test in expo/__tests__/botIntegrity.test.ts.
+#
+# This correction LOOSENS the gate, which is the point: a 25% overstatement of
+# friction is not conservatism, it is a refusal manufactured from a price that
+# does not exist.
+COMMISSION_PER_CONTRACT = float(os.getenv("COMMISSION_PER_CONTRACT", "0.52"))
 # Round-trip cost above this share of premium refuses the entry outright.
 MAX_ROUND_TRIP_COST_PCT = float(os.getenv("MAX_ROUND_TRIP_COST_PCT", "12.0"))
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
@@ -6657,7 +6676,7 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
         pass
 
     # EXECUTION COST — refuse a contract whose round trip eats the edge. A
-    # $0.30 option pays 4.3% in commission alone before the spread; no win rate
+    # $0.30 option pays 3.5% in commission alone before the spread; no win rate
     # survives that. Only applied when the payload priced a real contract.
     cost = assess_entry_cost(p)
     if cost["prohibitive"]:
@@ -9846,9 +9865,13 @@ def assess_entry_cost(payload: Dict[str, Any]) -> Dict[str, Any]:
     Counting only the entry under-reports the real cost by roughly half.
 
     Cheap contracts are the trap: ${COMMISSION_PER_CONTRACT} each way on a $0.30
-    option is 4.3% before the spread is considered. Returns `prohibitive` only
+    option is 3.5% before the spread is considered. Returns `prohibitive` only
     when a real premium was priced — an unpriced payload is not evidence of a
     bad contract, and refusing it here would block the connectivity test.
+
+    `priced` is True only when the FULL round trip was measurable. With a
+    premium but no bid/ask, `total_pct` carries the commission floor and
+    `spread_measured` is False — a floor is not a total.
     """
     def num(key: str) -> float:
         try:
@@ -9862,31 +9885,68 @@ def assess_entry_cost(payload: Dict[str, Any]) -> Dict[str, Any]:
     # / `option_bid` / `option_ask`. Every real payload therefore priced at 0
     # and returned "not measurable", so the cost ceiling never refused a single
     # contract — it was dead code wearing a safety label. On 2026-09-11 that let
-    # through a $0.14 NFLX call whose commission ALONE is 9.4% of premium.
+    # through a $0.14 NFLX call whose commission ALONE is 7.4% of premium.
     premium = (num("option_limit_price") or num("limit_price") or num("premium")
                or num("contract_premium") or num("entry_premium"))
     if premium <= 0:
         return {"prohibitive": False, "total_pct": 0.0, "priced": False,
                 "reason": "no contract premium in payload — cost not measurable"}
 
+    # AN UNQUOTED BOOK IS NOT A TIGHT BOOK.
+    #
+    # This charged `spread_pct = 0.0` whenever the payload carried no usable
+    # bid/ask, then stamped the result `priced: True` — a commission-only cost
+    # wearing the label of a full measurement. That understates the round trip
+    # exactly where the gate matters most (the widest, cheapest contracts are
+    # also the ones most likely to arrive unquoted), and it is the same
+    # unmeasured-as-zero error the app already fixed: AutopilotProvider passes
+    # `undefined` rather than 0 precisely because 0 asserts a perfect book.
+    #
+    # The spread is now either MEASURED or absent. When it is absent the
+    # commission floor is still a real, known cost, so a contract that breaches
+    # the ceiling on commission ALONE is still refused (the $0.14 NFLX call pays
+    # 7.4% before any spread). What is never done is calling the total complete.
     bid = num("option_bid") or num("contract_bid")
     ask = num("option_ask") or num("contract_ask")
-    spread_pct = ((ask - bid) / premium * 100.0) if (ask > bid > 0) else 0.0
+    quoted = ask > bid > 0
+    spread_pct = ((ask - bid) / premium * 100.0) if quoted else 0.0
     commission_pct = (COMMISSION_PER_CONTRACT * 2.0) / (premium * 100.0) * 100.0
     total_pct = spread_pct + commission_pct
+    known_pct = total_pct if quoted else commission_pct
 
-    if total_pct > MAX_ROUND_TRIP_COST_PCT:
+    if known_pct > MAX_ROUND_TRIP_COST_PCT:
+        detail = (f"spread {spread_pct:.1f}% + commission {commission_pct:.1f}%" if quoted
+                  else f"commission {commission_pct:.1f}% ALONE, spread unquoted")
         return {
             "prohibitive": True,
-            "total_pct": round(total_pct, 2),
-            "priced": True,
+            "total_pct": round(known_pct, 2),
+            "priced": quoted,
+            "spread_measured": quoted,
             "reason": (
-                f"execution cost {total_pct:.1f}% of premium (spread {spread_pct:.1f}% + "
-                f"commission {commission_pct:.1f}%) over the {MAX_ROUND_TRIP_COST_PCT:.0f}% "
-                f"ceiling on a ${premium:.2f} contract — the round trip eats the edge"
+                f"execution cost {known_pct:.1f}% of premium ({detail}) over the "
+                f"{MAX_ROUND_TRIP_COST_PCT:.0f}% ceiling on a ${premium:.2f} contract — "
+                f"the round trip eats the edge"
             ),
         }
+
+    if not quoted:
+        # Under the ceiling on commission alone, but the spread — usually the
+        # LARGER half of the round trip — was never seen. Report it as partial
+        # so nothing downstream reads this as a clean bill of health.
+        return {
+            "prohibitive": False,
+            "total_pct": round(commission_pct, 2),
+            "priced": False,
+            "spread_measured": False,
+            "reason": (
+                f"commission {commission_pct:.1f}% of premium on a ${premium:.2f} contract; "
+                f"no bid/ask in the payload so the SPREAD IS UNMEASURED — this total is a "
+                f"floor, not the round trip"
+            ),
+        }
+
     return {"prohibitive": False, "total_pct": round(total_pct, 2), "priced": True,
+            "spread_measured": True,
             "reason": f"round-trip cost {total_pct:.1f}% of premium"}
 
 
