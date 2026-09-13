@@ -37,6 +37,7 @@ Key layout (exact names, no surprises):
   stop_guards:index            SET of tickers with a guard record
   daily:{YYYY-MM-DD}           HASH {trades_today, realized_pnl_today_pct} (3-day TTL)
   balance:snapshot             JSON {value, ts} — last broker buying-power fetch
+  equity:snapshot              JSON {value, ts} — last broker ACCOUNT-EQUITY fetch (halt denominator)
   balance:delta                HASH {delta} — running win/loss/cost adjustment since snapshot
   killed                       "1" when the kill switch is engaged
   sig:{sha1}                   idempotency keys (24h TTL, SET NX)
@@ -271,6 +272,15 @@ BALANCE_DELTA_KEY = "balance:delta"
 # A tracked balance older than this is unusable — sizing must fail closed
 # (or fall back to the broker's own funds check) instead of trusting it.
 BALANCE_TTL_SECONDS = 15 * 60
+
+EQUITY_SNAPSHOT_KEY = "equity:snapshot"
+# Account equity is kept FAR longer than buying power (15 min) on purpose.
+# Buying power swings intraday with every fill, so a stale one is dangerous
+# for SIZING. Equity moves slowly and is only ever used here as the daily
+# loss limit's DENOMINATOR, where a several-hour-old account value is orders
+# of magnitude closer to the truth than live leftover cash. The 2026-09-11
+# halt is the proof: $8,101 equity vs ~$640 buying power, a 12.7x error.
+EQUITY_TTL_SECONDS = 36 * 3600
 
 
 def _utcnow() -> datetime:
@@ -1098,6 +1108,41 @@ class StateStore:
             await self.redis.expire(BALANCE_DELTA_KEY, BALANCE_TTL_SECONDS)
             return float(val)
         return await self._memory.hincrbyfloat(BALANCE_DELTA_KEY, "delta", amount, BALANCE_TTL_SECONDS)
+
+    async def set_equity_snapshot(self, value: float) -> None:
+        """Remember the last broker-reported ACCOUNT EQUITY (totalAccountValue).
+
+        Unlike the buying-power snapshot this carries NO running delta: equity
+        is whole-account value, and win/loss adjustments are already reflected
+        the next time the broker answers. A stale-but-labelled account value is
+        the correct fallback denominator for the daily loss limit."""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return
+        if not (v > 0):
+            return
+        payload = _dumps({"value": v, "ts": _utcnow().timestamp()})
+        await self.set(EQUITY_SNAPSHOT_KEY, payload, ex=EQUITY_TTL_SECONDS)
+
+    async def last_equity(self) -> Optional[Dict[str, float]]:
+        """Last known account equity as {value, age_seconds}, or None.
+
+        The age travels with the number so a caller can label the denominator
+        it used instead of passing a stale figure off as live account truth."""
+        raw = await self.get(EQUITY_SNAPSHOT_KEY)
+        if not raw:
+            return None
+        try:
+            snap = json.loads(raw)
+            value = float(snap.get("value") or 0)
+            ts = float(snap.get("ts") or 0)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not (value > 0):
+            return None
+        age = max(0.0, _utcnow().timestamp() - ts) if ts else float("inf")
+        return {"value": value, "age_seconds": age}
 
     async def tracked_balance(self) -> Optional[float]:
         """Snapshot ± win/loss delta, or None when no fresh snapshot exists
@@ -9304,7 +9349,8 @@ def build_preflight(*,
 
 
 def plan_account_pct(realized_usd: Any, equity: Any, buying_power: Any,
-                     per_trade_pct: Any = None) -> Dict[str, Any]:
+                     per_trade_pct: Any = None,
+                     last_equity: Any = None) -> Dict[str, Any]:
     """Convert a closed trade's dollars into an ACCOUNT-level percent for the
     daily loss limit, choosing the denominator explicitly.
 
@@ -9320,16 +9366,33 @@ def plan_account_pct(realized_usd: Any, equity: Any, buying_power: Any,
     loss is divided by a smaller number: the counter accelerates toward the
     halt exactly when it should be most stable.
 
-    Rules:
+    THE SECOND HALF OF THE BUG. Fixing the happy path was not enough: live
+    equity comes from E*TRADE, and when the OAuth token expires (it did, at
+    04:02 on 09-13) the fetch returns nothing and the old code fell straight
+    back to buying power — restoring the exact ~$640 denominator, and with it
+    the 12.7x inflation, precisely when nobody was watching. A fix that only
+    holds while the broker answers does not hold. Hence `last_equity`.
+
+    Rules, in strict order:
       * `equity` (totalAccountValue) is the only correct denominator — the
         daily loss limit is a percentage OF THE ACCOUNT.
-      * `buying_power` is used ONLY when equity is unreadable AND it is the
-        larger of the two — never to manufacture a bigger percent.
-      * With neither, fall back to the raw per-trade move (deliberately
-        over-braking: a too-sensitive halt is safe, an insensitive one is not).
+      * `last_equity`, the last broker-reported account value, comes next.
+        Equity drifts by percents per day; buying power can be off by an order
+        of magnitude within one session. Stale account truth beats live cash.
+      * `buying_power` is used ONLY when NO equity reference exists at all,
+        live or remembered — the ordering above is what makes the old promise
+        ("never to manufacture a bigger percent") true by construction rather
+        than by an unreachable comparison against an equity that is None.
+      * With none of the three, fall back to the raw per-trade move.
 
-    Returns {pct, basis, denominator}. `basis` is recorded so a reader can tell
-    an account-true percent from an over-braking fallback.
+    On over-braking: this function used to call a too-sensitive halt "safe".
+    2026-09-11 disproved that — the inflated halt refused a 100-score SMCI
+    setup and every entry after it. An unnecessary halt is not a safe default,
+    it is a silent, all-day outage. The fallbacks are ordered to keep the
+    denominator HONEST, not merely conservative.
+
+    Returns {pct, basis, denominator, stale_seconds}. `basis` is recorded so a
+    reader can tell account truth from a labelled fallback.
     """
     def num(value: Any) -> Optional[float]:
         try:
@@ -9343,16 +9406,33 @@ def plan_account_pct(realized_usd: Any, equity: Any, buying_power: Any,
     bp = num(buying_power)
     raw = num(per_trade_pct)
 
+    stale_age: Optional[float] = None
+    stale_eq: Optional[float] = None
+    if isinstance(last_equity, dict):
+        stale_eq = num(last_equity.get("value"))
+        stale_age = num(last_equity.get("age_seconds"))
+    else:
+        stale_eq = num(last_equity)
+
     if usd is not None and eq is not None and eq > 0:
-        return {"pct": usd / eq * 100.0, "basis": "equity", "denominator": eq}
-    # No equity. Buying power is an ACCEPTABLE denominator only when it is not
-    # smaller than the account it stands in for — a shrunken cash figure would
-    # reproduce the exact inflation this function exists to prevent.
+        return {"pct": usd / eq * 100.0, "basis": "equity",
+                "denominator": eq, "stale_seconds": None}
+    # Live equity is gone (expired token, broker outage). The last account
+    # value we actually saw is still an ACCOUNT-sized denominator; leftover
+    # cash is not. Order matters more than any comparison here.
+    if usd is not None and stale_eq is not None and stale_eq > 0:
+        return {"pct": usd / stale_eq * 100.0, "basis": "last_known_equity",
+                "denominator": stale_eq, "stale_seconds": stale_age}
+    # Reached only with NO equity reference of any kind. Labelled loudly: this
+    # is the denominator that caused the incident.
     if usd is not None and bp is not None and bp > 0:
-        return {"pct": usd / bp * 100.0, "basis": "buying_power", "denominator": bp}
+        return {"pct": usd / bp * 100.0, "basis": "buying_power",
+                "denominator": bp, "stale_seconds": None}
     if raw is not None:
-        return {"pct": raw, "basis": "per_trade_fallback", "denominator": None}
-    return {"pct": None, "basis": "unmeasurable", "denominator": None}
+        return {"pct": raw, "basis": "per_trade_fallback",
+                "denominator": None, "stale_seconds": None}
+    return {"pct": None, "basis": "unmeasurable",
+            "denominator": None, "stale_seconds": None}
 
 
 def plan_risk_budget(account_size: Any, realized_usd: Any, open_risk_usd: Any,
@@ -12885,12 +12965,21 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         scaled = await _account_scaled_pct(realized_usd, pnl_pct)
         if scaled["basis"] == "equity":
             account_pct = scaled["pct"]
+        elif scaled["basis"] == "last_known_equity":
+            account_pct = scaled["pct"]
+            age_h = (scaled.get("stale_seconds") or 0) / 3600.0
+            logger.warning(
+                f"[PNL] {ticker} live equity unreadable (expired token or broker outage) — daily "
+                f"counter scaled by LAST KNOWN EQUITY ${scaled['denominator']:,.0f} "
+                f"({age_h:.1f}h old). Account-sized and honest; relink to restore live truth."
+            )
         elif scaled["basis"] == "buying_power":
             account_pct = scaled["pct"]
             logger.warning(
-                f"[PNL] {ticker} account equity unreadable — daily counter scaled by BUYING POWER "
-                f"${scaled['denominator']:,.0f}. This over-states the percent whenever cash is "
-                f"committed to open contracts; the halt may trip early."
+                f"[PNL] {ticker} NO equity reference at all — daily counter scaled by BUYING POWER "
+                f"${scaled['denominator']:,.0f}. This is the denominator behind the 2026-09-11 "
+                f"false halt; it over-states the percent whenever cash is committed to open "
+                f"contracts, so the limit may trip on a day that never lost that much."
             )
         else:
             logger.warning(
@@ -13117,8 +13206,13 @@ async def _book_partial_stop_fill(
     account_pct: Optional[float] = None
     if pnl_pct is not None:
         scaled = await _account_scaled_pct(realized_usd, pnl_pct)
-        if scaled["basis"] in {"equity", "buying_power"}:
+        if scaled["basis"] in {"equity", "last_known_equity", "buying_power"}:
             account_pct = scaled["pct"]
+            if scaled["basis"] != "equity":
+                logger.warning(
+                    f"[PARTIAL] {ticker} live equity unreadable — daily counter scaled by "
+                    f"{scaled['basis'].upper()} ${scaled['denominator']:,.0f}"
+                )
         await state.add_realized_pnl(account_pct if account_pct is not None else pnl_pct)
     if realized_usd is not None:
         try:
@@ -13305,9 +13399,20 @@ def _pnl_repair_key(day: str) -> str:
 
 
 async def _repair_daily_pnl() -> Dict[str, Any]:
-    """Correct today's stored `realized_pnl_today_pct` if the sign bug polluted
+    """Correct today's stored `realized_pnl_today_pct` if the SIGN bug polluted
     it. Runs once per startup; safe to re-run (already-applied corrections are
-    remembered per day, so a second pass is a no-op)."""
+    remembered per day, so a second pass is a no-op).
+
+    SCOPE — this repairs inverted SIGNS and nothing else. The replay sums the
+    `account_pnl_pct` values the ledger already recorded, so if a close was
+    booked against the wrong DENOMINATOR (a percent taken over open risk or a
+    stale balance instead of account equity), the replay reproduces that same
+    wrong magnitude, finds it matches, and reports "no correction needed".
+    A clean verdict here means the counter AGREES WITH THE LEDGER — it is not
+    a claim that the percentage is true. Do not reach for this endpoint to
+    clear a halt whose magnitude looks wrong; it is structurally incapable of
+    changing one, and reading its 'clean' as 'correct' is how a bad
+    denominator survives a repair pass."""
     day = _utcnow().date().isoformat()
     result: Dict[str, Any] = {"day": day, "status": "clean", "applied_delta": 0.0}
     try:
@@ -13351,8 +13456,9 @@ async def _repair_daily_pnl() -> Dict[str, Any]:
                 )
         elif abs(needed) <= PNL_REPAIR_EPSILON:
             logger.info(
-                f"[PNL-REPAIR] daily P&L verified against ledger — {stored:.4f}% "
-                f"over {replay['closes']} close(s), no correction needed"
+                f"[PNL-REPAIR] daily P&L matches the ledger — {stored:.4f}% "
+                f"over {replay['closes']} close(s), no sign correction needed "
+                f"(agreement only; magnitude/denominator is not checked here)"
             )
         else:
             new_value = await state.add_realized_pnl(needed)
@@ -13471,6 +13577,15 @@ async def _fetch_broker_balance() -> Optional[Dict[str, Optional[float]]]:
         computed = ((bal or {}).get("BalanceResponse", {}) or {}).get("Computed", {}) or {}
         real_time = computed.get("RealTimeValues", {}) or {}
         total = _positive_float(real_time.get("totalAccountValue"))
+        # Remember every account value the broker gives us. This is what the
+        # daily loss limit falls back to when the token later expires — written
+        # here, at the single point where equity is actually observed, so no
+        # future call site can forget to record it.
+        if total is not None:
+            try:
+                await state.set_equity_snapshot(total)
+            except Exception as e:
+                logger.warning(f"[PNL] equity snapshot persist failed (non-fatal): {e}")
         # Cash actually spendable on new orders — the number that prevents
         # 8400 insufficient-funds rejections. Order of preference matches
         # E*TRADE's own "purchasing power" semantics for cash accounts.
@@ -13502,8 +13617,9 @@ async def _account_scaled_pct(realized_usd: Optional[float],
     The denominator is the whole bug (see `plan_account_pct`): buying power is
     the cash left AFTER contracts were bought, so dividing by it inflated a
     -2.15% day into -27.24% and halted trading. Equity is fetched live; the
-    tracked snapshot is only a fallback, and the raw per-trade move is the
-    last resort.
+    LAST KNOWN equity covers a broker outage or expired token; the tracked
+    snapshot (buying power) is a last-ditch denominator, and the raw per-trade
+    move is the final resort.
     """
     equity: Optional[float] = None
     buying_power: Optional[float] = None
@@ -13513,7 +13629,15 @@ async def _account_scaled_pct(realized_usd: Optional[float],
         buying_power = bal.get("available")
     except Exception as e:
         logger.warning(f"[PNL] broker balance unavailable for account scaling ({e})")
+    last_equity: Optional[Dict[str, float]] = None
     if equity is None:
+        # Live equity is gone. Reach for the last ACCOUNT value the broker
+        # reported before trusting leftover cash — an expired OAuth token must
+        # not be able to reinstate the denominator that caused the incident.
+        try:
+            last_equity = await state.last_equity()
+        except Exception:
+            last_equity = None
         # The tracked snapshot is seeded from `available`, so it stands in for
         # BUYING POWER here — never for equity. Labelling it correctly is what
         # keeps the fallback from silently reintroducing the inflated percent.
@@ -13523,7 +13647,8 @@ async def _account_scaled_pct(realized_usd: Optional[float],
                 buying_power = tracked
         except Exception:
             pass
-    return plan_account_pct(realized_usd, equity, buying_power, per_trade_pct)
+    return plan_account_pct(realized_usd, equity, buying_power, per_trade_pct,
+                            last_equity=last_equity)
 
 
 async def _available_funds() -> Optional[float]:
