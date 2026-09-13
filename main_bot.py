@@ -2357,9 +2357,46 @@ def _as_list(node: Any) -> List[dict]:
     return []
 
 
+def contract_key(right: Any, strike: Any, expiration: Any) -> Optional[Tuple[str, int, str]]:
+    """Canonical identity of ONE option contract: (C|P, strike×1000, YYYY-MM-DD).
+
+    Strike is carried as an integer of thousandths so 470.0 and "470.00" are the
+    same contract and float noise cannot split one position into two. Returns
+    None when any component is unreadable — an unidentifiable contract must not
+    silently collide with a real one.
+    """
+    cp = str(right or "").strip().upper()
+    if cp.startswith("C"):
+        cp = "C"
+    elif cp.startswith("P"):
+        cp = "P"
+    else:
+        return None
+    try:
+        strike_k = int(round(float(strike) * 1000))
+    except (TypeError, ValueError):
+        return None
+    if strike_k <= 0:
+        return None
+    exp = str(expiration or "")[:10]
+    if len(exp) != 10:
+        return None
+    return (cp, strike_k, exp)
+
+
+def tracked_contract_key(position: Optional[dict]) -> Optional[Tuple[str, int, str]]:
+    """`contract_key` for a TRACKED position, or None when it carries no
+    identifiable contract (equity, or an older record with no `contract`)."""
+    contract = (position or {}).get("contract") if isinstance(position, dict) else None
+    if not isinstance(contract, dict):
+        return None
+    return contract_key(contract.get("right"), contract.get("strike"),
+                        contract.get("expiration"))
+
+
 def parse_broker_positions(portfolio_resp: Dict[str, Any]) -> Dict[str, dict]:
     """Flatten a PortfolioResponse into
-    {SYMBOL: {qty, eq_qty, optn_qty, security_type, occ}}.
+    {SYMBOL: {qty, eq_qty, optn_qty, security_type, occ, optn_legs}}.
 
     Options are keyed by UNDERLYING symbol (matching how the bot tracks
     positions) but counted SEPARATELY from any equity lot on the same symbol.
@@ -2368,7 +2405,19 @@ def parse_broker_positions(portfolio_resp: Dict[str, Any]) -> Dict[str, dict]:
     under-covering, cancelled it, and asked for a 102-contract replacement
     the broker rejected — protection destroyed by the repair meant to
     enforce it. `qty` remains the blended total for display only; sizing
-    logic must go through `broker_qty_for()`."""
+    logic must go through `broker_qty_for()`.
+
+    `optn_legs` KEEPS THE CONTRACTS APART. `optn_qty` still sums every contract
+    on the underlying, which is the same blending one level down: a tracked
+    NVDA 470C (2 lots) beside an untracked NVDA 500C (4 lots) read as a single
+    6-lot option position. That made the bot heal its own `filled_qty` 2 → 6
+    (contracts it never bought, later booking 3× the real P&L), cancel a
+    correctly-sized 2-lot stop as "under-covered", and report NOTHING untracked
+    — the 4 manual contracts were invisible precisely because the symbol was
+    tracked. E*TRADE returns `callPut`, `strikePrice` and `expiryYear/Month/Day`
+    per position, so contract identity was always available; it was simply
+    discarded here.
+    """
     out: Dict[str, dict] = {}
     root = (portfolio_resp or {}).get("PortfolioResponse", {}) or {}
     for acct in _as_list(root.get("AccountPortfolio")):
@@ -2384,25 +2433,69 @@ def parse_broker_positions(portfolio_resp: Dict[str, Any]) -> Dict[str, dict]:
                 qty = 0
             record = out.setdefault(symbol, {
                 "qty": 0, "eq_qty": 0, "optn_qty": 0,
-                "security_type": sec_type, "occ": None,
+                "security_type": sec_type, "occ": None, "optn_legs": [],
             })
             record["qty"] += qty
             if sec_type == "OPTN":
                 record["optn_qty"] += qty
                 record["security_type"] = "OPTN"
-                record["occ"] = pos.get("symbolDescription") or product.get("displaySymbol")
+                occ = pos.get("symbolDescription") or product.get("displaySymbol")
+                record["occ"] = occ
+                expiry = ""
+                try:
+                    expiry = (f"{int(product.get('expiryYear')):04d}-"
+                              f"{int(product.get('expiryMonth')):02d}-"
+                              f"{int(product.get('expiryDay')):02d}")
+                except (TypeError, ValueError):
+                    expiry = ""
+                record["optn_legs"].append({
+                    "qty": qty,
+                    "occ": occ,
+                    "call_put": str(product.get("callPut") or "").upper(),
+                    "strike": product.get("strikePrice"),
+                    "expiration": expiry,
+                    "key": contract_key(product.get("callPut"),
+                                        product.get("strikePrice"), expiry),
+                })
             else:
                 record["eq_qty"] += qty
     return out
 
 
-def broker_qty_for(record: Optional[dict], is_option: bool) -> int:
+def broker_qty_for(record: Optional[dict], is_option: bool,
+                   position: Optional[dict] = None) -> int:
     """Broker quantity on the SAME basis as a tracked position — option
     contracts for option positions, shares for equities. Never the blended
     total. Falls back to the legacy `qty` for records written before the
-    split (a restart mid-deploy replaying an old report)."""
+    split (a restart mid-deploy replaying an old report).
+
+    Pass `position` to narrow an option answer to THAT POSITION'S CONTRACT.
+    Without it the answer is every contract on the underlying, which is how a
+    tracked 2-lot 470C beside an untracked 4-lot 500C answered "6".
+
+    The contract filter only engages when BOTH sides are identifiable — the
+    tracked record names a contract and the broker leg carries a readable key.
+    Anything less falls back to the blended option total, deliberately: an
+    unidentifiable leg read as 0 would present a live position as a ghost and
+    invite the reconciler to delete it. Unknown must not read as gone.
+    """
     if not isinstance(record, dict):
         return 0
+    if is_option:
+        want = tracked_contract_key(position)
+        legs = record.get("optn_legs")
+        if want is not None and isinstance(legs, list) and legs:
+            # Only trust the filter if every leg is identifiable; one unreadable
+            # leg means the remainder cannot be proven to exclude this contract.
+            if all(leg.get("key") is not None for leg in legs):
+                total = 0
+                for leg in legs:
+                    if leg.get("key") == want:
+                        try:
+                            total += int(leg.get("qty") or 0)
+                        except (TypeError, ValueError):
+                            continue
+                return total
     key = "optn_qty" if is_option else "eq_qty"
     if key in record:
         try:
@@ -2456,12 +2549,27 @@ def plan_untracked_exposure(
         else:
             legs = (str(record.get("security_type") or "EQ").upper() == "OPTN",)
         for is_option in legs:
+            # The TOTAL on this basis — deliberately unfiltered. What the tracked
+            # position accounts for is subtracted below, so contracts on the same
+            # underlying that the bot does NOT hold still surface.
             broker_qty = abs(broker_qty_for(record, is_option))
             if broker_qty <= 0:
                 continue
-            # A tracked position only accounts for exposure on its OWN basis.
+            # A tracked position only accounts for exposure on its OWN basis —
+            # and, for options, only for ITS OWN CONTRACT. A tracked NVDA 470C
+            # used to excuse every NVDA contract in the account, so an untracked
+            # 500C bought by hand was reported as nothing at all.
             if pos is not None and position_is_option(pos) == is_option:
-                continue
+                if not is_option:
+                    continue
+                accounted = abs(broker_qty_for(record, True, pos))
+                if accounted <= 0:
+                    # The tracked contract is not identifiable against these
+                    # legs; the old blanket exemption is the safe read.
+                    continue
+                broker_qty -= accounted
+                if broker_qty <= 0:
+                    continue
             out.append({
                 "symbol": symbol,
                 "is_option": is_option,
@@ -2618,7 +2726,11 @@ def build_account_snapshot(
         # Options first: when a symbol holds both, the contract leg is the one
         # this system trades and the one carrying leveraged risk.
         for is_option in (True, False):
-            leg_qty = broker_qty_for(record, is_option)
+            # Reported per CONTRACT for a tracked option leg, so the snapshot the
+            # app renders as "broker truth" shows the position the bot actually
+            # holds rather than every contract on the underlying.
+            leg_qty = broker_qty_for(record, is_option,
+                                     pos if (is_option and tracked_is_option) else None)
             if leg_qty == 0:
                 continue
             # A tracked position only accounts for its OWN basis. The bot
@@ -2664,7 +2776,8 @@ def build_account_snapshot(
     # even while 100 shares of the same symbol sit in the account.
     ghosts = [
         s for s in sorted(tracked.keys())
-        if broker_qty_for(broker_positions.get(s), position_is_option(tracked.get(s))) == 0
+        if broker_qty_for(broker_positions.get(s), position_is_option(tracked.get(s)),
+                          tracked.get(s)) == 0
     ]
 
     orders_out = [{
@@ -3037,7 +3150,7 @@ async def reconcile_once(
     for ticker, pos in tracked.items():
         broker = broker_positions.get(ticker)
         is_opt_pos = position_is_option(pos)
-        basis_qty = abs(broker_qty_for(broker, is_opt_pos))
+        basis_qty = abs(broker_qty_for(broker, is_opt_pos, pos))
         opened_ts = 0.0
         try:
             opened_ts = datetime.fromisoformat(str(pos.get("ts"))).timestamp()
@@ -3185,7 +3298,7 @@ async def reconcile_once(
         broker = broker_positions.get(ticker)
         if broker is None:
             continue
-        basis_qty_1b = abs(broker_qty_for(broker, position_is_option(pos)))
+        basis_qty_1b = abs(broker_qty_for(broker, position_is_option(pos), pos))
         if basis_qty_1b == 0:
             continue  # not present on this basis — section 1 handled the ghost
         if guard_owns_stop(guards.get(ticker), now):
@@ -5657,7 +5770,24 @@ is_sandbox = ENV == "sandbox"
 # cost model (see the healthz handler). That part is self-proving: it reports
 # what the running process will actually charge, whether or not anyone
 # remembered to touch this line.
-BOT_VERSION = "5.58.0-measured-cost-truth"
+#
+# 5.59.0: three money-path fixes, all of the same shape — a number that was
+# right in one place and stale or blended in another.
+#   * CONTROL AUTH: six mutating endpoints had no authentication at all
+#     (account/select, auth/renew, auth/restore, auth/complete, disconnect,
+#     app/heartbeat). All 17 now pass `_require_control_auth`, which fails OPEN
+#     with a critical alert when WEBHOOK_SECRET is unset — refusing would brick
+#     the relink path that is the only way back in.
+#   * FUNDS CLAMP AUTHORITY: the pre-flight/8400 clamps edited a private copy
+#     of the order dict, so the caller kept the PRE-clamp size and armed the
+#     stop guard with it. The entry chase then re-placed that oversized
+#     quantity through the one path that re-runs no funds gate.
+#   * CONTRACT IDENTITY: the broker portfolio summed every option contract on
+#     an underlying into one number, so a tracked 470C beside a manual 500C
+#     healed filled_qty to the blend (booking inflated P&L), condemned a
+#     correctly-sized stop as under-covered, and reported the manual lot as
+#     nothing at all.
+BOT_VERSION = "5.59.0-position-truth"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -6182,6 +6312,63 @@ def _verify_webhook_auth(
     if body_secret == WEBHOOK_SECRET or secret_header == WEBHOOK_SECRET:
         return
     raise HTTPException(403, "Unauthorized")
+
+
+# Endpoints already warned about running unauthenticated, so a secretless
+# deploy reports each surface once instead of on every poll.
+_unauth_control_warned: set = set()
+
+
+async def _require_control_auth(
+    x_rork_secret: Optional[str],
+    endpoint: str = "control",
+) -> None:
+    """Gate a MUTATING control endpoint on the shared secret.
+
+    `/webhook` was authenticated from the start, which made it easy to believe
+    the control surface was. It was not: six mutating endpoints had no check at
+    all, and each one moves money or the licence to risk it —
+
+    * `/etrade/account/select` re-routes every real order to another account;
+    * `/etrade/auth/restore` adopts OAuth tokens into the live session;
+    * `/etrade/auth/complete` + `/etrade/auth/renew` mint/extend that session;
+    * `/etrade/disconnect` unlinks the broker mid-position;
+    * `/app/heartbeat` is the claim `_app_eyes_pass` reads to decide whether
+      the broker may hold the DISASTER stop (OPTION_BACKSTOP_HAIRCUT_PCT, 55%)
+      instead of the tactical one. A forged `exit_armed: true` plus a
+      `guarding` list naming the open tickers is enough to widen real stops on
+      a real book, from anyone who knows the URL.
+
+    WHY NOT FAIL CLOSED WHEN THE SECRET IS UNSET: these are also the endpoints
+    an operator uses to RECOVER a bot. Refusing them on a secretless deploy
+    would brick relinking with no way back in — and a bot with no WEBHOOK_SECRET
+    already accepts `/webhook` from anyone, so refusing here buys nothing while
+    costing the fix. Instead the hole is made LOUD: preflight already flags
+    `webhook_secret` as blocking, and the first unauthenticated mutation on each
+    surface now raises a critical alert rather than passing silently.
+    """
+    if WEBHOOK_SECRET:
+        if x_rork_secret != WEBHOOK_SECRET:
+            raise HTTPException(401, "invalid secret")
+        return
+    if endpoint in _unauth_control_warned:
+        return
+    _unauth_control_warned.add(endpoint)
+    logger.critical(
+        f"UNAUTHENTICATED control request accepted on {endpoint} — WEBHOOK_SECRET is not "
+        f"set, so anyone who knows this URL can drive it. Set WEBHOOK_SECRET and redeploy."
+    )
+    try:
+        await alerts.send(
+            "critical", "unauthenticated_control",
+            f"{endpoint} accepted an UNAUTHENTICATED request — WEBHOOK_SECRET is not set on "
+            f"this deploy. Anyone who knows the bot URL can re-route orders, unlink the "
+            f"broker, or claim the app is guarding positions it is not. Set WEBHOOK_SECRET "
+            f"and redeploy.",
+            dedupe_key="unauthenticated_control",
+        )
+    except Exception as e:  # alerting must never break a control path
+        logger.debug(f"unauthenticated-control alert failed: {e}")
 
 
 def _signal_key(p: dict) -> str:
@@ -7384,7 +7571,11 @@ def _classify_exchange_error(msg: str) -> Tuple[int, str]:
 
 @app.post("/etrade/auth/complete")
 @app.post("/complete-link")
-async def etrade_auth_complete(data: dict = Body(...)):
+async def etrade_auth_complete(
+    data: dict = Body(...),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    await _require_control_auth(x_rork_secret, "/etrade/auth/complete")
     global _latest_request_token
     try:
         verifier = str(data.get("oauth_verifier") or data.get("verifier") or data.get("code") or "").strip()
@@ -7563,7 +7754,10 @@ async def get_etrade_account():
 
 
 @app.post("/etrade/account/select")
-async def select_etrade_account(data: dict = Body(default={})):
+async def select_etrade_account(
+    data: dict = Body(default={}),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
     """Pin the E*TRADE account that real orders route to — from the app.
 
     Previously the routed account could only be changed by editing the
@@ -7579,6 +7773,7 @@ async def select_etrade_account(data: dict = Body(default={})):
 
     Body: {"account_id": "146261816"} | {"clear": true} | {"account_id": null}
     """
+    await _require_control_auth(x_rork_secret, "/etrade/account/select")
     tokens = load_tokens()
     if not tokens:
         raise HTTPException(401, "E*TRADE account not linked")
@@ -7677,7 +7872,11 @@ async def select_etrade_account(data: dict = Body(default={})):
 
 # ==================== RENEW ====================
 @app.post("/etrade/auth/renew")
-async def etrade_auth_renew(data: dict = Body(...)):
+async def etrade_auth_renew(
+    data: dict = Body(...),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    await _require_control_auth(x_rork_secret, "/etrade/auth/renew")
     try:
         access_token = data.get("access_token") or os.getenv("ETRADE_ACCESS_TOKEN")
         access_token_secret = data.get("access_token_secret") or os.getenv("ETRADE_ACCESS_TOKEN_SECRET")
@@ -7736,7 +7935,9 @@ async def _forget_persisted_tokens() -> bool:
 
 
 @app.post("/etrade/disconnect")
-async def etrade_disconnect():
+async def etrade_disconnect(
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
     """Fully unlink the broker session.
 
     Clearing only the in-memory token left three things behind: the persisted
@@ -7745,6 +7946,7 @@ async def etrade_disconnect():
     a `token_valid: true` session flag — i.e. the app could keep reporting a
     trusted live session for an account the user had just disconnected.
     """
+    await _require_control_auth(x_rork_secret, "/etrade/disconnect")
     global _current_tokens, _resolved_account_id_key, _account_binding, _token_source
     _current_tokens = None
     _token_source = None
@@ -7764,12 +7966,16 @@ async def etrade_disconnect():
 
 # ==================== RESTORE ====================
 @app.post("/etrade/auth/restore")
-async def etrade_auth_restore(data: dict = Body(...)):
+async def etrade_auth_restore(
+    data: dict = Body(...),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
     """Adopt access tokens the APP persisted locally so the session self-heals
     after a bot cold start/redeploy without a full OAuth relink. The tokens
     are validated against E*TRADE BEFORE being adopted — dead tokens (e.g.
     expired at midnight ET) can never clobber a working session, and the app
     gets a clean 401 telling it a fresh relink is required."""
+    await _require_control_auth(x_rork_secret, "/etrade/auth/restore")
     token = str(data.get("oauth_token") or data.get("access_token") or "").strip()
     token_secret = str(data.get("oauth_token_secret") or data.get("access_token_secret") or "").strip()
     if not token or not token_secret:
@@ -8093,14 +8299,23 @@ def _snapshot_age(snapshot: Optional[dict]) -> Optional[float]:
 
 
 @app.post("/app/heartbeat")
-async def app_heartbeat(data: dict = Body(default={})):
+async def app_heartbeat(
+    data: dict = Body(default={}),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
     """The app tells the server it is alive, armed, and what it believes.
 
     The bot trades autonomously — the scanner places real orders with nobody
     watching. It had no way to know whether the operator's app was open, armed,
     or running in a different money mode than the server, so an app showing
     PAPER while the server traded LIVE was undetectable from either side.
+
+    AUTHENTICATED because this is not a diagnostic: `_app_eyes_pass` reads
+    `exit_armed` + `guarding` to decide whether the broker may keep the
+    DISASTER-tier stop (55% haircut) instead of the tactical one. A forged
+    heartbeat naming the open tickers widens real stops on a real book.
     """
+    await _require_control_auth(x_rork_secret, "/app/heartbeat")
     beat = {
         "ts": _utcnow().isoformat(),
         "received_epoch": time.time(),
@@ -10917,6 +11132,16 @@ async def _place_entry_with_funds_clamp(
     so handing it the original id made a clamped entry permanently unmatchable
     ("NOT_FOUND"), and the guard then cancelled and deleted a position that may
     well have been filled and live.
+
+    `common["quantity"]` IS UPDATED IN PLACE to the size actually sent. This
+    function used to clamp onto a private copy (`common = dict(common)`), so the
+    caller's dict still read the pre-clamp size. The option entry path arms the
+    stop guard from that dict, and the guard's `qty` is what the ENTRY CHASE
+    re-places after cancelling an unfilled entry — through
+    `_place_option_limit_entry`, which by design re-runs NO sizing, drift or
+    funds gate. A 10-contract signal clamped to 4 for affordability therefore
+    came back as a 10-contract order at a HIGHER chase limit: the funds clamp
+    undone by the one path that never re-checks funds.
     """
     requested = int(common["quantity"])
     unit_name = "contract" if kind == "option" else "share"
@@ -10935,7 +11160,8 @@ async def _place_entry_with_funds_clamp(
                     f"💰 Pre-flight size clamp: {common.get('symbol')} qty {requested} → {affordable} "
                     f"(available ≈${available:.2f}, {unit_name} cost ≈${unit_cost:.2f})"
                 )
-                common = dict(common)
+                # IN PLACE, deliberately — see the docstring. The caller arms
+                # the stop guard (and thus the entry chase) from this dict.
                 common["quantity"] = affordable
                 requested = affordable
         else:
@@ -10968,6 +11194,10 @@ async def _place_entry_with_funds_clamp(
         final = await _place_order_smart(kind, retry, tokens)
         logger.info(f"✅ Clamped retry accepted: {clamped}x {common.get('symbol')} (was {requested})")
         placed_qty = clamped
+        # The broker-side clamp must reach the caller for the same reason the
+        # pre-flight one does: whatever rests at the broker is `clamped`, and
+        # the chase would otherwise re-place the original oversized quantity.
+        common["quantity"] = clamped
     if unit_cost is not None and unit_cost > 0:
         try:
             await state.adjust_balance(-float(unit_cost) * placed_qty)
@@ -16398,8 +16628,7 @@ async def alerts_config_set(
     """Set (or clear) the alert delivery webhook live — no redeploy needed.
     Body: { "webhook_url": "https://…" | "" , "min_severity": "warning" }.
     Accepts Slack, Discord, ntfy, or any generic JSON receiver URL."""
-    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
-        raise HTTPException(401, "invalid secret")
+    await _require_control_auth(x_rork_secret, "/alerts/config")
     url = body.get("webhook_url")
     sev = body.get("min_severity")
     if url is not None and not isinstance(url, str):
@@ -16424,8 +16653,7 @@ async def alerts_test(
     """Fire a test alert through the FULL delivery chain and report whether the
     webhook accepted it — lets the user prove delivery works BEFORE relying on
     it for kill-switch / unprotected-position alerts."""
-    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
-        raise HTTPException(401, "invalid secret")
+    await _require_control_auth(x_rork_secret, "/alerts/test")
     result = await alerts.test_fire()
     return {**result, "config": await alerts.get_config()}
 
@@ -16448,8 +16676,7 @@ async def setup_evidence_import(
     Body: { "trades": [{import_id, setup, r_multiple, realized_pnl_pct,
     closed_at, symbol}] }.
     """
-    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
-        raise HTTPException(401, "invalid secret")
+    await _require_control_auth(x_rork_secret, "/setup/evidence")
 
     history = trade_ledger.recent(SETUP_VETO_LOOKBACK)
     # The stored ROWS, not just their ids: a re-push that fills in a basis the
@@ -16555,8 +16782,7 @@ async def policy_set(
     `envelope`. Anything clamped or ignored comes back in `clamped`/`ignored`
     and is republished on /status, so the app can show the number that is
     really binding instead of the one it asked for."""
-    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
-        raise HTTPException(401, "invalid secret")
+    await _require_control_auth(x_rork_secret, "/policy")
     result = await apply_policy_patch(body or {}, "app")
     if result["changes"]:
         await alerts.send(
@@ -16584,8 +16810,7 @@ async def scanner_config_set(
     Body: { "mode": "off"|"shadow"|"live", "universe": ["AAPL", ...],
             "interval_seconds": 60, "min_score": 75, "min_rvol": 1.5,
             "max_spread_pct": 0.35, "max_signals_per_day": 3 }"""
-    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
-        raise HTTPException(401, "invalid secret")
+    await _require_control_auth(x_rork_secret, "/scanner/config")
     if scanner is None:
         raise HTTPException(503, "scanner not initialized")
     before = scanner.config["mode"]
@@ -16608,8 +16833,7 @@ async def scanner_scan_now(
 ):
     """Force one scan pass immediately and return the full report — lets the
     user prove the scanner sees the market without waiting for the cadence."""
-    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
-        raise HTTPException(401, "invalid secret")
+    await _require_control_auth(x_rork_secret, "/scanner/scan")
     if scanner is None:
         raise HTTPException(503, "scanner not initialized")
     if load_tokens() is None:
@@ -16662,8 +16886,7 @@ async def daily_pnl_repair(
     """Re-verify today's realized P&L against the immutable ledger and correct
     it when the old inverted-sign bug polluted the daily loss-limit counter.
     `?dry_run=true` reports what would change without writing."""
-    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
-        raise HTTPException(401, "invalid secret")
+    await _require_control_auth(x_rork_secret, "/daily-pnl/repair")
     if dry_run:
         day = _utcnow().date().isoformat()
         replay = recompute_daily_pnl(trade_ledger.recent(PNL_REPAIR_LEDGER_SCAN), day)
@@ -16680,8 +16903,7 @@ async def daily_pnl_repair(
 
 @app.post("/kill")
 async def kill(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret")):
-    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
-        raise HTTPException(401, "invalid secret")
+    await _require_control_auth(x_rork_secret, "/kill")
     await state.set_killed(True)
     logger.warning("KILL SWITCH activated (distributed — all workers respect it)")
     open_tickers = await state.position_tickers()
@@ -16707,8 +16929,7 @@ async def flatten(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secr
     price. Per-position failures are reported, never fatal - one bad contract must
     not strand the rest of the book.
     """
-    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
-        raise HTTPException(401, "invalid secret")
+    await _require_control_auth(x_rork_secret, "/flatten")
 
     await state.set_killed(True)
     positions = await state.all_positions()
@@ -16819,8 +17040,7 @@ async def flatten(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secr
 
 @app.post("/resume")
 async def resume(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret")):
-    if WEBHOOK_SECRET and x_rork_secret != WEBHOOK_SECRET:
-        raise HTTPException(401, "invalid secret")
+    await _require_control_auth(x_rork_secret, "/resume")
     await state.set_killed(False)
     logger.info("Kill switch released — trading resumed")
     await trade_ledger.record("kill_switch_released", {})
