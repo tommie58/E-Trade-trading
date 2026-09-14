@@ -3625,6 +3625,54 @@ MIN_GIVEBACK_LOCK_R = 1.0
 GIVEBACK_COST_MULT = 3
 # Multiple of the bid/ask spread the trail must always clear.
 SPREAD_FLOOR_MULT = 1.5
+# MFE percent at which the profit-lock floor starts protecting part of the run.
+# Deliberately ABOVE BREAKEVEN_TRIGGER_PCT: the band between them is where a
+# young trade is held at entry to keep working.
+PROFIT_LOCK_TRIGGER_PCT = 0.2
+
+# Profit-lock ladder: (minimum MFE percent, fraction of the run locked in).
+#
+# THE DEAD BAND THIS CLOSES (added 5.60.0, from a live MSFT round-trip).
+#
+# A $9.00 call with the standard 30%-of-premium stop has R = $2.70. The R
+# ladder's first rung ("protect") needs +1R, i.e. a +30% premium move. The
+# give-back cap needs to lock MIN_GIVEBACK_LOCK_R = 1R before it may govern,
+# which at the 0.70 keep rung needs a +43% run. So between the breakeven lock
+# at +8% and +30% the ONLY protection was breakeven: the trade ran to about
+# +28% (~$252 of open profit on one contract) and round-tripped to a scratch
+# with its stop still resting at the fill price.
+#
+# That is NOT the give-back cap failing. The cap was right to stand down:
+# firing there books a fraction of R that a 38% win rate cannot pay for. Two
+# things are true at once - the run was not worth HARVESTING, and giving all of
+# it back was not acceptable either. The missing piece was never a tighter
+# trail, it was a FLOOR.
+#
+# BE HONEST ABOUT THE COST. A floor above the previous stop DOES trigger
+# earlier on a pullback: the MSFT trade would have exited near 9.88 instead of
+# riding back to 9.00. That is the trade being made - a smaller winner on the
+# paths that retrace, in exchange for never returning a whole run to a scratch.
+#
+# SCOPE: only fills the gap where the R ladder has NOT engaged ("initial").
+# Once a real R rung governs ("protect" at +1R and above) that rung owns the
+# stop and this floor stands down.
+#
+# STARTS AT +20%, NOT AT THE BREAKEVEN TRIGGER. Between +8% and +20% the engine
+# deliberately holds the position at entry so it can keep working. Locking 15%
+# of a +10% run on a $4.90 premium protects about $0.07 while pulling the stop
+# into the noise a young trade needs to breathe through. This ladder is for the
+# band where the give-back is measured in HUNDREDS of dollars.
+#
+# INVARIANT: every lock is strictly below the keep at the same rung of
+# GIVEBACK_LADDER, so the floor always sits BELOW the harvest level and
+# protection can never become harvesting by the back door.
+#
+# MUST STAY EQUAL to the app's trailingEngine.PROFIT_LOCK_LADDER - the parity
+# test reads both files and fails if they drift.
+PROFIT_LOCK_LADDER = (
+    (0.30, 0.40),
+    (PROFIT_LOCK_TRIGGER_PCT, 0.35),
+)
 
 # Profit-tier ladder: (minimum MFE in R, trail distance as fraction of R, tier).
 TIER_LADDER = (
@@ -3648,6 +3696,7 @@ TRAIL_TIER_LABEL = {
     "locked": "+2R — trailing 0.50R",
     "runner": "+3R runner — trailing 0.35R",
     "giveback": "Profit give-back capped",
+    "profit_lock": "Profit locked in",
 }
 
 
@@ -3679,6 +3728,18 @@ def trail_tier_for(r_multiple: float) -> Dict[str, Any]:
     if r_multiple >= BREAKEVEN_TRIGGER_R:
         return {"tier": "breakeven", "frac": 1.0}
     return {"tier": "initial", "frac": 1.0}
+
+
+def profit_lock_for(mfe_percent: float) -> Optional[float]:
+    """Fraction of the open run the profit-lock floor protects at this MFE
+    percent, or None when the run is too small for anything beyond breakeven."""
+    pct = _finite(mfe_percent)
+    if pct is None:
+        return None
+    for min_pct, lock in PROFIT_LOCK_LADDER:
+        if pct >= min_pct:
+            return lock
+    return None
 
 
 def giveback_keep_for(mfe_percent: float) -> Optional[float]:
@@ -3800,6 +3861,35 @@ def compute_trail_level(
 
     if r_multiple >= BREAKEVEN_TRIGGER_R or mfe_percent >= BREAKEVEN_TRIGGER_PCT:
         raw = max(raw, entry) if is_buy else min(raw, entry)
+
+    # Profit-lock floor: raise the worst acceptable exit above a scratch as the
+    # run extends. Only where the R ladder has NOT engaged - once "protect" or
+    # better governs, that rung owns the stop. Held outside the spread so a
+    # wide chain can never stop itself out on its own quote.
+    # "Engaged" means a rung that actually TIGHTENS (frac < 1.0): protect,
+    # locked, runner. NOT "breakeven", whose frac is 1.0 - identical to
+    # initial. Testing the tier name instead of the fraction silently switched
+    # protection back OFF at 0.75R: a 30%-premium-stop position locked $63 at
+    # +20% and then $0 again at +25%, because the rung label had changed while
+    # the trail distance had not.
+    r_ladder_engaged = rung["frac"] < 1.0
+    lock_fraction = None if r_ladder_engaged else profit_lock_for(mfe_percent)
+    if lock_fraction is not None and mfe > 0:
+        spread_gap = (
+            min(risk, SPREAD_FLOOR_MULT * spread_f)
+            if spread_f is not None and spread_f > 0
+            else 0.0
+        )
+        ceiling = (water_mark - spread_gap) if is_buy else (water_mark + spread_gap)
+        lock_level = (
+            min(entry + lock_fraction * mfe, ceiling)
+            if is_buy
+            else max(entry - lock_fraction * mfe, ceiling)
+        )
+        if (lock_level > raw) if is_buy else (lock_level < raw):
+            raw = lock_level
+            if tier in ("breakeven", "initial"):
+                tier = "profit_lock"
 
     trail = max(stop, raw) if is_buy else min(stop, raw)
     prev = _finite(prev_trail)
@@ -5787,7 +5877,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.59.0-position-truth"
+BOT_VERSION = "5.60.0-profit-lock"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
