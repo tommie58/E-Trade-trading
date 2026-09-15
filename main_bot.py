@@ -3928,6 +3928,340 @@ def native_trail_offset(
     }
 
 
+# A premium target more than this multiple of the entry premium is not a
+# target, it is an UNDERLYING price that leaked into a premium field. The
+# live book carried an AAPL put at 9.00 of premium whose `target` was 335 —
+# the underlying level. Comparing the two says "never take profit" forever,
+# which is exactly the silence this guard exists to break.
+MAX_TARGET_PREMIUM_MULT = 8.0
+
+
+# Delta assumed when the chain never supplied one. Mirrors the app's
+# `optionStop.ASSUMED_ATM_DELTA` — an at-the-money contract moves about half
+# the underlying. Flagged as assumed wherever it is used so a target derived
+# from a guess is never presented as a measured one.
+ASSUMED_ATM_DELTA = 0.5
+
+
+def derive_target_premium(
+    entry_premium: Any,
+    underlying_entry: Any,
+    underlying_target: Any,
+    delta: Any = None,
+) -> Dict[str, Any]:
+    """Translate an UNDERLYING price target into a PREMIUM target.
+
+    Returns ``{"target": float|None, "delta_used": float, "delta_assumed": bool,
+    "basis": str, "detail": str}``.
+
+    The signal's objective is a price on the UNDERLYING; the option position is
+    marked in PREMIUM. Without this translation the two are incomparable, and
+    the take-profit that is supposed to bank winners can never fire.
+
+    Linear delta, deliberately conservative in the same direction as the stop
+    translation: gamma makes a long option gain premium slightly FASTER than
+    delta predicts as it moves in your favour, so the modelled target is
+    reached a touch late rather than early. Late means the position is still
+    working when it fires; early means banking less than the plan promised.
+
+    Refuses (target None) on an incomplete basis — an unmeasured target is
+    unknown, not zero, and the trail must stay in charge.
+    """
+    entry_p = _finite(entry_premium)
+    u_entry = _finite(underlying_entry)
+    u_target = _finite(underlying_target)
+
+    raw_delta = _finite(delta)
+    delta_assumed = raw_delta is None or abs(raw_delta) <= 0
+    delta_used = ASSUMED_ATM_DELTA if delta_assumed else min(1.0, max(0.05, abs(raw_delta)))
+
+    def refuse(why: str) -> Dict[str, Any]:
+        return {"target": None, "delta_used": delta_used,
+                "delta_assumed": delta_assumed, "basis": "unknown", "detail": why}
+
+    if entry_p is None or entry_p <= 0:
+        return refuse("no entry premium — a premium target needs a cost basis")
+    if u_entry is None or u_target is None:
+        return refuse("underlying entry/target incomplete — nothing to translate")
+
+    move = abs(u_target - u_entry)
+    if move <= 0:
+        return refuse("target sits on the entry — no move to translate")
+
+    gain = move * delta_used
+    target = _round2(entry_p + gain)
+    return {
+        "target": target,
+        "delta_used": delta_used,
+        "delta_assumed": delta_assumed,
+        "basis": "delta_assumed" if delta_assumed else "delta",
+        "detail": (
+            f"{move:.2f} underlying move x {delta_used:.2f} delta"
+            f"{' (ASSUMED)' if delta_assumed else ''} = {gain:.2f} premium — "
+            f"target {target:.2f} on a {entry_p:.2f} entry"
+        ),
+    }
+
+
+def plan_take_profit(
+    position: Dict[str, Any],
+    mark: Any,
+    spread: Any = None,
+) -> Dict[str, Any]:
+    """Decide whether a position's PREMIUM mark has reached its PREMIUM target.
+
+    Returns ``{"fire": bool, "target": float|None, "basis": str, "detail": str}``.
+
+    THE BASIS IS THE WHOLE BUG. A tracked option position stores `target` as an
+    UNDERLYING price (the signal's price objective) while everything that marks
+    the position — the trail, the stop, the scale-out — works in PREMIUM. A
+    take-profit comparing a 6.85 premium mark against a 335 underlying target
+    can never fire, so a target tag was unreachable by construction. This
+    function therefore reads `target_premium` ONLY, and refuses when it is
+    absent rather than falling back to the underlying number.
+
+    REFUSES ON A MISSING PREMIUM TARGET. An unmeasured target is not a target
+    at zero and not a target at infinity — it is unknown, and the honest
+    answer is to leave the trail in charge and say so.
+
+    The caller must pass the mark on the exitable side of the book (the BID for
+    a long option). A target "tagged" on the ask is a target tagged at a price
+    nobody would pay: the position would be closed into the spread, booking
+    less than the target it claims to have hit.
+    """
+    mark_f = _finite(mark)
+    if mark_f is None or mark_f <= 0:
+        return {"fire": False, "target": None, "basis": "no_mark",
+                "detail": "no usable mark — nothing to compare a target against"}
+
+    entry = _finite(position.get("entry_premium"))
+    if entry is None or entry <= 0:
+        return {"fire": False, "target": None, "basis": "no_entry",
+                "detail": "entry premium unknown — a target needs a cost basis to mean anything"}
+
+    target = _finite(position.get("target_premium"))
+    if target is None or target <= 0:
+        return {
+            "fire": False, "target": None, "basis": "no_premium_target",
+            "detail": (
+                "no premium target recorded — the underlying `target` cannot be "
+                "compared to a premium mark, so the trail stays in charge"
+            ),
+        }
+
+    # A target at or below the cost basis is not a profit objective.
+    if target <= entry:
+        return {
+            "fire": False, "target": target, "basis": "target_below_entry",
+            "detail": (
+                f"premium target {target:.2f} sits at or below the {entry:.2f} entry — "
+                f"that is a stop, not a target; refusing to treat it as profit"
+            ),
+        }
+
+    # BASIS SANITY. Catches an underlying price stored in the premium field.
+    if target > entry * MAX_TARGET_PREMIUM_MULT:
+        return {
+            "fire": False, "target": target, "basis": "basis_mismatch",
+            "detail": (
+                f"premium target {target:.2f} is {target / entry:.0f}x the {entry:.2f} "
+                f"entry premium — that is an underlying price in a premium field, "
+                f"not a reachable target"
+            ),
+        }
+
+    if mark_f < target:
+        return {
+            "fire": False, "target": target, "basis": "working",
+            "detail": f"mark {mark_f:.2f} has not reached the {target:.2f} premium target",
+        }
+
+    spread_f = _finite(spread)
+    spread_note = f", spread {spread_f:.2f}" if (spread_f is not None and spread_f > 0) else ""
+    gain_pct = (mark_f - entry) / entry * 100.0
+    return {
+        "fire": True, "target": target, "basis": "target_tagged",
+        "detail": (
+            f"exitable mark {mark_f:.2f} reached the {target:.2f} premium target "
+            f"(+{gain_pct:.1f}% on a {entry:.2f} entry{spread_note})"
+        ),
+    }
+
+
+# The app's Auto-Exit card promises a 3:40 PM ET hard flatten and an 8-hour
+# max hold. Minute-of-day in ET, and hours.
+EOD_FLATTEN_MINUTE = 15 * 60 + 40
+MARKET_CLOSE_MINUTE = 16 * 60
+DEFAULT_MAX_HOLD_HOURS = 8.0
+
+
+def plan_scheduled_exit(
+    held_seconds: Any,
+    et_minutes: Any,
+    weekday: Any,
+    max_hold_hours: Any = None,
+    eod_enabled: bool = True,
+    time_exit_enabled: bool = True,
+) -> Dict[str, Any]:
+    """Do the CLOCK-driven exits fire? Returns
+    ``{"fire": bool, "reason": str|None, "detail": str}``.
+
+    Two exits the app's card promises and the bot could not perform:
+
+      EOD HARD FLATTEN — from 3:40 PM ET to the bell, every position closes.
+        This is the guarantee that a same-day (0DTE) option can never be held
+        into the close and expire worthless. The app enforced it only while the
+        phone was awake; a locked phone at 3:40 meant the promise silently did
+        not apply, and an expiring contract went to zero.
+
+      MAX HOLD — a position that has reached neither target nor stop in
+        `max_hold_hours` is not working. Holding it longer only pays theta.
+
+    The EOD flatten OUTRANKS the max-hold timer: inside the window everything
+    goes regardless of age, so an aging position never escapes the window by
+    also qualifying for the softer reason.
+
+    Fails CLOSED on unreadable inputs — these exits DESTROY positions, so an
+    unparseable clock must never be able to liquidate the book. (The protective
+    stop and the trail both still run, and they fail OPEN; the asymmetry is
+    deliberate.)
+    """
+    minutes = _finite(et_minutes)
+    day = str(weekday or "")
+    is_weekend = day in ("Sat", "Sun")
+
+    if eod_enabled and minutes is not None and not is_weekend:
+        if EOD_FLATTEN_MINUTE <= minutes < MARKET_CLOSE_MINUTE:
+            hh, mm = divmod(int(minutes), 60)
+            return {
+                "fire": True, "reason": "eod_flatten",
+                "detail": (
+                    f"{hh:02d}:{mm:02d} ET is inside the hard-flatten window — "
+                    f"a same-day option must never be held into the close"
+                ),
+            }
+
+    if time_exit_enabled:
+        held = _finite(held_seconds)
+        hours = _finite(max_hold_hours)
+        if hours is None or hours <= 0:
+            hours = DEFAULT_MAX_HOLD_HOURS
+        if held is not None and held >= hours * 3600.0:
+            return {
+                "fire": True, "reason": "time_exit",
+                "detail": (
+                    f"held {held / 3600.0:.1f}h with neither target nor stop reached "
+                    f"(max {hours:.0f}h) — the position is paying theta, not working"
+                ),
+            }
+
+    return {"fire": False, "reason": None, "detail": "no scheduled exit is due"}
+
+
+# Mirrors main_bot's `_REALTIME_QUOTE_STATUSES`. E*TRADE stamps every quote
+# with what entitlement served it; anything else ("DELAYED", "CLOSING", or an
+# empty string) is NOT a live print.
+REALTIME_MARK_STATUSES = frozenset({"REALTIME", "EH_REALTIME"})
+# A quote older than this cannot price an exit on a 30-second loop. Well under
+# the 15 minutes a delayed entitlement runs behind, so a stalled feed that keeps
+# re-serving one print is caught even when it claims REALTIME.
+MAX_MARK_AGE_SECONDS = 180.0
+
+
+def assess_mark_quality(
+    quote_status: Any,
+    quote_time_utc: Any,
+    now_epoch: Any,
+    max_age_seconds: Any = None,
+) -> Dict[str, Any]:
+    """Is this mark good enough to SELL a position on? Returns
+    ``{"trusted": bool, "realtime": bool, "age_seconds": float|None,
+    "reason": str, "detail": str}``.
+
+    THE MISSING PROVENANCE. `_current_bid_ask` reads `All.bid`/`All.ask` and
+    throws away the two fields that say whether the number is real:
+    `quoteStatus` (which entitlement served it) and `dateTimeUTC` (when the
+    exchange printed it). Every exit added since then — take-profit, scale-out
+    — decided on a bare float with no way to know it was 15 minutes old.
+
+    That is not hypothetical on this account: E*TRADE is serving DELAYED
+    quotes for 24 symbols because the real-time market data agreement was never
+    accepted. The APP already refuses to price live entries off those prints.
+    The BOT, which is the half that actually sells, never checked — so a
+    take-profit could fire on a 13.19 that stopped being true a quarter of an
+    hour ago, booking a "win" that is a loss at the real bid.
+
+    Ages against the BROKER'S OWN timestamp, never against when the HTTP call
+    returned: a stalled feed re-serving the same 09:47 print is otherwise
+    indistinguishable from a live one.
+
+    FAILS CLOSED for the price-driven decisions that consume it — an unreadable
+    status or a missing timestamp means "not trusted", exactly as the app
+    treats an unknown entitlement as delayed. Never invent REALTIME.
+
+    Pure: no I/O, fully unit-testable.
+    """
+    status = str(quote_status or "").upper().strip()
+    realtime = status in REALTIME_MARK_STATUSES
+
+    limit = _finite(max_age_seconds)
+    if limit is None or limit <= 0:
+        limit = MAX_MARK_AGE_SECONDS
+
+    printed = _finite(quote_time_utc)
+    now = _finite(now_epoch)
+    age: Optional[float] = None
+    if printed is not None and now is not None:
+        # E*TRADE sends epoch SECONDS; a millisecond epoch is ~1000x larger and
+        # would otherwise read as a 55-year-old quote and refuse every exit.
+        if printed > 1e11:
+            printed = printed / 1000.0
+        age = now - printed
+
+    if not status:
+        return {
+            "trusted": False, "realtime": False, "age_seconds": age,
+            "reason": "unknown_status",
+            "detail": "the quote carries no entitlement status — unknown is treated as delayed, never as live",
+        }
+    if not realtime:
+        return {
+            "trusted": False, "realtime": False, "age_seconds": age,
+            "reason": "delayed_entitlement",
+            "detail": (
+                f"quoteStatus={status} — this is a DELAYED print; accept the real-time "
+                f"market data agreement on the E*TRADE account"
+            ),
+        }
+    if age is None:
+        return {
+            "trusted": False, "realtime": True, "age_seconds": None,
+            "reason": "no_quote_time",
+            "detail": "the quote carries no exchange timestamp — its age cannot be proven",
+        }
+    if age > limit:
+        return {
+            "trusted": False, "realtime": True, "age_seconds": age,
+            "reason": "stale_print",
+            "detail": (
+                f"the last print is {age:.0f}s old (limit {limit:.0f}s) — the feed is "
+                f"stalled even though it claims real-time"
+            ),
+        }
+    # A clock skewed far into the future would make a stale quote look fresh.
+    if age < -limit:
+        return {
+            "trusted": False, "realtime": True, "age_seconds": age,
+            "reason": "clock_skew",
+            "detail": f"the print is timestamped {-age:.0f}s in the FUTURE — the clocks disagree",
+        }
+    return {
+        "trusted": True, "realtime": True, "age_seconds": age,
+        "reason": "realtime_fresh",
+        "detail": f"real-time print, {max(age, 0.0):.0f}s old",
+    }
+
+
 def trail_tier_for(r_multiple: float) -> Dict[str, Any]:
     """Resolve the tier + trail fraction for a given MFE in R multiples."""
     for min_r, frac, tier in TIER_LADDER:
@@ -6089,7 +6423,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.61.0-native-trail"
+BOT_VERSION = "5.63.0-mark-provenance"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -6272,6 +6606,30 @@ PROFIT_LOCK_MIN_CUSHION_USD = float(os.getenv("PROFIT_LOCK_MIN_CUSHION_USD", "50
 DEBUG_QUOTES = os.getenv("DEBUG_QUOTES", "false").lower() == "true"
 SCALE_OUT_ENABLED = os.getenv("SCALE_OUT_ENABLED", "true").lower() == "true"
 SCALE_OUT_FIRST_TARGET_PCT = float(os.getenv("SCALE_OUT_FIRST_TARGET_PCT", "14.0"))
+# SERVER-SIDE TAKE PROFIT. The app's Auto-Exit card promises "lock in winners
+# the moment price tags the signal target" and implements it — but only while
+# the phone is awake and in the foreground. The bot owned every other exit
+# (stop, trail, scale-out) and had no take-profit at all, so the `target`
+# written onto each position at entry was never read by anything. On by
+# default: a promised exit that only sometimes exists is worse than none.
+TAKE_PROFIT_ENABLED = os.getenv("TAKE_PROFIT_ENABLED", "true").lower() == "true"
+# The clock-driven exits the same card promises: the 3:40 PM ET hard flatten
+# ("same-day options can never be held into the close and expire worthless")
+# and the 8-hour max hold. Both were app-foreground-only too, so a locked
+# phone at 3:40 meant an expiring contract rode to zero — which is why the
+# bot already carries an `expired_worthless` close reason.
+SCHEDULED_EXIT_ENABLED = os.getenv("SCHEDULED_EXIT_ENABLED", "true").lower() == "true"
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "8"))
+# A mark older than this cannot price a harvesting exit on a 30s loop. Well
+# inside the 15 minutes a DELAYED entitlement runs behind, so a stalled feed is
+# caught even when it claims REALTIME.
+MAX_MARK_AGE_SECONDS = float(os.getenv("MAX_MARK_AGE_SECONDS", "180"))
+# Set true only to harvest on delayed prints (paper/debug). The PROTECTIVE
+# exits — stop, trail, EOD flatten — are never gated on this: refusing to
+# protect a position because the feed is bad is the more dangerous mistake.
+ALLOW_UNTRUSTED_MARK_EXITS = (
+    os.getenv("ALLOW_UNTRUSTED_MARK_EXITS", "false").lower() == "true"
+)
 # A trailing exit may not fire inside this many seconds of the entry fill. The
 # hard stop is NEVER delayed — this only stops quote noise from flattening a
 # position that has barely started working.
@@ -12124,10 +12482,51 @@ async def _cancel_order_safe(order_id: Optional[str]) -> bool:
     return await _cancel_order_verified(order_id) == CANCEL_CONFIRMED
 
 
+# PROVENANCE OF THE LAST MARK. `_current_bid_ask` returns bare floats, so the
+# entitlement and exchange timestamp that came with the quote had nowhere to
+# live and were dropped. Harvesting exits need them: a DELAYED print can be 15
+# minutes stale, and selling on one books a "win" that is a loss at the real
+# bid. Keyed by the exact quote symbol (option contracts included) and only
+# ever written by the fetch itself, so it can never outlive its own quote.
+_LAST_MARK_QUALITY: Dict[str, Dict[str, Any]] = {}
+
+
+def last_mark_quality(ticker: str, contract: Optional[dict] = None) -> Dict[str, Any]:
+    """Quality verdict for the most recent `_current_bid_ask` on this symbol.
+
+    Unknown symbol → NOT trusted. A missing entry means no quote was recorded,
+    which is exactly the condition that must never read as "fine to sell".
+    """
+    rec = _LAST_MARK_QUALITY.get(_quote_symbol(ticker, contract))
+    if not rec:
+        return {
+            "trusted": False, "realtime": False, "age_seconds": None,
+            "reason": "no_quote_recorded",
+            "detail": "no quote provenance was recorded for this symbol",
+        }
+    return dict(rec)
+
+
+def _quote_symbol(ticker: str, contract: Optional[dict] = None) -> str:
+    """E*TRADE quote symbol for an equity or a specific option contract."""
+    if contract:
+        exp = str(contract.get("expiration") or "")[:10]
+        parts = exp.split("-")
+        if len(parts) == 3 and contract.get("strike") is not None:
+            right = "CALL" if str(contract.get("right") or "").upper().startswith("C") else "PUT"
+            return f"{ticker}:{int(parts[0])}:{int(parts[1])}:{int(parts[2])}:{right}:{float(contract['strike']):g}"
+    return ticker
+
+
 async def _current_bid_ask(ticker: str, contract: Optional[dict] = None) -> Tuple[float, float]:
     """Best-effort live (bid, ask) for an equity — or a specific option
     contract via E*TRADE's SYMBOL:YYYY:MM:DD:TYPE:STRIKE quote syntax.
-    Returns (0.0, 0.0) when no quote is available; callers must handle it."""
+    Returns (0.0, 0.0) when no quote is available; callers must handle it.
+
+    Also records the quote's PROVENANCE (entitlement + exchange timestamp) in
+    `_LAST_MARK_QUALITY` so exits can ask whether the number they are about to
+    sell on is actually real. The price contract is unchanged — callers that
+    only need a number are untouched."""
     tokens = load_tokens()
     if not tokens:
         return 0.0, 0.0
@@ -12136,13 +12535,7 @@ async def _current_bid_ask(ticker: str, contract: Optional[dict] = None) -> Tupl
             CONSUMER_KEY, CONSUMER_SECRET,
             tokens["oauth_token"], tokens["oauth_token_secret"], dev=is_sandbox,
         )
-        sym = ticker
-        if contract:
-            exp = str(contract.get("expiration") or "")[:10]
-            parts = exp.split("-")
-            if len(parts) == 3 and contract.get("strike") is not None:
-                right = "CALL" if str(contract.get("right") or "").upper().startswith("C") else "PUT"
-                sym = f"{ticker}:{int(parts[0])}:{int(parts[1])}:{int(parts[2])}:{right}:{float(contract['strike']):g}"
+        sym = _quote_symbol(ticker, contract)
         resp = await _etrade_call(market.get_quote, [sym], resp_format="json", source="stop_reprice_quote")
         data = (((resp or {}).get("QuoteResponse") or {}).get("QuoteData")) or []
         if isinstance(data, dict):
@@ -12152,9 +12545,15 @@ async def _current_bid_ask(ticker: str, contract: Optional[dict] = None) -> Tupl
             try:
                 bid = max(0.0, float(all_q.get("bid") or 0))
                 ask = max(0.0, float(all_q.get("ask") or 0))
-                return bid, ask
             except (TypeError, ValueError):
                 continue
+            # Stamped from the SAME response that produced the price, so the
+            # verdict can never describe a different quote than the one used.
+            _LAST_MARK_QUALITY[sym] = trailing_engine.assess_mark_quality(
+                q.get("quoteStatus"), q.get("dateTimeUTC"), time.time(),
+                max_age_seconds=MAX_MARK_AGE_SECONDS,
+            )
+            return bid, ask
     except Exception as e:
         logger.warning(f"reprice quote failed for {ticker}: {e}")
     return 0.0, 0.0
@@ -12598,6 +12997,49 @@ async def _place_option_limit_entry(ticker: str, contract: dict, qty: int,
     return _order_id_from_place(placed)
 
 
+def _mark_trusted_for_harvest(ticker: str, contract: Optional[dict], label: str) -> bool:
+    """May a HARVESTING exit act on the last mark for this symbol?
+
+    THE GAP THIS CLOSES. `_current_bid_ask` used to return bare floats, so
+    take-profit and scale-out decided on a number with no idea whether it was a
+    real-time print or a 15-minute-old DELAYED one. On this account that is the
+    live condition, not a hypothetical: E*TRADE is serving DELAYED quotes
+    because the real-time market data agreement was never accepted. The APP
+    already refuses to price entries off those prints; the BOT, which is the
+    half that actually sells, did not check at all.
+
+    Selling on a stale print books a number that was true a quarter of an hour
+    ago — a "win" that can be a loss at the real bid. Refusing costs one
+    deferred pass 30 seconds later.
+
+    PROTECTIVE exits deliberately do NOT consult this. The stop, the trail and
+    the 3:40 flatten must run on whatever the broker will tell us: refusing to
+    protect a position because the feed is degraded is the far more dangerous
+    mistake. Only the two exits that HARVEST are gated.
+    """
+    quality = last_mark_quality(ticker, contract)
+    if quality["trusted"]:
+        return True
+    if ALLOW_UNTRUSTED_MARK_EXITS:
+        logger.warning(
+            f"[{label}] {ticker} acting on an UNTRUSTED mark — {quality['detail']} "
+            f"(ALLOW_UNTRUSTED_MARK_EXITS=true)"
+        )
+        return True
+    logger.warning(
+        f"[{label}] {ticker} target reached on an untrusted mark — {quality['detail']}; "
+        f"holding rather than selling on a price that may not be real "
+        f"(the stop and trail still protect this position)"
+    )
+    asyncio.create_task(alerts.send(
+        "warning", "harvest_blocked_untrusted_mark",
+        f"{ticker}: a take-profit/scale-out was due but the quote is not trustworthy — "
+        f"{quality['detail']}. The position stays open and protected.",
+        dedupe_key=f"untrustedmark:{ticker}:{quality['reason']}",
+    ))
+    return False
+
+
 async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
     """Bank half the position at the first target and let the rest run.
 
@@ -12633,6 +13075,10 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
         return False
     gain_pct = (mark - entry_premium) / entry_premium * 100.0
     if gain_pct < split["first_target_pct"]:
+        return False
+
+    # The gain above is only as real as the print it was measured on.
+    if not _mark_trusted_for_harvest(ticker, contract, "SCALE-OUT"):
         return False
 
     scale_qty = int(split["scale_qty"])
@@ -12755,6 +13201,345 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
             "order_id": close_id,
         },
         dedupe_key=f"sellfill:scale:{close_id}:{scale_qty}",
+    )
+    return True
+
+
+async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
+                            spread: Optional[float] = None) -> bool:
+    """Close the FULL position when its premium mark reaches the premium target.
+
+    THE MISSING EXIT. The app's Auto-Exit card advertises "Take-profit
+    auto-close — lock in winners the moment price tags the signal target", and
+    the app does implement it — but only while the phone is awake, in the
+    foreground, with fresh quotes. The bot, which runs 24/7 and owns every
+    other exit (stop, trail, scale-out), had NO take-profit at all: `target`
+    was written onto the position at entry and then never read by anything.
+    So a winner that tagged its target while the app was closed just kept
+    running until the trail gave the move back — the 2.18R hand-back the
+    journal reports, on 64% of instrumented losses that first ran +0.5R.
+
+    Returns True when the position was closed (the caller must stop touching it).
+
+    ORDERING. This runs BEFORE the scale-out and before the ratchet: at the
+    target the whole position comes off, so banking half of it first and then
+    immediately closing the runner would pay two commissions and two spreads
+    for one decision.
+
+    Every failure path leaves the position PROTECTED — the resting stop is only
+    cancelled once, and if the close cannot be placed the stop is re-armed
+    before returning False.
+    """
+    if not TAKE_PROFIT_ENABLED or pos.get("take_profit_done"):
+        return False
+    contract = dict(pos.get("contract") or {})
+    if not contract.get("right"):
+        return False  # options only — equity targets are underlying-basis
+    try:
+        qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
+    except (TypeError, ValueError):
+        return False
+    if qty < 1:
+        return False
+
+    # BACKFILL FOR POSITIONS OPENED BEFORE THIS EXIT EXISTED. Their record has
+    # the UNDERLYING `target` and no `target_premium`, so without this they
+    # would keep running to the trail forever — the fix would only ever help
+    # trades opened after the deploy. Derived here from the SAME translation the
+    # entry path uses, stamped once, and flagged so the ledger can tell a
+    # backfilled target from one priced at entry.
+    if pos.get("target_premium") is None and pos.get("target") is not None:
+        back = trailing_engine.derive_target_premium(
+            pos.get("entry_premium"), pos.get("entry"), pos.get("target"),
+            (pos.get("contract") or {}).get("delta"),
+        )
+        if back["target"] is not None:
+            pos["target_premium"] = back["target"]
+            pos["target_premium_basis"] = f"{back['basis']}+backfilled"
+            pos["target_delta_assumed"] = bool(back["delta_assumed"])
+            await state.set_position(ticker, pos)
+            logger.info(f"[TAKE PROFIT] {ticker} premium target backfilled — {back['detail']}")
+        else:
+            # Stamped so this derivation is attempted once, not every 30s.
+            pos["target_premium_basis"] = "unavailable"
+            await state.set_position(ticker, pos)
+            logger.warning(
+                f"[TAKE PROFIT] {ticker} cannot derive a premium target — "
+                f"{back['detail']}; the trail is the only exit for this position"
+            )
+
+    # PROVENANCE BEFORE ACTION. Checked before the verdict is even computed so
+    # a delayed print cannot produce a "target tagged" line in the log that
+    # then does not fire — the log would read like a bug for the life of the
+    # position.
+    if not _mark_trusted_for_harvest(ticker, contract, "TAKE PROFIT"):
+        return False
+
+    verdict = trailing_engine.plan_take_profit(pos, mark, spread=spread)
+    if not verdict["fire"]:
+        # A basis mismatch is a REAL defect (an underlying price in a premium
+        # field), not a quiet "not yet" — say so once per ticker.
+        if verdict["basis"] in ("basis_mismatch", "target_below_entry"):
+            logger.warning(f"[TAKE PROFIT] {ticker} target unusable — {verdict['detail']}")
+        return False
+
+    # MIN HOLD. Same guard the trail uses: a target "tagged" in the first
+    # seconds of a position's life is usually the option's own spread
+    # breathing, not the move arriving. The hard stop is never delayed by this.
+    held = None
+    try:
+        opened = pos.get("ts")
+        if opened:
+            held = (_utcnow() - datetime.fromisoformat(str(opened))).total_seconds()
+    except (TypeError, ValueError):
+        held = None
+    allowed, hold_note = trail_exit_allowed(held if held is not None else float("inf"), False)
+    if not allowed:
+        logger.info(f"[TAKE PROFIT] {ticker} target tagged but {hold_note}")
+        return False
+
+    target = float(verdict["target"])
+    entry_premium = float(pos.get("entry_premium") or 0.0)
+    stop_order_id = pos.get("stop_order_id")
+
+    # A broker-native trail owns this leg's protection. Cancelling it here to
+    # bank the target is correct (the target outranks the trail), but it must
+    # be the SAME cancel-before-close discipline as the ordinary stop.
+    native_id = pos.get("native_trail_order_id")
+    resting_id = stop_order_id or native_id
+
+    if resting_id:
+        # The resting order already pledges the contracts. Selling while it
+        # rests earns E*TRADE 3004 on the one exit we most wanted.
+        outcome = await _cancel_order_verified(resting_id, expected_qty=qty)
+        if outcome == CANCEL_FILLED:
+            logger.warning(f"[TAKE PROFIT] {ticker} protective order filled first — nothing left to bank")
+            return False
+        if outcome == CANCEL_PARTIAL:
+            remaining = await _handle_partial_stop_fill(
+                ticker, resting_id, pos.get("stop_premium"), "take_profit_stop_partial",
+            )
+            if remaining > 0:
+                fresh = await state.get_position(ticker)
+                if fresh:
+                    try:
+                        await _reconcile_rearm_guard(ticker, dict(fresh))
+                    except Exception as e:
+                        logger.error(f"[TAKE PROFIT] {ticker} re-arm after partial fill FAILED: {e}")
+                        await alerts.send(
+                            "critical", "partial_fill_unprotected",
+                            f"{ticker}: the protective order filled part of the position while "
+                            f"banking the target and the remaining {remaining} could NOT be "
+                            f"re-protected — close them manually: {e}",
+                            dedupe_key=f"partial_unprotected:{ticker}",
+                        )
+            return False
+        if outcome != CANCEL_CONFIRMED:
+            logger.warning(
+                f"[TAKE PROFIT] {ticker} could not prove the resting order is dead ({outcome}) — "
+                f"skipping this pass rather than risking a double sale"
+            )
+            return False
+        pos["stop_order_id"] = None
+        pos["native_trail_order_id"] = None
+        await state.set_position(ticker, pos)
+
+    try:
+        close_id = await _place_option_market_close(ticker, contract, qty)
+    except Exception as e:
+        logger.error(f"[TAKE PROFIT] {ticker} close FAILED: {e} — re-arming protection")
+        try:
+            await _reconcile_rearm_guard(ticker, pos)
+        except Exception as re:
+            logger.error(f"[TAKE PROFIT] {ticker} stop re-arm after failed close ALSO failed: {re}")
+            await alerts.send(
+                "critical", "take_profit_unprotected",
+                f"{ticker}: the take-profit close failed AND the protective stop could not be "
+                f"re-armed — position is UNPROTECTED, manual review needed",
+                dedupe_key=f"tp_unprotected:{ticker}",
+            )
+        return False
+
+    # Mark it done BEFORE booking: a close is in flight at the broker, and a
+    # crash between here and the booking must never let the next pass sell a
+    # position that is already being sold.
+    pos["take_profit_done"] = True
+    pos["take_profit_order_id"] = close_id
+    await state.set_position(ticker, pos)
+
+    fill = await _resolve_exit_fill(close_id)
+    logger.info(
+        f"[TAKE PROFIT] {ticker} TARGET BANKED — {verdict['detail']} — sold {qty} "
+        f"(order {close_id}, fill {f'{fill:.2f}' if fill else 'pending'})"
+    )
+    await trade_ledger.record("take_profit_closed", {
+        "ticker": ticker, "qty": qty, "target_premium": round(target, 4),
+        "mark": round(float(mark), 4), "order_id": close_id,
+        "exit_premium": round(fill, 4) if fill else None,
+        "entry_premium": round(entry_premium, 4) if entry_premium > 0 else None,
+        "basis": pos.get("target_premium_basis"),
+        "delta_assumed": bool(pos.get("target_delta_assumed")),
+    })
+
+    # Book the close on the PREMIUM basis. Without a readable fill the booking
+    # is DEFERRED to the reconciler rather than guessing an exit price — the
+    # target level is what we aimed at, not necessarily what we got.
+    if fill:
+        payload_tp = {"ticker": ticker, "action": pos.get("action") or "BUY"}
+        await _record_close(ticker, None, payload_tp, exit_premium=float(fill),
+                            close_reason="take_profit")
+    else:
+        logger.warning(
+            f"[TAKE PROFIT] {ticker} close {close_id} has no readable fill yet — "
+            f"leaving the booking to the reconciler rather than inventing an exit price"
+        )
+    await _finish_guard(ticker, "closed_by_take_profit")
+    await alerts.send(
+        "info", "take_profit_closed",
+        f"{ticker}: take-profit target {target:.2f} tagged — {qty} contract(s) closed"
+        + (f" at {fill:.2f}" if fill else " (fill pending)"),
+        dedupe_key=f"tp:{ticker}:{close_id}",
+    )
+    return True
+
+
+async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
+    """Close the position when the CLOCK says it must go.
+
+    THE OTHER TWO MISSING EXITS. The Auto-Exit card promises four things; the
+    bot could perform two of them. `_maybe_take_profit` added the third. These
+    are the last two, and they are the ones that fail most quietly:
+
+      3:40 PM ET HARD FLATTEN — advertised as "every open position is
+        force-closed at 3:40 PM ET — same-day (0DTE) options can never be held
+        into the close and expire worthless". The app enforced it only while
+        the phone was awake and in the foreground. A locked phone at 3:40 meant
+        the guarantee silently did not apply and an expiring contract rode to
+        zero — the `expired_worthless` close reason the bot already has a label
+        for, which is the receipt of this exact failure.
+
+      8h MAX HOLD — advertised as "close stale positions that never reached
+        target or stop". Nothing server-side ever did.
+
+    Returns True when the position was closed. Failure paths re-arm protection,
+    exactly like the take-profit path.
+    """
+    if not SCHEDULED_EXIT_ENABLED or pos.get("scheduled_exit_done"):
+        return False
+    contract = dict(pos.get("contract") or {})
+    if not contract.get("right"):
+        return False  # options only — the 0DTE expiry risk is the whole point
+    try:
+        qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
+    except (TypeError, ValueError):
+        return False
+    if qty < 1:
+        return False
+
+    held = None
+    try:
+        opened = pos.get("ts")
+        if opened:
+            held = (_utcnow() - datetime.fromisoformat(str(opened))).total_seconds()
+    except (TypeError, ValueError):
+        held = None
+
+    now_et = _utcnow().astimezone(_ET_ZONE)
+    verdict = trailing_engine.plan_scheduled_exit(
+        held, now_et.hour * 60 + now_et.minute, now_et.strftime("%a"),
+        max_hold_hours=MAX_HOLD_HOURS,
+    )
+    if not verdict["fire"]:
+        return False
+
+    reason = str(verdict["reason"])
+    resting_id = pos.get("stop_order_id") or pos.get("native_trail_order_id")
+    if resting_id:
+        # Same cancel-before-close discipline as every other exit: the resting
+        # order pledges the contracts, so selling under it earns E*TRADE 3004.
+        outcome = await _cancel_order_verified(resting_id, expected_qty=qty)
+        if outcome == CANCEL_FILLED:
+            logger.warning(f"[{reason.upper()}] {ticker} protective order filled first — nothing left to close")
+            return False
+        if outcome == CANCEL_PARTIAL:
+            remaining = await _handle_partial_stop_fill(
+                ticker, resting_id, pos.get("stop_premium"), f"{reason}_stop_partial",
+            )
+            if remaining > 0:
+                fresh = await state.get_position(ticker)
+                if fresh:
+                    try:
+                        await _reconcile_rearm_guard(ticker, dict(fresh))
+                    except Exception as e:
+                        logger.error(f"[{reason.upper()}] {ticker} re-arm after partial fill FAILED: {e}")
+            return False
+        if outcome != CANCEL_CONFIRMED:
+            # INSIDE THE EOD WINDOW THIS IS URGENT. The position cannot be left
+            # to "the next pass" indefinitely — the bell is the deadline — but
+            # selling against an unproven resting order oversells into a naked
+            # short, which is worse than an expiring long. Escalate instead.
+            logger.warning(
+                f"[{reason.upper()}] {ticker} could not prove the resting order is dead "
+                f"({outcome}) — not risking a double sale"
+            )
+            if reason == "eod_flatten":
+                await alerts.send(
+                    "critical", "eod_flatten_blocked",
+                    f"{ticker}: the 3:40 PM ET flatten could NOT run — the resting protective "
+                    f"order could not be confirmed cancelled ({outcome}). Close this manually "
+                    f"before the bell or it may expire worthless.",
+                    dedupe_key=f"eodblocked:{ticker}:{now_et.date().isoformat()}",
+                )
+            return False
+        pos["stop_order_id"] = None
+        pos["native_trail_order_id"] = None
+        await state.set_position(ticker, pos)
+
+    try:
+        close_id = await _place_option_market_close(ticker, contract, qty)
+    except Exception as e:
+        logger.error(f"[{reason.upper()}] {ticker} close FAILED: {e} — re-arming protection")
+        try:
+            await _reconcile_rearm_guard(ticker, pos)
+        except Exception as re:
+            logger.error(f"[{reason.upper()}] {ticker} stop re-arm after failed close ALSO failed: {re}")
+        await alerts.send(
+            "critical", f"{reason}_failed",
+            f"{ticker}: the {reason.replace('_', ' ')} close FAILED ({e}) — "
+            + ("this position may expire worthless; close it manually."
+               if reason == "eod_flatten" else "position still open."),
+            dedupe_key=f"{reason}:failed:{ticker}",
+        )
+        return False
+
+    pos["scheduled_exit_done"] = True
+    pos["scheduled_exit_reason"] = reason
+    await state.set_position(ticker, pos)
+
+    fill = await _resolve_exit_fill(close_id)
+    logger.info(f"[{reason.upper()}] {ticker} CLOSED {qty} — {verdict['detail']} (order {close_id})")
+    await trade_ledger.record(f"{reason}_closed", {
+        "ticker": ticker, "qty": qty, "order_id": close_id,
+        "mark": round(float(mark), 4),
+        "exit_premium": round(fill, 4) if fill else None,
+        "held_seconds": int(held) if held is not None else None,
+        "et_time": now_et.strftime("%H:%M"),
+    })
+    if fill:
+        payload_se = {"ticker": ticker, "action": pos.get("action") or "BUY"}
+        await _record_close(ticker, None, payload_se, exit_premium=float(fill),
+                            close_reason=reason)
+    else:
+        logger.warning(
+            f"[{reason.upper()}] {ticker} close {close_id} has no readable fill yet — "
+            f"leaving the booking to the reconciler rather than inventing an exit price"
+        )
+    await _finish_guard(ticker, f"closed_by_{reason}")
+    await alerts.send(
+        "info", f"{reason}_closed",
+        f"{ticker}: {verdict['detail']} — {qty} contract(s) closed"
+        + (f" at {fill:.2f}" if fill else " (fill pending)"),
+        dedupe_key=f"{reason}:{ticker}:{close_id}",
     )
     return True
 
@@ -15138,6 +15923,29 @@ async def execute_live_order(payload: dict):
                     pos_rec = await state.get_position(str(symbol).upper())
                     if pos_rec is not None:
                         pos_rec["stop_premium"] = resting_premium
+                        # TAKE-PROFIT BASIS. The signal's `target` is a price on
+                        # the UNDERLYING; this position is marked in PREMIUM.
+                        # Stamping the translated level here is what makes the
+                        # target reachable at all — comparing a 6.85 premium mark
+                        # against a 335 underlying target never fires, which is
+                        # exactly why targets were never taken. Refusals leave
+                        # `target_premium` unset and the trail stays in charge.
+                        tgt = trailing_engine.derive_target_premium(
+                            fill_ref if fill_ref > 0 else planned_entry,
+                            payload.get("entry"),
+                            payload.get("target"),
+                            payload.get("option_delta"),
+                        )
+                        if tgt["target"] is not None:
+                            pos_rec["target_premium"] = tgt["target"]
+                            pos_rec["target_premium_basis"] = tgt["basis"]
+                            pos_rec["target_delta_assumed"] = bool(tgt["delta_assumed"])
+                            logger.info(f"[TAKE PROFIT] {symbol} premium target — {tgt['detail']}")
+                        else:
+                            logger.warning(
+                                f"[TAKE PROFIT] {symbol} no premium target derivable — "
+                                f"{tgt['detail']}; the trail is the only exit"
+                            )
                         # The app's intended level is remembered separately so
                         # `_app_eyes_pass` can re-tighten to it the moment the
                         # app goes dark, and so the reconciler's re-arm path
@@ -15690,6 +16498,22 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
             f"[TRAIL] {ticker} broker-native trail {native_trail_id} owns the stop — "
             f"engine trail standing down (watermark still tracked)"
         )
+        return
+
+    # THE CLOCK OUTRANKS EVERYTHING, INCLUDING THE TARGET. Inside the 3:40 PM
+    # window the position goes regardless: a 0DTE contract held for a better
+    # price is a contract that can expire worthless, and no target is worth
+    # that. The max-hold timer rides along here for the same reason — it is a
+    # decision about the clock, not about price.
+    if await _maybe_scheduled_exit(ticker, pos, mark):
+        return
+
+    # TAKE PROFIT OUTRANKS EVERYTHING BELOW. At the target the WHOLE position
+    # comes off, so this must run before the scale-out (which would otherwise
+    # bank half and then immediately close the runner — two commissions and
+    # two spreads for one decision) and before the ratchet (which would move a
+    # stop on a position that is already being sold).
+    if await _maybe_take_profit(ticker, pos, mark, spread):
         return
 
     # CAPTURE: bank half at the first target BEFORE the trail is evaluated, so
