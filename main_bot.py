@@ -1300,6 +1300,14 @@ RETRY_MAX_SECONDS = float(os.getenv("ETRADE_RETRY_MAX_SECONDS", "8"))
 # Statuses worth retrying: throttle, timeout, and server-side failures.
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 
+# ---- Broker-native trailing stops ----
+# E*TRADE trails these server-side, off the BID for a sell (the ask for a buy),
+# so they keep ratcheting while this process is down. CNST is a dollar offset,
+# PRCT a whole-number percentage.
+TRAILING_STOP_CNST = "TRAILING_STOP_CNST"
+TRAILING_STOP_PRCT = "TRAILING_STOP_PRCT"
+NATIVE_TRAIL_PRICE_TYPES = {TRAILING_STOP_CNST, TRAILING_STOP_PRCT}
+
 
 def backoff_delay(attempt: int, exact: bool = False) -> float:
     """Exponential backoff: base * 2^attempt capped at the max.
@@ -1489,7 +1497,47 @@ class ETradeAsyncClient:
     def order_detail(instruments: List[Dict[str, Any]], price_type: str,
                      limit_price: Optional[float] = None, stop_price: Optional[float] = None,
                      order_term: str = "GOOD_FOR_DAY", market_session: str = "REGULAR",
-                     all_or_none: bool = False) -> Dict[str, Any]:
+                     all_or_none: bool = False,
+                     offset_value: Optional[float] = None) -> Dict[str, Any]:
+        """Build one Order detail.
+
+        NATIVE TRAILING STOPS (`priceType` TRAILING_STOP_CNST/PRCT) need
+        `offset_value` — the trail DISTANCE (dollars for CNST, whole-number
+        percent for PRCT). Three field traps, all of them expensive:
+
+          1. E*TRADE's own docs show `stopPrice: 0` for trailing orders, and
+             that is rejected with error 7 ("You did not specify a stop
+             price"). The distance goes in `offsetValue`/`trailPrice`, and
+             `stopPrice` carries the CURRENT trigger price.
+          2. There is a long-standing SERVER-side bug where `stopPrice` and
+             the trailing parameter are read swapped, which rests a trail of
+             "64.49 points below bid" from a $0.66 request. E*TRADE support's
+             own guidance is that the current trailing stop price belongs in
+             `stopPrice` — so both fields are always sent together and never
+             guessed.
+          3. `offsetType` must echo the priceType, or the offset is ignored
+             and the order rests as a plain stop at `stopPrice`.
+
+        A trailing price type without an offset would silently become a plain
+        stop — the exact failure that leaves a position protected at a level
+        nobody chose — so it raises instead.
+        """
+        price_type = str(price_type).upper()
+        is_native_trail = price_type in NATIVE_TRAIL_PRICE_TYPES
+        if is_native_trail:
+            if offset_value is None or float(offset_value) <= 0:
+                raise ValueError(
+                    f"{price_type} requires a positive offset_value (trail distance); "
+                    f"without it the order rests as a plain stop"
+                )
+            if stop_price is None:
+                raise ValueError(
+                    f"{price_type} requires stop_price (the current trigger price); "
+                    f"E*TRADE rejects a trailing order without one (error 7)"
+                )
+        elif offset_value is not None:
+            raise ValueError(f"offset_value is only valid for {sorted(NATIVE_TRAIL_PRICE_TYPES)}")
+
         detail: Dict[str, Any] = {
             "allOrNone": bool(all_or_none),
             "priceType": price_type,
@@ -1501,6 +1549,15 @@ class ETradeAsyncClient:
             detail["limitPrice"] = round(float(limit_price), 2)
         if stop_price is not None:
             detail["stopPrice"] = round(float(stop_price), 2)
+        if is_native_trail:
+            # PRCT offsets are whole numbers (3 = 3%); CNST keeps cents.
+            offset = (round(float(offset_value)) if price_type == TRAILING_STOP_PRCT
+                      else round(float(offset_value), 2))
+            detail["offsetType"] = price_type
+            detail["offsetValue"] = offset
+            # Same value under the legacy key: E*TRADE accepts either
+            # depending on the endpoint build, and sending both is inert.
+            detail["trailPrice"] = offset
         return detail
 
     # ------------------------------------------------------------------
@@ -1580,10 +1637,12 @@ class ETradeAsyncClient:
     async def place_equity(self, account_id_key: str, client_order_id: str, symbol: str,
                            order_action: str, quantity: int, price_type: str,
                            limit_price: Optional[float] = None,
-                           stop_price: Optional[float] = None) -> Dict[str, Any]:
+                           stop_price: Optional[float] = None,
+                           offset_value: Optional[float] = None) -> Dict[str, Any]:
         detail = self.order_detail(
             [self.equity_instrument(symbol, order_action, quantity)],
             price_type, limit_price=limit_price, stop_price=stop_price,
+            offset_value=offset_value,
         )
         return await self.preview_and_place(account_id_key, "EQ", client_order_id, [detail])
 
@@ -1591,10 +1650,12 @@ class ETradeAsyncClient:
                            call_put: str, strike: float, expiry_iso: str,
                            order_action: str, quantity: int, price_type: str,
                            limit_price: Optional[float] = None,
-                           stop_price: Optional[float] = None) -> Dict[str, Any]:
+                           stop_price: Optional[float] = None,
+                           offset_value: Optional[float] = None) -> Dict[str, Any]:
         detail = self.order_detail(
             [self.option_instrument(symbol, call_put, strike, expiry_iso, order_action, quantity)],
             price_type, limit_price=limit_price, stop_price=stop_price,
+            offset_value=offset_value,
         )
         return await self.preview_and_place(account_id_key, "OPTN", client_order_id, [detail])
 
@@ -2258,6 +2319,12 @@ ACCOUNT_SNAPSHOT_KEY = "account:snapshot"
 GHOST_GRACE_SECONDS = 180
 _OPEN_ORDER_STATUSES = {"OPEN", "PARTIAL", "INDIVIDUAL_FILLS", "PENDING", "DO_NOT_EXERCISE"}
 _PROTECTIVE_PRICE_TYPES = {"STOP", "STOP_LIMIT", "TRAILING_STOP_CNST", "TRAILING_STOP_PRCT"}
+# Broker-native trailing stops. E*TRADE ratchets these server-side (off the bid
+# for a sell), so they keep protecting while this process is restarting — which
+# is precisely why they OUTRANK the bot's own plain STOP when both rest on one
+# leg, and why the engine-side trail must stand down instead of cancel/replacing
+# an order the operator placed by hand.
+_NATIVE_TRAIL_PRICE_TYPES = {"TRAILING_STOP_CNST", "TRAILING_STOP_PRCT"}
 # Order actions that CLOSE a position — the only ones a protective stop uses.
 _CLOSING_ACTIONS = {"SELL", "SELL_CLOSE", "BUY_TO_COVER", "BUY_CLOSE"}
 # Only OPTION orders carry the _OPEN/_CLOSE suffix — used to infer the basis of
@@ -2829,6 +2896,26 @@ def _broker_holds(broker_positions: Dict[str, dict], symbol: str) -> bool:
         return False
 
 
+def order_is_native_trail(order: dict) -> bool:
+    """Is this a broker-native TRAILING stop (as opposed to a fixed stop)?"""
+    return str(order.get("price_type") or "").upper() in _NATIVE_TRAIL_PRICE_TYPES
+
+
+def native_trail_stop(stops: List[dict], position_qty: int) -> Optional[dict]:
+    """The broker-native trailing stop that covers the WHOLE leg, if one rests.
+
+    Returned only when its readable size covers the position exactly — a
+    partial trail is not "the" protection for the leg and must not be allowed
+    to stand the bot's own stop down over the uncovered remainder.
+    """
+    if position_qty < 1:
+        return None
+    for order in stops:
+        if order_is_native_trail(order) and _stop_remaining(order) == position_qty:
+            return order
+    return None
+
+
 def _stop_remaining(order: dict) -> int:
     """Contracts/shares a resting stop would still sell if it triggered."""
     try:
@@ -2882,8 +2969,21 @@ def plan_protection_repair(
         return None  # invariant holds
 
     exact = [oid for oid, q in remaining.items() if q == position_qty]
+    # A broker-native trail that covers the leg exactly WINS the keep slot,
+    # ahead of even the bot's own tracked stop. Two reasons, both operator
+    # intent: it was placed deliberately by hand, and it keeps ratcheting at
+    # the broker while this process is down. Before this, a manual trailing
+    # stop next to the bot's plain STOP read as `over_committed` and the
+    # auto-healer cancelled the MANUAL order every time.
+    native_exact = [
+        str(o.get("order_id")) for o in stops
+        if order_is_native_trail(o) and str(o.get("order_id")) in exact
+    ] if not unknown_qty else []
+
     keep: Optional[str] = None
-    if tracked_stop_id and str(tracked_stop_id) in exact:
+    if native_exact:
+        keep = native_exact[0]
+    elif tracked_stop_id and str(tracked_stop_id) in exact:
         keep = str(tracked_stop_id)
     elif exact:
         keep = exact[0]
@@ -2914,6 +3014,9 @@ def plan_protection_repair(
         "cancel_order_ids": cancel_ids,
         "rearm": keep is None,
         "reason": reason,
+        # True when the surviving stop is a broker-native trail: the caller
+        # must stand the engine-side trail down for this position.
+        "keep_is_native_trail": bool(keep is not None and keep in set(native_exact)),
     }
 
 
@@ -3259,11 +3362,35 @@ async def reconcile_once(
             report["healed"].append(f"{ticker}: filled_qty {tracked_qty} → {broker_qty}")
             logger.info(f"[RECONCILE] {ticker} filled_qty synced {tracked_qty} → {broker_qty}")
 
+        # NATIVE TRAIL ADOPTION. A broker-native trailing stop covering the
+        # whole leg IS this position's protection: E*TRADE ratchets it
+        # server-side, so the engine-side trail must stand down rather than
+        # cancel/replace an order the operator placed by hand. Stamped here,
+        # in the one place that reads the broker's order book, and cleared the
+        # moment the trail is gone so protection never depends on stale state.
+        leg_stops = stops_by_leg.get((ticker, is_opt_pos)) or []
+        native = native_trail_stop(leg_stops, basis_qty)
+        native_id = str(native.get("order_id")) if native else None
+        if str(pos.get("native_trail_order_id") or "") != (native_id or ""):
+            pos["native_trail_order_id"] = native_id
+            pos["native_trail_price_type"] = (
+                str(native.get("price_type") or "").upper() if native else None
+            )
+            await state.set_position(ticker, pos)
+            if native_id:
+                report["healed"].append(
+                    f"{ticker}: broker-native trail {native_id} adopted — engine trail stands down")
+                logger.info(
+                    f"[RECONCILE] {ticker} broker-native trailing stop {native_id} "
+                    f"({pos['native_trail_price_type']}) owns this leg — engine trail standing down")
+            else:
+                logger.info(f"[RECONCILE] {ticker} broker-native trail gone — engine trail resumes")
+
         # Unprotected: real position, no live stop order ON ITS OWN BASIS, no
         # active guard.
         guard = guards.get(ticker)
         guard_active = guard_owns_stop(guards.get(ticker), now)
-        has_leg_stop = bool(stops_by_leg.get((ticker, is_opt_pos)))
+        has_leg_stop = bool(leg_stops)
         if not has_leg_stop and not guard_active and protective_level(pos) > 0:
             msg = f"{ticker}: UNPROTECTED — position at broker with no live stop and no active guard"
             report["warnings"].append(msg)
@@ -3674,6 +3801,25 @@ PROFIT_LOCK_LADDER = (
     (PROFIT_LOCK_TRIGGER_PCT, 0.35),
 )
 
+# Multiple of the round-trip spread a BROKER-NATIVE trailing stop must clear.
+#
+# WHY THIS IS WIDER THAN SPREAD_FLOOR_MULT (1.5). That floor governs a LEVEL
+# this engine recomputes each poll from the high-water mark: a one-tick bid
+# dislocation moves the level, but nothing is sent to the broker unless the
+# improvement clears the replace step, so transient noise is absorbed between
+# polls. A native trail is armed ONCE and then ratchets inside E*TRADE on
+# EVERY bid tick, with no poll to absorb anything and no way to consult the
+# ask. The two floors protect against different things, so they are different
+# numbers on purpose.
+#
+# THE EVIDENCE (live AAPL $335 put, 2026-09): bid/ask 6.70/6.85 then 6.45/6.60
+# — a 0.15 spread, so 1.5x gives 0.225. The mid moved 0.250 within ONE minute
+# of quiet tape. A 0.225 trail would have been taken out by the noise band
+# itself while the position was still working; the operator's proposed 0.20
+# was tighter still. At 2.0x the same chain asks for 0.30, which is the number
+# that actually sits outside the observed movement.
+NATIVE_TRAIL_SPREAD_MULT = 2.0
+
 # Profit-tier ladder: (minimum MFE in R, trail distance as fraction of R, tier).
 TIER_LADDER = (
     (3.0, 0.35, "runner"),
@@ -3718,6 +3864,68 @@ def _finite(value: Any) -> Optional[float]:
     if f != f or f in (float("inf"), float("-inf")):
         return None
     return f
+
+
+def native_trail_offset(
+    spread: Any,
+    risk: Any = None,
+    tick: float = 0.05,
+) -> Dict[str, Any]:
+    """Trail DISTANCE for a broker-native trailing stop, from the live spread.
+
+    Returns ``{"ok": True, "offset": float, "detail": str}`` or
+    ``{"ok": False, "offset": None, "detail": <why>}``. Never returns a
+    number it cannot justify from a measured quote.
+
+    REFUSES ON AN UNMEASURED SPREAD. A missing or one-sided book is not a
+    zero spread — treating it as one yields the tightest possible trail on
+    precisely the contract whose liquidity is unknown, which is the worst
+    place to guess. The caller must fall back and say so.
+
+    REFUSES A CHAIN TOO WIDE TO TRAIL. When the noise floor exceeds the
+    position's own risk, a native trail would rest further away than the
+    protective stop it is meant to replace — that is not protection, it is a
+    wider stop wearing its name. Better to keep the engine trail, which can
+    at least re-evaluate against the mid each poll.
+    """
+    spread_f = _finite(spread)
+    if spread_f is None or spread_f <= 0:
+        return {
+            "ok": False,
+            "offset": None,
+            "detail": (
+                "no two-sided quote — the spread is unmeasured, and an unmeasured "
+                "spread is not a zero spread"
+            ),
+        }
+
+    raw = NATIVE_TRAIL_SPREAD_MULT * spread_f
+    risk_f = _finite(risk)
+    if risk_f is not None and risk_f > 0 and raw > risk_f:
+        return {
+            "ok": False,
+            "offset": None,
+            "detail": (
+                f"spread {spread_f:.2f} needs a {raw:.2f} trail, wider than the "
+                f"position's own risk {risk_f:.2f} — a native trail here would rest "
+                f"further away than the stop it replaces"
+            ),
+        }
+
+    # Round UP to a tradable increment: rounding down could land back inside
+    # the noise band this floor exists to clear.
+    tick_f = _finite(tick) or 0.05
+    if tick_f <= 0:
+        tick_f = 0.05
+    offset = _round2(math.ceil(raw / tick_f - 1e-9) * tick_f)
+    return {
+        "ok": True,
+        "offset": offset,
+        "detail": (
+            f"{NATIVE_TRAIL_SPREAD_MULT:g}x the {spread_f:.2f} spread, "
+            f"rounded up to the {tick_f:.2f} tick"
+        ),
+    }
 
 
 def trail_tier_for(r_multiple: float) -> Dict[str, Any]:
@@ -5793,7 +6001,9 @@ try:  # package-style import (python -m bot.main_bot) or flat (uvicorn main_bot:
     from .state_store import (
         StateStore, LockNotAcquired, sanitize_conn_url, unreplaced_placeholders,
     )
-    from .etrade_async import ETradeAsyncClient, ETradeAPIError, OTOCOUnsupported
+    from .etrade_async import (
+        ETradeAsyncClient, ETradeAPIError, OTOCOUnsupported, TRAILING_STOP_CNST,
+    )
     from . import reconciliation
     from . import alerts
     from . import trade_ledger
@@ -5804,7 +6014,9 @@ except ImportError:
     from state_store import (
         StateStore, LockNotAcquired, sanitize_conn_url, unreplaced_placeholders,
     )
-    from etrade_async import ETradeAsyncClient, ETradeAPIError, OTOCOUnsupported
+    from etrade_async import (
+        ETradeAsyncClient, ETradeAPIError, OTOCOUnsupported, TRAILING_STOP_CNST,
+    )
     import reconciliation
     import alerts
     import trade_ledger
@@ -5877,7 +6089,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.60.0-profit-lock"
+BOT_VERSION = "5.61.0-native-trail"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -11143,17 +11355,22 @@ async def _place_order_smart(kind: str, common: dict, tokens: Dict[str, str]) ->
             price_type = str(common.get("priceType") or "MARKET")
             limit_price = common.get("limitPrice")
             stop_price = common.get("stopPrice")
+            # Native trail distance. Carried in the flat vocabulary as
+            # `offsetValue` so the pyetrade fallback below sees it too.
+            offset_value = common.get("offsetValue")
             if kind == "option":
                 return await client.place_option(
                     acct, cid, str(common["symbol"]), str(common["callPut"]),
                     float(common["strikePrice"]), str(common["expiryDate"]),
                     str(common["orderAction"]), int(common["quantity"]),
                     price_type, limit_price=limit_price, stop_price=stop_price,
+                    offset_value=offset_value,
                 )
             return await client.place_equity(
                 acct, cid, str(common["symbol"]), str(common["orderAction"]),
                 int(common["quantity"]), price_type,
                 limit_price=limit_price, stop_price=stop_price,
+                offset_value=offset_value,
             )
         except ETradeAPIError as e:
             if _raw_place_fallback_safe(e.status_code, False):
@@ -12066,6 +12283,159 @@ async def _place_option_protective_stop(ticker: str, contract: dict, qty: int, s
                      "expiration": contract.get("expiration")},
     })
     return {"order_id": order_id, "client_id": client_id, "qty": int(qty), "stop": stop_px}
+
+
+async def _arm_native_trail(ticker: str, offset: Optional[float] = None) -> dict:
+    """Replace this position's resting stop with a BROKER-NATIVE trailing stop,
+    sized from the live spread. Operator-initiated only — the bot never decides
+    on its own to hand its protection to E*TRADE.
+
+    WHY CANCEL BEFORE PLACE, despite the naked window. The obvious safer order
+    is place-then-cancel, and it does not work here: the resting stop already
+    holds the contract allocation, so a second SELL_CLOSE on the same leg is
+    rejected 3004 ("not enough available contracts"). The window is unavoidable,
+    so it is made SHORT and RECOVERABLE — every failure path below re-arms the
+    original stop rather than returning with the position naked.
+
+    Refuses rather than guesses on: an unmeasured spread, a chain too wide to
+    trail, an unverifiable cancel, and a stop that filled while we were working.
+    """
+    pos = await state.get_position(ticker)
+    if not pos:
+        raise Exception(f"{ticker}: no tracked position")
+    qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
+    if qty < 1:
+        raise Exception(f"{ticker}: nothing filled to protect")
+    if str(pos.get("action") or "BUY").upper() == "SELL":
+        raise Exception(f"{ticker}: native trail is long-side only")
+
+    contract = dict(pos.get("contract") or {})
+    is_option = bool(contract.get("right")) or pos.get("entry_premium") is not None
+    entry = float(pos.get("entry_premium") if is_option else (pos.get("entry") or 0) or 0)
+    base_stop = float(pos.get("stop_premium" if is_option else "stop") or 0)
+    risk = (entry - base_stop) if (entry > 0 and base_stop > 0) else None
+
+    bid, ask = await _current_bid_ask(ticker, contract if is_option else None)
+    spread = (ask - bid) if (bid > 0 and ask > 0 and ask >= bid) else None
+
+    if offset is None:
+        tick = (_option_tick_from_quote(bid or entry, bid, ask) or 0.05) if is_option else 0.01
+        plan = trailing_engine.native_trail_offset(spread, risk=risk, tick=tick)
+        if not plan["ok"]:
+            raise Exception(f"{ticker}: {plan['detail']}")
+        offset_value = float(plan["offset"])
+        rationale = plan["detail"]
+    else:
+        # An explicit operator offset is honoured, but never silently below the
+        # measured noise floor — that is the exact mistake this helper exists
+        # to prevent (a 0.20 trail on a 0.15-wide chain).
+        offset_value = round(float(offset), 2)
+        if offset_value <= 0:
+            raise Exception(f"{ticker}: trail offset must be positive")
+        floor_plan = trailing_engine.native_trail_offset(spread, risk=risk)
+        if floor_plan["ok"] and offset_value < float(floor_plan["offset"]):
+            raise Exception(
+                f"{ticker}: requested trail {offset_value:.2f} is inside the noise band — "
+                f"{floor_plan['detail']} puts the floor at {float(floor_plan['offset']):.2f}"
+            )
+        rationale = "operator-specified"
+
+    if bid <= 0:
+        raise Exception(f"{ticker}: no live bid — cannot set the trail's initial trigger")
+    # E*TRADE rejects stopPrice: 0 (error 7), so the initial trigger is sent
+    # explicitly: one full offset below the bid the trail references.
+    trigger = (_round_to_option_tick(bid - offset_value, "down")
+               if is_option else round(bid - offset_value, 2))
+    if trigger <= 0:
+        raise Exception(f"{ticker}: trail offset {offset_value:.2f} exceeds the {bid:.2f} bid")
+
+    stop_order_id = pos.get("stop_order_id")
+    outcome = await _cancel_order_verified(stop_order_id, expected_qty=qty)
+    if outcome == CANCEL_FILLED:
+        raise Exception(f"{ticker}: the resting stop just executed — position is flat, no trail armed")
+    if outcome == CANCEL_LIVE:
+        raise Exception(
+            f"{ticker}: could not prove stop {stop_order_id} is cancelled — refusing to place a "
+            f"second sell order against the same contracts"
+        )
+    if outcome == CANCEL_PARTIAL:
+        remaining = await _handle_partial_stop_fill(
+            ticker, stop_order_id, base_stop or None, "native_trail_partial",
+        )
+        raise Exception(
+            f"{ticker}: the resting stop filled part of the position while arming — "
+            f"{remaining} left; re-protected by the reconciler, no trail armed"
+        )
+
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("E*TRADE tokens not set")
+    acct_key = await _resolve_account_id_key(tokens)
+    client_id = str(uuid.uuid4().int)[:18]
+    common = dict(
+        resp_format="json",
+        accountIdKey=acct_key,
+        symbol=ticker,
+        orderAction="SELL_CLOSE" if is_option else "SELL",
+        clientOrderId=client_id,
+        priceType=TRAILING_STOP_CNST,
+        stopPrice=trigger,
+        offsetValue=offset_value,
+        quantity=qty,
+        orderTerm="GOOD_FOR_DAY",
+        marketSession="REGULAR",
+        allOrNone=False,
+    )
+    if is_option:
+        common.update(
+            callPut=str(contract["right"]).upper(),
+            strikePrice=float(contract["strike"]),
+            expiryDate=str(contract["expiration"])[:10],
+        )
+    try:
+        placed = await _place_order_smart("option" if is_option else "equity", common, tokens)
+    except Exception as e:
+        # THE NAKED WINDOW. The old stop is provably gone and the trail did not
+        # go on. Restore protection before surfacing the failure — returning an
+        # error with the position unprotected is the worst possible outcome.
+        logger.error(f"[NATIVE TRAIL] {ticker} placement FAILED ({e}) — restoring the protective stop")
+        try:
+            fresh = await state.get_position(ticker)
+            if fresh:
+                await _reconcile_rearm_guard(ticker, dict(fresh))
+        except Exception as re_arm_error:
+            await alerts.send(
+                "critical", "native_trail_unprotected",
+                f"{ticker}: arming a native trail failed AND the protective stop could not be "
+                f"restored — verify at your broker now ({e}; re-arm: {re_arm_error})",
+                dedupe_key=f"native_trail_unprotected:{ticker}",
+            )
+            raise Exception(f"{ticker}: trail failed and re-arm FAILED ({e}) — POSITION UNPROTECTED")
+        raise Exception(f"{ticker}: trail placement failed ({e}) — protective stop restored")
+
+    order_id = _order_id_from_place(placed)
+    pos = await state.get_position(ticker) or pos
+    pos["stop_order_id"] = None
+    pos["native_trail_order_id"] = str(order_id) if order_id else None
+    pos["native_trail_price_type"] = TRAILING_STOP_CNST
+    await state.set_position(ticker, pos)
+    logger.info(
+        f"[NATIVE TRAIL] {ticker} broker-native trailing stop RESTING: qty={qty} "
+        f"offset={offset_value:.2f} ({rationale}) trigger={trigger:.2f} bid={bid:.2f} "
+        f"spread={spread if spread is None else round(spread, 2)} (order={order_id}) — engine trail stands down"
+    )
+    await trade_ledger.record("native_trail_armed", {
+        "ticker": ticker, "qty": qty, "offset": offset_value, "trigger": trigger,
+        "bid": round(bid, 4), "spread": None if spread is None else round(spread, 4),
+        "rationale": rationale, "order_id": order_id,
+        "replaced_stop_order_id": stop_order_id,
+    })
+    return {
+        "ticker": ticker, "order_id": order_id, "offset": offset_value,
+        "trigger": trigger, "qty": qty, "bid": round(bid, 4),
+        "spread": None if spread is None else round(spread, 4),
+        "rationale": rationale, "replaced_stop_order_id": stop_order_id,
+    }
 
 
 # Hard ceiling on replacement flattens. Past this the bot stops sending market
@@ -15303,6 +15673,25 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         # scale-out return, a None plan, or a close booked by another path.
         await state.set_position(ticker, pos)
 
+    # NATIVE TRAIL STAND-DOWN. When a broker-native trailing stop covers this
+    # leg, E*TRADE ratchets it server-side and it IS the protection. Placed
+    # AFTER the watermark so instrumentation never depends on who owns the
+    # stop, and BEFORE both scale-out and cancel/replace because each would
+    # sabotage the operator's order:
+    #   • cancel/replace would destroy a hand-placed order and swap a trail
+    #     that keeps working while this process is down for one that only
+    #     moves when this worker runs.
+    #   • scale-out would sell contracts out from under it, leaving the trail
+    #     covering more than the position holds (E*TRADE 3004 on the real
+    #     exit, and a naked short if it triggers).
+    native_trail_id = pos.get("native_trail_order_id")
+    if native_trail_id:
+        logger.info(
+            f"[TRAIL] {ticker} broker-native trail {native_trail_id} owns the stop — "
+            f"engine trail standing down (watermark still tracked)"
+        )
+        return
+
     # CAPTURE: bank half at the first target BEFORE the trail is evaluated, so
     # the runner ratchets on its own (smaller) size from this pass onward. When
     # contracts were sold the position shape changed underneath us — re-read it
@@ -16989,6 +17378,65 @@ async def daily_pnl_repair(
     global _last_pnl_repair
     _last_pnl_repair = await _repair_daily_pnl()
     return _last_pnl_repair
+
+
+@app.post("/trail/native")
+async def arm_native_trail(
+    body: dict = Body(...),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Hand ONE position's protection to an E*TRADE-native trailing stop.
+
+    Body: { "ticker": "AAPL", "offset": 0.30 (optional), "dry_run": false }
+
+    With no `offset` the distance is derived from the contract's live spread
+    (NATIVE_TRAIL_SPREAD_MULT x spread, rounded up to a tradable tick). An
+    explicit offset is honoured only if it clears that same floor — the point
+    of this endpoint is that a trail tighter than the noise band is not a
+    tighter stop, it is a guaranteed exit on the next quote wobble.
+
+    `dry_run` prices the trail and returns the number WITHOUT touching the
+    resting stop, so the offset can be inspected before anything moves.
+
+    OPERATOR-INITIATED ONLY. Nothing in the bot calls this: handing protection
+    to the broker is a decision about who owns the exit, and the bot does not
+    make that decision by itself. Once armed, the reconciler adopts the trail
+    and the engine trail stands down (it keeps observing the watermark).
+    """
+    await _require_control_auth(x_rork_secret, "/trail/native")
+    ticker = str((body or {}).get("ticker") or "").upper().strip()
+    if not ticker:
+        raise HTTPException(400, "ticker is required")
+    raw_offset = (body or {}).get("offset")
+    offset = float(raw_offset) if raw_offset is not None else None
+
+    if bool((body or {}).get("dry_run")):
+        pos = await state.get_position(ticker)
+        if not pos:
+            raise HTTPException(404, f"{ticker}: no tracked position")
+        contract = dict(pos.get("contract") or {})
+        is_option = bool(contract.get("right")) or pos.get("entry_premium") is not None
+        entry = float(pos.get("entry_premium") if is_option else (pos.get("entry") or 0) or 0)
+        base_stop = float(pos.get("stop_premium" if is_option else "stop") or 0)
+        risk = (entry - base_stop) if (entry > 0 and base_stop > 0) else None
+        bid, ask = await _current_bid_ask(ticker, contract if is_option else None)
+        spread = (ask - bid) if (bid > 0 and ask > 0 and ask >= bid) else None
+        tick = (_option_tick_from_quote(bid or entry, bid, ask) or 0.05) if is_option else 0.01
+        plan = trailing_engine.native_trail_offset(spread, risk=risk, tick=tick)
+        return {
+            "dry_run": True, "ticker": ticker,
+            "bid": round(bid, 4) if bid > 0 else None,
+            "ask": round(ask, 4) if ask > 0 else None,
+            "spread": None if spread is None else round(spread, 4),
+            "risk": None if risk is None else round(risk, 4),
+            **plan,
+        }
+
+    try:
+        result = await _arm_native_trail(ticker, offset)
+    except Exception as e:
+        raise HTTPException(400, detail=str(e))
+    return {"status": "armed", **result}
 
 
 @app.post("/kill")
