@@ -6423,7 +6423,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.63.0-mark-provenance"
+BOT_VERSION = "5.64.0-private-schema"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -7761,8 +7761,29 @@ def _occ_symbol(ticker: str, expiry: str, right: str, strike: float) -> str:
 
 Base = declarative_base()
 
+# Bot-owned tables live in a Postgres schema PostgREST never publishes. The bot
+# creates its own tables (raw SQL + create_all), bypassing migrations — and
+# tables landing in `public` were readable with the PUBLIC anon key that ships
+# in the app bundle, including etrade_session_state's plaintext OAuth tokens.
+# Everything bot-owned now lives in `bot_private`; _ensure_private_schema
+# creates it, migrates any legacy public tables into it, and revokes the
+# PostgREST roles for belt-and-braces.
+_BOT_SCHEMA = "bot_private"
+# Schema qualifier active for the CURRENT backend: "bot_private" under
+# Postgres, None under SQLite. All raw SQL builds bot table names through
+# _bt() so the SQLite fallback keeps working unchanged.
+_bot_schema_active: Optional[str] = None
+
+
+def _bt(table: str) -> str:
+    """Schema-qualified bot table name for the active backend (bare on SQLite)."""
+    return f"{_bot_schema_active}.{table}" if _bot_schema_active else table
+
 
 class ETradeSessionState(Base):
+    # NOTE: declared schema-less so the SQLite fallback can run the same
+    # create_all; init_db scopes this table to _BOT_SCHEMA on the Postgres
+    # path via __table__.schema before any session touches it.
     __tablename__ = "etrade_session_state"
     id = Column(String(50), primary_key=True, default="active_state")
     oauth_token = Column(Text, nullable=False)
@@ -9214,7 +9235,7 @@ async def init_db():
     hostname/credential problem when the connection still fails before
     falling back to SQLite so the bot keeps running.
     """
-    global engine, async_session, _db_backend, _db_error
+    global engine, async_session, _db_backend, _db_error, _bot_schema_active
     engine = None
     async_session = None
     _db_backend = "none"
@@ -9275,7 +9296,17 @@ async def init_db():
                 # real round-trip here so the failure is attributable.
                 async with engine.connect() as conn:
                     await conn.execute(sql_text("SELECT 1"))
+                    # Schema isolation happens BEFORE anything else touches the
+                    # DB: legacy public tables are moved into bot_private before
+                    # create_all / durable-state DDL can create fresh ones there.
+                    # Failure here is fatal for the Postgres path — creating the
+                    # tables in public again is exactly the bug this prevents.
+                    await _ensure_private_schema(conn)
                 _db_backend = "postgres"
+                _bot_schema_active = _BOT_SCHEMA
+                # Scope the ORM token table to the private schema (see the class
+                # note — it stays schema-less so SQLite can share create_all).
+                ETradeSessionState.__table__.schema = _BOT_SCHEMA
                 suffix = f" [{', '.join(notes)}]" if notes else ""
                 logger.info(f"✅ Postgres connected @ {masked}{suffix}")
             except Exception as conn_err:
@@ -9329,19 +9360,52 @@ async def init_db():
 # backs a key-value table the StateStore writes through to in memory mode, and
 # a ledger table that mirrors every hash-chained record.
 
-_STATE_TABLE_SQL = (
-    "CREATE TABLE IF NOT EXISTS bot_state ("
-    "key TEXT PRIMARY KEY, "
-    "kind TEXT NOT NULL, "
-    "value TEXT NOT NULL, "
-    "updated_at TEXT)"
-)
-_LEDGER_TABLE_SQL = (
-    "CREATE TABLE IF NOT EXISTS bot_ledger ("
-    "hash TEXT PRIMARY KEY, "
-    "seq BIGINT NOT NULL, "
-    "line TEXT NOT NULL)"
-)
+async def _ensure_private_schema(conn) -> None:
+    """Create the bot-private schema and pull any legacy public tables into it.
+
+    PostgREST publishes `public` only. Bot tables created there were reachable
+    with the app's public anon key — bot_state (open positions, trails, kill
+    switch), bot_ledger, and worst of all etrade_session_state's plaintext
+    OAuth tokens. Everything bot-owned now lives in `bot_private`, which
+    PostgREST does not expose at all; the REVOKEs are belt-and-braces against a
+    future policy mistake. Idempotent: a table already in bot_private simply
+    fails the `public.` ALTER's IF EXISTS check.
+
+    Raises on schema creation / migration failure — init_db treats that as a
+    fatal Postgres-path error and falls back to SQLite loudly, rather than
+    silently recreating bot tables in public.
+    """
+    await conn.execute(sql_text("CREATE SCHEMA IF NOT EXISTS bot_private"))
+    await conn.execute(sql_text(
+        "ALTER TABLE IF EXISTS public.bot_state SET SCHEMA bot_private"))
+    await conn.execute(sql_text(
+        "ALTER TABLE IF EXISTS public.bot_ledger SET SCHEMA bot_private"))
+    await conn.execute(sql_text(
+        "ALTER TABLE IF EXISTS public.etrade_session_state SET SCHEMA bot_private"))
+    try:
+        await conn.execute(sql_text("REVOKE ALL ON SCHEMA bot_private FROM anon"))
+        await conn.execute(sql_text("REVOKE ALL ON SCHEMA bot_private FROM authenticated"))
+    except Exception as revoke_err:
+        logger.warning(f"could not REVOKE PostgREST roles on bot_private (non-fatal): {revoke_err}")
+
+
+def _state_table_sql() -> str:
+    return (
+        f"CREATE TABLE IF NOT EXISTS {_bt('bot_state')} ("
+        "key TEXT PRIMARY KEY, "
+        "kind TEXT NOT NULL, "
+        "value TEXT NOT NULL, "
+        "updated_at TEXT)"
+    )
+
+
+def _ledger_table_sql() -> str:
+    return (
+        f"CREATE TABLE IF NOT EXISTS {_bt('bot_ledger')} ("
+        "hash TEXT PRIMARY KEY, "
+        "seq BIGINT NOT NULL, "
+        "line TEXT NOT NULL)"
+    )
 
 
 class PgStatePersistence:
@@ -9356,7 +9420,7 @@ class PgStatePersistence:
         async with self._engine.begin() as conn:
             await conn.execute(
                 sql_text(
-                    "INSERT INTO bot_state (key, kind, value, updated_at) "
+                    f"INSERT INTO {_bt('bot_state')} (key, kind, value, updated_at) "
                     "VALUES (:key, :kind, :value, :ts) "
                     "ON CONFLICT (key) DO UPDATE SET "
                     "kind = :kind, value = :value, updated_at = :ts"
@@ -9366,11 +9430,13 @@ class PgStatePersistence:
 
     async def delete(self, key: str) -> None:
         async with self._engine.begin() as conn:
-            await conn.execute(sql_text("DELETE FROM bot_state WHERE key = :key"), {"key": key})
+            await conn.execute(
+                sql_text(f"DELETE FROM {_bt('bot_state')} WHERE key = :key"), {"key": key})
 
     async def load_all(self):
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql_text("SELECT key, kind, value FROM bot_state"))
+            result = await conn.execute(
+                sql_text(f"SELECT key, kind, value FROM {_bt('bot_state')}"))
             return [(row[0], row[1], row[2]) for row in result.fetchall()]
 
 
@@ -9388,8 +9454,8 @@ async def _init_durable_state() -> Optional[PgStatePersistence]:
         return None
     try:
         async with engine.begin() as conn:
-            await conn.execute(sql_text(_STATE_TABLE_SQL))
-            await conn.execute(sql_text(_LEDGER_TABLE_SQL))
+            await conn.execute(sql_text(_state_table_sql()))
+            await conn.execute(sql_text(_ledger_table_sql()))
         _state_persistence = PgStatePersistence(engine)
         return _state_persistence
     except Exception as e:
@@ -9404,7 +9470,7 @@ async def _ledger_mirror(seq: int, rec_hash: str, line: str) -> None:
     async with engine.begin() as conn:
         await conn.execute(
             sql_text(
-                "INSERT INTO bot_ledger (hash, seq, line) VALUES (:hash, :seq, :line) "
+                f"INSERT INTO {_bt('bot_ledger')} (hash, seq, line) VALUES (:hash, :seq, :line) "
                 "ON CONFLICT (hash) DO NOTHING"
             ),
             {"hash": rec_hash, "seq": int(seq), "line": line},
@@ -9418,7 +9484,8 @@ async def _restore_ledger_from_db() -> None:
         return
     try:
         async with engine.connect() as conn:
-            result = await conn.execute(sql_text("SELECT line FROM bot_ledger ORDER BY seq"))
+            result = await conn.execute(
+                sql_text(f"SELECT line FROM {_bt('bot_ledger')} ORDER BY seq"))
             lines = [row[0] for row in result.fetchall()]
         if lines:
             trade_ledger.restore_lines(TRADE_LEDGER_FILE, lines)
@@ -9608,9 +9675,9 @@ async def _announce_ledger_memory() -> None:
             try:
                 async with engine.connect() as conn:
                     mirrored = int((await conn.execute(
-                        sql_text("SELECT COUNT(*) FROM bot_ledger"))).scalar() or 0)
+                        sql_text(f"SELECT COUNT(*) FROM {_bt('bot_ledger')}"))).scalar() or 0)
                     state_rows = int((await conn.execute(
-                        sql_text("SELECT COUNT(*) FROM bot_state"))).scalar() or 0)
+                        sql_text(f"SELECT COUNT(*) FROM {_bt('bot_state')}"))).scalar() or 0)
             except Exception as e:
                 logger.warning(f"ledger memory: mirror count unavailable ({e})")
         _, local_records, _ = trade_ledger.verify()
