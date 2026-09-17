@@ -16117,10 +16117,28 @@ async def execute_live_order(payload: dict):
                     eyes = await _app_link_snapshot()
                     armed_at = time.time()
                     # Reachable is not the same as watching: require the app's
-                    # exit engine to be armed, and give it grace to report this
-                    # brand-new ticker before `_app_eyes_pass` demands proof.
+                    # exit engine to be armed AND naming this ticker.
+                    #
+                    # NO GRACE AT ARMING TIME (`grace_seconds=0`). Grace exists
+                    # for the reporting lag -- a fill cannot appear in a
+                    # heartbeat already sent -- and that is the right answer for
+                    # `_app_eyes_pass`, which decides whether to REVOKE a tier
+                    # already resting. It is the wrong answer here, because this
+                    # call decides which tier rests in the FIRST place, and
+                    # granting it meant a brand-new position opened at the 55%
+                    # disaster floor on nothing but an assumption that a report
+                    # was coming. For ~4 minutes the tactical stop the user
+                    # sized was not at the broker, and that window is exactly
+                    # where an option gap lives.
+                    #
+                    # Opening at the TACTICAL tier is the conservative default:
+                    # the level the user approved rests immediately, whether or
+                    # not the app ever checks in. A position still reaches the
+                    # backstop the moment the app affirmatively names it in a
+                    # heartbeat -- that claim is proof, an unsent report is not.
                     app_has_eyes = bool(assess_guard_proof(
                         eyes, str(symbol).upper(), armed_at, armed_at,
+                        grace_seconds=0,
                     )["guarded"])
                     placement = plan_broker_stop_placement(
                         stop_premium, fill_ref, app_has_eyes,
