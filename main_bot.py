@@ -4721,7 +4721,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "min_rvol": 0.9,
     "max_spread_pct": 0.35,
     "min_price": 5.0,
-    "max_signals_per_day": 3,
     "risk_pct": 2.0,
 }
 
@@ -4824,7 +4823,6 @@ def normalize_config(raw: Any) -> Dict[str, Any]:
             ("min_rvol", ENTRY_GATE_FLOORS["min_rvol"], 10.0, float),
             ("max_spread_pct", 0.01, 5.0, float),
             ("min_price", 0.0, 10_000.0, float),
-            ("max_signals_per_day", 0, 20, int),
             ("risk_pct", 0.05, 5.0, float),
         ):
             if raw.get(key) is None:
@@ -5399,7 +5397,7 @@ class Scanner:
         except Exception as e:
             logger.warning(f"series write failed for {quote.get('symbol')}: {e}")
 
-    # ---- emission budget --------------------------------------------------
+    # ---- emission tally (observability only) -------------------------------
     def _emit_key(self) -> str:
         return EMIT_KEY_FMT.format(self.now_et().date().isoformat())
 
@@ -5410,20 +5408,19 @@ class Scanner:
         except (TypeError, ValueError):
             return 0
 
-    async def _note_emit(self, used: int) -> int:
-        """Consume one unit of the daily signal budget.
+    async def _note_emit(self, used: Optional[int]) -> Optional[int]:
+        """Count one dispatched signal.
 
-        `used` is the caller's running count. A failed increment must still
-        consume the slot: returning 0 here reset the caller's counter, so the
-        `used >= budget` check could never fire again and the scanner would
-        dispatch EVERY qualifying candidate — real live orders, unbounded — for
-        the rest of the pass. Budget accounting fails CLOSED.
+        The daily signal cap was REMOVED in 5.65.0: every qualifying setup
+        dispatches and this counter is today's tally — display data only. It
+        must never gate (or un-gate) a dispatch again, so a counter failure
+        propagates as None (unknown) instead of inventing a number.
         """
         try:
             return int(await self.state.incr(self._emit_key(), ex=36 * 3600))
         except Exception as e:
-            logger.warning(f"emit counter failed ({e}) — counting the signal locally to preserve the daily budget")
-            return used + 1
+            logger.warning(f"emit counter failed ({e}) — today's tally unavailable")
+            return used
 
     # ---- one pass ---------------------------------------------------------
     async def scan_once(self) -> Dict[str, Any]:
@@ -5448,23 +5445,21 @@ class Scanner:
 
         candidates.sort(key=lambda c: (c["qualifies"], c["score"]), reverse=True)
         emitted: List[Dict[str, Any]] = []
-        budget = int(cfg["max_signals_per_day"])
+        # NO DAILY SIGNAL CAP (removed 5.65.0): every qualifying setup
+        # dispatches, in score order. Risk is governed by the entry gate, the
+        # real-time quote check and the risk layers downstream — not by
+        # rationing how many signals the scanner may send in a day.
         try:
-            used = await self.emits_today()
+            used: Optional[int] = await self.emits_today()
         except Exception as e:
-            # Unknown usage must not read as "zero used" — that would hand the
-            # scanner a fresh budget on every storage hiccup. Assume spent.
-            logger.warning(f"emit counter unreadable ({e}) — treating the daily budget as spent this pass")
-            used = budget
+            logger.warning(f"emit counter unreadable ({e}) — today's tally reported as unknown")
+            used = None
 
         for cand in candidates:
             if not cand["qualifies"]:
                 continue
             if cfg["mode"] != "live":
                 cand["dispatch"] = "shadow (not sent)"
-                continue
-            if used >= budget:
-                cand["dispatch"] = f"daily scanner budget reached ({budget})"
                 continue
             quote = next((q for q in quotes if q["symbol"] == cand["ticker"]), None)
             if quote is None:
@@ -5521,7 +5516,6 @@ class Scanner:
             "qualifying": sum(1 for c in candidates if c["qualifies"]),
             "emitted": emitted,
             "emits_today": used,
-            "max_signals_per_day": budget,
             "errors": errors[:5],
             "candidates": candidates[:12],
         }
@@ -6423,7 +6417,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.64.0-private-schema"
+BOT_VERSION = "5.65.0-private-schema"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -6725,7 +6719,6 @@ DISPATCH_ORIGIN_APP = "app"
 DISPATCH_ORIGIN_SCANNER = "scanner"
 SCANNER_UNIVERSE = os.getenv("SCANNER_UNIVERSE", "")
 SCANNER_INTERVAL_SECONDS = int(os.getenv("SCANNER_INTERVAL_SECONDS", "60"))
-SCANNER_MAX_SIGNALS_PER_DAY = int(os.getenv("SCANNER_MAX_SIGNALS_PER_DAY", "3"))
 # Real-time alerting: Slack/Discord/generic JSON webhook. Alerts always land
 # in the log and GET /alerts even without a webhook.
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
@@ -17301,7 +17294,6 @@ async def _start_scanner() -> None:
         seed: Dict[str, Any] = {
             "mode": SCANNER_MODE if SCANNER_ENABLED else "off",
             "interval_seconds": SCANNER_INTERVAL_SECONDS,
-            "max_signals_per_day": SCANNER_MAX_SIGNALS_PER_DAY,
         }
         if SCANNER_UNIVERSE.strip():
             seed["universe"] = SCANNER_UNIVERSE
@@ -17328,7 +17320,7 @@ async def _start_scanner() -> None:
         ))
     logger.info(
         f"🔭 Scanner wired — mode={stored['mode']}, {len(stored['universe'])} symbols, "
-        f"every {stored['interval_seconds']}s, budget {stored['max_signals_per_day']}/day"
+        f"every {stored['interval_seconds']}s"
         f"{'' if SCANNER_ALLOW_AUTONOMOUS_ENTRY else ' — origination locked to app dispatch'}"
     )
     asyncio.create_task(scanner.run())
@@ -18340,7 +18332,7 @@ async def scanner_config_set(
     """Change the scanner live — no redeploy.
     Body: { "mode": "off"|"shadow"|"live", "universe": ["AAPL", ...],
             "interval_seconds": 60, "min_score": 75, "min_rvol": 1.5,
-            "max_spread_pct": 0.35, "max_signals_per_day": 3 }"""
+            "max_spread_pct": 0.35 }"""
     await _require_control_auth(x_rork_secret, "/scanner/config")
     if scanner is None:
         raise HTTPException(503, "scanner not initialized")
@@ -18352,7 +18344,7 @@ async def scanner_config_set(
             "warning" if cfg["mode"] == "live" else "info",
             "scanner_mode_changed",
             f"Scanner mode {before} → {cfg['mode']} "
-            f"({len(cfg['universe'])} symbols, budget {cfg['max_signals_per_day']}/day)",
+            f"({len(cfg['universe'])} symbols)",
             dedupe_key="scanner_mode",
         )
     return await scanner.status()
