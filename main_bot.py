@@ -6486,6 +6486,31 @@ SETUP_VETO_LOOKBACK = int(os.getenv("SETUP_VETO_LOOKBACK", "1500"))
 SETUP_IMPORT_EVENT = "setup_evidence_imported"
 # One call may not write an unbounded number of ledger lines.
 SETUP_IMPORT_MAX_BATCH = int(os.getenv("SETUP_IMPORT_MAX_BATCH", "500"))
+# CONSECUTIVE-LOSS CIRCUIT BREAKER (ported from the app's lossStreak.ts).
+#
+# WHY THE BOT NEEDS ITS OWN COPY. The app-side breaker only protects signals
+# that travel through the app. Two paths reach this server without passing it:
+# the server-side scanner (process_signal) and any direct POST to /webhook
+# holding the shared secret. A breaker that lives in one brain is a breaker the
+# other brain routes around, and the bot is the process that actually places
+# the order — so the last gate before real money must hold it too.
+#
+# Nothing else here reacts to losses ARRIVING BACK TO BACK: the daily loss
+# limit, the risk budget and the runaway counter are all AGGREGATE rules, so an
+# unbroken run of three, four, five losers each inside per-trade risk sails
+# through every one of them.
+#
+# Unlike the setup veto above, this needs no inference and no sample floor:
+# three losses in a row is an OBSERVED FACT, not an estimate. So it is
+# threshold-cheap and TIME-LIMITED — it pauses opening, it does not ban.
+#
+# Both numbers mirror the app's constants exactly; the two must not drift.
+LOSS_STREAK_ENABLED = os.getenv("LOSS_STREAK_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
+STREAK_COOLDOWN_MINUTES = float(os.getenv("STREAK_COOLDOWN_MINUTES", "45"))
+# Bounded like SETUP_VETO_LOOKBACK — the entry path must never walk an
+# unbounded file while a signal is waiting.
+STREAK_LOOKBACK = int(os.getenv("STREAK_LOOKBACK", "400"))
 # Ledger events that RETRACT an optimistic `position_opened`. The open line is
 # written when the entry order is PLACED, so an order that is cancelled or dies
 # unfilled leaves a position that never existed behind it. These close that
@@ -7506,6 +7531,28 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     lock = plan_profit_lock(daily.get("realized_pnl_today_usd"))
     if lock["locked"]:
         blocked.append(lock["reason"])
+    # CONSECUTIVE-LOSS BREAKER — the only gate here that asks whether the losses
+    # are arriving BACK TO BACK. Every limit around it is aggregate, so an
+    # unbroken run of losers inside per-trade risk passes all of them.
+    #
+    # This sits in the RISK section, so a connectivity probe is held by it too:
+    # the probe skips QUALITY gates only, and a paused book is a risk state.
+    #
+    # Wrapped because a ledger read failure must never block a trade — an
+    # unreadable history is not evidence of a losing streak. Same fail-open
+    # posture as the setup veto.
+    try:
+        streak = assess_loss_streak(trade_ledger.recent(STREAK_LOOKBACK))
+        if streak["paused"]:
+            blocked.append(streak["reason"])
+            logger.warning(f"🛑 LOSS STREAK — {streak['reason']}")
+        elif streak["lapsed"]:
+            logger.info(
+                f"⚠️ {streak['streak']} losses in a row today, cooldown elapsed — "
+                f"one attempt allowed. If it loses, opening pauses again."
+            )
+    except Exception as e:
+        logger.warning(f"loss streak breaker unavailable (non-fatal, entry not blocked): {e}")
     # The daily trade COUNT no longer gates entries — see the config note on
     # RUNAWAY_TRADE_CIRCUIT_BREAKER. This ceiling only catches a dispatch loop,
     # which is a bug rather than a strategy, and is set far above any real day.
@@ -11290,6 +11337,120 @@ def _iso_epoch(value: Any) -> Optional[float]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.timestamp()
+
+
+def assess_loss_streak(records: List[dict], now_epoch: Any = None,
+                       zone: Any = None) -> Dict[str, Any]:
+    """Is live OPENING paused by an unbroken run of losing closes today?
+
+    ENTRY SIDE ONLY, and structurally so: the sole caller is
+    `_passes_entry_filters`, which `process_signal` runs only when
+    `live_intent and not is_close`. A breaker that trapped an open position
+    would be worse than the losses it exists to stop — same asymmetry as the
+    harvesting/protective split everywhere else in this file.
+
+    SCRATCHES ARE NEUTRAL. A breakeven close neither extends the streak nor
+    clears it; only a WIN clears it. A flat trade is not evidence the edge came
+    back, and letting one reset the counter would make the breaker trivially
+    easy to evade on a chop day.
+
+    AN UNPRICEABLE CLOSE IS UNMEASURED, NOT A WIN. It cannot clear a streak and
+    cannot extend one — the same rule the rest of this file applies to a
+    missing RVOL.
+
+    Sign convention matches `summarize_setup_performance`: the per-trade move
+    (`realized_pnl_pct`) as written, falling back to the account-level percent
+    when the per-trade field is absent. Both carry the same sign, and this is
+    deliberately the same basis the setup veto already trusts, so the two
+    memories of "what happened" cannot disagree about a trade.
+
+    Returns {day, streak, paused, cooldown_until, minutes_remaining, lapsed,
+    reason}. Pure — no I/O, no clock beyond the injected `now_epoch`.
+    """
+    tz = zone if zone is not None else _ET_ZONE
+    now_ts = None
+    if isinstance(now_epoch, (int, float)) and not isinstance(now_epoch, bool):
+        if math.isfinite(float(now_epoch)):
+            now_ts = float(now_epoch)
+    if now_ts is None:
+        now_ts = datetime.now(timezone.utc).timestamp()
+
+    def day_of(epoch: float) -> str:
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone(tz).date().isoformat()
+
+    today = day_of(now_ts)
+    base: Dict[str, Any] = {
+        "day": today,
+        "streak": 0,
+        "paused": False,
+        "cooldown_until": None,
+        "minutes_remaining": 0,
+        "lapsed": False,
+        "reason": "",
+    }
+    if not LOSS_STREAK_ENABLED:
+        return base
+
+    # Today's closes, newest first — a streak is measured backwards from now.
+    todays: List[Tuple[float, dict]] = []
+    for rec in records or []:
+        if not isinstance(rec, dict) or str(rec.get("event") or "") != "position_closed":
+            continue
+        data = rec.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        ts = _iso_epoch(rec.get("ts"))
+        # An unparseable timestamp cannot be placed in a day OR ordered against
+        # the others, so it is dropped rather than guessed into today.
+        if ts is None or day_of(ts) != today:
+            continue
+        todays.append((ts, data))
+    todays.sort(key=lambda pair: pair[0], reverse=True)
+
+    streak = 0
+    last_loss_ts: Optional[float] = None
+    for ts, data in todays:
+        raw = data.get("realized_pnl_pct")
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            raw = data.get("account_pnl_pct")
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            continue  # unmeasured — neither extends nor clears
+        pct = float(raw)
+        if not math.isfinite(pct):
+            continue
+        # Same ±0.1% dead band the app's classifyOutcomeFromPnl uses.
+        if pct < -0.1:
+            streak += 1
+            if last_loss_ts is None:
+                last_loss_ts = ts
+            continue
+        if pct > 0.1:
+            break  # a win ends the run
+        # breakeven → neutral, keep walking
+
+    base["streak"] = streak
+    tripped = streak >= MAX_CONSECUTIVE_LOSSES and last_loss_ts is not None
+    if not tripped:
+        return base
+
+    cooldown_end = last_loss_ts + STREAK_COOLDOWN_MINUTES * 60.0
+    base["cooldown_until"] = cooldown_end
+    if now_ts >= cooldown_end:
+        # TIME-LIMITED ON PURPOSE. A permanent halt would need a win to clear
+        # while forbidding the trade that could produce one. After the cooldown
+        # the engine gets one more attempt; if that loses, the streak is longer
+        # and this re-arms immediately.
+        base["lapsed"] = True
+        return base
+
+    remaining = max(1, int(math.ceil((cooldown_end - now_ts) / 60.0)))
+    base["paused"] = True
+    base["minutes_remaining"] = remaining
+    base["reason"] = (
+        f"loss streak breaker: {streak} losing trades in a row today — new positions "
+        f"paused for {remaining} more min. Exits, stops and trails stay fully active."
+    )
+    return base
 
 
 def setup_attribution_start(records: List[dict]) -> Optional[float]:
