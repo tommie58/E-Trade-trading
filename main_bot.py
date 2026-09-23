@@ -9414,6 +9414,19 @@ async def _ensure_private_schema(conn) -> None:
     Raises on schema creation / migration failure — init_db treats that as a
     fatal Postgres-path error and falls back to SQLite loudly, rather than
     silently recreating bot tables in public.
+
+    TRANSACTION SEMANTICS (the bug that kept bot_private from ever existing):
+    init_db calls this inside `engine.connect()`, which in SQLAlchemy 2.0
+    AUTOBEGINS a transaction and ROLLS IT BACK on exit unless committed. The
+    schema was created and the legacy tables moved on every boot — then all of
+    it was undone, and the next DDL died with `schema "bot_private" does not
+    exist`. Hence the explicit commit at the end.
+
+    The REVOKEs run inside a SAVEPOINT and only for roles that exist. A failed
+    statement aborts the whole Postgres transaction (25P02) even when Python
+    catches the exception, and `anon`/`authenticated` are Supabase-only roles:
+    on a plain Postgres (e.g. Railway's) the unguarded REVOKE poisoned the
+    transaction so even a commit would have discarded the schema.
     """
     await conn.execute(sql_text("CREATE SCHEMA IF NOT EXISTS bot_private"))
     await conn.execute(sql_text(
@@ -9422,11 +9435,20 @@ async def _ensure_private_schema(conn) -> None:
         "ALTER TABLE IF EXISTS public.bot_ledger SET SCHEMA bot_private"))
     await conn.execute(sql_text(
         "ALTER TABLE IF EXISTS public.etrade_session_state SET SCHEMA bot_private"))
-    try:
-        await conn.execute(sql_text("REVOKE ALL ON SCHEMA bot_private FROM anon"))
-        await conn.execute(sql_text("REVOKE ALL ON SCHEMA bot_private FROM authenticated"))
-    except Exception as revoke_err:
-        logger.warning(f"could not REVOKE PostgREST roles on bot_private (non-fatal): {revoke_err}")
+    for role in ("anon", "authenticated"):
+        await conn.execute(sql_text("SAVEPOINT bot_private_revoke"))
+        try:
+            await conn.execute(sql_text(
+                "DO $$ BEGIN "
+                f"IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN "
+                f"REVOKE ALL ON SCHEMA bot_private FROM {role}; "
+                "END IF; END $$"))
+            await conn.execute(sql_text("RELEASE SAVEPOINT bot_private_revoke"))
+        except Exception as revoke_err:
+            # Roll back ONLY the revoke; the schema work above survives.
+            await conn.execute(sql_text("ROLLBACK TO SAVEPOINT bot_private_revoke"))
+            logger.warning(f"could not REVOKE {role} on bot_private (non-fatal): {revoke_err}")
+    await conn.commit()
 
 
 def _state_table_sql() -> str:
