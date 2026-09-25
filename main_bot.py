@@ -5662,7 +5662,7 @@ EVENT_EVIDENCE = "setup_evidence_imported"
 # ---------------------------------------------------------------------------
 
 _SAFE_CASTS = r"""
-create or replace function public.bot_num(v text)
+create or replace function bot_private.bot_num(v text)
 returns double precision
 language plpgsql immutable strict
 as $fn$
@@ -5675,7 +5675,7 @@ $fn$;
 """
 
 _SAFE_TS = r"""
-create or replace function public.bot_ts(v text)
+create or replace function bot_private.bot_ts(v text)
 returns timestamptz
 language plpgsql immutable strict
 as $fn$
@@ -5688,7 +5688,7 @@ $fn$;
 """
 
 _SAFE_BOOL = r"""
-create or replace function public.bot_bool(v text)
+create or replace function bot_private.bot_bool(v text)
 returns boolean
 language plpgsql immutable strict
 as $fn$
@@ -5701,7 +5701,7 @@ $fn$;
 """
 
 _SAFE_JSON = r"""
-create or replace function public.bot_json(v text)
+create or replace function bot_private.bot_json(v text)
 returns jsonb
 language plpgsql immutable strict
 as $fn$
@@ -5722,7 +5722,7 @@ $fn$;
 # trades sharing all three would collapse into one -- which is why it is the
 # fallback and not the key.
 _EVIDENCE_KEY_FN = r"""
-create or replace function public.bot_evidence_key(
+create or replace function bot_private.bot_evidence_key(
   import_id text, ticker text, setup text, closed_at timestamptz
 )
 returns text
@@ -5740,15 +5740,15 @@ $fn$;
 # yields NULL here instead of erroring the whole view -- one bad row must never
 # blind the entire study layer.
 _EVENTS_VIEW = r"""
-create or replace view public.bot_ledger_events as
+create or replace view bot_private.bot_ledger_events as
 select
   l.seq,
-  public.bot_json(l.line)->>'event'      as event,
-  public.bot_json(l.line)->>'hash'       as ledger_hash,
-  public.bot_ts(public.bot_json(l.line)->>'ts') as at,
-  public.bot_json(l.line)->'data'        as data
-from public.bot_ledger l
-where public.bot_json(l.line) is not null;
+  bot_private.bot_json(l.line)->>'event'      as event,
+  bot_private.bot_json(l.line)->>'hash'       as ledger_hash,
+  bot_private.bot_ts(bot_private.bot_json(l.line)->>'ts') as at,
+  bot_private.bot_json(l.line)->'data'        as data
+from bot_private.bot_ledger l
+where bot_private.bot_json(l.line) is not null;
 """
 
 # Closed trades, typed. Laterally joined to the most recent PRIOR open for the
@@ -5757,7 +5757,7 @@ where public.bot_json(l.line) is not null;
 #     premiums in entry/exit, so underlying risk is otherwise unrecoverable);
 #   - the setup label, when it was stamped at open but not at close.
 _CLOSES_VIEW = r"""
-create or replace view public.bot_trade_closes as
+create or replace view bot_private.bot_trade_closes as
 select
   e.seq,
   e.ledger_hash,
@@ -5766,29 +5766,29 @@ select
   coalesce(nullif(e.data->>'setup', ''), o.open_setup) as setup,
   nullif(e.data->>'reason', '')                     as exit_reason,
   nullif(e.data->>'basis', '')                      as pnl_basis,
-  public.bot_num(e.data->>'realized_pnl_pct')       as realized_pnl_pct,
-  public.bot_num(e.data->>'realized_pnl_usd')       as realized_pnl_usd,
-  public.bot_num(e.data->>'account_pnl_pct')        as account_pnl_pct,
-  public.bot_num(e.data->>'peak_r')                 as peak_r,
-  public.bot_num(e.data->>'peak_mfe_pct')           as peak_mfe_frac,
-  public.bot_num(e.data->>'peak_mfe_pct') * 100.0   as peak_mfe_pct,
+  bot_private.bot_num(e.data->>'realized_pnl_pct')       as realized_pnl_pct,
+  bot_private.bot_num(e.data->>'realized_pnl_usd')       as realized_pnl_usd,
+  bot_private.bot_num(e.data->>'account_pnl_pct')        as account_pnl_pct,
+  bot_private.bot_num(e.data->>'peak_r')                 as peak_r,
+  bot_private.bot_num(e.data->>'peak_mfe_pct')           as peak_mfe_frac,
+  bot_private.bot_num(e.data->>'peak_mfe_pct') * 100.0   as peak_mfe_pct,
   nullif(e.data->>'peak_basis', '')                 as peak_basis,
-  public.bot_num(e.data->>'entry')                  as entry_price,
-  public.bot_num(e.data->>'exit')                   as exit_price,
-  public.bot_num(e.data->>'qty')                    as qty,
+  bot_private.bot_num(e.data->>'entry')                  as entry_price,
+  bot_private.bot_num(e.data->>'exit')                   as exit_price,
+  bot_private.bot_num(e.data->>'qty')                    as qty,
   o.opened_at,
   o.underlying_entry,
   o.underlying_stop,
   o.underlying_target
-from public.bot_ledger_events e
+from bot_private.bot_ledger_events e
 left join lateral (
   select
     oe.at                                  as opened_at,
     nullif(oe.data->>'setup', '')          as open_setup,
-    public.bot_num(oe.data->>'entry')      as underlying_entry,
-    public.bot_num(oe.data->>'stop')       as underlying_stop,
-    public.bot_num(oe.data->>'target')     as underlying_target
-  from public.bot_ledger_events oe
+    bot_private.bot_num(oe.data->>'entry')      as underlying_entry,
+    bot_private.bot_num(oe.data->>'stop')       as underlying_stop,
+    bot_private.bot_num(oe.data->>'target')     as underlying_target
+  from bot_private.bot_ledger_events oe
   where oe.event = 'position_opened'
     and oe.data->>'ticker' = e.data->>'ticker'
     and oe.seq < e.seq
@@ -5802,19 +5802,19 @@ where e.event = 'position_closed';
 # won/lost verdict but NOT a basis, so its returns are never pooled with the
 # live premium-basis trades -- only its win/loss counts are used downstream.
 _EVIDENCE_VIEW = r"""
-create or replace view public.bot_setup_evidence as
+create or replace view bot_private.bot_setup_evidence as
 select
   e.seq,
   e.ledger_hash,
   e.at                                          as imported_at,
   e.data->>'symbol'                             as ticker,
   nullif(e.data->>'setup', '')                  as setup,
-  public.bot_bool(e.data->>'won')               as won,
-  public.bot_num(e.data->>'r_multiple')         as r_multiple,
-  public.bot_num(e.data->>'realized_pnl_pct')   as realized_pnl_pct,
+  bot_private.bot_bool(e.data->>'won')               as won,
+  bot_private.bot_num(e.data->>'r_multiple')         as r_multiple,
+  bot_private.bot_num(e.data->>'realized_pnl_pct')   as realized_pnl_pct,
   nullif(e.data->>'source', '')                 as source,
   nullif(e.data->>'import_id', '')              as import_id,
-  public.bot_ts(e.data->>'closed_at')           as closed_at,
+  bot_private.bot_ts(e.data->>'closed_at')           as closed_at,
   -- Appended LAST on purpose: CREATE OR REPLACE VIEW can only ADD columns at
   -- the end, so a database already holding the previous definition upgrades in
   -- place instead of needing a DROP ... CASCADE.
@@ -5822,9 +5822,9 @@ select
   -- must stay null: assuming 'premium' would let stock percentages be averaged
   -- into option percentages and the result would still look authoritative.
   nullif(e.data->>'pnl_basis', '')              as pnl_basis,
-  public.bot_num(e.data->>'peak_r')             as peak_r,
-  public.bot_num(e.data->>'peak_mfe_pct')       as peak_mfe_pct
-from public.bot_ledger_events e
+  bot_private.bot_num(e.data->>'peak_r')             as peak_r,
+  bot_private.bot_num(e.data->>'peak_mfe_pct')       as peak_mfe_pct
+from bot_private.bot_ledger_events e
 where e.event = 'setup_evidence_imported';
 """
 
@@ -5836,23 +5836,23 @@ where e.event = 'setup_evidence_imported';
 # and deliberately excluded here, because an expectancy is a mean and a mean
 # over mixed instruments is not a smaller truth, it is a wrong one.
 _EXPECTANCY_VIEW = r"""
-create or replace view public.bot_setup_expectancy as
+create or replace view bot_private.bot_setup_expectancy as
 with unified as (
   select lower(btrim(setup)) as setup_key, setup, pnl_basis,
          realized_pnl_pct as pct, 'live'::text as src
-  from public.bot_trade_closes
+  from bot_private.bot_trade_closes
   where setup is not null and realized_pnl_pct is not null
     and pnl_basis in ('premium', 'underlying')
   union all
   select lower(btrim(setup)) as setup_key, setup, pnl_basis,
          realized_pnl_pct as pct, 'evidence'::text as src
   from (
-    select distinct on (public.bot_evidence_key(import_id, ticker, setup, closed_at))
+    select distinct on (bot_private.bot_evidence_key(import_id, ticker, setup, closed_at))
            setup, pnl_basis, realized_pnl_pct
-    from public.bot_setup_evidence
+    from bot_private.bot_setup_evidence
     where setup is not null and realized_pnl_pct is not null
       and pnl_basis in ('premium', 'underlying')
-    order by public.bot_evidence_key(import_id, ticker, setup, closed_at), seq desc
+    order by bot_private.bot_evidence_key(import_id, ticker, setup, closed_at), seq desc
   ) deduped
 )
 select
@@ -5893,7 +5893,7 @@ group by setup_key, pnl_basis;
 # is dropped rather than assumed. `peak_dropped_basis` reports how many were
 # dropped, because a coverage number that quietly shrinks is its own lie.
 _PERFORMANCE_VIEW = r"""
-create or replace view public.bot_setup_performance as
+create or replace view bot_private.bot_setup_performance as
 select
   setup,
   pnl_basis,
@@ -5924,14 +5924,14 @@ select
   -- basis entirely (older rows, recorded before the basis was stamped).
   count(peak_mfe_pct) filter (where peak_basis is null
         or pnl_basis is null or peak_basis <> pnl_basis)::int      as peak_dropped_basis
-from public.bot_trade_closes
+from bot_private.bot_trade_closes
 where setup is not null
 group by setup, pnl_basis;
 """
 
 # Which exit paths pay and which bleed. Also basis-grouped.
 _EXITS_VIEW = r"""
-create or replace view public.bot_exit_reasons as
+create or replace view bot_private.bot_exit_reasons as
 select
   exit_reason,
   pnl_basis,
@@ -5951,7 +5951,7 @@ select
                                                                   as avg_giveback_pct,
   count(peak_mfe_pct) filter (where peak_basis is null
         or pnl_basis is null or peak_basis <> pnl_basis)::int      as peak_dropped_basis
-from public.bot_trade_closes
+from bot_private.bot_trade_closes
 where exit_reason is not null
 group by exit_reason, pnl_basis;
 """
@@ -5975,18 +5975,18 @@ group by exit_reason, pnl_basis;
 # fill in a basis or a water mark supersedes the thinner original instead of
 # being counted beside it.
 _PRIORS_VIEW = r"""
-create or replace view public.bot_setup_priors as
+create or replace view bot_private.bot_setup_priors as
 with live as (
   select setup, (realized_pnl_pct > 0) as won
-  from public.bot_trade_closes
+  from bot_private.bot_trade_closes
   where setup is not null and realized_pnl_pct is not null
 ),
 evidence as (
-  select distinct on (public.bot_evidence_key(import_id, ticker, setup, closed_at))
+  select distinct on (bot_private.bot_evidence_key(import_id, ticker, setup, closed_at))
          setup, won
-  from public.bot_setup_evidence
+  from bot_private.bot_setup_evidence
   where setup is not null and won is not null
-  order by public.bot_evidence_key(import_id, ticker, setup, closed_at), seq desc
+  order by bot_private.bot_evidence_key(import_id, ticker, setup, closed_at), seq desc
 ),
 pooled as (
   select setup, won, 'live'::text as src from live
@@ -6089,7 +6089,7 @@ async def _rows(sql: str) -> List[Dict[str, Any]]:
 async def setup_priors(min_samples: int = 1) -> List[Dict[str, Any]]:
     """Win-rate priors per setup, best first. Basis-free (counts only)."""
     return await _rows(
-        "select * from public.bot_setup_priors "
+        "select * from bot_private.bot_setup_priors "
         f"where samples >= {int(min_samples)} "
         "order by win_rate_pct desc nulls last, samples desc"
     )
@@ -6098,7 +6098,7 @@ async def setup_priors(min_samples: int = 1) -> List[Dict[str, Any]]:
 async def setup_performance() -> List[Dict[str, Any]]:
     """Per-setup P&L, grouped by basis. Never pools premium with underlying."""
     return await _rows(
-        "select * from public.bot_setup_performance "
+        "select * from bot_private.bot_setup_performance "
         "order by total_pnl_usd desc nulls last"
     )
 
@@ -6111,7 +6111,7 @@ async def setup_expectancy() -> List[Dict[str, Any]]:
     claim from 20 the bot placed itself.
     """
     return await _rows(
-        "select * from public.bot_setup_expectancy "
+        "select * from bot_private.bot_setup_expectancy "
         "order by trades desc, setup"
     )
 
@@ -6119,7 +6119,7 @@ async def setup_expectancy() -> List[Dict[str, Any]]:
 async def exit_reasons() -> List[Dict[str, Any]]:
     """Which exit paths pay and which bleed."""
     return await _rows(
-        "select * from public.bot_exit_reasons order by trades desc"
+        "select * from bot_private.bot_exit_reasons order by trades desc"
     )
 
 
@@ -6129,7 +6129,7 @@ async def recent_closes(limit: int = 25) -> List[Dict[str, Any]]:
         "select closed_at, ticker, setup, exit_reason, pnl_basis, "
         "realized_pnl_pct, realized_pnl_usd, peak_r, peak_mfe_pct, peak_basis, "
         "underlying_entry, underlying_stop "
-        "from public.bot_trade_closes "
+        "from bot_private.bot_trade_closes "
         f"order by seq desc limit {int(limit)}"
     )
 
@@ -6150,18 +6150,18 @@ async def coverage() -> Dict[str, Any]:
         "  count(*) filter (where pnl_basis = 'underlying')::int as underlying_basis, "
         "  min(closed_at)                                  as first_close, "
         "  max(closed_at)                                  as last_close "
-        "from public.bot_trade_closes"
+        "from bot_private.bot_trade_closes"
     )
     out: Dict[str, Any] = dict(rows[0]) if rows else {}
     ev = await _rows(
         "select count(*)::int as evidence_records, "
         "count(distinct setup)::int as evidence_setups, "
         "count(pnl_basis)::int as evidence_basis_qualified "
-        "from public.bot_setup_evidence where setup is not null"
+        "from bot_private.bot_setup_evidence where setup is not null"
     )
     if ev:
         out.update(ev[0])
-    total = await _rows("select count(*)::int as ledger_records from public.bot_ledger")
+    total = await _rows("select count(*)::int as ledger_records from bot_private.bot_ledger")
     if total:
         out.update(total[0])
     closes = int(out.get("closes") or 0)
@@ -8730,17 +8730,41 @@ _quote_entitlement: Dict[str, Any] = {
 }
 
 
-def _record_quote_entitlement(quotes: List[Dict[str, Any]]) -> None:
-    """Remember whether the broker is serving real-time or delayed prints."""
-    if not quotes:
-        return
-    delayed = [q["symbol"] for q in quotes if not q.get("realtime")]
-    _quote_entitlement.update({
-        "checked_at": _utcnow().isoformat(),
+def plan_entitlement_update(quotes: Any, in_session: bool) -> Optional[Dict[str, Any]]:
+    """The entitlement verdict one quote batch supports, or None if it proves nothing.
+
+    ONLY A REGULAR-SESSION BATCH IS EVIDENCE. Observed 2026-09-25: the account
+    was served real-time quotes on every poll from 2:24 PM to 3:29 PM ET (a poll
+    every ~8s, zero DELAYED warnings). From 5:32 PM ET the same account on the
+    same token got all 24 symbols back as non-realtime. The agreement did not
+    lapse at the bell; outside the session E*TRADE simply stamps quotes with a
+    status that is not REALTIME. Scoring those batches made preflight's
+    blocking `market_data` check flip to FAILED every evening and logged "the
+    real-time market data agreement is not accepted", which was false.
+
+    Outside the session the last in-session verdict stands. Nothing is
+    loosened: the app still refuses to price a live entry off any non-realtime
+    quote, and no entries happen outside the session anyway.
+    """
+    if not in_session or not isinstance(quotes, list) or not quotes:
+        return None
+    delayed = [str(q.get("symbol") or "?") for q in quotes
+               if isinstance(q, dict) and not q.get("realtime")]
+    return {
         "realtime": len(quotes) - len(delayed),
         "delayed": len(delayed),
         "delayed_symbols": delayed[:10],
-    })
+    }
+
+
+def _record_quote_entitlement(quotes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Remember whether the broker is serving real-time or delayed prints.
+    Returns the update applied, or None when the batch was not evidence."""
+    update = plan_entitlement_update(quotes, _is_market_open())
+    if update is None:
+        return None
+    _quote_entitlement.update({"checked_at": _utcnow().isoformat(), **update})
+    return update
 
 
 def normalize_quote_response(resp: Dict[str, Any]) -> Dict[str, Any]:
@@ -8842,12 +8866,12 @@ async def get_quotes(symbols: str = Query(...)):
         # the old hand-rolled fixed-sleep loop existed for.
         raw = await _etrade_call(market.get_quote, symbol_list, resp_format="json", source="quote")
         normalized = normalize_quote_response(raw)
-        delayed = [q["symbol"] for q in normalized["quotes"] if not q["realtime"]]
-        _record_quote_entitlement(normalized["quotes"])
+        judged = _record_quote_entitlement(normalized["quotes"])
+        delayed = (judged or {}).get("delayed_symbols") or []
         if delayed:
             logger.warning(
-                f"E*TRADE served DELAYED quotes for {len(delayed)} symbol(s) "
-                f"({', '.join(delayed[:5])}) — the real-time market data agreement "
+                f"E*TRADE served DELAYED quotes for {judged['delayed']} symbol(s) "
+                f"({', '.join(delayed[:5])}) during the regular session — the real-time market data agreement "
                 f"is not accepted on this account; the app will refuse live entries priced off them"
             )
         # Raw payload stays available for debugging without changing the contract.
@@ -18272,9 +18296,20 @@ async def setup_evidence_import(
             and before.get(label, {}).get("wilson_high", 100.0) < SETUP_VETO_WIN_RATE
         )
     )
+    # WHY each trade was skipped. "0 accepted, 105 skipped" on its own reads the
+    # same whether every trade was already on file (healthy, idempotent) or the
+    # app sent 105 unusable rows (broken). Those need opposite responses.
+    skip_reasons: Dict[str, int] = {}
+    for r in plan["rejected"]:
+        key = str(r.get("reason") or "unspecified")
+        skip_reasons[key] = skip_reasons.get(key, 0) + 1
+    reason_text = "; ".join(
+        f"{n}× {reason}" for reason, n in sorted(skip_reasons.items(), key=lambda kv: -kv[1])
+    )
     logger.info(
         f"[{BOT_VERSION}] setup evidence import — {len(plan['accepted'])} accepted, "
-        f"{len(plan['rejected'])} skipped, newly vetoed: {newly_vetoed or 'none'}"
+        f"{len(plan['rejected'])} skipped" + (f" ({reason_text})" if reason_text else "")
+        + f", newly vetoed: {newly_vetoed or 'none'}"
     )
     return {
         "ok": True,
