@@ -6756,6 +6756,19 @@ OPTION_STOP_MAX_HAIRCUT_PCT = float(os.getenv("OPTION_STOP_MAX_HAIRCUT_PCT", "25
 # the haircut it was designed to express. See plan_intent_preserving_stop.
 STOP_INTENT_DRIFT_TOLERANCE = float(os.getenv("STOP_INTENT_DRIFT_TOLERANCE", "0.05"))
 
+# ---- FILLED-SHAPE GATE (mirrors expo/services/filledShapeGate.ts) ----------
+# A live option entry must be able to pay MIN_ENTRY_PAYOFF_R at its REAL fill,
+# net of the round trip, with a stop that survives the quote. These mirror the
+# app's optionStop.ts / payoffGate.ts constants on purpose: the app decides the
+# shape on its quote, the bot re-decides it on E*TRADE's, and the two must be
+# doing the same arithmetic or they will disagree about the same trade.
+MIN_ENTRY_PAYOFF_R = 1.5
+SHAPE_SPREAD_STOP_MULTIPLE = 1.5
+SHAPE_MIN_HAIRCUT_PCT = 12.0
+SHAPE_MAX_HAIRCUT_PCT = 22.0
+SHAPE_ASSUMED_DELTA = 0.5
+FILLED_SHAPE_PREFIX = "filled shape cannot pay"
+
 # ---- EXIT AUTHORITY: the app has eyes, the broker stop is a backstop -------
 # 2026-09-09 (AAPL 310C): the app dispatched with stop=311.69 against a 312.78
 # entry. The bot converted that to a PREMIUM stop of 4.80 (basis=app_delta) and
@@ -10711,6 +10724,327 @@ def derive_armed_option_stop(explicit: Any, fill_ref: Any,
     if stop is None or stop <= 0:
         return None, "none"
     return _round_to_option_tick(stop, "down"), basis
+
+
+def tighten_to_shape_stop(derived: Optional[float], shape_stop: Any) -> Optional[float]:
+    """The resting stop may only be as wide as the stop the shape was graded on.
+
+    A long option's protective stop is a SELL below the fill, so a HIGHER
+    premium is a TIGHTER stop. Subtract-only: this can raise the level toward
+    the graded one, never lower it, and never invents a stop when neither side
+    has one. The intent-preserving rescale is capped at 25% of the fill while
+    the graded stop was sized to what the win can fund, so without this the
+    order admitted at 1.5R could rest at a stop that pays less.
+    """
+    try:
+        graded = float(shape_stop) if shape_stop is not None else None
+    except (TypeError, ValueError):
+        graded = None
+    if graded is None or not math.isfinite(graded) or graded <= 0:
+        return derived
+    if derived is None or derived <= 0:
+        return round(graded, 2)
+    return round(max(derived, graded), 2)
+
+
+def plan_filled_shape(entry: Any, stop: Any, target: Any, bid: Any, ask: Any,
+                      delta: Any = None) -> Dict[str, Any]:
+    """May this option entry be a LIVE ticket at its real fill?
+
+    The NFLX 79P trade of 2026-09-04, as policy. A sane 31% haircut on a 0.13
+    estimate became an 84% risk on the real 0.57 fill, then a 47% "rescue".
+    Every layer repaired the STOP; none asked whether ANY stop that survives
+    the quote could still pay for the loser at that fill. This asks it:
+
+      1. The fill is the real ASK. No two-sided quote -> no live ticket.
+      2. Win in premium = |target - entry| x delta, less spread and both fees.
+      3. Stop in premium on the same fill: delta risk, widened to the spread
+         and noise floors, capped at the max haircut and at what the win can
+         fund at 1.5R (after the exit fee and a one-cent tick margin), then
+         pulled under the bid so it can rest.
+      4. If the floors are wider than the win can fund, or the stop that
+         survives the quote still pays under 1.5R net -> refuse live.
+
+    Pure. Fails CLOSED by design: the unmeasured input here is the fill
+    itself, and spending real money on an unmeasured fill is the bug.
+    Returns `{live, code, reason, fill, stop, risk, max_risk, net_win,
+    net_loss, payoff_r, delta_assumed}`.
+    """
+    def num(value: Any) -> Optional[float]:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    def floor_cent(n: float) -> float:
+        return math.floor(n * 100 + 1e-9) / 100
+
+    base: Dict[str, Any] = {
+        "live": False, "code": "", "reason": "", "fill": None, "stop": None,
+        "risk": None, "max_risk": None, "net_win": None, "net_loss": None,
+        "payoff_r": None, "delta_assumed": False,
+    }
+
+    def refuse(code: str, why: str, **extra: Any) -> Dict[str, Any]:
+        out = dict(base)
+        out.update(extra)
+        out["code"] = code
+        out["reason"] = f"{FILLED_SHAPE_PREFIX} {MIN_ENTRY_PAYOFF_R}R at the real ask — {why}"
+        return out
+
+    b = num(bid)
+    a = num(ask)
+    if a is None or a <= 0 or b is None or b <= 0 or a < b:
+        return refuse("unquoted", "no two-sided E*TRADE quote on this contract — the fill, "
+                                  "the spread floor and the exit are all unmeasured")
+
+    e, s, t = num(entry), num(stop), num(target)
+    if e is None or s is None or t is None or e <= 0 or abs(t - e) <= 0 or abs(e - s) <= 0:
+        return refuse("no_geometry", "entry/stop/target incomplete — the win and the stop "
+                                     "cannot be sized", fill=a)
+
+    raw = num(delta)
+    assumed = raw is None or abs(raw) <= 0
+    d = SHAPE_ASSUMED_DELTA if assumed else min(1.0, max(0.05, abs(raw)))
+    fee = COMMISSION_PER_CONTRACT / 100.0  # per share, one leg
+
+    spread = a - b
+    friction = spread + 2.0 * fee
+    gross_win = abs(t - e) * d
+    net_win = gross_win - friction
+    if net_win <= 0:
+        return refuse("no_win", f"a full-target move is worth {gross_win:.2f} of premium but the "
+                                f"round trip costs {friction:.2f} — it loses even if the signal is right",
+                      fill=a, net_win=round(net_win, 2), delta_assumed=assumed)
+
+    # The widest PREMIUM risk the win can fund once the exit fee is paid and a
+    # cent of tick rounding is allowed for. Without the fee term every trade
+    # the payoff cap touched would land a hair under 1.5R net.
+    fundable = net_win / MIN_ENTRY_PAYOFF_R - 2.0 * fee - 0.01
+    sized = {"fill": a, "net_win": round(net_win, 2),
+             "max_risk": round(max(fundable, 0.0), 2), "delta_assumed": assumed}
+
+    spread_floor = SHAPE_SPREAD_STOP_MULTIPLE * spread
+    min_floor = a * SHAPE_MIN_HAIRCUT_PCT / 100.0
+    structural = max(spread_floor, min_floor)
+    risk = max(abs(e - s) * d, spread_floor, min_floor)
+    risk = min(risk, a * SHAPE_MAX_HAIRCUT_PCT / 100.0)
+    if fundable < risk:
+        if fundable < structural:
+            return refuse(
+                "payoff_unviable",
+                f"on the {a:.2f} fill a {net_win:.2f} net win can fund at most "
+                f"{max(fundable, 0.0):.2f} of risk, but the spread/noise floor needs "
+                f"{structural:.2f} — no stop both survives the quote and pays for the loser",
+                **sized,
+            )
+        risk = fundable
+
+    stop_p = floor_cent(a - risk)
+    if b > 0.02 and stop_p >= b:
+        stop_p = floor_cent(b - 0.01)
+    if stop_p < 0.01 or stop_p >= a:
+        return refuse("no_stop", f"no protective stop is placeable on the {a:.2f} fill", **sized)
+
+    real_risk = round(a - stop_p, 2)
+    net_loss = real_risk + 2.0 * fee
+    payoff_r = round(net_win / net_loss, 2)
+    graded = dict(sized, stop=stop_p, risk=real_risk,
+                  net_loss=round(net_loss, 2), payoff_r=payoff_r)
+    haircut = round(real_risk / a * 100.0)
+    if payoff_r < MIN_ENTRY_PAYOFF_R:
+        return refuse(
+            "below_payoff",
+            f"the stop that survives the quote ({stop_p:.2f}, {haircut}% of the {a:.2f} fill) risks "
+            f"{net_loss:.2f} against a {net_win:.2f} net win — {payoff_r}:1",
+            **graded,
+        )
+    out = dict(base)
+    out.update(graded)
+    out.update({
+        "live": True, "code": "ok",
+        "reason": (f"filled shape {payoff_r}:1 at the {a:.2f} ask — stop {stop_p:.2f} ({haircut}%) "
+                   f"against a {net_win:.2f} net win{' [delta assumed]' if assumed else ''}"),
+    })
+    return out
+
+
+def _explain_basis(derived_basis: str, clamp_note: str, shape_tightened: bool) -> str:
+    """Collapse the armed-stop provenance into ONE word a human can read.
+
+    `payoff-cap`   the filled-shape gate's stop was tighter and won
+    `bot-haircut`  no usable app stop — the bot's blind percentage rested
+    `rescaled`     the entry repriced; the app's HAIRCUT was carried, not its level
+    `min-floor`    the app's level sat inside option noise; widened to the floor
+    `max-ceiling`  the app's level risked more than the ceiling; tightened
+    `app-delta`    the app's delta-derived level rested untouched
+    """
+    if shape_tightened:
+        return "payoff-cap"
+    if derived_basis == "none":
+        return "none"
+    if derived_basis == "pct_default":
+        return "bot-haircut"
+    if "+rescaled" in derived_basis:
+        return "rescaled"
+    if derived_basis.endswith("+clamped"):
+        return "min-floor" if "floor" in clamp_note else "max-ceiling"
+    return "app-delta"
+
+
+def plan_explain_option(payload: dict, real_bid: Any, real_ask: Any,
+                        quote_source: str = "etrade",
+                        budget: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """DRY RUN of the option-entry half of `execute_live_order` — no order, no state.
+
+    Replays steps 4 and 5 of placement with the SAME shipped helpers, in the
+    same order: limit sanitized against the real quote and tick grid ->
+    intent-preserving resize -> filled-shape gate -> armed stop (intent
+    rescale, sanity clamp, shape tighten) -> priced-risk recheck. Every step is
+    computed even after an earlier one refuses, so a training screen can show
+    what the app INTENDED next to what the broker side would CLAMP it to.
+
+    Pure: no I/O. `budget` is `{remaining_usd, base_budget_usd}` or None (the
+    priced-risk step then reports unmeasured instead of inventing a ceiling).
+    """
+    def num(value: Any) -> Optional[float]:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    p = payload or {}
+    bid = num(real_bid) or 0.0
+    ask = num(real_ask) or 0.0
+    try:
+        qty = int(p.get("option_contracts") or p.get("contracts") or p.get("quantity") or 1)
+    except (TypeError, ValueError):
+        qty = 1
+    app_limit = num(p.get("option_limit_price") or p.get("limit_price"))
+    app_stop = num(p.get("option_stop_price"))
+    app_basis = str(p.get("option_stop_basis") or "") or None
+    notes: List[str] = []
+
+    # -- 4a. Limit sanitized against the REAL quote (mirrors the entry branch).
+    desired = app_limit if app_limit is not None and app_limit > 0 else None
+    repriced = False
+    fill: Optional[float] = None
+    if ask > 0:
+        if desired is None or desired > ask or desired < bid:
+            if desired is not None:
+                repriced = True
+                notes.append(f"App limit {desired} outside real market [{bid}, {ask}] — repricing to ask")
+            desired = ask
+        quote_tick = _option_tick_from_quote(desired, bid, ask)
+        priced = _round_to_option_tick(desired, "up", quote_tick)
+        if priced > ask >= desired:
+            on_ask = _round_to_option_tick(ask, "down", quote_tick)
+            if on_ask >= bid:
+                priced = on_ask
+        fill = priced
+    elif desired is not None:
+        fill = _round_to_option_tick(desired)
+
+    # -- 4b. Intent-preserving resize.
+    reprice = plan_entry_reprice(app_limit, qty, fill or ask)
+    final_qty = int(reprice["qty"]) if reprice["action"] == "resize" else qty
+
+    # -- 5a. Filled-shape gate on the real quote.
+    shape = plan_filled_shape(p.get("entry"), p.get("stop"), p.get("target"),
+                              bid, ask, p.get("option_delta"))
+    shape_stop = shape["stop"] if shape["live"] else None
+
+    # -- 5b. The stop that would actually rest.
+    derived, derived_basis = derive_armed_option_stop(app_stop, fill or 0.0, app_limit)
+    clamp_note = ""
+    if derived_basis.startswith("app_delta"):
+        if "+rescaled" in derived_basis:
+            notes.append(plan_intent_preserving_stop(
+                app_stop, app_limit, fill, OPTION_STOP_MAX_HAIRCUT_PCT / 100.0,
+            )["reason"])
+        if derived_basis.endswith("+clamped"):
+            clamp_note = _clamp_option_stop_premium(app_stop, fill or 0.0)[1]
+            if "+rescaled" in derived_basis:
+                # The clamp judged the RESCALED level, not the raw app stop.
+                clamp_note = _clamp_option_stop_premium(
+                    plan_intent_preserving_stop(app_stop, app_limit, fill,
+                                                OPTION_STOP_MAX_HAIRCUT_PCT / 100.0)["stop"],
+                    fill or 0.0,
+                )[1]
+            if clamp_note:
+                notes.append(f"app option stop {clamp_note}")
+    shaped = tighten_to_shape_stop(derived, shape_stop)
+    shape_tightened = shaped is not None and derived is not None and shaped > derived
+    if shape_tightened:
+        notes.append(f"option stop tightened to the graded shape stop {shaped:.2f}")
+    basis = _explain_basis(derived_basis, clamp_note, shape_tightened)
+
+    # -- 5c. Priced-risk recheck in broker dollars.
+    priced_risk: Optional[Dict[str, Any]] = None
+    if budget is not None and fill:
+        priced_risk = plan_priced_option_risk(
+            premium=fill, qty=final_qty, stop_premium=shaped,
+            remaining_budget_usd=budget.get("remaining_usd"),
+            base_budget_usd=budget.get("base_budget_usd"),
+        )
+        if priced_risk["action"] == "shrink":
+            final_qty = int(priced_risk["qty"])
+
+    def risk_of(entry_p: Optional[float], stop_p: Optional[float], n: int) -> Dict[str, Any]:
+        if entry_p is None or stop_p is None or entry_p <= 0 or not (0 < stop_p < entry_p):
+            return {"haircut_pct": None, "risk_per_contract_usd": None, "risk_usd": None}
+        per = (entry_p - stop_p) * 100.0
+        return {
+            "haircut_pct": round((entry_p - stop_p) / entry_p * 100.0, 1),
+            "risk_per_contract_usd": round(per, 2),
+            "risk_usd": round(per * max(n, 0), 2),
+        }
+
+    refused_at: Optional[str] = None
+    reason = ""
+    if ask <= 0 and desired is None:
+        refused_at, reason = "quote", "no real quote and no app limit — nothing to price against"
+    elif reprice["action"] == "reject":
+        refused_at = "reprice"
+        reason = (f"entry price drifted {reprice['drift_pct']:.0f}% above the app's estimate "
+                  f"(≈${(reprice['actual_unit_usd'] or 0):.0f}/contract vs "
+                  f"≈${(reprice['intended_usd'] or 0):.0f} intended)")
+    elif not shape["live"]:
+        refused_at, reason = "shape", shape["reason"]
+    elif priced_risk is not None and priced_risk["action"] == "reject":
+        refused_at, reason = "priced_risk", priced_risk["reason"]
+
+    return {
+        "dry_run": True,
+        "placed": False,
+        "quote": {"bid": bid or None, "ask": ask or None, "source": quote_source},
+        "app_intent": {
+            "limit": app_limit,
+            "stop": app_stop,
+            "basis": app_basis,
+            "qty": qty,
+            **risk_of(app_limit, app_stop, qty),
+        },
+        "broker": {
+            "fill": fill,
+            "repriced": repriced,
+            "qty": final_qty,
+            "stop": shaped,
+            "basis": basis,
+            "basis_detail": f"{derived_basis}{'+shape' if shape_tightened else ''}",
+            "tier": "tactical",
+            **risk_of(fill, shaped, final_qty),
+        },
+        "reprice": reprice,
+        "shape": shape,
+        "priced_risk": priced_risk,
+        "notes": [n for n in notes if n],
+        "verdict": "refused" if refused_at else "would_place",
+        "refused_at": refused_at,
+        "reason": reason,
+    }
 
 
 def plan_broker_stop_placement(
@@ -15545,6 +15879,27 @@ def _clamp_option_stop_premium(candidate: float, fill_ref: float) -> tuple:
     return round(stop, 2), ""
 
 
+async def _day_risk_budget() -> Dict[str, Any]:
+    """The day's dollar risk budget for a PRICED entry — read only.
+
+    One assembly shared by the priced-risk gate and the /explain dry run, so
+    the budget a dry run reports is the budget placement would enforce.
+    Raises on failure; each caller decides what an unavailable budget means.
+    """
+    account_ref = await _risk_account_reference()
+    daily = await state.get_daily()
+    open_positions = await state.all_positions()
+    open_risk_usd = sum(position_risk_usd(pos) for pos in open_positions.values())
+    lock = plan_profit_lock(daily.get("realized_pnl_today_usd"))
+    return plan_risk_budget(
+        account_size=account_ref,
+        realized_usd=daily.get("realized_pnl_today_usd"),
+        open_risk_usd=open_risk_usd,
+        profit_lock_max_risk=(lock["max_risk_usd"] if lock["cushion_usd"] > 0 else None),
+        loss_limit_pct=live_policy("daily_loss_limit_pct"),
+    )
+
+
 async def _priced_option_risk_gate(symbol: str, premium: Any, qty: Any,
                                    stop_premium: Any) -> Dict[str, Any]:
     """Rebuild the day's real risk budget and judge a PRICED option entry.
@@ -15557,18 +15912,7 @@ async def _priced_option_risk_gate(symbol: str, premium: Any, qty: Any,
     fallback = {"action": "allow", "qty": qty, "risk_usd": None,
                 "per_contract_usd": None, "ceiling_usd": None, "reason": ""}
     try:
-        account_ref = await _risk_account_reference()
-        daily = await state.get_daily()
-        open_positions = await state.all_positions()
-        open_risk_usd = sum(position_risk_usd(pos) for pos in open_positions.values())
-        lock = plan_profit_lock(daily.get("realized_pnl_today_usd"))
-        budget = plan_risk_budget(
-            account_size=account_ref,
-            realized_usd=daily.get("realized_pnl_today_usd"),
-            open_risk_usd=open_risk_usd,
-            profit_lock_max_risk=(lock["max_risk_usd"] if lock["cushion_usd"] > 0 else None),
-            loss_limit_pct=live_policy("daily_loss_limit_pct"),
-        )
+        budget = await _day_risk_budget()
         return plan_priced_option_risk(
             premium=premium, qty=qty, stop_premium=stop_premium,
             remaining_budget_usd=budget["remaining_usd"],
@@ -15776,6 +16120,9 @@ async def execute_live_order(payload: dict):
                 payload.get("option_right") or payload.get("call_put") or "CALL",
             )
             is_exit = order_action == "SELL_CLOSE"
+            # The stop the filled-shape gate graded. Set only on a passing live
+            # entry; the armed stop may never rest WIDER than this level.
+            shape_stop: Optional[float] = None
             # Normalized ticker for state/ledger/guard keys. Assigned ABOVE the
             # exit/entry split because BOTH paths key off it (the close flow for
             # the position and guard, the entry flow for the priced-risk gate).
@@ -16010,6 +16357,39 @@ async def execute_live_order(payload: dict):
                     common["quantity"] = quantity
 
             if not is_exit:
+                # FILLED-SHAPE GATE — the trade must still pay 1.5R at the REAL
+                # ask, not at the app's limit. Runs on E*TRADE's own quote,
+                # after the reprice, before any dollars are budgeted. Returns
+                # (never raises): a dead shape is a policy verdict, not a sick
+                # broker, so it must not feed the API circuit breaker.
+                shape = plan_filled_shape(
+                    payload.get("entry"), payload.get("stop"), payload.get("target"),
+                    real_bid, real_ask, payload.get("option_delta"),
+                )
+                if not shape["live"]:
+                    logger.warning(f"⛔ {symbol} {shape['reason']}")
+                    await trade_ledger.record("entry_shape_refused", {
+                        "ticker": sym_u,
+                        "code": shape["code"],
+                        "estimate": float(limit_price or 0) or None,
+                        "real_bid": real_bid or None,
+                        "real_ask": real_ask or None,
+                        "stop_premium": shape["stop"],
+                        "net_win": shape["net_win"],
+                        "net_loss": shape["net_loss"],
+                        "payoff_r": shape["payoff_r"],
+                        "qty_requested": quantity,
+                    })
+                    await alerts.send(
+                        "warning", "entry_shape_refused",
+                        f"{symbol}: no live ticket — {shape['reason']}. Paper it instead.",
+                        dedupe_key=f"shape_refused:{symbol}",
+                    )
+                    return {"status": "refused", "reason": shape["reason"],
+                            "code": shape["code"], "paper": True}
+                logger.info(f"✅ {symbol} {shape['reason']}")
+                shape_stop = shape["stop"]
+
                 # POST-PRICING RISK RECHECK — the last gate that sees the REAL
                 # contract. Every gate before this one judged an option payload
                 # that had no premium in it yet, so they measured a nominal
@@ -16023,6 +16403,7 @@ async def execute_live_order(payload: dict):
                     payload.get("option_stop_price"), entry_premium_ref,
                     payload.get("option_limit_price"),
                 )
+                armed_stop = tighten_to_shape_stop(armed_stop, shape_stop)
                 risk_check = await _priced_option_risk_gate(
                     sym_u, entry_premium_ref, quantity, armed_stop,
                 )
@@ -16137,6 +16518,9 @@ async def execute_live_order(payload: dict):
                     explicit, fill_ref, planned_entry,
                 )
                 stop_basis = derived_basis
+                shaped = tighten_to_shape_stop(stop_premium, shape_stop)
+                shape_tightened = shaped is not None and stop_premium is not None and shaped > stop_premium
+                stop_premium = shaped
                 if derived_basis.startswith("app_delta"):
                     app_basis = str(payload.get("option_stop_basis") or "app_delta")
                     if "+rescaled" in derived_basis:
@@ -16155,6 +16539,11 @@ async def execute_live_order(payload: dict):
                         logger.warning(f"⚠️ {symbol} app option stop {clamp_note}")
                     else:
                         stop_basis = app_basis
+                if shape_tightened:
+                    # The entry was admitted on THIS stop's payoff; a wider
+                    # derived level would rest a trade nobody graded.
+                    stop_basis = f"{stop_basis}+shape"
+                    logger.warning(f"⚖️ {symbol} option stop tightened to the graded shape stop {stop_premium:.2f}")
                 if stop_premium and stop_premium > 0:
                     # WHERE the stop rests depends on who can see. While the app
                     # is connected it owns the tactical exit and the broker only
@@ -18013,6 +18402,111 @@ async def process_signal(pd: dict) -> dict:
         logger.error(f"Direct processing failed: {e}")
         await _record_dispatch_verdict(pd, "failed", err[:200])
         return {"status": "error", "message": str(e), "signal_id": sig_key}
+
+
+# ==================== DRY RUN ====================
+# POST /explain — the /webhook payload, the /webhook auth, NO order. Replays
+# the entry filters, the reprice/resize, the filled-shape gate, the armed-stop
+# clamp and the priced-risk recheck, and returns the basis and the dollars at
+# risk. It takes no idempotency key, sets no cooldown, queues nothing, records
+# no ledger event, arms no guard and writes no position. The only broker call
+# is the read-only chain lookup the real placement also makes.
+@app.post("/explain")
+async def explain(
+    request: Request,
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+    x_signature: Optional[str] = Header(None, alias="X-Rork-Signature"),
+):
+    raw = await request.body()
+    try:
+        data = json.loads(raw or b"{}")
+    except json.JSONDecodeError:
+        raise HTTPException(400, "invalid json")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "invalid payload")
+    _verify_webhook_auth(raw, data.get("secret"), x_rork_secret, x_signature)
+    try:
+        payload = WebhookPayload(**data)
+    except ValidationError as e:
+        raise HTTPException(400, f"invalid payload: {e.errors()[:3]}")
+    pd = payload.dict()
+    pd.pop("secret", None)
+    return await explain_signal(pd)
+
+
+async def _explain_budget() -> Optional[Dict[str, Any]]:
+    """The same day budget `_priced_option_risk_gate` enforces — read only."""
+    try:
+        budget = await _day_risk_budget()
+        return {"remaining_usd": budget["remaining_usd"], "base_budget_usd": budget["base_budget_usd"]}
+    except Exception as e:
+        logger.warning(f"explain: risk budget unavailable (reported as unmeasured): {e}")
+        return None
+
+
+async def explain_signal(pd: dict) -> Dict[str, Any]:
+    """Everything placement would decide for ONE entry payload, without placing."""
+    ticker = str(pd.get("ticker") or "").upper()
+    mode = str(pd.get("mode") or "paper").lower()
+    instrument = str(pd.get("instrument") or "stock").lower()
+    base: Dict[str, Any] = {
+        "dry_run": True, "placed": False, "bot_version": BOT_VERSION, "ticker": ticker,
+        "would_route": "live" if (mode == "live" and LIVE_TRADING and not is_sandbox)
+        else f"skipped (mode={mode}, LIVE_TRADING={LIVE_TRADING}, sandbox={is_sandbox})",
+        "market_open": _is_market_open(),
+    }
+    if _is_close_payload(pd):
+        return {**base, "verdict": "not_applicable",
+                "reason": "explain covers entries — a close always passes entry gating"}
+
+    try:
+        filters_ok, blocked = await _passes_entry_filters(pd)
+    except Exception as e:
+        filters_ok, blocked = True, []
+        base["filters_error"] = str(e)[:200]
+    base["filters"] = {"passed": filters_ok, "blocked_by": blocked}
+
+    if instrument != "option":
+        return {**base, "verdict": "would_place" if filters_ok else "refused",
+                "refused_at": None if filters_ok else "filters",
+                "reason": "; ".join(blocked),
+                "note": "equity entry — no option-stop clamp applies"}
+
+    right = str(pd.get("option_right") or pd.get("call_put") or "CALL").upper()
+    route, call_put = plan_option_route(str(pd.get("action") or "BUY").upper(), False, right)
+    strike = pd.get("strike_hint") or pd.get("strike")
+    expiry = _resolve_expiry_string(pd)
+    bid = ask = 0.0
+    source = "etrade"
+    tokens = load_tokens()
+    if tokens and strike and expiry:
+        try:
+            market = pyetrade.ETradeMarket(
+                CONSUMER_KEY, CONSUMER_SECRET,
+                tokens["oauth_token"], tokens["oauth_token_secret"], dev=is_sandbox,
+            )
+            expiry, strike, bid, ask = await asyncio.to_thread(
+                _snap_option_contract, market, ticker, expiry, float(strike), call_put,
+            )
+        except Exception as e:
+            logger.warning(f"explain: chain lookup failed for {ticker} (falling back to app quote): {e}")
+    if not (bid > 0 and ask > 0):
+        bid = float(pd.get("option_bid") or 0) or 0.0
+        ask = float(pd.get("option_ask") or 0) or 0.0
+        source = "app_payload" if ask > 0 else "none"
+
+    plan = plan_explain_option(pd, bid, ask, source, await _explain_budget())
+    out = {**base, **plan, "route": route, "right": call_put, "strike": strike, "expiry": expiry}
+    if not filters_ok:
+        out["verdict"] = "refused"
+        out["refused_at"] = "filters"
+        out["reason"] = "; ".join(blocked)
+    logger.info(
+        f"[EXPLAIN] {ticker} {out['verdict']}{' at ' + out['refused_at'] if out.get('refused_at') else ''} — "
+        f"app stop {plan['app_intent']['stop']} → broker {plan['broker']['stop']} ({plan['broker']['basis']}), "
+        f"risk ${plan['broker']['risk_usd']}"
+    )
+    return out
 
 
 @app.get("/health")
