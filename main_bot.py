@@ -4102,6 +4102,7 @@ def plan_scheduled_exit(
     max_hold_hours: Any = None,
     eod_enabled: bool = True,
     time_exit_enabled: bool = True,
+    close_minute: Any = None,
 ) -> Dict[str, Any]:
     """Do the CLOCK-driven exits fire? Returns
     ``{"fire": bool, "reason": str|None, "detail": str}``.
@@ -4129,9 +4130,16 @@ def plan_scheduled_exit(
     minutes = _finite(et_minutes)
     day = str(weekday or "")
     is_weekend = day in ("Sat", "Sun")
+    # `close_minute` is today's REAL close (13:00 on a half day). The window
+    # is the same 20 minutes before it; an unreadable value falls back to the
+    # regular 16:00 bell rather than disabling the flatten.
+    close = _finite(close_minute)
+    if close is None or not (9 * 60 + 30 < close <= MARKET_CLOSE_MINUTE):
+        close = float(MARKET_CLOSE_MINUTE)
+    window_open = close - (MARKET_CLOSE_MINUTE - EOD_FLATTEN_MINUTE)
 
     if eod_enabled and minutes is not None and not is_weekend:
-        if EOD_FLATTEN_MINUTE <= minutes < MARKET_CLOSE_MINUTE:
+        if window_open <= minutes < close:
             hh, mm = divmod(int(minutes), 60)
             return {
                 "fire": True, "reason": "eod_flatten",
@@ -6192,6 +6200,140 @@ async def summary(min_samples: int = 1, recent: int = 10) -> Dict[str, Any]:
 
 ''')
 
+_bundle_load('econ_calendar', r'''
+"""
+Economic calendar — the bot's copy of the app's macro-event schedule.
+
+WHY IT EXISTS. The app flattened positions ahead of FOMC / CPI / PPI / jobs
+releases, but only while the phone was awake. Once the cloud bot became the
+only live guardian (5.66), that duty had nowhere to run for live positions.
+This module lets the risk desk flatten the book before a binary release with
+no phone involved.
+
+A DELIBERATE MIRROR of `expo/services/economicCalendar.ts`. Same dates, same
+windows, same 30-minute lead. `expo/__tests__/econCalendarParity.test.ts`
+reads both files and fails if either side drifts, because a calendar that
+disagrees with the app flattens (or fails to flatten) on a different day than
+the one the operator was shown.
+
+Dates are the official published 2026 schedules (federalreserve.gov, bls.gov).
+Past the last covered year the calendar reports itself OUTDATED instead of
+silently answering "no event today" — an unknown day is not a quiet day.
+
+Stdlib only, no I/O. Pure.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+
+def _m(h: int, m: int) -> int:
+    return h * 60 + m
+
+
+# FOMC decision days 2026 (second day of each meeting). Decision 14:00 ET.
+FOMC_DECISION_DAYS_2026 = (
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+    "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+)
+
+# CPI release days 2026 (8:30 ET) — official BLS schedule.
+CPI_DAYS_2026 = (
+    "2026-01-13", "2026-02-13", "2026-03-11", "2026-04-10", "2026-05-12", "2026-06-10",
+    "2026-07-14", "2026-08-12", "2026-09-11", "2026-10-14", "2026-11-10", "2026-12-10",
+)
+
+# PPI release days 2026 (8:30 ET) — official BLS schedule.
+PPI_DAYS_2026 = (
+    "2026-01-14", "2026-01-30", "2026-02-27", "2026-03-18", "2026-04-14", "2026-05-13",
+    "2026-06-11", "2026-07-15", "2026-08-13", "2026-09-10", "2026-10-15", "2026-11-13",
+    "2026-12-15",
+)
+
+# Jobs report (NFP) release days 2026 (8:30 ET) — official BLS schedule.
+JOBS_DAYS_2026 = (
+    "2026-01-09", "2026-02-11", "2026-03-06", "2026-04-03", "2026-05-08", "2026-06-05",
+    "2026-07-02", "2026-08-07", "2026-09-04", "2026-10-02", "2026-11-06", "2026-12-04",
+)
+
+CALENDAR_COVERAGE_LAST_YEAR = 2026
+
+# Minutes before a window OPENS at which the event already counts as active.
+IMMINENT_LEAD_MINUTES = 30
+
+# (kind, name, days, release, block_start, block_end) — windows in ET minutes.
+_EVENT_SPECS = (
+    ("fomc", "FOMC Rate Decision + Powell Press Conference", FOMC_DECISION_DAYS_2026,
+     _m(14, 0), _m(13, 30), _m(15, 45)),
+    ("cpi", "CPI Inflation Report", CPI_DAYS_2026, _m(8, 30), _m(8, 0), _m(10, 0)),
+    ("ppi", "PPI Inflation Report", PPI_DAYS_2026, _m(8, 30), _m(8, 0), _m(9, 50)),
+    ("jobs", "Jobs Report (Nonfarm Payrolls)", JOBS_DAYS_2026, _m(8, 30), _m(8, 0), _m(10, 0)),
+)
+
+
+def events_for_day(day_key: str) -> List[Dict[str, Any]]:
+    """Every high-impact event scheduled on an ET day (YYYY-MM-DD)."""
+    out: List[Dict[str, Any]] = []
+    for kind, name, days, release, start, end in _EVENT_SPECS:
+        if day_key in days:
+            out.append({
+                "kind": kind, "name": name, "date_et": day_key,
+                "release_minute": release,
+                "block_start_minute": start, "block_end_minute": end,
+            })
+    out.sort(key=lambda e: e["block_start_minute"])
+    return out
+
+
+def assess_event_window(day_key: Any, et_minute: Any, year: Any = None) -> Dict[str, Any]:
+    """Is a macro-event volatility window active right now?
+
+    Mirrors `computeEconomicCalendarFilter`'s `blocked` verdict exactly:
+    inside [block_start, block_end], or within IMMINENT_LEAD_MINUTES before
+    block_start. Returns::
+
+        {"active": bool, "reason": str|None, "event": dict|None,
+         "calendar_outdated": bool, "today": [kind, ...]}
+
+    Unreadable inputs return inactive: this verdict DESTROYS positions, so an
+    unparseable clock must never liquidate the book (stops still protect it).
+    """
+    key = str(day_key or "")
+    try:
+        minute = int(et_minute)
+    except (TypeError, ValueError):
+        minute = None
+    try:
+        yr = int(year) if year is not None else int(key[:4])
+    except (TypeError, ValueError):
+        yr = None
+    outdated = yr is not None and yr > CALENDAR_COVERAGE_LAST_YEAR
+    today = events_for_day(key)
+    base = {"active": False, "reason": None, "event": None,
+            "calendar_outdated": outdated, "today": [e["kind"] for e in today]}
+    if minute is None or not today:
+        return base
+    for ev in today:
+        if ev["block_start_minute"] <= minute <= ev["block_end_minute"]:
+            until = ev["release_minute"] - minute
+            reason = (f"{ev['name']} in {until} min" if until > 0
+                      else f"{ev['name']} volatility window active")
+            return {**base, "active": True, "reason": reason, "event": ev}
+        until_block = ev["block_start_minute"] - minute
+        if 0 < until_block <= IMMINENT_LEAD_MINUTES:
+            return {**base, "active": True,
+                    "reason": f"{ev['name']} in {ev['release_minute'] - minute} min",
+                    "event": ev}
+    return base
+
+
+def next_event_after(day_key: str) -> Optional[str]:
+    """First scheduled event day strictly after `day_key` (for status)."""
+    days = sorted({d for spec in _EVENT_SPECS for d in spec[2] if d > str(day_key)})
+    return days[0] if days else None
+
+''')
+
 # =========================================================================
 # main_bot.py source follows (its `from x import y` calls resolve to the
 # embedded modules registered in sys.modules above).
@@ -6338,6 +6480,7 @@ try:  # package-style import (python -m bot.main_bot) or flat (uvicorn main_bot:
     from . import trailing_engine
     from . import scanner as scanner_mod
     from . import study
+    from . import econ_calendar
 except ImportError:
     from state_store import (
         StateStore, LockNotAcquired, sanitize_conn_url, unreplaced_placeholders,
@@ -6351,6 +6494,7 @@ except ImportError:
     import trailing_engine
     import scanner as scanner_mod
     import study
+    import econ_calendar
 
 load_dotenv()
 
@@ -6417,7 +6561,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.65.0-private-schema"
+BOT_VERSION = "5.67.0-event-flatten"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -6639,6 +6783,22 @@ TAKE_PROFIT_ENABLED = os.getenv("TAKE_PROFIT_ENABLED", "true").lower() == "true"
 # bot already carries an `expired_worthless` close reason.
 SCHEDULED_EXIT_ENABLED = os.getenv("SCHEDULED_EXIT_ENABLED", "true").lower() == "true"
 MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "8"))
+# DAILY-LOSS FLATTEN. The daily loss limit used to refuse the NEXT entry and
+# nothing else: the positions already on kept running into a day that had
+# already breached. When realized loss crosses the limit the bot now engages
+# the kill switch and flattens the book itself, once per ET day.
+DAILY_LOSS_FLATTEN_ENABLED = os.getenv("DAILY_LOSS_FLATTEN_ENABLED", "true").lower() == "true"
+# EVENT FLATTEN. Ahead of a scheduled binary release (FOMC, CPI, PPI, jobs)
+# the book is flattened and new entries are refused, from 30 minutes before
+# the volatility window opens until it closes. This was a phone-only exit;
+# with the bot as the only live guardian it runs here, off `econ_calendar`
+# (a mirror of the app's schedule, parity-tested).
+EVENT_FLATTEN_ENABLED = os.getenv("EVENT_FLATTEN_ENABLED", "true").lower() == "true"
+# GUARDIAN HEARTBEAT. How often the risk desk loop beats, and how old that beat
+# may be before /healthz reports the guardian as NOT green. The app refuses to
+# arm live money on anything but a green guardian.
+RISK_DESK_INTERVAL_SECONDS = int(os.getenv("RISK_DESK_INTERVAL_SECONDS", "30"))
+GUARDIAN_STALE_SECONDS = int(os.getenv("GUARDIAN_STALE_SECONDS", "120"))
 # A mark older than this cannot price a harvesting exit on a 30s loop. Well
 # inside the 15 minutes a DELAYED entitlement runs behind, so a stalled feed is
 # caught even when it claims REALTIME.
@@ -6792,7 +6952,16 @@ FILLED_SHAPE_PREFIX = "filled shape cannot pay"
 # The moment the app stops sending heartbeats, nobody is watching, and the
 # broker stop is re-tightened to the app's tactical level (see
 # `_app_eyes_pass`). Authority follows the eyes.
-APP_EXIT_AUTHORITY = os.getenv("APP_EXIT_AUTHORITY", "true").lower() == "true"
+#
+# RETIRED AS THE DEFAULT (5.66). "Authority follows the eyes" still left the
+# book depending on a phone: a wide backstop was only safe while the app was
+# awake, and the app finding out it had been asleep was a banner AFTER the
+# fact. The bot is now the only live guardian -- the tactical stop always
+# rests at the broker and every exit (stop, ratchet, premium take-profit, EOD
+# flatten, max hold, daily-loss flatten) runs here. A locked phone changes
+# nothing about risk. Set APP_EXIT_AUTHORITY=true only to restore the old
+# two-tier behaviour deliberately.
+APP_EXIT_AUTHORITY = os.getenv("APP_EXIT_AUTHORITY", "false").lower() == "true"
 # Deliberately WIDER than OPTION_STOP_MAX_HAIRCUT_PCT: that clamp bounds a
 # tactical stop meant to pay 1.5:1, while this is the disaster floor and is not
 # supposed to be reachable by noise.
@@ -6968,6 +7137,11 @@ _MARKET_HALF_DAYS = {
     "2026-11-27", "2026-12-24",
     "2027-11-26",
 }
+
+
+def _session_close_minute(now_et: datetime) -> int:
+    """Minute-of-day (ET) of today's regular close: 13:00 on half days."""
+    return 13 * 60 if now_et.date().isoformat() in _MARKET_HALF_DAYS else 16 * 60
 
 
 def _is_market_open() -> bool:
@@ -7519,6 +7693,16 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
                 logger.warning(f"📕 SETUP VETO — {verdict['reason']}")
         except Exception as e:
             logger.warning(f"setup expectancy veto unavailable (non-fatal, entry not blocked): {e}")
+        # EVENT WINDOW — the same window the risk desk flattens the book in.
+        # Opening a position the desk is about to close pays two spreads for
+        # nothing and rides the release in between.
+        if EVENT_FLATTEN_ENABLED:
+            now_et = _utcnow().astimezone(_ET_ZONE)
+            event = econ_calendar.assess_event_window(
+                now_et.date().isoformat(), now_et.hour * 60 + now_et.minute, now_et.year,
+            )
+            if event["active"]:
+                blocked.append(f"event window — {event['reason']}")
     else:
         logger.info("🧪 Connectivity test payload — quality gates skipped, risk gates still enforced")
 
@@ -14049,7 +14233,20 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
     verdict = trailing_engine.plan_scheduled_exit(
         held, now_et.hour * 60 + now_et.minute, now_et.strftime("%a"),
         max_hold_hours=MAX_HOLD_HOURS,
+        # A half day closes at 13:00 — the flatten must land at 12:40, not
+        # hours after the bell when the contract is already stuck.
+        close_minute=_session_close_minute(now_et),
     )
+    if not verdict["fire"] and EVENT_FLATTEN_ENABLED:
+        # EVENT FLATTEN rides the same close path: it is a decision about the
+        # calendar, not about price, and the EOD flatten above still outranks
+        # it (harder deadline, same action).
+        event = econ_calendar.assess_event_window(
+            now_et.date().isoformat(), now_et.hour * 60 + now_et.minute, now_et.year,
+        )
+        if event["active"]:
+            verdict = {"fire": True, "reason": "event_flatten",
+                       "detail": f"{event['reason']} — not riding a binary release"}
     if not verdict["fire"]:
         return False
 
@@ -14096,6 +14293,15 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
         pos["native_trail_order_id"] = None
         await state.set_position(ticker, pos)
 
+    if not mark or mark <= 0:
+        # The clock path runs before any quote is read. Best-effort mark for
+        # the ledger only — the close is MARKET and never waits on it.
+        try:
+            b, _a = await _current_bid_ask(ticker, contract)
+            mark = float(b or 0.0)
+        except Exception:
+            mark = 0.0
+
     try:
         close_id = await _place_option_market_close(ticker, contract, qty)
     except Exception as e:
@@ -14121,7 +14327,7 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
     logger.info(f"[{reason.upper()}] {ticker} CLOSED {qty} — {verdict['detail']} (order {close_id})")
     await trade_ledger.record(f"{reason}_closed", {
         "ticker": ticker, "qty": qty, "order_id": close_id,
-        "mark": round(float(mark), 4),
+        "mark": round(float(mark), 4) if mark and mark > 0 else None,
         "exit_premium": round(fill, 4) if fill else None,
         "held_seconds": int(held) if held is not None else None,
         "et_time": now_et.strftime("%H:%M"),
@@ -14675,6 +14881,10 @@ _CLOSE_REASON_LABELS = {
     "reconciler": "close detected by broker reconciliation",
     "trailing_stop": "trailing stop executed",
     "scale_out": "scale-out at the first target",
+    "take_profit": "premium take-profit target tagged",
+    "eod_flatten": "3:40 PM ET hard flatten",
+    "time_exit": "max hold reached",
+    "event_flatten": "event flatten ahead of a macro release",
 }
 
 
@@ -17127,8 +17337,6 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     # Conservative mark: longs (and long options) trail off the BID, shorts
     # off the ASK — the trail only ratchets on prices we could actually exit at.
     mark = bid if (is_buy or is_option) else ask
-    if mark <= 0:
-        return
 
     # Live round-trip spread on the same basis as the mark. It floors the trail
     # distance so a wide chain (ARM at 10.85/11.75) is never stopped out by its
@@ -17142,7 +17350,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     # incomplete premium basis. Each of those exits used to lose the peak for
     # that pass, so a trade that ran +1.2R and then died — precisely the trade
     # the exit audit needs — recorded nothing at all.
-    observed = trailing_engine.observe_water_mark(pos, mark)
+    observed = trailing_engine.observe_water_mark(pos, mark) if mark > 0 else None
     if observed is not None:
         pos["trail_high"] = observed["high_since"]
         pos["trail_low"] = observed["low_since"]
@@ -17154,6 +17362,17 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         # Persisted BEFORE the branches below so the observation survives a
         # scale-out return, a None plan, or a close booked by another path.
         await state.set_position(ticker, pos)
+
+    # THE CLOCK RUNS BEFORE THE DEAD-QUOTE BAIL AND THE NATIVE-TRAIL
+    # STAND-DOWN. The 3:40 flatten and the max-hold timer are decisions about
+    # TIME, not price: a missing quote used to `return` right here, and a
+    # broker-native trail used to stand the whole pass down, so a 0DTE contract
+    # in either state rode into the bell with nothing asking the clock. The
+    # clock also outranks the target, the scale-out and the ratchet below.
+    if await _maybe_scheduled_exit(ticker, pos, mark if mark > 0 else 0.0):
+        return
+    if mark <= 0:
+        return
 
     # NATIVE TRAIL STAND-DOWN. When a broker-native trailing stop covers this
     # leg, E*TRADE ratchets it server-side and it IS the protection. Placed
@@ -17172,14 +17391,6 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
             f"[TRAIL] {ticker} broker-native trail {native_trail_id} owns the stop — "
             f"engine trail standing down (watermark still tracked)"
         )
-        return
-
-    # THE CLOCK OUTRANKS EVERYTHING, INCLUDING THE TARGET. Inside the 3:40 PM
-    # window the position goes regardless: a 0DTE contract held for a better
-    # price is a contract that can expire worthless, and no target is worth
-    # that. The max-hold timer rides along here for the same reason — it is a
-    # decision about the clock, not about price.
-    if await _maybe_scheduled_exit(ticker, pos, mark):
         return
 
     # TAKE PROFIT OUTRANKS EVERYTHING BELOW. At the target the WHOLE position
@@ -17478,6 +17689,9 @@ async def trailing_worker():
     )
     while not _worker_stop:
         try:
+            # Guardian beat: this loop is alive (in session or not).
+            await state.set(GUARDIAN_TRAIL_BEAT_KEY, f"{time.time():.3f}",
+                            ex=max(600, GUARDIAN_STALE_SECONDS * 5))
             if _is_market_open() and load_tokens() is not None:
                 lock = state.lock("trail_engine", ttl_ms=max(60_000, TRAIL_INTERVAL_SECONDS * 2000))
                 if await lock.try_acquire():
@@ -17561,6 +17775,217 @@ async def _app_eyes_pass() -> None:
             )
         finally:
             await lock.release()
+
+
+# ==================== RISK DESK (the only live guardian) ====================
+GUARDIAN_RISK_DESK_BEAT_KEY = "guardian:risk_desk_beat"
+GUARDIAN_TRAIL_BEAT_KEY = "guardian:trail_beat"
+DAILY_LOSS_FLATTEN_DONE_PREFIX = "risk_desk:daily_loss_flattened:"
+
+
+def plan_daily_loss_flatten(
+    realized_pct: Any,
+    limit_pct: Any,
+    already_flattened_today: bool,
+    open_positions: int,
+    enabled: bool = True,
+) -> Dict[str, Any]:
+    """Does the day's REALIZED loss require the risk desk to flatten the book?
+
+    Fires once per ET day, only with something open to close, only when the
+    realized percent is at or through the NEGATIVE limit. Unreadable inputs
+    never fire: this path destroys positions, so an unparseable counter must
+    not be able to liquidate the book (the resting stops still protect it).
+
+    Pure: no I/O, fully unit-testable.
+    """
+    def _f(v: Any) -> Optional[float]:
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return None
+        return x if math.isfinite(x) else None
+
+    if not enabled:
+        return {"fire": False, "reason": "daily-loss flatten disabled"}
+    pct = _f(realized_pct)
+    limit = _f(limit_pct)
+    if pct is None or limit is None or limit == 0:
+        return {"fire": False, "reason": "daily loss or limit unreadable — not flattening on unknowns"}
+    if already_flattened_today:
+        return {"fire": False, "reason": "already flattened for today's breach"}
+    threshold = -abs(limit)
+    if pct > threshold:
+        return {"fire": False, "reason": f"realized {pct:.2f}% is inside the {threshold:g}% limit"}
+    if int(open_positions or 0) <= 0:
+        return {"fire": False, "reason": "limit breached but nothing is open"}
+    return {"fire": True,
+            "reason": f"realized {pct:.2f}% breached the {threshold:g}% daily loss limit"}
+
+
+def assess_guardian(
+    now: float,
+    risk_desk_beat: Any,
+    trail_beat: Any,
+    stale_seconds: float,
+    linked: bool,
+    killed: bool,
+    trail_enabled: bool,
+    take_profit_enabled: bool,
+    scheduled_exit_enabled: bool,
+    daily_loss_flatten_enabled: bool,
+    app_exit_authority: bool,
+    backend_degraded: bool = False,
+    event_flatten_enabled: bool = True,
+    calendar_outdated: bool = False,
+) -> Dict[str, Any]:
+    """Is the bot provably running the WHOLE exit lifecycle right now?
+
+    GREEN means every live-money duty is owned here and its loop has beaten
+    recently — so a locked phone changes nothing about risk. The app refuses
+    to arm live mode on anything else. Every blocker is named; a missing or
+    unreadable beat is NOT green (unknown is never a pass).
+
+    The kill switch is reported but is NOT a blocker: kill halts entries,
+    and the protective exits keep running under it.
+
+    Pure: no I/O, fully unit-testable.
+    """
+    def _age(v: Any) -> Optional[float]:
+        try:
+            t = float(v)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(t) or t <= 0:
+            return None
+        return max(0.0, now - t)
+
+    desk_age = _age(risk_desk_beat)
+    trail_age = _age(trail_beat)
+    blockers: List[str] = []
+    if desk_age is None:
+        blockers.append("risk desk has never beaten — guardian loop not running")
+    elif desk_age > stale_seconds:
+        blockers.append(f"risk desk heartbeat is {int(desk_age)}s old (limit {int(stale_seconds)}s)")
+    if not trail_enabled:
+        blockers.append("trailing engine disabled (TRAIL_ENGINE_ENABLED=false) — stops would not ratchet")
+    elif trail_age is None:
+        blockers.append("trailing engine has never beaten")
+    elif trail_age > stale_seconds:
+        blockers.append(f"trailing engine heartbeat is {int(trail_age)}s old (limit {int(stale_seconds)}s)")
+    if not take_profit_enabled:
+        blockers.append("premium take-profit disabled (TAKE_PROFIT_ENABLED=false)")
+    if not scheduled_exit_enabled:
+        blockers.append("3:40 PM flatten / max hold disabled (SCHEDULED_EXIT_ENABLED=false)")
+    if not daily_loss_flatten_enabled:
+        blockers.append("daily-loss flatten disabled (DAILY_LOSS_FLATTEN_ENABLED=false)")
+    if not event_flatten_enabled:
+        blockers.append("event flatten disabled (EVENT_FLATTEN_ENABLED=false) — positions would ride FOMC/CPI")
+    # An outdated calendar is a WARNING, not a blocker: every other exit still
+    # runs, and locking all live trading on Jan 1 would be its own outage. It
+    # is still said out loud — an unknown day is not a quiet day.
+    warnings: List[str] = []
+    if event_flatten_enabled and calendar_outdated:
+        warnings.append("macro calendar out of date — event flatten cannot see this year's FOMC/CPI dates; update econ_calendar.py")
+    if app_exit_authority:
+        blockers.append("APP_EXIT_AUTHORITY=true — the phone still owns tactical exits; a locked phone would widen risk")
+    if not linked:
+        blockers.append("no broker session — the bot cannot place an exit")
+    if backend_degraded:
+        blockers.append("state backend degraded — positions may not survive a restart")
+    return {
+        "green": len(blockers) == 0,
+        "blockers": blockers,
+        "warnings": warnings,
+        "risk_desk_age_seconds": None if desk_age is None else int(desk_age),
+        "trail_age_seconds": None if trail_age is None else int(trail_age),
+        "stale_after_seconds": int(stale_seconds),
+        "killed": bool(killed),
+        "owns": {
+            "resting_stop": True,
+            "ratchet": bool(trail_enabled),
+            "premium_take_profit": bool(take_profit_enabled),
+            "eod_flatten": bool(scheduled_exit_enabled),
+            "max_hold": bool(scheduled_exit_enabled),
+            "daily_loss_flatten": bool(daily_loss_flatten_enabled),
+            "event_flatten": bool(event_flatten_enabled) and not calendar_outdated,
+            "tactical_stop_at_broker": not app_exit_authority,
+        },
+    }
+
+
+async def _guardian_snapshot() -> Dict[str, Any]:
+    """Read the beats and config into the /healthz `guardian` block."""
+    try:
+        desk = await state.get(GUARDIAN_RISK_DESK_BEAT_KEY)
+        trail = await state.get(GUARDIAN_TRAIL_BEAT_KEY)
+        killed = await state.is_killed()
+        degraded = bool(getattr(state, "redis_degraded", False))
+    except Exception as e:
+        return {"green": False, "blockers": [f"guardian state unreadable: {str(e)[:120]}"],
+                "risk_desk_age_seconds": None, "trail_age_seconds": None,
+                "stale_after_seconds": GUARDIAN_STALE_SECONDS, "killed": None, "owns": {}}
+    return assess_guardian(
+        time.time(), desk, trail, GUARDIAN_STALE_SECONDS,
+        linked=load_tokens() is not None, killed=killed,
+        trail_enabled=TRAIL_ENGINE_ENABLED,
+        take_profit_enabled=TAKE_PROFIT_ENABLED,
+        scheduled_exit_enabled=SCHEDULED_EXIT_ENABLED,
+        daily_loss_flatten_enabled=DAILY_LOSS_FLATTEN_ENABLED,
+        app_exit_authority=APP_EXIT_AUTHORITY,
+        backend_degraded=degraded,
+        event_flatten_enabled=EVENT_FLATTEN_ENABLED,
+        calendar_outdated=econ_calendar.assess_event_window(
+            _utcnow().astimezone(_ET_ZONE).date().isoformat(), None,
+        )["calendar_outdated"],
+    )
+
+
+async def _risk_desk_pass() -> None:
+    """One risk-desk pass: flatten the book on a daily-loss breach."""
+    if not (_is_market_open() and load_tokens() is not None):
+        return
+    daily = await state.get_daily()
+    positions = await state.all_positions()
+    day = _utcnow().astimezone(_ET_ZONE).date().isoformat()
+    done_key = f"{DAILY_LOSS_FLATTEN_DONE_PREFIX}{day}"
+    verdict = plan_daily_loss_flatten(
+        daily.get("realized_pnl_today_pct"), live_policy("daily_loss_limit_pct"),
+        await state.exists(done_key), len(positions or {}),
+        enabled=DAILY_LOSS_FLATTEN_ENABLED,
+    )
+    if not verdict["fire"]:
+        return
+    # NX claim: exactly one worker flattens for a given day's breach.
+    if not await state.set(done_key, "1", ex=36 * 3600, nx=True):
+        return
+    logger.error(f"[RISK DESK] {verdict['reason']} — engaging kill switch and flattening the book")
+    await trade_ledger.record("daily_loss_flatten", {"reason": verdict["reason"],
+                                                     "open_positions": sorted((positions or {}).keys())})
+    await _flatten_book("daily_loss")
+
+
+async def risk_desk_worker():
+    """The guardian heartbeat. Beats every pass whether or not the market is
+    open — a beat means THIS loop is alive — and runs the daily-loss flatten."""
+    logger.info(
+        f"[RISK DESK] guardian started — beat every {RISK_DESK_INTERVAL_SECONDS}s, "
+        f"daily-loss flatten {'ON' if DAILY_LOSS_FLATTEN_ENABLED else 'OFF'}, "
+        f"tactical stop {'at the broker' if not APP_EXIT_AUTHORITY else 'owned by the APP (legacy)'}"
+    )
+    while not _worker_stop:
+        try:
+            await state.set(GUARDIAN_RISK_DESK_BEAT_KEY, f"{time.time():.3f}",
+                            ex=max(600, GUARDIAN_STALE_SECONDS * 5))
+            lock = state.lock("risk_desk", ttl_ms=max(60_000, RISK_DESK_INTERVAL_SECONDS * 2000))
+            if await lock.try_acquire():
+                try:
+                    await _risk_desk_pass()
+                finally:
+                    await lock.release()
+        except Exception as e:
+            logger.error(f"[RISK DESK] loop error: {e}")
+        await asyncio.sleep(RISK_DESK_INTERVAL_SECONDS)
 
 
 async def app_eyes_worker():
@@ -17784,6 +18209,7 @@ async def start_worker():
     _worker_task = asyncio.create_task(placement_worker())
     asyncio.create_task(token_keepalive_worker())
     asyncio.create_task(trailing_worker())
+    asyncio.create_task(risk_desk_worker())
     asyncio.create_task(app_eyes_worker())
     await _start_scanner()
 
@@ -18579,6 +19005,9 @@ async def healthz():
         "ok": True,
         "ts": _utcnow().isoformat(),
         "version": BOT_VERSION,
+        # The live-arm gate. The app refuses to arm live money unless this is
+        # green: every exit duty owned here, every loop beating.
+        "guardian": await _guardian_snapshot(),
         "cost_model": {
             "commission_per_contract": COMMISSION_PER_CONTRACT,
             "max_round_trip_cost_pct": MAX_ROUND_TRIP_COST_PCT,
@@ -19081,13 +19510,20 @@ async def flatten(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secr
     not strand the rest of the book.
     """
     await _require_control_auth(x_rork_secret, "/flatten")
+    return await _flatten_book("panic")
 
+
+async def _flatten_book(trigger: str) -> Dict[str, Any]:
+    """Kill entries, then close every tracked position. ONE implementation for
+    every caller -- the panic button (`trigger='panic'`) and the risk desk's
+    daily-loss breach (`trigger='daily_loss'`) -- so the cancel-before-close
+    discipline cannot drift between them."""
     await state.set_killed(True)
     positions = await state.all_positions()
     guards = await state.all_guards()
     plan = plan_flatten(positions, guards)
     logger.warning(
-        f"[FLATTEN] panic exit requested - entries halted, {len(plan)} tracked position(s): "
+        f"[FLATTEN] {trigger} exit requested - entries halted, {len(plan)} tracked position(s): "
         f"{', '.join(p['ticker'] for p in plan) or 'none'}"
     )
 
@@ -19178,14 +19614,16 @@ async def flatten(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secr
 
     closing = [r["ticker"] for r in results if r["status"] == "closing"]
     failed = [r["ticker"] for r in results if r["status"] in {"failed", "blocked"}]
-    await trade_ledger.record("flatten_all", {"results": results})
+    await trade_ledger.record("flatten_all", {"trigger": trigger, "results": results})
+    headline = ("DAILY LOSS LIMIT BREACHED - the risk desk flattened the book"
+                if trigger == "daily_loss" else "PANIC EXIT")
     await alerts.send(
         "critical", "flatten_all",
-        "PANIC EXIT - entries halted. "
+        f"{headline} - entries halted. "
         f"Closing: {', '.join(closing) or 'none'}. "
         + (f"NEEDS ATTENTION: {', '.join(failed)}" if failed else "All positions handled."),
     )
-    return {"status": "flattened", "killed": True, "closing": closing,
+    return {"status": "flattened", "killed": True, "trigger": trigger, "closing": closing,
             "failed": failed, "results": results}
 
 
