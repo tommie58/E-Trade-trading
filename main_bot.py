@@ -6710,6 +6710,20 @@ RUNAWAY_TRADE_CIRCUIT_BREAKER = int(os.getenv("RUNAWAY_TRADE_CIRCUIT_BREAKER", "
 COMMISSION_PER_CONTRACT = float(os.getenv("COMMISSION_PER_CONTRACT", "0.52"))
 # Round-trip cost above this share of premium refuses the entry outright.
 MAX_ROUND_TRIP_COST_PCT = float(os.getenv("MAX_ROUND_TRIP_COST_PCT", "12.0"))
+# PREMIUM FLOOR — the cheapest option premium an ENTRY may be placed at.
+#
+# Deliberately NOT an env read. The app holds the same value as a measured
+# constant (MIN_ENTRY_PREMIUM_USD in expo/services/autoTradeCore.ts), and a
+# deploy-time override is exactly how the two sides would drift apart without
+# anyone noticing. Parity is guarded by expo/__tests__/botIntegrity.test.ts.
+#
+# Why it exists: the Oct-09-26 book died in 5–8 minutes on sub-dollar tickets
+# (NVDA @ $0.22, UBER @ $0.66). $0.52 each way is a 4.7% round trip on a $0.22
+# contract before the spread — and the spread on those books is routinely a
+# fifth of the premium. The round-trip ceiling above can still pass a thin
+# contract quoted on a tight book; this floor refuses it on price alone.
+# Exits never come through the entry filter, so a close is never blocked.
+MIN_ENTRY_PREMIUM_USD = 0.5
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
 PORTFOLIO_HEAT_PCT = float(os.getenv("PORTFOLIO_HEAT_PCT", "6.0"))
 # ---- Per-trade concentration ----
@@ -7818,6 +7832,12 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     cost = assess_entry_cost(p)
     if cost["prohibitive"]:
         blocked.append(cost["reason"])
+
+    # PREMIUM FLOOR — the same $0.50 line the app's checklist draws, enforced
+    # here so a command from anywhere else cannot buy a sub-floor ticket.
+    floor = assess_premium_floor(p)
+    if floor["blocked"]:
+        blocked.append(floor["reason"])
 
     return len(blocked) == 0, blocked
 
@@ -11582,6 +11602,51 @@ def assess_entry_cost(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"prohibitive": False, "total_pct": round(total_pct, 2), "priced": True,
             "spread_measured": True,
             "reason": f"round-trip cost {total_pct:.1f}% of premium"}
+
+
+def assess_premium_floor(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Refuse an option ENTRY priced below MIN_ENTRY_PREMIUM_USD.
+
+    Mirrors the app's pre-dispatch checklist so the floor holds no matter who
+    sent the command — the app, a retry, a manual curl, or an older client
+    that predates the app-side check.
+
+    Applies only to options. An unpriced payload is NOT refused: unknown is not
+    evidence of a thin contract, and refusing it would block the connectivity
+    probe. `limit_price` is read only when the payload says it is an option,
+    because on an equity payload that field is the SHARE price.
+    """
+    instrument = str(payload.get("instrument") or "").lower()
+    if instrument and instrument != "option":
+        return {"blocked": False, "premium": None, "reason": "not an option entry"}
+
+    def num(key: str) -> float:
+        try:
+            value = float(payload.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if math.isfinite(value) else 0.0
+
+    premium = (num("option_limit_price") or num("contract_premium")
+               or num("entry_premium") or num("premium")
+               or (num("limit_price") if instrument == "option" else 0.0))
+    if premium <= 0:
+        return {"blocked": False, "premium": None,
+                "reason": "no contract premium in payload — floor not measurable"}
+
+    if premium < MIN_ENTRY_PREMIUM_USD:
+        commission_pct = (COMMISSION_PER_CONTRACT * 2.0) / (premium * 100.0) * 100.0
+        return {
+            "blocked": True,
+            "premium": round(premium, 4),
+            "reason": (
+                f"premium ${premium:.2f} below the ${MIN_ENTRY_PREMIUM_USD:.2f} floor — "
+                f"commission alone is a {commission_pct:.1f}% round trip on premium this "
+                f"thin, before the spread"
+            ),
+        }
+    return {"blocked": False, "premium": round(premium, 4),
+            "reason": f"premium ${premium:.2f} clears the ${MIN_ENTRY_PREMIUM_USD:.2f} floor"}
 
 
 def wilson_bounds(wins: Any, n: Any) -> Tuple[float, float]:
@@ -19011,6 +19076,7 @@ async def healthz():
         "cost_model": {
             "commission_per_contract": COMMISSION_PER_CONTRACT,
             "max_round_trip_cost_pct": MAX_ROUND_TRIP_COST_PCT,
+            "min_entry_premium_usd": MIN_ENTRY_PREMIUM_USD,
         },
     }
 
