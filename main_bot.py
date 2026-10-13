@@ -3718,6 +3718,21 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, Optional
 
+# REGIME FILTER trail modes (mirrors expo/services/regimeFilter.ts).
+#   full            — the tiered ratchet below, unchanged
+#   breakeven_only  — entered in a chop / VIX-breaker / thin-book zone: the
+#                     hard stop stays, the breakeven lock stays, the ratchet
+#                     that assumes the move will extend is frozen. In a range
+#                     the trail is tagged by noise; the fixed target exits.
+TRAIL_MODES = ("full", "breakeven_only")
+
+
+def normalize_trail_mode(mode: Any) -> str:
+    """Unknown or absent → 'full' (an unmeasured tape is not chop)."""
+    m = str(mode or "").strip().lower()
+    return m if m in TRAIL_MODES else "full"
+
+
 # MFE (in R) at which the stop locks to breakeven.
 BREAKEVEN_TRIGGER_R = 0.75
 # Fraction of ATR the trail must always leave for normal noise.
@@ -4616,6 +4631,18 @@ def plan_ratchet(
         prev_trail=current_stop,
         spread=spread,
     )
+
+    if normalize_trail_mode(position.get("trail_mode")) == "breakeven_only":
+        # Frozen ratchet: the hard stop until breakeven locks, then entry —
+        # never tighter than that, never looser than the stop already resting.
+        frozen = entry if trail["breakeven_locked"] else initial
+        level = max(current_stop, frozen) if is_buy else min(current_stop, frozen)
+        trail = dict(trail)
+        trail["trail_price"] = _round2(level)
+        trail["trail_distance"] = _round2(abs((high if is_buy else low) - level))
+        trail["tier"] = "breakeven" if trail["breakeven_locked"] else "initial"
+        trail["giveback_active"] = False
+        trail["trail_mode"] = "breakeven_only"
 
     step = max(float(min_step_abs), float(min_step_frac) * risk)
     spread_f = _finite(spread)
@@ -12864,6 +12891,100 @@ ENTRY_CHASE_MAX_REPRICES = int(os.getenv("ENTRY_CHASE_MAX_REPRICES", "2"))
 # planned 2% cost becomes an 8% cost by buying the top of the move.
 ENTRY_CHASE_MAX_PCT = float(os.getenv("ENTRY_CHASE_MAX_PCT", "3.0"))
 
+# ---- Execution alpha: spread ceiling, mid-peg entry, crossing-limit exits -----
+# Widest option spread, % of MID, a new entry may take on E*TRADE's live quote.
+# Measured against the premium, not the underlying: a $0.10 spread is 0.1% of a
+# $100 stock but 33% of a $0.30 option, and the round trip pays it out of the
+# PREMIUM. Mirrors DEFAULT_MAX_OPTION_SPREAD_PCT in the app; a payload's
+# `max_spread_pct` may only tighten it.
+MAX_OPTION_SPREAD_PCT = float(os.getenv("MAX_OPTION_SPREAD_PCT", "10.0"))
+# Where between mid (0.0) and ask (1.0) a new entry STARTS, by the app's
+# verdict. The chase then walks it toward the ask-anchored ceiling, so a
+# patient entry captures the mid when the book allows and still fills when not.
+ENTRY_PEG_START_FRAC = {"STRONG_BUY": 0.5, "BUY": 0.25}
+ENTRY_PEG_DEFAULT_FRAC = 0.0
+# Option exits are CROSSING LIMITS, not market orders: a sell limit this far
+# below the live bid is marketable (it fills at the best bid, with any price
+# improvement) but caps the damage when the bid momentarily vanishes.
+EXIT_CROSS_CUSHION_PCT = float(os.getenv("EXIT_CROSS_CUSHION_PCT", "10.0"))
+# How long a crossing exit may rest unfilled before it is cancelled (verified)
+# and replaced by a MARKET order. A position whose stop was cancelled for this
+# close must never be left naked waiting on a price.
+EXIT_CROSS_WAIT_SECONDS = float(os.getenv("EXIT_CROSS_WAIT_SECONDS", "4.0"))
+
+
+def plan_spread_gate(bid, ask, payload_max_pct=None) -> Dict[str, Any]:
+    """Pure spread-width verdict for a NEW option entry on the live quote.
+
+    Returns {ok, spread_pct, ceiling, reason}. The ceiling is the bot's
+    MAX_OPTION_SPREAD_PCT, tightened (never widened) by the app's payload.
+    No two-sided quote is `ok: None` — unmeasured, decided by the caller.
+    """
+    def _f(v):
+        try:
+            out = float(v)
+            return out if out == out else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    ceiling = MAX_OPTION_SPREAD_PCT
+    p = _f(payload_max_pct)
+    if p > 0:
+        ceiling = min(ceiling, p)
+    b, a = _f(bid), _f(ask)
+    if b <= 0 or a <= 0 or a < b:
+        return {"ok": None, "spread_pct": None, "ceiling": ceiling,
+                "reason": "no two-sided quote — spread unmeasured"}
+    mid = (a + b) / 2.0
+    pct = round((a - b) / mid * 100.0, 2)
+    if pct > ceiling:
+        return {"ok": False, "spread_pct": pct, "ceiling": ceiling,
+                "reason": (f"option spread {pct:.1f}% of mid > {ceiling:.1f}% ceiling "
+                           f"({b:.2f} x {a:.2f}) — the round trip would eat the edge")}
+    return {"ok": True, "spread_pct": pct, "ceiling": ceiling,
+            "reason": f"spread {pct:.1f}% of mid within {ceiling:.1f}%"}
+
+
+def plan_entry_peg(bid, ask, recommendation=None) -> Dict[str, Any]:
+    """Pure starting price for a new option entry: pegged off the MID.
+
+    Returns {limit, frac, mid, reason}; `limit` is None without a two-sided
+    quote. Never below the bid, never above the ask — the chase owns any move
+    past the offer, inside its own hard cap.
+    """
+    try:
+        b, a = float(bid or 0), float(ask or 0)
+    except (TypeError, ValueError):
+        b, a = 0.0, 0.0
+    if b <= 0 or a <= 0 or a < b:
+        return {"limit": None, "frac": None, "mid": None,
+                "reason": "no two-sided quote to peg against"}
+    frac = ENTRY_PEG_START_FRAC.get(str(recommendation or "").upper(), ENTRY_PEG_DEFAULT_FRAC)
+    mid = (a + b) / 2.0
+    limit = round(min(a, max(b, mid + (a - mid) * frac)), 4)
+    return {"limit": limit, "frac": frac, "mid": round(mid, 4),
+            "reason": f"pegged {int(frac * 100)}% from mid {mid:.2f} toward ask {a:.2f}"}
+
+
+def plan_exit_limit(bid, cushion_pct=None) -> Optional[float]:
+    """Pure crossing-limit price for an option SELL_CLOSE, or None (no bid).
+
+    A sell limit below the bid is marketable — it executes at the best bid —
+    while the cushion bounds the worst print. Floored at one penny.
+    """
+    try:
+        b = float(bid or 0)
+    except (TypeError, ValueError):
+        return None
+    if not (b > 0):
+        return None
+    try:
+        c = float(EXIT_CROSS_CUSHION_PCT if cushion_pct is None else cushion_pct)
+    except (TypeError, ValueError):
+        c = EXIT_CROSS_CUSHION_PCT
+    c = min(50.0, max(0.0, c))
+    return max(0.01, round(b * (1.0 - c / 100.0), 4))
+
 
 def plan_entry_reprice(app_limit, qty, real_price) -> Dict[str, Any]:
     """Pure sizing decision for a repriced option entry.
@@ -12916,8 +13037,17 @@ def plan_entry_reprice(app_limit, qty, real_price) -> Dict[str, Any]:
 
 
 def plan_entry_chase(placed_limit, ceiling_pct, attempts, max_reprices,
-                     elapsed_s, chase_seconds, filled, status) -> Dict[str, Any]:
+                     elapsed_s, chase_seconds, filled, status,
+                     anchor_limit=None, ask_anchor=None) -> Dict[str, Any]:
     """Pure decision for repricing a RESTING, UNFILLED entry limit.
+
+    ANCHORED CEILING. `anchor_limit` is the FIRST placed limit and
+    `ask_anchor` the offer at placement. The ceiling is measured from
+    max(anchor, ask) and never moves: recomputing it from the latest repriced
+    limit let the cap creep up every step (3% became ~4.5% over two). Anchoring
+    to the ask is what lets a MID-pegged entry chase through the spread at all
+    — 3% above the mid can sit below the offer on a wide book. Both default to
+    the placed limit, which reproduces the original behaviour.
 
     Returns {action, next_limit, ceiling, reason}:
       hold      — never touch this order;
@@ -12967,7 +13097,11 @@ def plan_entry_chase(placed_limit, ceiling_pct, attempts, max_reprices,
     if pct <= 0:
         pct = ENTRY_CHASE_MAX_PCT
     pct = min(pct, ENTRY_CHASE_MAX_PCT)
-    ceiling = round(limit * (1.0 + pct / 100.0), 2)
+    base = _f(anchor_limit)
+    if base <= 0:
+        base = limit
+    ask_ref = _f(ask_anchor)
+    ceiling = round(max(base, ask_ref) * (1.0 + pct / 100.0), 2)
 
     done = _i(attempts)
     if done >= budget:
@@ -12983,8 +13117,8 @@ def plan_entry_chase(placed_limit, ceiling_pct, attempts, max_reprices,
         return {"action": "wait", "next_limit": None, "ceiling": ceiling,
                 "reason": f"{waited:.0f}s resting, next reprice due at {due_at:.0f}s"}
 
-    step = (ceiling - limit) / budget
-    nxt = round(min(ceiling, limit + step * (done + 1)), 2)
+    step = (ceiling - base) / budget
+    nxt = round(min(ceiling, base + step * (done + 1)), 2)
     if nxt <= limit:
         # The ceiling rounds back onto the placed limit (a penny contract on a
         # 3% chase). There is no higher tradable price inside the cap, so this
@@ -13782,8 +13916,71 @@ async def _emergency_flatten(ticker: str, guard: dict, qty: int) -> Optional[str
     return flatten_id
 
 
+async def _place_crossing_exit(common: dict, tokens: dict, bid: float) -> Any:
+    """Place an option SELL_CLOSE as a CROSSING LIMIT, never a blind market.
+
+    The limit sits EXIT_CROSS_CUSHION_PCT below the live bid: marketable, so it
+    fills at the best bid like a market order would, but a vanished bid can no
+    longer fill it at a penny. If it rests EXIT_CROSS_WAIT_SECONDS unfilled it
+    is cancelled (verified against the broker) and replaced by a MARKET order —
+    every caller has already cancelled the protective stop, and a position must
+    never sit naked waiting on a price. No bid at all is the only path straight
+    to MARKET, and it is logged as such.
+
+    Mutates `common` to the order actually sent first; returns the place
+    response of whichever order is working.
+    """
+    limit = plan_exit_limit(bid)
+    if limit is None:
+        logger.warning(
+            f"[CROSS EXIT] {common.get('symbol')} no live bid — MARKET close as the last resort"
+        )
+        common["priceType"] = "MARKET"
+        common.pop("limitPrice", None)
+        return await _place_order_smart("option", common, tokens)
+    common["priceType"] = "LIMIT"
+    common["limitPrice"] = _round_to_option_tick(limit, "down")
+    logger.info(
+        f"[CROSS EXIT] {common.get('symbol')} crossing limit {common['limitPrice']} "
+        f"({EXIT_CROSS_CUSHION_PCT:.0f}% under bid {float(bid):.2f})"
+    )
+    placed = await _place_order_smart("option", common, tokens)
+    order_id = _order_id_from_place(placed)
+    if not order_id or EXIT_CROSS_WAIT_SECONDS <= 0:
+        return placed
+    if await _resolve_exit_fill(order_id, timeout_s=EXIT_CROSS_WAIT_SECONDS):
+        return placed
+    outcome = await _cancel_order_verified(order_id, expected_qty=int(common.get("quantity") or 0))
+    if outcome == CANCEL_CONFIRMED:
+        fallback = dict(common)
+        fallback["priceType"] = "MARKET"
+        fallback.pop("limitPrice", None)
+        fallback["clientOrderId"] = str(uuid.uuid4().int)[:18]
+        logger.warning(
+            f"[CROSS EXIT] {common.get('symbol')} crossing limit rested {EXIT_CROSS_WAIT_SECONDS:.0f}s "
+            f"unfilled — cancelled and replaced by MARKET so the position is not left naked"
+        )
+        await trade_ledger.record("exit_cross_fallback", {
+            "ticker": str(common.get("symbol") or ""), "limit": common.get("limitPrice"),
+            "bid": float(bid), "order_id": order_id,
+        })
+        return await _place_order_smart("option", fallback, tokens)
+    if outcome in (CANCEL_PARTIAL, CANCEL_LIVE):
+        await alerts.send(
+            "critical", "crossing_exit_unresolved",
+            f"{common.get('symbol')}: crossing exit {order_id} did not fill in "
+            f"{EXIT_CROSS_WAIT_SECONDS:.0f}s and the cancel returned {outcome} — check the position",
+            dedupe_key=f"cross_exit:{common.get('symbol')}",
+        )
+    return placed
+
+
 async def _place_option_market_close(ticker: str, contract: dict, qty: int) -> Optional[str]:
-    """MARKET SELL_CLOSE for `qty` contracts of an OCC contract we hold."""
+    """SELL_CLOSE for `qty` contracts of an OCC contract we hold.
+
+    Name kept for its callers; the order is a CROSSING LIMIT off the live bid
+    with a verified MARKET fallback (see `_place_crossing_exit`).
+    """
     tokens = load_tokens()
     if not tokens:
         raise Exception("E*TRADE tokens not set")
@@ -13805,7 +14002,11 @@ async def _place_option_market_close(ticker: str, contract: dict, qty: int) -> O
         strikePrice=float(contract["strike"]),
         expiryDate=str(contract["expiration"])[:10],
     )
-    placed = await _place_order_smart("option", common, tokens)
+    try:
+        bid, _ask = await _current_bid_ask(ticker, contract)
+    except Exception:
+        bid = 0.0
+    placed = await _place_crossing_exit(common, tokens, float(bid or 0.0))
     return _order_id_from_place(placed)
 
 
@@ -14655,6 +14856,8 @@ async def _stop_guard_worker(ticker: str) -> None:
                     time.time() - float(guard.get("placed_ts") or guard.get("armed_ts") or time.time()),
                     guard.get("chase_seconds"),
                     filled, status,
+                    anchor_limit=guard.get("chase_anchor_limit"),
+                    ask_anchor=guard.get("chase_ask"),
                 )
                 if chase["action"] == "chase":
                     chase_qty = int(guard.get("qty") or 0)
@@ -14903,6 +15106,10 @@ async def _arm_stop_guard(ticker: str, action: str, stop_price: float,
         "chase_ceiling_pct": (chase or {}).get("ceiling_pct"),
         "chase_seconds": (chase or {}).get("seconds"),
         "chase_max_reprices": (chase or {}).get("max_reprices"),
+        # The chase ceiling is anchored to the FIRST limit and the offer at
+        # placement — never to a repriced limit (see plan_entry_chase).
+        "chase_anchor_limit": round(float(entry_limit), 2) if entry_limit else None,
+        "chase_ask": (chase or {}).get("ask"),
         "done": False,
         "result": None,
     })
@@ -16525,29 +16732,48 @@ async def execute_live_order(payload: dict):
                     common["stopPrice"] = _round_to_option_tick(float(broker_stop_level), "down")
                     logger.info(f"Placing resting broker-side STOP close at {common['stopPrice']}")
                 else:
-                    common["priceType"] = "MARKET"
+                    # CROSSING LIMIT off the live bid, placed below with a
+                    # verified MARKET fallback (`_place_crossing_exit`).
+                    common["priceType"] = "CROSS"
             else:
                 # ENTRY (BUY_OPEN): NEVER a STOP/TRAILING_STOP price type — that
                 # turns the entry into a trigger order instead of a fill (the
                 # v2.8.0 design flaw). Stop/trail fields on entries are stored
                 # app-side and enforced by the Auto-Exit engine.
                 desired = float(limit_price) if limit_price and float(limit_price) > 0 else None
+                # SPREAD CEILING on E*TRADE's own quote, before any price is
+                # chosen. A refusal is a policy verdict (returned, never
+                # raised) so it cannot feed the API circuit breaker.
+                spread_gate = plan_spread_gate(real_bid, real_ask, payload.get("max_spread_pct"))
+                if spread_gate["ok"] is False:
+                    logger.warning(f"⛔ {symbol} {spread_gate['reason']}")
+                    await trade_ledger.record("entry_spread_refused", {
+                        "ticker": sym_u, "real_bid": real_bid or None, "real_ask": real_ask or None,
+                        "spread_pct": spread_gate["spread_pct"], "ceiling_pct": spread_gate["ceiling"],
+                    })
+                    await alerts.send(
+                        "warning", "entry_spread_refused",
+                        f"{symbol}: no live ticket — {spread_gate['reason']}.",
+                        dedupe_key=f"spread_refused:{symbol}",
+                    )
+                    return {"status": "refused", "reason": spread_gate["reason"],
+                            "code": "spread_too_wide", "paper": True}
                 if real_ask > 0:
-                    # Sanitize against the REAL quote. The app's estimate is
-                    # frequently far off the true premium:
-                    #  - above ask → E*TRADE 1011 (limit too far above market)
-                    #    and would overpay anyway → cap at ask
-                    #  - below bid → resting order that never fills → lift to ask
-                    #  - inside the spread → keep it
-                    # Then round UP to a valid $0.05/$0.10 tick (2040 guard);
-                    # one tick above ask is a normal marketable limit.
-                    if desired is None or desired > real_ask or desired < real_bid:
-                        if desired is not None:
-                            logger.warning(
-                                f"⚠️ App limit {desired} outside real market "
-                                f"[{real_bid}, {real_ask}] — repricing to ask"
-                            )
-                        desired = real_ask
+                    # MID-PEG START off the REAL quote. The app's estimate is
+                    # frequently far off the true premium, so the bot owns the
+                    # starting price: pegged from the mid toward the ask by the
+                    # verdict's urgency (see plan_entry_peg). The entry chase
+                    # then walks it toward an ASK-anchored ceiling, so a patient
+                    # order captures the mid when the book allows and still
+                    # fills when it does not.
+                    peg = plan_entry_peg(real_bid, real_ask, payload.get("recommendation"))
+                    pegged = peg["limit"] if peg["limit"] is not None else real_ask
+                    if desired is not None and abs(desired - pegged) > 0.005:
+                        logger.info(
+                            f"entry peg: app limit {desired} → {pegged:.2f} ({peg['reason']}, "
+                            f"market [{real_bid}, {real_ask}])"
+                        )
+                    desired = pegged
                     common["priceType"] = "LIMIT"
                     # Believe the quote's own granularity before rounding UP
                     # past the offer (see _option_tick_from_quote).
@@ -16569,7 +16795,12 @@ async def execute_live_order(payload: dict):
                     common["priceType"] = "LIMIT"
                     common["limitPrice"] = _round_to_option_tick(desired)
                 else:
-                    common["priceType"] = "MARKET"
+                    # No quote AND no price: a MARKET option entry is a blank
+                    # cheque on a book nobody has seen. Refuse it.
+                    reason = "no live quote and no limit price — option entries are never sent at MARKET"
+                    logger.warning(f"⛔ {symbol} {reason}")
+                    return {"status": "refused", "reason": reason,
+                            "code": "no_price_for_entry", "paper": True}
                 if payload.get("stop") or payload.get("trail_stop") or payload.get("stop_price"):
                     logger.info(
                         f"Entry stop telemetry noted (app-managed): stop={payload.get('stop') or payload.get('stop_price')} "
@@ -16727,7 +16958,10 @@ async def execute_live_order(payload: dict):
             if is_exit:
                 # Closes must always cover the full tracked position — never clamp.
                 try:
-                    final = await _place_order_smart("option", common, tokens)
+                    if common.get("priceType") == "CROSS":
+                        final = await _place_crossing_exit(common, tokens, float(real_bid or 0.0))
+                    else:
+                        final = await _place_order_smart("option", common, tokens)
                 except Exception:
                     # The resting protective stop was cancelled above. A failed
                     # close must NOT leave the position naked until the next
@@ -16867,6 +17101,9 @@ async def execute_live_order(payload: dict):
                             "ceiling_pct": payload.get("option_chase_ceiling_pct"),
                             "seconds": payload.get("option_chase_seconds"),
                             "max_reprices": payload.get("option_max_reprices"),
+                            # Offer at placement — anchors the chase ceiling so
+                            # a mid-pegged entry can chase through the spread.
+                            "ask": float(real_ask) if real_ask and real_ask > 0 else None,
                         },
                     )
                     pos_rec = await state.get_position(str(symbol).upper())
@@ -16907,6 +17144,11 @@ async def execute_live_order(payload: dict):
                         # without it an option position cannot be trailed.
                         if fill_ref > 0:
                             pos_rec["entry_premium"] = round(fill_ref, 2)
+                        # REGIME FILTER at entry: a chop / VIX-breaker /
+                        # thin-book entry freezes the trailing ratchet (hard
+                        # stop + breakeven lock only; the target is the exit).
+                        pos_rec["trail_mode"] = trailing_engine.normalize_trail_mode(
+                            payload.get("trail_mode"))
                         await state.set_position(str(symbol).upper(), pos_rec)
                     risk_pct = ((fill_ref - resting_premium) / fill_ref * 100.0) if fill_ref > 0 else 0.0
                     logger.info(
