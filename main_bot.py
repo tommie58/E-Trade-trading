@@ -4744,6 +4744,2984 @@ def plan_ratchet(
 
 ''')
 
+_bundle_load('edge', r'''
+"""
+EDGE DISCIPLINE — why a setup should work, whether it still does, and proof
+that does not come from the same data that picked it.
+==========================================================================
+
+WHY THIS EXISTS
+---------------
+The scanner's setups (breakout, VWAP reclaim, momentum, and the app's ORB /
+flag / mean-reversion family) are rules. A rule that fits past price action
+is not an edge: intraday options on liquid names are about as noisy as
+markets get, and most technical patterns stop paying once you charge a real
+spread, real slippage and a regime change. Every gate the bot already has
+(score, RVOL, setup veto, loss streak) asks how a trade LOOKS or how a WIN
+RATE has gone. None of them asked the questions that decide whether there is
+anything to harvest at all:
+
+1. WHO IS ON THE OTHER SIDE? Each setup family carries a written thesis: the
+   structural flow it harvests, the counterparty that pays for it, why that
+   flow keeps coming back, and the conditions under which the story breaks.
+   The conditions are machine-checked against measured features, so a VWAP
+   reclaim with no institutional participation, or a breakout carried only
+   by the index, is refused because its own thesis says it is not the trade.
+   A setup with no thesis (an EMA cross, an unclassified signal) has no
+   reason to persist and may not trade live.
+
+2. FEATURES BEYOND PRICE/VOLUME. Relative strength against SPY and against
+   the stock's own sector peers (is the move idiosyncratic demand, or beta?),
+   the volatility regime (VIX, or SPY's own range as a labelled proxy),
+   top-of-book imbalance, and short-dated options flow skew. Every feature is
+   MEASURED or None: unmeasured never reads as neutral.
+
+3. VALIDATION THAT CANNOT GRADE ITS OWN HOMEWORK. A thesis family's realized
+   outcomes are tested with purged k-fold cross-validation (trades whose
+   holding interval touches the test window, plus an embargo, are removed
+   from training) and an anchored walk-forward. The only free choice in a
+   rule-based system — "trade this family or not" — is made on the training
+   fold and scored on the held-out fold. The required t-statistic is
+   deflated for the number of families searched, and outcomes are segmented
+   by volatility regime so an edge that lives in one regime is only traded
+   in that regime.
+
+4. DECAY MONITORING. A one-sided CUSUM watches each family's outcomes for a
+   downward shift from its validated expectancy. When it alarms, the family
+   is RETIRED: live entries are refused until an operator reinstates it,
+   which restarts the monitor from that moment.
+
+UNITS. Outcomes are the ledger's realized percent on ONE basis per family
+(the best-evidenced one) — never a blend of premium and underlying percents.
+They are realized FILLS, so spread, slippage and fees are already inside
+them: this is after-cost evidence by construction, not a backtest.
+
+PAPER NEVER COUNTS. Only the bot's own ledger of live closes feeds
+validation and decay.
+
+THRESHOLDS ARE DECLARED, NOT FITTED. Every number below is a round, a-priori
+value with its reason beside it. Tuning them to the ledger would turn this
+module into the overfitting machine it exists to prevent.
+
+Pure functions only — no I/O, no clock reads except where a `now` is passed.
+"""
+from __future__ import annotations
+
+import math
+import statistics
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+VOL_REGIMES = ("calm", "normal", "stressed")
+# VIX bands — same lines the app's tape engine draws (tapeContext.ts).
+VIX_CALM = 18.0
+VIX_STRESSED = 25.0
+# SPY intraday range (high−low as % of prior close) — the proxy when no VIX
+# reading exists. ~0.8% is a quiet session, ~1.8% a stressed one.
+SPY_RANGE_CALM = 0.8
+SPY_RANGE_STRESSED = 1.8
+# Top-of-book sizes below this are too thin to mean anything.
+MIN_BOOK_SIZE = 2.0
+# Options-flow skew needs real volume behind it.
+MIN_FLOW_CONTRACTS = 100.0
+# Sector relative strength needs at least this many measured peers.
+MIN_SECTOR_PEERS = 2
+
+# Mirrors expo/services/sectorRotation.ts SECTOR_MAP (asserted equal by
+# edgeParity.test.ts) so the bot and the app judge the same peer group.
+SECTOR_MAP: Dict[str, str] = {
+    "AAPL": "Technology", "MSFT": "Technology", "ORCL": "Technology", "CRM": "Technology", "PLTR": "Technology",
+    "NVDA": "Semiconductors", "AMD": "Semiconductors", "AVGO": "Semiconductors", "MU": "Semiconductors",
+    "INTC": "Semiconductors", "SMCI": "Semiconductors", "ARM": "Semiconductors", "TSM": "Semiconductors",
+    "META": "Communication", "GOOGL": "Communication", "NFLX": "Communication", "SNAP": "Communication",
+    "TSLA": "Consumer Discretionary", "AMZN": "Consumer Discretionary", "UBER": "Consumer Discretionary",
+    "SHOP": "Consumer Discretionary", "RIVN": "Consumer Discretionary",
+    "COIN": "Crypto & Fintech", "MSTR": "Crypto & Fintech", "MARA": "Crypto & Fintech",
+    "SOFI": "Crypto & Fintech", "HOOD": "Crypto & Fintech",
+}
+
+BENCHMARK = "SPY"
+FEATURE_KEYS = (
+    "rvol", "session_minutes", "rs_spy_pct", "rs_sector_pct",
+    "vol_regime", "book_imbalance", "options_flow",
+)
+_NUMERIC_FEATURES = ("rvol", "session_minutes", "rs_spy_pct", "rs_sector_pct", "book_imbalance", "options_flow")
+
+
+def _num(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def day_change_pct(quote: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Percent change vs the prior close, or None when either side is missing."""
+    if not quote:
+        return None
+    last = _num(quote.get("last"))
+    prev = _num(quote.get("previous_close"))
+    if last is None or prev is None or prev <= 0 or last <= 0:
+        return None
+    return (last - prev) / prev * 100.0
+
+
+def spy_range_pct(quote: Optional[Dict[str, Any]]) -> Optional[float]:
+    """SPY's session high−low as a percent of the prior close."""
+    if not quote:
+        return None
+    hi = _num(quote.get("high"))
+    lo = _num(quote.get("low"))
+    prev = _num(quote.get("previous_close"))
+    if hi is None or lo is None or prev is None or prev <= 0 or hi < lo or lo <= 0:
+        return None
+    return (hi - lo) / prev * 100.0
+
+
+def classify_vol_regime(vix: Any = None, spy_range: Any = None) -> Tuple[Optional[str], Optional[str]]:
+    """(regime, source). VIX wins when measured; SPY's range is the labelled
+    proxy; neither → (None, None). Never defaults to 'normal'."""
+    v = _num(vix)
+    if v is not None and v > 0:
+        if v >= VIX_STRESSED:
+            return "stressed", "vix"
+        return ("calm" if v < VIX_CALM else "normal"), "vix"
+    r = _num(spy_range)
+    if r is not None and r >= 0:
+        if r >= SPY_RANGE_STRESSED:
+            return "stressed", "spy_range"
+        return ("calm" if r < SPY_RANGE_CALM else "normal"), "spy_range"
+    return None, None
+
+
+def relative_strength(stock_change: Any, bench_change: Any) -> Optional[float]:
+    s = _num(stock_change)
+    b = _num(bench_change)
+    if s is None or b is None:
+        return None
+    return round(s - b, 3)
+
+
+def sector_relative_strength(symbol: str, changes: Dict[str, Optional[float]]) -> Tuple[Optional[float], int]:
+    """Stock's day change minus the mean of its MEASURED sector peers
+    (itself excluded). (None, n) when fewer than MIN_SECTOR_PEERS exist."""
+    sym = str(symbol or "").upper()
+    sector = SECTOR_MAP.get(sym)
+    own = _num(changes.get(sym))
+    if sector is None or own is None:
+        return None, 0
+    peers = [
+        _num(chg) for peer, chg in changes.items()
+        if peer != sym and SECTOR_MAP.get(peer) == sector and _num(chg) is not None
+    ]
+    if len(peers) < MIN_SECTOR_PEERS:
+        return None, len(peers)
+    return round(own - sum(peers) / len(peers), 3), len(peers)
+
+
+def book_imbalance(bid_size: Any, ask_size: Any) -> Optional[float]:
+    """(bid − ask) / (bid + ask) on top-of-book size, in [−1, 1]."""
+    b = _num(bid_size)
+    a = _num(ask_size)
+    if b is None or a is None or b < 0 or a < 0 or (b + a) < MIN_BOOK_SIZE:
+        return None
+    return round((b - a) / (b + a), 3)
+
+
+def options_flow_skew(call_volume: Any, put_volume: Any) -> Optional[float]:
+    """(calls − puts) / (calls + puts) on short-dated volume, in [−1, 1]."""
+    c = _num(call_volume)
+    p = _num(put_volume)
+    if c is None or p is None or c < 0 or p < 0 or (c + p) < MIN_FLOW_CONTRACTS:
+        return None
+    return round((c - p) / (c + p), 3)
+
+
+def session_minutes(now_et: datetime) -> float:
+    """Minutes since the 09:30 ET open (negative pre-market)."""
+    return round((now_et.hour * 60 + now_et.minute + now_et.second / 60.0) - 570.0, 1)
+
+
+def build_features(
+    symbol: str,
+    quote: Dict[str, Any],
+    quotes_by_symbol: Dict[str, Dict[str, Any]],
+    now_et: datetime,
+    rvol: Any = None,
+    vix: Any = None,
+) -> Dict[str, Any]:
+    """Every feature the theses read, each measured or None, with provenance."""
+    changes = {sym: day_change_pct(q) for sym, q in quotes_by_symbol.items()}
+    changes[str(symbol).upper()] = day_change_pct(quote)
+    spy = quotes_by_symbol.get(BENCHMARK)
+    rs_sector, peers = sector_relative_strength(symbol, changes)
+    regime, source = classify_vol_regime(vix, spy_range_pct(spy))
+    return {
+        "rvol": _num(rvol),
+        "session_minutes": session_minutes(now_et),
+        "rs_spy_pct": None if str(symbol).upper() == BENCHMARK
+        else relative_strength(changes.get(str(symbol).upper()), day_change_pct(spy)),
+        "rs_sector_pct": rs_sector,
+        "sector_peers": peers,
+        "vol_regime": regime,
+        "vol_source": source,
+        "book_imbalance": book_imbalance(quote.get("bid_size"), quote.get("ask_size")),
+        # The scanner reads quotes, not chains — short-dated flow is supplied
+        # by the app when it has the chain. Unmeasured here, never zero.
+        "options_flow": None,
+        "source": "bot_scanner",
+    }
+
+
+def sanitize_features(raw: Any) -> Dict[str, Any]:
+    """Untrusted payload → only known keys, finite numbers, valid regimes."""
+    out: Dict[str, Any] = {k: None for k in FEATURE_KEYS}
+    if not isinstance(raw, dict):
+        return out
+    for key in _NUMERIC_FEATURES:
+        out[key] = _num(raw.get(key))
+    for key in ("book_imbalance", "options_flow"):
+        if out[key] is not None and not -1.0 <= out[key] <= 1.0:
+            out[key] = None
+    regime = str(raw.get("vol_regime") or "").strip().lower()
+    out["vol_regime"] = regime if regime in VOL_REGIMES else None
+    src = str(raw.get("vol_source") or "").strip().lower()
+    out["vol_source"] = src if src in {"vix", "spy_range"} and out["vol_regime"] else None
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Theses — the economic reason each setup family should persist
+# ---------------------------------------------------------------------------
+# Condition ops:
+#   ">=" / "<="        raw feature vs value
+#   "aligned>="        feature × side sign (long +1, short −1) vs value — RS
+#                      for a short must be NEGATIVE to support the thesis
+#   "not_in"           categorical feature must not be one of `value`
+# Roles: "required" conditions must be measured AND met; "confirming" ones
+# are reported (and travel to the app) but never block.
+THESES: Dict[str, Dict[str, Any]] = {
+    "vwap_benchmark": {
+        "title": "VWAP benchmark pressure",
+        "setups": ("vwap reclaim", "vwap rejection"),
+        "rationale": (
+            "Large institutional orders are benchmarked to the session VWAP and worked by "
+            "execution algorithms that lean against it. When price crosses back through VWAP "
+            "with real participation, the algos that were filling on the wrong side are now "
+            "behind their benchmark and have to chase."
+        ),
+        "counterparty": "Benchmark-constrained execution algos and short-horizon traders trapped on the wrong side of VWAP.",
+        "flow": "VWAP-benchmarked parent orders completing their schedule.",
+        "persists_because": "Execution mandates are graded against VWAP; the incentive is contractual, not a pattern.",
+        "fails_when": "No institutional participation (thin volume), early session before VWAP anchors, or index stress that overruns single-name flow.",
+        "horizon_minutes": 60,
+        "conditions": (
+            {"feature": "rvol", "op": ">=", "value": 1.2, "role": "required",
+             "why": "benchmark flow is only present when the name is trading above normal volume"},
+            {"feature": "session_minutes", "op": ">=", "value": 30.0, "role": "required",
+             "why": "VWAP is not an anchor until enough of the session's volume has printed"},
+            {"feature": "rs_spy_pct", "op": "aligned>=", "value": 0.0, "role": "required",
+             "why": "the reclaim must be the stock's own demand, not the index dragging it"},
+            {"feature": "vol_regime", "op": "not_in", "value": ("stressed",), "role": "required",
+             "why": "in a stressed tape index flows overrun single-name benchmarks"},
+            {"feature": "rs_sector_pct", "op": "aligned>=", "value": 0.0, "role": "confirming",
+             "why": "leading its own sector"},
+            {"feature": "book_imbalance", "op": "aligned>=", "value": 0.1, "role": "confirming",
+             "why": "resting size on the trade's side"},
+        ),
+    },
+    "stop_cluster_breakout": {
+        "title": "Stop-cluster breakout",
+        "setups": ("breakout", "volume breakout", "breakdown"),
+        "rationale": (
+            "Stop orders and resting supply cluster at obvious levels (session highs/lows, "
+            "prior closes). When that supply is absorbed on volume, the triggered stops and "
+            "the breakout-following flow arrive on the same side at once — a one-directional "
+            "imbalance that takes time to clear."
+        ),
+        "counterparty": "Short sellers whose stops sit beyond the level, and passive sellers who just got lifted.",
+        "flow": "Triggered stop-loss orders and breakout-following demand.",
+        "persists_because": "Stop placement at visible levels is a durable behavioural habit (Osler, 2003).",
+        "fails_when": "Low volume (a liquidity hole, not absorption), index-driven moves, and stressed tapes where breaks mean-revert.",
+        "horizon_minutes": 45,
+        "conditions": (
+            {"feature": "rvol", "op": ">=", "value": 1.5, "role": "required",
+             "why": "absorption needs volume — low-volume breaks are liquidity holes that reverse"},
+            {"feature": "rs_spy_pct", "op": "aligned>=", "value": 0.3, "role": "required",
+             "why": "the level must break on the stock's own demand, not on beta"},
+            {"feature": "vol_regime", "op": "not_in", "value": ("stressed",), "role": "required",
+             "why": "breakouts mean-revert in a stressed index tape"},
+            {"feature": "rs_sector_pct", "op": "aligned>=", "value": 0.0, "role": "confirming",
+             "why": "not just a sector move"},
+            {"feature": "book_imbalance", "op": "aligned>=", "value": 0.1, "role": "confirming",
+             "why": "the book still leans the trade's way after the break"},
+            {"feature": "options_flow", "op": "aligned>=", "value": 0.1, "role": "confirming",
+             "why": "short-dated options flow agrees with the break"},
+        ),
+    },
+    "information_diffusion": {
+        "title": "Information diffusion (underreaction)",
+        "setups": ("momentum", "momentum fade", "bull flag", "bear flag"),
+        "rationale": (
+            "News is absorbed gradually: institutions split large orders across hours and "
+            "slower participants update late, so a stock moving on its own information keeps "
+            "drifting while the remaining parent orders work."
+        ),
+        "counterparty": "Slow-updating liquidity providers and anchored traders fading the move.",
+        "flow": "Split institutional orders still being executed after an information event.",
+        "persists_because": "Order splitting and limited attention are structural; underreaction is one of the best-documented anomalies.",
+        "fails_when": "There is no information event (ordinary volume), the move is the index's, or too little session is left for the drift.",
+        "horizon_minutes": 90,
+        "conditions": (
+            {"feature": "rvol", "op": ">=", "value": 2.0, "role": "required",
+             "why": "an information event shows up as abnormal volume"},
+            {"feature": "rs_spy_pct", "op": "aligned>=", "value": 0.5, "role": "required",
+             "why": "the drift must be stock-specific information, not market beta"},
+            {"feature": "session_minutes", "op": "<=", "value": 330.0, "role": "required",
+             "why": "after 15:00 ET there is no runway before the forced flatten"},
+            {"feature": "rs_sector_pct", "op": "aligned>=", "value": 0.0, "role": "confirming",
+             "why": "idiosyncratic, not a sector rotation"},
+            {"feature": "options_flow", "op": "aligned>=", "value": 0.1, "role": "confirming",
+             "why": "informed short-dated options flow on the same side"},
+        ),
+    },
+    "opening_imbalance": {
+        "title": "Opening-imbalance resolution",
+        "setups": ("orb",),
+        "rationale": (
+            "Overnight information arrives as an order imbalance at the open. The opening "
+            "auction only partly clears it; the rest resolves through the first hour in the "
+            "direction of the imbalance."
+        ),
+        "counterparty": "Overnight liquidity providers and gap-faders absorbing the opening imbalance.",
+        "flow": "Unfilled opening-auction demand and overnight-news repositioning.",
+        "persists_because": "Information arrives while the market is closed every single day.",
+        "fails_when": "Taken after the first ninety minutes, on ordinary volume, or when the move is the index's.",
+        "horizon_minutes": 60,
+        "conditions": (
+            {"feature": "session_minutes", "op": "<=", "value": 90.0, "role": "required",
+             "why": "the opening imbalance is resolved within the first ninety minutes"},
+            {"feature": "rvol", "op": ">=", "value": 1.5, "role": "required",
+             "why": "a real imbalance prints abnormal volume"},
+            {"feature": "rs_spy_pct", "op": "aligned>=", "value": 0.0, "role": "required",
+             "why": "the imbalance must be the stock's, not the index's"},
+            {"feature": "book_imbalance", "op": "aligned>=", "value": 0.1, "role": "confirming",
+             "why": "the book still leans the imbalance's way"},
+        ),
+    },
+    "liquidity_provision": {
+        "title": "Liquidity provision (price-pressure reversal)",
+        "setups": ("mean reversion",),
+        "rationale": (
+            "Impatient, uninformed selling (or buying) pushes price away from value; whoever "
+            "supplies liquidity to it is paid when the pressure fades and price reverts."
+        ),
+        "counterparty": "Forced or impatient traders demanding immediacy (liquidations, stop cascades without news).",
+        "flow": "Temporary price pressure from liquidity demand.",
+        "persists_because": "Someone always needs immediacy; providing it is compensated risk.",
+        "fails_when": "The pressure is informed (a news event — abnormal volume) or the whole tape is stressed.",
+        "horizon_minutes": 60,
+        "conditions": (
+            {"feature": "rvol", "op": "<=", "value": 3.0, "role": "required",
+             "why": "extreme volume means information — never fade news"},
+            {"feature": "vol_regime", "op": "not_in", "value": ("stressed",), "role": "required",
+             "why": "in a stressed tape the pressure is persistent, not temporary"},
+            {"feature": "rvol", "op": ">=", "value": 0.8, "role": "confirming",
+             "why": "enough liquidity to exit the reversion cleanly"},
+        ),
+    },
+}
+
+# Setups with NO thesis — kept explicit so the refusal names them.
+NO_THESIS_SETUPS = ("ema cross", "unclassified", "unknown")
+
+
+def normalize_setup(label: Any) -> str:
+    """'Bull Flag + ADX' → 'bull flag'; 'vwap_reclaim' → 'vwap reclaim'."""
+    text = str(label or "").strip().lower().replace("_", " ")
+    text = text.replace("+ adx", "").replace("+adx", "")
+    return " ".join(text.split())
+
+
+_SETUP_TO_THESIS: Dict[str, str] = {
+    alias: tid for tid, t in THESES.items() for alias in t["setups"]
+}
+
+
+def thesis_for(setup: Any) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    tid = _SETUP_TO_THESIS.get(normalize_setup(setup))
+    return (tid, THESES[tid]) if tid else (None, None)
+
+
+def side_of(action: Any) -> str:
+    """Signal direction → thesis side. A bearish signal (SELL → long PUT) is
+    the SHORT side of the thesis even though the option is held long."""
+    a = str(action or "").strip().upper()
+    return "short" if a in {"SELL", "SELL_SHORT", "SHORT", "SELL_OPEN"} else "long"
+
+
+def _check(cond: Dict[str, Any], features: Dict[str, Any], sign: float) -> Optional[bool]:
+    """True/False when measured; None when the feature is unmeasured."""
+    raw = features.get(cond["feature"])
+    if cond["op"] == "not_in":
+        if raw is None:
+            return None
+        return str(raw) not in cond["value"]
+    value = _num(raw)
+    if value is None:
+        return None
+    if cond["op"] == ">=":
+        return value >= float(cond["value"])
+    if cond["op"] == "<=":
+        return value <= float(cond["value"])
+    if cond["op"] == "aligned>=":
+        return value * sign >= float(cond["value"])
+    return None
+
+
+def _describe(cond: Dict[str, Any], features: Dict[str, Any]) -> str:
+    raw = features.get(cond["feature"])
+    shown = "unmeasured" if raw is None else (f"{raw:g}" if isinstance(raw, (int, float)) else str(raw))
+    target = cond["value"]
+    if cond["op"] == "not_in":
+        rule = f"not {'/'.join(target)}"
+    elif cond["op"] == "aligned>=":
+        rule = f"≥ {float(target):g} in the trade's direction"
+    else:
+        rule = f"{cond['op']} {float(target):g}"
+    return f"{cond['feature']} {shown} (needs {rule}: {cond['why']})"
+
+
+def evaluate_thesis(setup: Any, side: str, features: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Does this candidate satisfy its OWN economic thesis?
+
+    ok=False when: there is no thesis; a required condition is measured and
+    unmet; or a required condition is UNMEASURED (the thesis cannot be
+    checked, so it is not assumed)."""
+    feats = features or {}
+    tid, thesis = thesis_for(setup)
+    out: Dict[str, Any] = {
+        "setup": normalize_setup(setup) or None, "side": side, "thesis": tid,
+        "ok": False, "unmet": [], "unmeasured": [], "confirmed": [], "unconfirmed": [],
+        "reason": "",
+    }
+    if thesis is None:
+        label = normalize_setup(setup) or "unlabelled"
+        out["reason"] = (
+            f"no economic thesis on file for setup '{label}' — nothing names who pays for "
+            "this trade or why it should persist"
+        )
+        return out
+    sign = -1.0 if side == "short" else 1.0
+    for cond in thesis["conditions"]:
+        verdict = _check(cond, feats, sign)
+        text = _describe(cond, feats)
+        if cond["role"] == "required":
+            if verdict is None:
+                out["unmeasured"].append(text)
+            elif not verdict:
+                out["unmet"].append(text)
+        elif verdict:
+            out["confirmed"].append(cond["feature"])
+        else:
+            out["unconfirmed"].append(cond["feature"])
+    if out["unmet"]:
+        out["reason"] = f"{thesis['title']} thesis not present — " + " · ".join(out["unmet"])
+    elif out["unmeasured"]:
+        out["reason"] = f"{thesis['title']} thesis unverifiable — " + " · ".join(out["unmeasured"])
+    else:
+        out["ok"] = True
+        out["reason"] = f"{thesis['title']} thesis present ({len(out['confirmed'])} confirming)"
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Trades from the ledger
+# ---------------------------------------------------------------------------
+def _epoch(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) if math.isfinite(float(value)) else None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def edge_trades(records: Iterable[Any], abandoned_events: Iterable[str] = ()) -> List[Dict[str, Any]]:
+    """Closed LIVE trades with their thesis, holding interval, regime and
+    realized percent. Records are the (sign-corrected) ledger, oldest first."""
+    abandoned = set(abandoned_events)
+    opens: Dict[str, Dict[str, Any]] = {}
+    out: List[Dict[str, Any]] = []
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        data = rec.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        event = str(rec.get("event") or "")
+        ticker = str(data.get("ticker") or "").upper()
+        if event == "position_opened":
+            if ticker:
+                opens[ticker] = {"ts": _epoch(rec.get("ts")), "edge": data.get("edge"),
+                                 "setup": data.get("setup")}
+            continue
+        if event in abandoned:
+            opens.pop(ticker, None)
+            continue
+        if event != "position_closed":
+            continue
+        opened = opens.pop(ticker, None) or {}
+        pct = _num(data.get("realized_pnl_pct"))
+        if pct is None:
+            continue
+        setup = data.get("setup") or opened.get("setup")
+        tid, _ = thesis_for(setup)
+        closed_ts = _epoch(rec.get("ts"))
+        if closed_ts is None:
+            continue
+        open_ts = _epoch(data.get("opened_at")) or opened.get("ts") or closed_ts
+        edge = data.get("edge") if isinstance(data.get("edge"), dict) else opened.get("edge")
+        edge = edge if isinstance(edge, dict) else {}
+        regime = str(edge.get("vol_regime") or "").lower()
+        out.append({
+            "ticker": ticker,
+            "setup": normalize_setup(setup) or None,
+            "thesis": tid,
+            "opened": float(min(open_ts, closed_ts)),
+            "closed": float(closed_ts),
+            "ret": float(pct),
+            "basis": str(data.get("basis") or data.get("pnl_basis") or "underlying"),
+            "regime": regime if regime in VOL_REGIMES else "unknown",
+            "side": str(edge.get("side") or "long"),
+            # portfolio_risk evidence class at entry ("proven"/"permitted"),
+            # None for closes from before the classifier existed.
+            "ev_class": ((edge.get("risk") or {}).get("ev_class")
+                         if isinstance(edge.get("risk"), dict) else None),
+            # cost_model's expected round trip at entry (None before it existed)
+            # — so realized outcomes can be set against the predicted breakeven.
+            "cost": edge.get("cost") if isinstance(edge.get("cost"), dict) else None,
+        })
+    return out
+
+
+def dominant_basis(trades: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+    """Keep ONE unit: the basis with the most samples (ties → alphabetical)."""
+    if not trades:
+        return "", []
+    counts: Dict[str, int] = {}
+    for t in trades:
+        counts[t["basis"]] = counts.get(t["basis"], 0) + 1
+    basis = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    return basis, [t for t in trades if t["basis"] == basis]
+
+
+# ---------------------------------------------------------------------------
+# Validation — purged k-fold, anchored walk-forward, regime segments
+# ---------------------------------------------------------------------------
+MIN_VALIDATION_TRADES = 30   # below this nothing is validated or condemned
+MIN_TRAIN_TRADES = 8         # a fold decision needs at least this much history
+CV_FOLDS = 5
+WF_SPLITS = 4
+MIN_REGIME_TRADES = 8        # a regime segment speaks only above this
+REGIME_LOSS_T = -1.0         # a regime this negative is refused for the family
+VALIDATION_ALPHA = 0.05      # family-wise, one-sided, before deflation
+MIN_WF_POSITIVE_SHARE = 0.5  # at least half the forward folds must pay
+
+
+def _mean(xs: List[float]) -> Optional[float]:
+    return sum(xs) / len(xs) if xs else None
+
+
+def _tstat(xs: List[float]) -> Optional[float]:
+    if len(xs) < 2:
+        return None
+    sd = statistics.stdev(xs)
+    if sd <= 0:
+        m = _mean(xs) or 0.0
+        return math.copysign(99.0, m) if m else 0.0
+    return (_mean(xs) or 0.0) / (sd / math.sqrt(len(xs)))
+
+
+def required_t(n_tested: int) -> float:
+    """One-sided z for VALIDATION_ALPHA, Bonferroni-deflated by the number of
+    families searched. Searching five theses and keeping the best one is five
+    chances to be lucky — the bar rises accordingly."""
+    k = max(1, int(n_tested))
+    return statistics.NormalDist().inv_cdf(1.0 - VALIDATION_ALPHA / k)
+
+
+def _regime_blocks(trades: List[Dict[str, Any]]) -> List[str]:
+    """Measured regimes in which the family measurably LOSES — the same rule
+    the cross-validation learns on each training fold and the live gate
+    enforces, so the regime filter is itself validated out-of-sample."""
+    blocked: List[str] = []
+    for regime in VOL_REGIMES:
+        rets = [t["ret"] for t in trades if t["regime"] == regime]
+        t = _tstat(rets)
+        if len(rets) >= MIN_REGIME_TRADES and t is not None and t <= REGIME_LOSS_T:
+            blocked.append(regime)
+    return blocked
+
+
+def _decide(train: List[Dict[str, Any]]) -> Optional[List[str]]:
+    """The only free choices in a rule-based family, made on TRAINING data:
+    trade it at all (None = no), and which measured regimes to refuse."""
+    blocks = _regime_blocks(train)
+    kept = [t["ret"] for t in train if t["regime"] not in blocks]
+    m = _mean(kept)
+    if len(kept) < MIN_TRAIN_TRADES or m is None or m <= 0:
+        return None
+    return blocks
+
+
+def purged_kfold(trades: List[Dict[str, Any]], k: int = CV_FOLDS, embargo_s: float = 0.0) -> Dict[str, Any]:
+    """k contiguous time blocks. Each block is scored by a decision made on
+    the OTHER blocks, after purging every training trade whose holding
+    interval comes within `embargo_s` of the test block (no label leakage)."""
+    ordered = sorted(trades, key=lambda t: (t["opened"], t["closed"]))
+    n = len(ordered)
+    folds: List[Dict[str, Any]] = []
+    oos: List[float] = []
+    if n < k:
+        return {"folds": folds, "oos_n": 0, "oos_mean": None, "oos_t": None, "purged": 0}
+    bounds = [round(i * n / k) for i in range(k + 1)]
+    purged_total = 0
+    for i in range(k):
+        test = ordered[bounds[i]:bounds[i + 1]]
+        if not test:
+            continue
+        t0 = min(t["opened"] for t in test) - embargo_s
+        t1 = max(t["closed"] for t in test) + embargo_s
+        train: List[Dict[str, Any]] = []
+        purged = 0
+        for j, t in enumerate(ordered):
+            if bounds[i] <= j < bounds[i + 1]:
+                continue
+            if t["closed"] >= t0 and t["opened"] <= t1:
+                purged += 1
+                continue
+            train.append(t)
+        purged_total += purged
+        blocks = _decide(train)
+        taken = [t["ret"] for t in test if blocks is not None and t["regime"] not in blocks]
+        oos.extend(taken)
+        folds.append({
+            "test_n": len(test), "train_n": len(train), "purged": purged,
+            "train_mean": _round(_mean([t["ret"] for t in train])), "take": blocks is not None,
+            "blocked_regimes": blocks or [], "taken_n": len(taken), "test_mean": _round(_mean(taken)),
+        })
+    return {"folds": folds, "oos_n": len(oos), "oos_mean": _round(_mean(oos)),
+            "oos_t": _round(_tstat(oos)), "purged": purged_total}
+
+
+def walk_forward(trades: List[Dict[str, Any]], splits: int = WF_SPLITS, embargo_s: float = 0.0,
+                 min_train: int = MIN_TRAIN_TRADES) -> Dict[str, Any]:
+    """Anchored walk-forward: train on everything strictly BEFORE each block
+    (minus the embargo), test on the block. Never sees the future."""
+    ordered = sorted(trades, key=lambda t: (t["opened"], t["closed"]))
+    n = len(ordered)
+    folds: List[Dict[str, Any]] = []
+    oos: List[float] = []
+    if n <= min_train:
+        return {"folds": folds, "oos_n": 0, "oos_mean": None, "oos_t": None,
+                "positive_share": None, "taken_folds": 0}
+    rest = n - min_train
+    bounds = [min_train + round(i * rest / splits) for i in range(splits + 1)]
+    for i in range(splits):
+        test = ordered[bounds[i]:bounds[i + 1]]
+        if not test:
+            continue
+        t0 = min(t["opened"] for t in test) - embargo_s
+        train = [t for t in ordered[:bounds[i]] if t["closed"] < t0]
+        blocks = _decide(train)
+        taken_rets = [t["ret"] for t in test if blocks is not None and t["regime"] not in blocks]
+        oos.extend(taken_rets)
+        folds.append({
+            "test_n": len(test), "train_n": len(train), "take": blocks is not None and bool(taken_rets),
+            "blocked_regimes": blocks or [], "taken_n": len(taken_rets),
+            "train_mean": _round(_mean([t["ret"] for t in train])), "test_mean": _round(_mean(taken_rets)),
+        })
+    taken = [f for f in folds if f["take"]]
+    positive = [f for f in taken if (f["test_mean"] or 0) > 0]
+    return {"folds": folds, "oos_n": len(oos), "oos_mean": _round(_mean(oos)), "oos_t": _round(_tstat(oos)),
+            "positive_share": _round(len(positive) / len(taken)) if taken else None,
+            "taken_folds": len(taken)}
+
+
+def regime_segments(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for regime in VOL_REGIMES + ("unknown",):
+        rets = [t["ret"] for t in trades if t["regime"] == regime]
+        if rets:
+            out[regime] = {"n": len(rets), "mean": _round(_mean(rets)), "t": _round(_tstat(rets))}
+    return out
+
+
+def _round(x: Optional[float], nd: int = 4) -> Optional[float]:
+    return None if x is None else round(float(x), nd)
+
+
+def validate_thesis(trades: List[Dict[str, Any]], n_tested: int, horizon_minutes: float = 60.0) -> Dict[str, Any]:
+    """Out-of-sample verdict for ONE thesis family.
+
+    validated        OOS (purged CV) positive with t ≥ the deflated bar AND
+                     the walk-forward pays in at least half its taken folds
+    regime_dependent validated, but at least one measured regime loses —
+                     that regime is refused for the family
+    no_edge          enough trades, and both OOS reads are ≤ 0: refuse
+    unproven         anything in between — trades at probation
+    insufficient     fewer than MIN_VALIDATION_TRADES
+    """
+    basis, sample = dominant_basis(trades)
+    embargo = float(horizon_minutes) * 60.0
+    rets = [t["ret"] for t in sample]
+    bar = required_t(n_tested)
+    out: Dict[str, Any] = {
+        "verdict": "insufficient", "n": len(sample), "basis": basis or None,
+        "in_sample_mean": _round(_mean(rets)), "in_sample_t": _round(_tstat(rets)),
+        "in_sample_fitted_mean": None,
+        "required_t": round(bar, 3), "n_tested": int(n_tested),
+        "cv": None, "walk_forward": None, "regimes": regime_segments(sample),
+        "blocked_regimes": [], "optimism": None, "reason": "",
+    }
+    if len(sample) < MIN_VALIDATION_TRADES:
+        out["reason"] = (
+            f"{len(sample)} live closes on the {basis or 'any'} basis — needs {MIN_VALIDATION_TRADES} "
+            "before an out-of-sample verdict means anything"
+        )
+        return out
+    cv = purged_kfold(sample, embargo_s=embargo)
+    wf = walk_forward(sample, embargo_s=embargo)
+    out["cv"], out["walk_forward"] = cv, wf
+    blocked = _regime_blocks(sample)
+    out["blocked_regimes"] = blocked
+    # What the in-sample fit (family on, losing regimes off) claims, vs what
+    # the same procedure earned on data it never saw: the overfitting bill.
+    fitted = _mean([t["ret"] for t in sample if t["regime"] not in blocked])
+    out["in_sample_fitted_mean"] = _round(fitted)
+    if cv["oos_mean"] is not None and fitted is not None:
+        out["optimism"] = _round(fitted - cv["oos_mean"])
+    cv_ok = cv["oos_mean"] is not None and cv["oos_mean"] > 0 and (cv["oos_t"] or 0) >= bar
+    wf_ok = wf["oos_mean"] is not None and wf["oos_mean"] > 0 and (wf["positive_share"] or 0) >= MIN_WF_POSITIVE_SHARE
+    cv_dead = cv["oos_mean"] is None or cv["oos_mean"] <= 0
+    wf_dead = wf["oos_mean"] is None or wf["oos_mean"] <= 0
+    if cv_ok and wf_ok:
+        out["verdict"] = "regime_dependent" if blocked else "validated"
+        out["reason"] = (
+            f"out-of-sample {cv['oos_mean']:+.2f}%/trade (t {cv['oos_t']:.2f} ≥ deflated {bar:.2f}), "
+            f"walk-forward pays in {wf['positive_share'] * 100:.0f}% of folds"
+            + (f"; refused in {', '.join(blocked)} regimes where it measurably loses" if blocked else "")
+        )
+    elif cv_dead and wf_dead:
+        out["verdict"] = "no_edge"
+        out["reason"] = (
+            f"{len(sample)} live closes and NO out-of-sample edge (purged CV "
+            f"{_oos_phrase(cv)}, walk-forward {_oos_phrase(wf)}) — the in-sample "
+            f"{_fmt(out['in_sample_mean'])} does not survive data it did not see"
+        )
+    else:
+        out["verdict"] = "unproven"
+        out["reason"] = (
+            f"out-of-sample {_fmt(cv['oos_mean'])} (t {_fmt(cv['oos_t'], '')} vs deflated {bar:.2f}) — "
+            "not distinguishable from noise yet; trades on probation"
+        )
+    return out
+
+
+def _oos_phrase(res: Dict[str, Any]) -> str:
+    if res.get("oos_mean") is None:
+        return "declined to trade it in every fold"
+    return _fmt(res["oos_mean"])
+
+
+def _fmt(x: Optional[float], unit: str = "%") -> str:
+    return "unmeasured" if x is None else f"{x:+.2f}{unit}"
+
+
+# ---------------------------------------------------------------------------
+# Decay — one-sided CUSUM against the expected edge
+# ---------------------------------------------------------------------------
+DECAY_MIN_TRADES = 10   # the monitor stays silent below this
+# CUSUM design (Page, 1954) on standardized outcomes, reference value
+#   ref = μ0 − K·σ,  K = max(DECAY_MIN_K, μ0 / 2σ)
+# μ0 is the in-control mean: the family's validated out-of-sample
+# expectancy, or 0 for an unproven family. For a validated family with a big
+# edge, ref sits halfway to zero (the edge is gone); for a small or unproven
+# one the slack floor keeps the false-alarm run length at ~465 closes
+# (k = 0.5, h = 5; Montgomery's ARL tables) while a −1σ bleed alarms in ~10.
+DECAY_MIN_K = 0.5
+DECAY_H = 5.0
+# The monitor watches the most recent closes; the in-control mean is
+# validated on the closes BEFORE that window. Using today's full-sample
+# validation as the baseline for old closes would be look-ahead.
+DECAY_MONITOR = 40
+DECAY_WINDOW = 20       # recent-window read for the early "watch" state
+DECAY_WATCH_T = -1.0
+
+
+def assess_decay(trades: List[Dict[str, Any]], baseline_mean: Optional[float] = None,
+                 since_epoch: Optional[float] = None, window: Optional[int] = None) -> Dict[str, Any]:
+    """Has this family's edge disappeared?
+
+    Lower CUSUM on standardized outcomes: S = max(0, S + (ref − r)/σ), with
+    ref = μ0 − K·σ (see DECAY_MIN_K). μ0 is the validated out-of-sample
+    expectancy when one exists (decay = the proven edge is gone), else 0
+    (decay = the family is bleeding).
+    The alarm is sticky inside the monitored window: once retired, a family
+    stays retired until an operator reinstates it (`since_epoch`)."""
+    basis, sample = dominant_basis(
+        [t for t in trades if since_epoch is None or t["closed"] >= since_epoch]
+    )
+    sample.sort(key=lambda t: t["closed"])
+    if window is not None and window > 0:
+        sample = sample[-window:]
+    rets = [t["ret"] for t in sample]
+    mu0 = max(0.0, float(baseline_mean)) if isinstance(baseline_mean, (int, float)) else 0.0
+    out: Dict[str, Any] = {
+        "state": "insufficient", "n": len(rets), "basis": basis or None, "baseline": round(mu0, 4),
+        "cusum": 0.0, "threshold": DECAY_H, "alarm_at": None, "recent_mean": None, "recent_t": None,
+        "since": since_epoch, "reason": "",
+    }
+    if len(rets) < DECAY_MIN_TRADES:
+        out["reason"] = f"{len(rets)} closes in the monitored window — monitor arms at {DECAY_MIN_TRADES}"
+        return out
+    sd = statistics.stdev(rets) or (abs(_mean(rets) or 0.0) or 1.0)
+    s = 0.0
+    peak = 0.0
+    alarm_at: Optional[int] = None
+    ref = mu0 - max(DECAY_MIN_K, mu0 / (2.0 * sd)) * sd
+    for i, r in enumerate(rets):
+        s = max(0.0, s + (ref - r) / sd)
+        peak = max(peak, s)
+        if alarm_at is None and s >= DECAY_H:
+            alarm_at = i
+    recent = rets[-DECAY_WINDOW:]
+    out["cusum"] = round(s, 3)
+    out["recent_mean"] = _round(_mean(recent))
+    out["recent_t"] = _round(_tstat(recent))
+    if alarm_at is not None:
+        out["state"] = "decayed"
+        out["alarm_at"] = sample[alarm_at]["closed"]
+        out["reason"] = (
+            f"edge decayed — cumulative shortfall vs the expected {mu0:+.2f}%/trade crossed "
+            f"{DECAY_H:g}σ at close #{alarm_at + 1} of {len(rets)} (recent {_fmt(out['recent_mean'])}/trade); "
+            "family retired until reinstated"
+        )
+    elif out["recent_t"] is not None and out["recent_t"] <= DECAY_WATCH_T:
+        out["state"] = "watch"
+        out["reason"] = (
+            f"last {len(recent)} closes average {_fmt(out['recent_mean'])} (t {out['recent_t']:.2f}) — "
+            f"CUSUM {s:.2f}σ of {DECAY_H:g}σ; not retired yet"
+        )
+    else:
+        out["state"] = "healthy"
+        out["reason"] = f"CUSUM {s:.2f}σ of {DECAY_H:g}σ — no measured decay"
+    return out
+
+
+def family_decay(family: List[Dict[str, Any]], blocked: List[str], horizon_minutes: float,
+                 n_tested: int, since_epoch: Optional[float] = None) -> Dict[str, Any]:
+    """Decay state for one family, judged on the stream the gate lets trade
+    (closes in refused regimes cannot decay it twice). The baseline is the
+    out-of-sample expectancy validated on closes BEFORE the monitored window
+    — never on the closes being monitored."""
+    _, stream = dominant_basis([t for t in family if t["regime"] not in blocked])
+    stream.sort(key=lambda t: t["closed"])
+    watched = [t for t in stream if since_epoch is None or t["closed"] >= since_epoch][-DECAY_MONITOR:]
+    cut = watched[0]["closed"] if watched else None
+    prior = [t for t in stream if cut is not None and t["closed"] < cut]
+    baseline: Optional[float] = None
+    if prior:
+        v = validate_thesis(prior, n_tested, horizon_minutes)
+        if v["verdict"] in {"validated", "regime_dependent"} and v["cv"]:
+            baseline = v["cv"]["oos_mean"]
+    out = assess_decay(watched, baseline)
+    out["since"] = since_epoch
+    out["baseline_source"] = "validated_prior_window" if baseline is not None else "zero_edge"
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The gate and the report
+# ---------------------------------------------------------------------------
+def assess_edge_gate(
+    setup: Any,
+    side: str,
+    features: Optional[Dict[str, Any]],
+    trades: List[Dict[str, Any]],
+    reinstated: Optional[Dict[str, float]] = None,
+    require_thesis: bool = True,
+) -> Dict[str, Any]:
+    """Every edge refusal for ONE live entry. ENTRY SIDE ONLY — an exit is
+    never consulted against any of this."""
+    reasons: List[str] = []
+    thesis_eval = evaluate_thesis(setup, side, features)
+    tid = thesis_eval["thesis"]
+    if require_thesis and not thesis_eval["ok"]:
+        reasons.append(thesis_eval["reason"])
+    validation: Optional[Dict[str, Any]] = None
+    decay: Optional[Dict[str, Any]] = None
+    if tid is not None:
+        thesis = THESES[tid]
+        family = [t for t in trades if t["thesis"] == tid]
+        validation = validate_thesis(family, len(THESES), thesis["horizon_minutes"])
+        if validation["verdict"] == "no_edge":
+            reasons.append(f"{thesis['title']}: {validation['reason']}")
+        if validation["blocked_regimes"]:
+            regime = (features or {}).get("vol_regime")
+            if regime is None:
+                reasons.append(
+                    f"{thesis['title']} measurably loses in {', '.join(validation['blocked_regimes'])} "
+                    "regimes and the current regime is unmeasured"
+                )
+            elif regime in validation["blocked_regimes"]:
+                reasons.append(f"{thesis['title']} measurably loses in a {regime} regime: {validation['reason']}")
+        decay = family_decay(family, validation["blocked_regimes"], thesis["horizon_minutes"],
+                             len(THESES), (reinstated or {}).get(tid))
+        if decay["state"] == "decayed":
+            reasons.append(f"{thesis['title']}: {decay['reason']}")
+    return {
+        "allowed": not reasons, "reasons": reasons, "thesis": thesis_eval,
+        "validation": validation, "decay": decay,
+    }
+
+
+def edge_report(trades: List[Dict[str, Any]], reinstated: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    """Every thesis with its out-of-sample verdict and decay state."""
+    families: List[Dict[str, Any]] = []
+    for tid, thesis in THESES.items():
+        family = [t for t in trades if t["thesis"] == tid]
+        validation = validate_thesis(family, len(THESES), thesis["horizon_minutes"])
+        decay = family_decay(family, validation["blocked_regimes"], thesis["horizon_minutes"],
+                             len(THESES), (reinstated or {}).get(tid))
+        families.append({
+            "id": tid,
+            "title": thesis["title"],
+            "setups": list(thesis["setups"]),
+            "rationale": thesis["rationale"],
+            "counterparty": thesis["counterparty"],
+            "flow": thesis["flow"],
+            "persists_because": thesis["persists_because"],
+            "fails_when": thesis["fails_when"],
+            "horizon_minutes": thesis["horizon_minutes"],
+            "conditions": [
+                {k: (list(v) if isinstance(v, tuple) else v) for k, v in c.items()}
+                for c in thesis["conditions"]
+            ],
+            "validation": validation,
+            "decay": decay,
+            "tradable": validation["verdict"] != "no_edge" and decay["state"] != "decayed",
+        })
+    unattributed = sum(1 for t in trades if t["thesis"] is None)
+    return {
+        "theses": families,
+        "no_thesis_setups": list(NO_THESIS_SETUPS) + ["ema cross + adx"],
+        "unattributed_closes": unattributed,
+        "live_closes": len(trades),
+        "required_t": round(required_t(len(THESES)), 3),
+        "thresholds": {
+            "min_validation_trades": MIN_VALIDATION_TRADES, "cv_folds": CV_FOLDS, "wf_splits": WF_SPLITS,
+            "decay_min_k": DECAY_MIN_K, "decay_h": DECAY_H, "decay_monitor": DECAY_MONITOR, "decay_min_trades": DECAY_MIN_TRADES,
+        },
+    }
+
+''')
+
+_bundle_load('learning', r'''
+"""
+LEARNING LOOP — live results change what the bot trades, how big, and how often.
+=================================================================================
+
+WHY THIS EXISTS
+---------------
+The study layer, the setup priors and the expectancy views describe what
+happened. Description is forensic: nothing in it changed the next decision.
+This module closes the loop:
+
+    live closes → expectancy per (setup × volatility regime) cell
+                → size weight / disablement → probation re-test → …
+
+THE CELLS
+---------
+Every live close lands in three cells, each with its own state:
+  * `setup|regime`  — e.g. `breakout|stressed` (the specific evidence),
+  * `setup|*`       — the setup across regimes (detects a setup that is bad
+                      everywhere faster than four thin regime cells would),
+  * `*|*`           — the whole book (throttle only, see below).
+An entry's weight is the MINIMUM of its cell and setup weights times the book
+weight. Disablement of either specific cell refuses the entry.
+
+THE STATE MACHINE (per cell, replayed from the ledger — no hidden state)
+-----------------------------------------------------------------------
+  active     weight 1.0 until MIN_CELL_TRADES closes. Then, over the trailing
+             CELL_WINDOW closes on ONE basis:
+               mean ≥ 0                 → 1.0
+               DISABLE_T < t < 0        → linearly down to MIN_WEIGHT
+               t ≤ DISABLE_T            → DISABLED
+  disabled   weight 0 (entries refused) for a cooldown that doubles with each
+             strike: 7, 14, 28, 56 days (cap). Closes of positions opened
+             before the disablement are tallied, never judged.
+  probation  the RE-TEST. After the cooldown the cell trades again at
+             PROBATION_WEIGHT, and is judged ONLY on closes opened after it
+             was re-admitted — old evidence cannot re-condemn it, and old
+             evidence cannot vouch for it. After PROBATION_TRADES closes:
+               mean > 0 → active (one strike forgiven)
+               mean ≤ 0 → disabled again with the next, longer cooldown.
+  An operator reset (`learning_cell_reset` ledger record) puts a cell into
+  probation at once — it is never a shortcut back to full size.
+
+ASYMMETRY ON PURPOSE. The loop can only take risk AWAY (weight ≤ 1). Sizing
+UP on a noisy run of winners is how an adaptive system turns luck into a
+blow-up; the existing gates already decide what full size is.
+
+THE BOOK CELL never refuses — halting everything is the daily loss limit's
+job, not a statistical one. Its weight shrinks every entry's size and
+stretches the scanner's cadence by 1/weight (≤ ×4): a book that is measurably
+losing trades smaller and looks less often, and keeps producing the closes
+that let it recover.
+
+UNITS AND HONESTY. Outcomes are realized percent per trade (size-invariant,
+so a down-weighted trade is still full evidence) on the window's best-
+evidenced basis — never a premium/underlying blend. Live closes only; paper
+never counts. Thresholds are round, declared values — never fitted to the
+ledger. Pure functions: no I/O; `now` is always passed in.
+"""
+from __future__ import annotations
+
+import math
+import statistics
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+try:  # package-style import (python -m bot...) or flat (uvicorn main_bot:app)
+    from . import edge as edge_mod
+except ImportError:
+    import edge as edge_mod
+
+CELL_WINDOW = 60          # trailing closes a cell is judged on (recency wins)
+MIN_CELL_TRADES = 10      # below this a cell is unproven and keeps full weight
+DISABLE_T = -2.0          # t this negative = a measured loser, not noise
+MIN_WEIGHT = 0.25         # the smallest size an active cell is cut to
+PROBATION_WEIGHT = 0.25   # re-tests run small: the cell owes us evidence
+PROBATION_TRADES = 10     # fresh closes a re-test is judged on
+BASE_COOLDOWN_DAYS = 7.0  # one trading week
+MAX_COOLDOWN_DAYS = 56.0  # eight weeks: a relapsing cell is still re-tested
+MAX_THROTTLE = 4.0        # scanner cadence stretch ceiling (1 / MIN_WEIGHT)
+
+RESET_EVENT = "learning_cell_reset"
+ANY = "*"
+BOOK = f"{ANY}|{ANY}"
+REGIME_UNKNOWN = "unknown"
+
+ACTIVE, DISABLED, PROBATION = "active", "disabled", "probation"
+
+
+def cell_key(setup: Any, regime: Any) -> str:
+    s = edge_mod.normalize_setup(setup) or "unlabelled"
+    r = str(regime or "").strip().lower()
+    if r != ANY and r not in edge_mod.VOL_REGIMES:
+        r = REGIME_UNKNOWN
+    return f"{s}|{r}"
+
+
+def cooldown_days(strikes: int) -> float:
+    return min(MAX_COOLDOWN_DAYS, BASE_COOLDOWN_DAYS * (2 ** max(0, strikes - 1)))
+
+
+def _stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    basis, kept = edge_mod.dominant_basis(trades)
+    rets = [float(t["ret"]) for t in kept]
+    n = len(rets)
+    if n == 0:
+        return {"n": 0, "basis": basis or None, "mean": None, "t": None}
+    mean = sum(rets) / n
+    if n < 2:
+        return {"n": n, "basis": basis, "mean": mean, "t": None}
+    sd = statistics.stdev(rets)
+    if sd <= 0:
+        t = math.inf if mean > 0 else (-math.inf if mean < 0 else 0.0)
+    else:
+        t = mean / (sd / math.sqrt(n))
+    return {"n": n, "basis": basis, "mean": mean, "t": t}
+
+
+def active_weight(stats: Dict[str, Any]) -> Tuple[float, bool]:
+    """(weight, disable?) for an ACTIVE cell's trailing window."""
+    if stats["n"] < MIN_CELL_TRADES or stats["mean"] is None or stats["t"] is None:
+        return 1.0, False
+    if stats["mean"] >= 0:
+        return 1.0, False
+    t = float(stats["t"])
+    if t <= DISABLE_T:
+        return 0.0, True
+    return max(MIN_WEIGHT, 1.0 + t / abs(DISABLE_T)), False
+
+
+def _finite(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    return round(float(x), 4) if math.isfinite(float(x)) else (99.0 if x > 0 else -99.0)
+
+
+def replay_cell(trades: List[Dict[str, Any]], resets: List[float], now: float) -> Dict[str, Any]:
+    """Run one cell's state machine over its closes (oldest first) and resets."""
+    state, epoch, strikes = ACTIVE, -math.inf, 0
+    until: Optional[float] = None
+    window: List[Dict[str, Any]] = []
+    history: List[Dict[str, Any]] = []
+    ignored = 0
+    # The evidence that disabled the cell — shown while it sits out, so the
+    # report says WHY instead of an empty window.
+    condemned: Optional[Dict[str, Any]] = None
+
+    def disable(at: float, why: str) -> None:
+        nonlocal state, strikes, until, window
+        strikes += 1
+        until = at + cooldown_days(strikes) * 86400.0
+        state, window = DISABLED, []
+        history.append({"ts": at, "to": DISABLED, "strikes": strikes, "until": until, "why": why})
+
+    def readmit(at: float, why: str) -> None:
+        nonlocal state, epoch, window, until
+        state, epoch, window, until = PROBATION, at, [], None
+        history.append({"ts": at, "to": PROBATION, "why": why})
+
+    events: List[Tuple[float, int, Optional[Dict[str, Any]]]] = (
+        [(float(r), 0, None) for r in resets] + [(float(t["closed"]), 1, t) for t in trades]
+    )
+    events.sort(key=lambda e: (e[0], e[1]))
+    for ts, kind, trade in events:
+        if state == DISABLED and until is not None and ts >= until:
+            readmit(until, "cooldown served — re-test at probation size")
+        if kind == 0:
+            readmit(ts, "operator reset")
+            continue
+        assert trade is not None
+        if state == DISABLED or float(trade["opened"]) < epoch:
+            ignored += 1
+            continue
+        window.append(trade)
+        if state == PROBATION:
+            if len(window) >= PROBATION_TRADES:
+                st = _stats(window)
+                if st["mean"] is not None and st["mean"] > 0:
+                    state = ACTIVE
+                    strikes = max(0, strikes - 1)
+                    history.append({"ts": ts, "to": ACTIVE,
+                                    "why": f"re-test paid {st['mean']:+.2f}% over {st['n']} closes"})
+                else:
+                    mean = st["mean"] if st["mean"] is not None else 0.0
+                    condemned = st
+                    disable(ts, f"re-test failed {mean:+.2f}% over {st['n']} closes")
+            continue
+        window = window[-CELL_WINDOW:]
+        st = _stats(window)
+        _, off = active_weight(st)
+        if off:
+            condemned = st
+            disable(ts, f"{st['mean']:+.2f}%/trade, t {st['t']:.2f} ≤ {DISABLE_T:g} over {st['n']} closes")
+
+    if state == DISABLED and until is not None and now >= until:
+        readmit(until, "cooldown served — re-test at probation size")
+
+    st = condemned if (state == DISABLED and condemned is not None) else _stats(window[-CELL_WINDOW:])
+    if state == DISABLED:
+        weight = 0.0
+    elif state == PROBATION:
+        weight = PROBATION_WEIGHT
+    else:
+        weight, _ = active_weight(st)
+    return {
+        "state": state,
+        "weight": round(weight, 3),
+        "strikes": strikes,
+        "until": until,
+        "n": len(trades),
+        "window_n": st["n"],
+        "probation_n": len(window) if state == PROBATION else None,
+        "basis": st["basis"],
+        "mean": _finite(st["mean"]),
+        "t": _finite(st["t"]),
+        "ignored": ignored,
+        "history": history[-6:],
+    }
+
+
+def resets_from_ledger(records: Iterable[Any]) -> Dict[str, List[float]]:
+    out: Dict[str, List[float]] = {}
+    for rec in records or []:
+        if not isinstance(rec, dict) or rec.get("event") != RESET_EVENT:
+            continue
+        data = rec.get("data") or {}
+        cell = str((data or {}).get("cell") or "")
+        ts = edge_mod._epoch(rec.get("ts"))
+        if cell and ts is not None:
+            out.setdefault(cell, []).append(ts)
+    return out
+
+
+def learning_state(trades: List[Dict[str, Any]], resets: Dict[str, List[float]], now: float) -> Dict[str, Any]:
+    """Every cell's state from the live closes (edge.edge_trades output)."""
+    ordered = sorted(trades, key=lambda t: float(t["closed"]))
+    buckets: Dict[str, List[Dict[str, Any]]] = {BOOK: []}
+    for t in ordered:
+        buckets[BOOK].append(t)
+        if not t.get("setup"):
+            continue
+        buckets.setdefault(cell_key(t["setup"], t.get("regime")), []).append(t)
+        buckets.setdefault(cell_key(t["setup"], ANY), []).append(t)
+    for key in resets:
+        buckets.setdefault(key, [])
+    cells = {key: replay_cell(rows, resets.get(key, []), now) for key, rows in buckets.items()}
+    book = cells[BOOK]
+    # The book cell never refuses (see module doc): disabled/probation read as
+    # the smallest weight, never zero.
+    book_weight = book["weight"] if book["state"] == ACTIVE else MIN_WEIGHT
+    book_weight = max(MIN_WEIGHT, book_weight)
+    return {
+        "cells": cells,
+        "book_weight": round(book_weight, 3),
+        "scanner_throttle": round(min(MAX_THROTTLE, 1.0 / book_weight), 2),
+        "live_closes": len(ordered),
+    }
+
+
+def entry_verdict(snapshot: Dict[str, Any], setup: Any, regime: Any) -> Dict[str, Any]:
+    """ENTRY SIDE ONLY. Weight and allow/refuse for a new entry."""
+    cells = snapshot.get("cells") or {}
+    specific = cell_key(setup, regime)
+    broad = cell_key(setup, ANY)
+    out: Dict[str, Any] = {"allowed": True, "weight": 1.0, "cells": {}, "reasons": [], "notes": []}
+    weights: List[float] = []
+    for key in (specific, broad):
+        c = cells.get(key)
+        if c is None:
+            out["cells"][key] = None
+            weights.append(1.0)
+            continue
+        out["cells"][key] = {"state": c["state"], "weight": c["weight"]}
+        weights.append(float(c["weight"]))
+        if c["state"] == DISABLED:
+            out["allowed"] = False
+            out["reasons"].append(
+                f"learning loop: '{key}' disabled after {c['strikes']} strike(s) — "
+                f"{(c['history'][-1]['why'] if c['history'] else 'measured loser')} · re-test opens "
+                f"{_iso(c['until'])}"
+            )
+        elif c["state"] == PROBATION:
+            out["notes"].append(f"'{key}' on probation re-test ({c['probation_n'] or 0}/{PROBATION_TRADES})")
+        elif c["weight"] < 1.0:
+            out["notes"].append(f"'{key}' down-weighted to {c['weight']:.2f} (t {c['t']})")
+    book_w = float(snapshot.get("book_weight") or 1.0)
+    if book_w < 1.0:
+        out["notes"].append(f"book down-weighted to {book_w:.2f}")
+    out["weight"] = 0.0 if not out["allowed"] else round(min(weights) * book_w, 3)
+    return out
+
+
+def apply_weight(qty: Any, weight: float) -> Tuple[int, bool]:
+    """(sized qty, floor_bound). Never below 1 unit for an allowed entry —
+    `floor_bound` is True when the weight wanted less than one unit, so the
+    ledger can say the cut did not bite instead of pretending it did."""
+    try:
+        base = int(qty)
+    except (TypeError, ValueError):
+        return 0, False
+    if base < 1 or weight >= 1.0:
+        return base, False
+    want = math.floor(base * max(0.0, weight))
+    return max(1, want), want < 1
+
+
+def _iso(epoch: Optional[float]) -> str:
+    if epoch is None:
+        return "unknown"
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+
+
+def learning_report(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """JSON-safe report for GET /learning/report — worst cells first."""
+    rows = []
+    for key, c in (snapshot.get("cells") or {}).items():
+        setup, regime = key.split("|", 1)
+        rows.append({"cell": key, "setup": setup, "regime": regime, **c,
+                     "until": _iso(c["until"]) if c["until"] else None,
+                     "history": [{**h, "ts": _iso(h["ts"]),
+                                  **({"until": _iso(h["until"])} if h.get("until") else {})}
+                                 for h in c["history"]]})
+    order = {DISABLED: 0, PROBATION: 1, ACTIVE: 2}
+    rows.sort(key=lambda r: (r["cell"] != BOOK, order[r["state"]], r["weight"], r["cell"]))
+    return {
+        "book_weight": snapshot.get("book_weight"),
+        "scanner_throttle": snapshot.get("scanner_throttle"),
+        "live_closes": snapshot.get("live_closes"),
+        "thresholds": {
+            "cell_window": CELL_WINDOW, "min_cell_trades": MIN_CELL_TRADES, "disable_t": DISABLE_T,
+            "min_weight": MIN_WEIGHT, "probation_weight": PROBATION_WEIGHT,
+            "probation_trades": PROBATION_TRADES, "base_cooldown_days": BASE_COOLDOWN_DAYS,
+            "max_cooldown_days": MAX_COOLDOWN_DAYS,
+        },
+        "cells": rows,
+    }
+
+''')
+
+_bundle_load('portfolio_risk', r'''
+"""
+PORTFOLIO RISK — the book, the regime, the order book, and the evidence.
+=========================================================================
+
+WHY THIS EXISTS
+---------------
+Every limit before this module asks a PER-TRADE question (is this stop too
+wide, does this trade fit the day's budget) or an AGGREGATE-DOLLAR question
+(heat = Σ risk). Four questions were still unasked:
+
+  1. CORRELATION. Three long semis calls are one bet, not three. Heat counts
+     them as three separate risks that happen to add up; a real gap down
+     takes all three through their stops at once.
+  2. REGIME. A stop is a promise that holds only while prices trade
+     continuously. In a stressed tape — or on a name gapping or reporting —
+     the loss arrives THROUGH the stop, so the same nominal risk is a bigger
+     real one.
+  3. CAPACITY. Lifting more of the displayed offer than is there means the
+     fill is a price nobody showed. A size that is safe on paper can be the
+     whole book of a thin contract.
+  4. EVIDENCE. "Not forbidden" is not "+EV". Every gate before this one
+     refuses measured losers; none of them distinguishes a setup that is
+     PROVEN to pay in this regime from one that simply has not been caught
+     losing yet. They should not be sized the same.
+
+DESIGN RULES (same as edge.py / learning.py)
+-------------------------------------------
+* Every threshold is a pre-declared constant with its reason inline — never
+  tuned on the ledger.
+* Unmeasured is not zero and not calm. An unmeasured regime is sized as
+  "not known to be calm", an unmeasured correlation regime uses the STRESSED
+  correlations, unmeasured book depth is reported as unmeasured (no cap is
+  invented, no refusal is invented).
+* One-sided: everything here can only shrink or refuse an entry. Nothing
+  sizes up.
+* Pure functions. main_bot.py supplies the positions, the account, the
+  payload and the ledger; this module only judges.
+"""
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+try:  # bundled / package import
+    from . import edge as edge_mod
+    from . import learning as learning_mod
+except ImportError:  # pragma: no cover - flat module layout
+    import edge as edge_mod
+    import learning as learning_mod
+
+# ---------------------------------------------------------------------------
+# 1. Correlation / overlapping exposure
+# ---------------------------------------------------------------------------
+INDEX_CLUSTER = "Index"
+# Broad index products: they ARE the market factor every single name loads on.
+INDEX_SYMBOLS = frozenset({"SPY", "QQQ", "IWM", "DIA", "SPX", "NDX", "VOO", "RSP", "XSP"})
+# Names and sector ETFs edge.SECTOR_MAP does not carry (that map is the
+# app-mirrored relative-strength peer set; this one only needs clusters).
+EXTRA_CLUSTERS: Dict[str, str] = {
+    "SMH": "Semiconductors", "SOXX": "Semiconductors", "SOXL": "Semiconductors",
+    "XLK": "Technology", "XLC": "Communication", "XLY": "Consumer Discretionary",
+    "JPM": "Financials", "BAC": "Financials", "GS": "Financials", "MS": "Financials",
+    "WFC": "Financials", "C": "Financials", "SCHW": "Financials", "XLF": "Financials",
+    "XOM": "Energy", "CVX": "Energy", "OXY": "Energy", "COP": "Energy", "XLE": "Energy",
+    "UNH": "Healthcare", "LLY": "Healthcare", "JNJ": "Healthcare", "PFE": "Healthcare",
+    "MRNA": "Healthcare", "ABBV": "Healthcare", "XLV": "Healthcare",
+    "BA": "Industrials", "CAT": "Industrials", "GE": "Industrials", "XLI": "Industrials",
+    "WMT": "Consumer Staples", "COST": "Consumer Staples", "KO": "Consumer Staples",
+    "PEP": "Consumer Staples", "XLP": "Consumer Staples",
+}
+
+# STRUCTURAL correlations, pre-declared — not estimated. Intraday correlation
+# estimated from a few sessions is mostly noise, and the number that matters
+# is the one in a selloff: correlations converge toward 1 exactly when the
+# stops are being gapped. So each pair class carries a stressed value, and an
+# UNMEASURED regime uses it (not knowing the tape is calm is not the same as
+# the tape being calm).
+RHO: Dict[str, Dict[str, float]] = {
+    #                         calm  normal stressed
+    "same_name":      {"calm": 1.00, "normal": 1.00, "stressed": 1.00},
+    "index_index":    {"calm": 0.90, "normal": 0.90, "stressed": 0.95},
+    "same_cluster":   {"calm": 0.70, "normal": 0.75, "stressed": 0.90},
+    "index_member":   {"calm": 0.55, "normal": 0.60, "stressed": 0.80},
+    "unclustered":    {"calm": 0.45, "normal": 0.50, "stressed": 0.70},
+    "cross_cluster":  {"calm": 0.30, "normal": 0.35, "stressed": 0.60},
+}
+# Correlated exposure may be at most this many single-trade risks. 1.75 lets
+# two same-sector names coexist in a normal tape (1 + 0.75) and refuses the
+# third; in a stressed tape the same pair is refused (1 + 0.90 > 1.75) and
+# three cross-sector longs become one bet (1 + 2 × 0.60 > 1.75).
+CORRELATED_RISK_MULT = 1.75
+# At most this many open positions on the SAME side of ONE cluster — catches
+# a stack of cheap contracts whose dollar risks are each too small to trip
+# the exposure limit.
+MAX_CLUSTER_SAME_SIDE = 2
+
+
+def cluster_of(symbol: Any) -> Optional[str]:
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return None
+    if sym in INDEX_SYMBOLS:
+        return INDEX_CLUSTER
+    return edge_mod.SECTOR_MAP.get(sym) or EXTRA_CLUSTERS.get(sym)
+
+
+def _rho_regime(regime: Any) -> str:
+    r = str(regime or "").lower()
+    return r if r in edge_mod.VOL_REGIMES else "stressed"
+
+
+def pair_class(a: Any, b: Any) -> str:
+    sa, sb = str(a or "").upper(), str(b or "").upper()
+    if sa == sb:
+        return "same_name"
+    ca, cb = cluster_of(sa), cluster_of(sb)
+    if ca == INDEX_CLUSTER and cb == INDEX_CLUSTER:
+        return "index_index"
+    if INDEX_CLUSTER in (ca, cb):
+        return "index_member"
+    if ca is None or cb is None:
+        return "unclustered"
+    return "same_cluster" if ca == cb else "cross_cluster"
+
+
+def correlation(a: Any, b: Any, regime: Any = None) -> float:
+    return RHO[pair_class(a, b)][_rho_regime(regime)]
+
+
+def _finite(x: Any) -> Optional[float]:
+    if x is None or isinstance(x, bool):
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def payload_direction(payload: Dict[str, Any]) -> int:
+    """+1 bullish / −1 bearish exposure an ENTRY payload creates. A long PUT is
+    bearish exposure even though the order is a BUY."""
+    p = payload or {}
+    action = str(p.get("action") or "").upper()
+    if str(p.get("instrument") or "stock").lower() == "option":
+        right = str(p.get("option_right") or p.get("call_put") or "").upper()
+        if right == "PUT":
+            return -1
+        if right == "CALL":
+            return 1
+        return -1 if action == "SELL" else 1
+    return -1 if action in {"SELL", "SELL_SHORT", "SHORT"} else 1
+
+
+def position_direction(pos: Dict[str, Any]) -> int:
+    contract = (pos or {}).get("contract") or {}
+    if isinstance(contract, dict) and contract.get("right"):
+        sign = -1 if str(contract.get("right")).upper() == "PUT" else 1
+        # A SOLD option inverts its exposure (this bot only buys, but be honest).
+        return -sign if str((pos or {}).get("action") or "").upper() == "SELL_OPEN" else sign
+    action = str((pos or {}).get("action") or "BUY").upper()
+    return -1 if action in {"SELL", "SELL_SHORT", "SHORT"} else 1
+
+
+def book_rows(positions: Dict[str, Dict[str, Any]], risk_fn) -> List[Dict[str, Any]]:
+    """Open positions → {ticker, direction, risk_usd, cluster}. `risk_fn` is
+    main_bot.position_risk_usd (premium-aware)."""
+    rows: List[Dict[str, Any]] = []
+    for ticker, pos in (positions or {}).items():
+        try:
+            risk = float(risk_fn(pos) or 0.0)
+        except Exception:
+            risk = 0.0
+        rows.append({
+            "ticker": str(ticker).upper(),
+            "direction": position_direction(pos),
+            "risk_usd": round(max(0.0, risk), 2),
+            "cluster": cluster_of(ticker),
+        })
+    return rows
+
+
+def assess_correlation(
+    symbol: Any,
+    direction: int,
+    new_risk_usd: float,
+    book: List[Dict[str, Any]],
+    account_usd: float,
+    risk_per_trade_pct: float,
+    heat_cap_pct: float,
+    regime: Any = None,
+) -> Dict[str, Any]:
+    """Correlation-weighted exposure the book would carry IN THIS NAME'S
+    DIRECTION after the entry:  new + Σ ρ·sᵢ·sⱼ·riskⱼ.  Opposite-side
+    positions offset (a hedge is a hedge), never below zero."""
+    sym = str(symbol or "").upper()
+    cluster = cluster_of(sym)
+    overlaps: List[Dict[str, Any]] = []
+    total = float(new_risk_usd or 0.0)
+    for row in book:
+        if row["ticker"] == sym:
+            continue
+        rho = correlation(sym, row["ticker"], regime)
+        contrib = rho * direction * row["direction"] * row["risk_usd"]
+        total += contrib
+        overlaps.append({
+            "ticker": row["ticker"], "rho": rho, "pair": pair_class(sym, row["ticker"]),
+            "same_side": row["direction"] == direction, "contrib_usd": round(contrib, 2),
+        })
+    total = max(0.0, total)
+    account = max(float(account_usd or 0.0), 1.0)
+    limit_pct = min(float(heat_cap_pct), CORRELATED_RISK_MULT * float(risk_per_trade_pct))
+    pct = total / account * 100.0
+    reasons: List[str] = []
+    top = sorted((o for o in overlaps if o["contrib_usd"] > 0), key=lambda o: -o["contrib_usd"])[:3]
+    if pct > limit_pct + 1e-9:
+        reasons.append(
+            f"correlated exposure {pct:.2f}% > {limit_pct:.2f}% "
+            f"({CORRELATED_RISK_MULT:g}× per-trade risk) — overlaps "
+            + " · ".join(f"{o['ticker']} ρ{o['rho']:.2f}" for o in top)
+            + f" in a {_rho_regime(regime)} tape"
+        )
+    stacked = [r["ticker"] for r in book
+               if cluster and r["cluster"] == cluster and r["direction"] == direction and r["ticker"] != sym]
+    if len(stacked) >= MAX_CLUSTER_SAME_SIDE:
+        side = "long" if direction > 0 else "short"
+        reasons.append(
+            f"cluster '{cluster}' already holds {len(stacked)} {side} position(s) "
+            f"({'/'.join(stacked)}) — one bet, not {len(stacked) + 1}"
+        )
+    return {
+        "allowed": not reasons, "reasons": reasons, "cluster": cluster,
+        "direction": direction, "rho_regime": _rho_regime(regime),
+        "new_risk_usd": round(float(new_risk_usd or 0.0), 2),
+        "correlated_usd": round(total, 2), "correlated_pct": round(pct, 3),
+        "limit_pct": round(limit_pct, 3), "overlaps": overlaps, "stacked": stacked,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 2. Regime- and gap-scaled sizing
+# ---------------------------------------------------------------------------
+# PAUSE — crisis tape. VIX 35+ has been a handful of sessions a decade (Aug
+# 2024, Mar 2020, 2022 lows); a 3% SPY range or a 2% SPY opening gap is the
+# same day measured without VIX. Stops do not hold there.
+VIX_PAUSE = 35.0
+SPY_RANGE_PAUSE = 3.0
+SPY_GAP_PAUSE = 2.0
+# The NAME is in price discovery after an 8% opening gap — the level a stop
+# would rest at did not exist yesterday.
+NAME_GAP_PAUSE = 8.0
+# A 3% opening gap is a news day for the name: half size.
+NAME_GAP_TRIM = 3.0
+NAME_GAP_WEIGHT = 0.5
+# Stressed regime (edge.py bands: VIX ≥ 25 or SPY range ≥ 1.8%) → half size:
+# the gap-through-stop tail roughly doubles.
+STRESSED_WEIGHT = 0.5
+# No regime reading at all: not known to be calm.
+UNMEASURED_WEIGHT = 0.75
+
+RISK_CONTEXT_KEYS = (
+    "vix", "spy_range_pct", "spy_gap_pct", "gap_pct", "earnings_nearby",
+    "bid_size", "ask_size", "volume", "open_interest",
+)
+
+
+def sanitize_risk_context(raw: Any) -> Dict[str, Any]:
+    """Untrusted payload `risk_context` → known keys only; numbers finite and
+    sane, booleans only when literally boolean. Anything else is None."""
+    out: Dict[str, Any] = {k: None for k in RISK_CONTEXT_KEYS}
+    if not isinstance(raw, dict):
+        return out
+    for key in ("vix", "spy_range_pct", "bid_size", "ask_size", "volume", "open_interest"):
+        v = _finite(raw.get(key))
+        out[key] = v if v is not None and v >= 0 else None
+    for key in ("spy_gap_pct", "gap_pct"):
+        v = _finite(raw.get(key))
+        out[key] = v if v is not None and abs(v) < 100 else None
+    if out["vix"] is not None and not 5.0 <= out["vix"] <= 150.0:
+        out["vix"] = None
+    e = raw.get("earnings_nearby")
+    out["earnings_nearby"] = e if isinstance(e, bool) else None
+    return out
+
+
+def gap_pct(open_px: Any, prev_close: Any) -> Optional[float]:
+    o, c = _finite(open_px), _finite(prev_close)
+    if o is None or c is None or o <= 0 or c <= 0:
+        return None
+    return round((o - c) / c * 100.0, 3)
+
+
+def assess_regime_sizing(ctx: Dict[str, Any], vol_regime: Any) -> Dict[str, Any]:
+    """{pause, weight, reasons (pause), notes (trims)} for one entry."""
+    reasons: List[str] = []
+    notes: List[str] = []
+    weights: List[float] = [1.0]
+    vix, spy_range, spy_gap = ctx.get("vix"), ctx.get("spy_range_pct"), ctx.get("spy_gap_pct")
+    name_gap, earnings = ctx.get("gap_pct"), ctx.get("earnings_nearby")
+    if vix is not None and vix >= VIX_PAUSE:
+        reasons.append(f"regime pause: VIX {vix:.1f} ≥ {VIX_PAUSE:g} — stops gap in a crisis tape")
+    if spy_range is not None and spy_range >= SPY_RANGE_PAUSE:
+        reasons.append(f"regime pause: SPY range {spy_range:.2f}% ≥ {SPY_RANGE_PAUSE:g}% — crisis tape")
+    if spy_gap is not None and abs(spy_gap) >= SPY_GAP_PAUSE:
+        reasons.append(f"regime pause: SPY opened {spy_gap:+.2f}% — index gap ≥ {SPY_GAP_PAUSE:g}%")
+    if earnings is True:
+        reasons.append("gap risk: earnings inside the holding window — the print gaps through any stop")
+    if name_gap is not None and abs(name_gap) >= NAME_GAP_PAUSE:
+        reasons.append(f"gap risk: opened {name_gap:+.1f}% — price discovery, no stop level existed yesterday")
+    elif name_gap is not None and abs(name_gap) >= NAME_GAP_TRIM:
+        weights.append(NAME_GAP_WEIGHT)
+        notes.append(f"opening gap {name_gap:+.1f}% ≥ {NAME_GAP_TRIM:g}% → ×{NAME_GAP_WEIGHT:g}")
+    regime = str(vol_regime or "").lower()
+    if regime not in edge_mod.VOL_REGIMES:
+        # Fall back to the context's own readings before calling it unmeasured.
+        regime, _ = edge_mod.classify_vol_regime(vix, spy_range)
+        regime = regime or ""
+    if regime == "stressed":
+        weights.append(STRESSED_WEIGHT)
+        notes.append(f"stressed volatility regime → ×{STRESSED_WEIGHT:g}")
+    elif regime not in edge_mod.VOL_REGIMES:
+        weights.append(UNMEASURED_WEIGHT)
+        notes.append(f"volatility regime unmeasured (not known to be calm) → ×{UNMEASURED_WEIGHT:g}")
+    weight = 0.0 if reasons else round(min(weights), 3)
+    return {
+        "pause": bool(reasons), "weight": weight, "reasons": reasons, "notes": notes,
+        "regime": regime or None,
+        "inputs": {"vix": vix, "spy_range_pct": spy_range, "spy_gap_pct": spy_gap,
+                   "gap_pct": name_gap, "earnings_nearby": earnings},
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3. Capacity — how much of the book an order consumes
+# ---------------------------------------------------------------------------
+# Options: lift at most HALF the displayed offer (the rest is the price you
+# saw; past it is a price you did not), and at most 10% of the larger of the
+# day's volume / open interest (an exit has to find the other side too).
+OPTION_BOOK_SHARE = 0.5
+OPTION_FLOW_SHARE = 0.10
+# Equities refresh far faster: up to the whole displayed offer, ≤ 1% of the
+# day's volume.
+EQUITY_BOOK_SHARE = 1.0
+EQUITY_FLOW_SHARE = 0.01
+
+
+def _positive(x: Any) -> Optional[float]:
+    v = _finite(x)
+    # A zero size next to a real quote is E*TRADE's "not reported", not an
+    # empty book — read as unmeasured, never as zero capacity.
+    return v if v is not None and v > 0 else None
+
+
+def assess_capacity(qty: Any, instrument: str, liquidity: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """{allowed, qty (capped), caps, consumption, reason, measured}. Entries
+    only — this bot's entries always BUY, so they consume the OFFER."""
+    try:
+        want = int(qty)
+    except (TypeError, ValueError):
+        want = 0
+    liq = liquidity or {}
+    is_option = str(instrument or "").lower() == "option"
+    book_share = OPTION_BOOK_SHARE if is_option else EQUITY_BOOK_SHARE
+    flow_share = OPTION_FLOW_SHARE if is_option else EQUITY_FLOW_SHARE
+    unit = "contract" if is_option else "share"
+    ask_size = _positive(liq.get("ask_size"))
+    volume = _positive(liq.get("volume"))
+    oi = _positive(liq.get("open_interest")) if is_option else None
+    flow = max(v for v in (volume, oi, 0.0) if v is not None) or None
+    caps: Dict[str, Optional[int]] = {
+        "book": int(math.floor(book_share * ask_size)) if ask_size else None,
+        "flow": int(math.floor(flow_share * flow)) if flow else None,
+    }
+    measured = [c for c in caps.values() if c is not None]
+    out: Dict[str, Any] = {
+        "allowed": True, "qty": want, "requested_qty": want, "caps": caps,
+        "measured": bool(measured), "reason": "",
+        "inputs": {"ask_size": ask_size, "volume": volume, "open_interest": oi},
+        "consumption": {
+            "book_pct": round(want / ask_size * 100.0, 1) if ask_size and want > 0 else None,
+            "flow_pct": round(want / flow * 100.0, 2) if flow and want > 0 else None,
+        },
+    }
+    if not measured or want < 1:
+        out["reason"] = "" if measured else "book depth and flow unmeasured — capacity not judged"
+        return out
+    cap = min(measured)
+    if cap < 1:
+        parts = []
+        if ask_size:
+            parts.append(f"{1 / ask_size * 100:.0f}% of the {ask_size:g}-lot offer")
+        if flow:
+            parts.append(f"{1 / flow * 100:.1f}% of the day's {flow:g} {unit}s of flow")
+        out.update(allowed=False, qty=0, reason=(
+            f"capacity: one {unit} would be {' and '.join(parts)} — the book cannot absorb this order"
+        ))
+        return out
+    if cap < want:
+        out["qty"] = cap
+        out["reason"] = (
+            f"capacity: {want} → {cap} {unit}(s) — "
+            + " · ".join(f"{k} cap {v}" for k, v in caps.items() if v is not None)
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 4. Evidence class — "+EV in this regime" vs "merely not forbidden"
+# ---------------------------------------------------------------------------
+PROVEN = "proven"
+PERMITTED = "permitted"
+EV_CLASSES = (PROVEN, PERMITTED)
+# Not-forbidden-but-unproven trades run at half size: they are paying for
+# evidence, not harvesting an edge. Overridable by env in main_bot.
+UNPROVEN_WEIGHT = 0.5
+
+
+def classify_ev(
+    thesis_id: Optional[str],
+    validation: Optional[Dict[str, Any]],
+    regime: Any,
+    cell: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """PROVEN only when every one of these holds:
+      * the setup has an economic thesis,
+      * its family is validated OUT-OF-SAMPLE (edge.validate_thesis),
+      * the CURRENT regime is measured and the family's closes in it are
+        numerous enough (MIN_REGIME_TRADES) and positive,
+      * the live setup×regime learning cell is not measured ≤ 0.
+    Anything else is PERMITTED — it passed every gate because nothing has
+    caught it losing, which is a different claim."""
+    gaps: List[str] = []
+    evidence: List[str] = []
+    r = str(regime or "").lower()
+    if thesis_id is None:
+        gaps.append("no economic thesis for this setup")
+    else:
+        v = validation or {}
+        verdict = str(v.get("verdict") or "insufficient")
+        if verdict in ("validated", "regime_dependent"):
+            evidence.append(f"family validated out-of-sample ({v.get('n')} closes)")
+        elif verdict == "insufficient":
+            gaps.append(f"family has {v.get('n') or 0}/{edge_mod.MIN_VALIDATION_TRADES} closes for an out-of-sample verdict")
+        else:
+            gaps.append(f"family out-of-sample verdict is '{verdict}'")
+        if r not in edge_mod.VOL_REGIMES:
+            gaps.append("volatility regime unmeasured — '+EV in this regime' cannot be claimed")
+        else:
+            seg = (v.get("regimes") or {}).get(r) or {}
+            n = int(seg.get("n") or 0)
+            mean = _finite(seg.get("mean"))
+            if n < edge_mod.MIN_REGIME_TRADES:
+                gaps.append(f"{n}/{edge_mod.MIN_REGIME_TRADES} family closes in a {r} regime")
+            elif mean is None or mean <= 0:
+                gaps.append(f"family averages {mean if mean is not None else 0:+.2f}% in a {r} regime")
+            else:
+                evidence.append(f"{n} closes in a {r} regime averaging {mean:+.2f}%")
+    if isinstance(cell, dict):
+        wn = int(cell.get("window_n") or 0)
+        mean = _finite(cell.get("mean"))
+        if wn >= learning_mod.MIN_CELL_TRADES and mean is not None and mean <= 0:
+            gaps.append(f"live setup×regime record trails at {mean:+.2f}%")
+    ev_class = PROVEN if not gaps else PERMITTED
+    return {"ev_class": ev_class, "gaps": gaps, "evidence": evidence}
+
+
+def ev_outcomes(trades: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Live outcome by evidence class (edge.edge_trades rows with `ev_class`).
+    Closes from before the classifier existed are 'unclassified'."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for key in EV_CLASSES + ("unclassified",):
+        out[key] = {"n": 0, "mean": None, "win_rate": None}
+    buckets: Dict[str, List[float]] = {k: [] for k in out}
+    for t in trades or []:
+        k = t.get("ev_class") if t.get("ev_class") in EV_CLASSES else "unclassified"
+        buckets[k].append(float(t["ret"]))
+    for k, rets in buckets.items():
+        if rets:
+            out[k] = {
+                "n": len(rets),
+                "mean": round(sum(rets) / len(rets), 4),
+                "win_rate": round(sum(1 for x in rets if x > 0) / len(rets), 4),
+            }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Book report
+# ---------------------------------------------------------------------------
+def book_report(book: List[Dict[str, Any]], account_usd: float, regime: Any = None) -> Dict[str, Any]:
+    """Cluster exposure, net direction and the correlation-weighted risk of
+    the open book (√ rᵀ C r) next to the plain heat sum it replaces."""
+    account = max(float(account_usd or 0.0), 1.0)
+    clusters: Dict[str, Dict[str, Any]] = {}
+    for row in book:
+        key = row["cluster"] or "Unclustered"
+        c = clusters.setdefault(key, {"cluster": key, "long_usd": 0.0, "short_usd": 0.0, "tickers": []})
+        c["long_usd" if row["direction"] > 0 else "short_usd"] += row["risk_usd"]
+        c["tickers"].append(row["ticker"])
+    var = 0.0
+    for a in book:
+        for b in book:
+            var += (correlation(a["ticker"], b["ticker"], regime)
+                    * a["direction"] * a["risk_usd"] * b["direction"] * b["risk_usd"])
+    gross = sum(r["risk_usd"] for r in book)
+    net = sum(r["direction"] * r["risk_usd"] for r in book)
+    corr = math.sqrt(max(0.0, var))
+    for c in clusters.values():
+        c["long_usd"], c["short_usd"] = round(c["long_usd"], 2), round(c["short_usd"], 2)
+        c["long_pct"] = round(c["long_usd"] / account * 100.0, 3)
+        c["short_pct"] = round(c["short_usd"] / account * 100.0, 3)
+    return {
+        "positions": book,
+        "clusters": sorted(clusters.values(), key=lambda c: -(c["long_usd"] + c["short_usd"])),
+        "gross_usd": round(gross, 2), "gross_pct": round(gross / account * 100.0, 3),
+        "net_usd": round(net, 2), "net_pct": round(net / account * 100.0, 3),
+        "correlated_usd": round(corr, 2), "correlated_pct": round(corr / account * 100.0, 3),
+        # 1 = every position is the same bet; 1/√n = fully independent.
+        "concentration": round(corr / gross, 3) if gross > 0 else None,
+        "rho_regime": _rho_regime(regime),
+    }
+
+
+def thresholds() -> Dict[str, Any]:
+    return {
+        "correlated_risk_mult": CORRELATED_RISK_MULT, "max_cluster_same_side": MAX_CLUSTER_SAME_SIDE,
+        "vix_pause": VIX_PAUSE, "spy_range_pause": SPY_RANGE_PAUSE, "spy_gap_pause": SPY_GAP_PAUSE,
+        "name_gap_pause": NAME_GAP_PAUSE, "name_gap_trim": NAME_GAP_TRIM, "name_gap_weight": NAME_GAP_WEIGHT,
+        "stressed_weight": STRESSED_WEIGHT, "unmeasured_weight": UNMEASURED_WEIGHT,
+        "option_book_share": OPTION_BOOK_SHARE, "option_flow_share": OPTION_FLOW_SHARE,
+        "equity_book_share": EQUITY_BOOK_SHARE, "equity_flow_share": EQUITY_FLOW_SHARE,
+        "unproven_weight": UNPROVEN_WEIGHT,
+    }
+
+''')
+
+_bundle_load('cost_model', r'''
+"""Expected execution cost in the SIGNAL path — before a setup is scored.
+
+The filled-shape gate and the spread ceiling judge a contract at the last
+moment, on the real quote. By then the scanner has already ranked the setup
+on GROSS geometry: a 2R target that pays 2R only if the fill is free. In
+options day trading the fill is never free, and the three costs together
+routinely eat the whole gross edge:
+
+  1. SPREAD — half crossed on the way in (a marketable limit sits between the
+     mid and the ask), half on a limit exit at target, the FULL spread on a
+     stop exit (a stop is a market order in disguise).
+  2. SLIPPAGE — what the fill pays beyond the quote it was priced from: one
+     tick on a share, the measured-prior share of premium on a contract, plus
+     the commission both ways.
+  3. ADVERSE SELECTION — the underlying keeps moving while the order works.
+     A marketable order that fills is, conditionally, the one the market
+     moved against: the expected cost is E[max(0, X)] for X ~ N(0, σ²t), which
+     is σ·√t / √(2π) — taken over the signal-to-fill window `t`, with σ the
+     name's own measured per-second volatility.
+
+Everything is expressed in UNDERLYING terms so it can be charged against the
+trade's own geometry. An option cost in premium becomes an underlying-
+equivalent cost by dividing by delta; the adverse move is already in
+underlying terms (premium move = delta × underlying move, so the delta
+cancels). Costs are then stated in R (the stop distance):
+
+  net win  = RR − win_cost_R            (half spread out at the target limit)
+  net loss = 1 + loss_cost_R            (full spread out at the stop)
+  breakeven win rate = net loss / (net win + net loss)
+
+That breakeven is the honest summary: "this 2R breakout needs 33% gross, but
+41% after the round trip" is the sentence the gross score never said.
+
+House rules carried over:
+  - Unmeasured is not zero. A cost input the market didn't report falls back
+    to a pre-declared CONSERVATIVE prior and the basis is labelled `prior` —
+    a cost assumed free is the one direction this model must never err in.
+  - Missing GEOMETRY (no stop / target distance) makes the whole cost
+    unmeasured: no R to charge against. That is reported, never refused here
+    — the filled-shape and payoff gates already refuse an underived geometry.
+  - One-sided: the model can lower a score and refuse an entry. It never
+    raises a score above what the gross factors earned.
+  - Thresholds are pre-declared constants with their reasoning, never tuned
+    on the ledger.
+  - Refusal parts join with ' · ' (a comma would split the dispatch funnel).
+"""
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Pre-declared constants
+# ---------------------------------------------------------------------------
+# E[max(0, X)] / (σ√t) for X ~ N(0, σ²t) — the expected adverse move of an
+# order that fills, per unit of window volatility. 1/√(2π), not a fit.
+ADVERSE_SHARE = 1.0 / math.sqrt(2.0 * math.pi)
+# Signal → order at the broker when the signal's age is not measured. The
+# scanner dispatches in the same pass that read the quote; an app payload
+# carries its own timestamp and the measured age replaces this.
+SIGNAL_TO_ORDER_SEC = 5.0
+# A marketable limit priced between the mid and the ask either fills within
+# seconds or is repriced — 15s is the working time before it is a chase.
+ORDER_WORK_SEC = 15.0
+# Signal ages beyond this are clamped: the stale-signal gates refuse those
+# outright, and a 10-minute window would just be a different trade.
+MAX_SIGNAL_AGE_SEC = 300.0
+# Regular session seconds and trading days — per-second σ from annual vol.
+SESSION_SECONDS = 23400.0
+TRADING_DAYS = 252.0
+# Expected range of a Brownian path over its window = 2·√(2/π)·σ ≈ 1.596σ
+# (ATR) and Parkinson's high/low estimator divides ln(H/L) by 2·√ln2 ≈ 1.665.
+ATR_TO_SIGMA = 2.0 * math.sqrt(2.0 / math.pi)
+PARKINSON_DIVISOR = 2.0 * math.sqrt(math.log(2.0))
+# Fewer returns than this and the sample σ is noise — fall through to the
+# next source.
+MIN_SIGMA_RETURNS = 4
+# Annualized vol when nothing measured it. Above typical large-cap implied
+# vol (25–40%) so the unmeasured case is never the CHEAP case.
+VOL_PRIOR_ANNUAL = 0.50
+
+# Options — must mirror expo/services/executionQuality.ts + costedBacktest.ts.
+# E*TRADE per-contract commission each way (measured from fills; equal to
+# main_bot.COMMISSION_PER_CONTRACT).
+COMMISSION_PER_CONTRACT = 0.52
+# Entry slippage beyond the limit, % of premium — the app's PRIOR_SLIPPAGE
+# planning percentile. A cost model that disagrees with the gate downstream
+# prices the same fill twice.
+OPTION_SLIP_PCT = 2.5
+# Option bid/ask as % of mid when the contract has not been quoted yet (the
+# scanner reads the underlying, not the chain). Liquid ATM weeklies quote
+# 2–5%, mid-caps 5–10%, and the bot refuses anything wider than 10% at the
+# order — 6% sits at the expensive end of what can actually be traded.
+OPTION_SPREAD_PRIOR_PCT = 6.0
+# ATM delta when the chain was not read — the same MODEL_DELTA the app's
+# costed backtest charges.
+MODEL_DELTA = 0.5
+# Weekly expiry horizon when no expiry was given; the premium model floors
+# time at one trading day (a 0DTE ATM premium is not zero).
+MODEL_DAYS_TO_EXPIRY = 7.0
+MIN_DAYS_TO_EXPIRY = 1.0
+# In-the-money contracts (|Δ| ≥ ITM_DELTA_MIN) quote a far smaller spread as a
+# share of their (much larger) premium than an ATM weekly does — a listed
+# width grows far slower than premium. The two %-of-premium priors above were
+# set on ATM weeklies, so for an ITM contract they are halved. Still a PRIOR:
+# the bot re-prices every option on the snapped contract's real bid/ask.
+ITM_DELTA_MIN = 0.6
+ITM_PCT_SCALE = 0.5
+
+# Equities — E*TRADE charges no commission on shares.
+EQUITY_TICK = 0.01
+# Stock spread % of mid when the quote was one-sided — a liquid large cap
+# quotes 1–3 bps; 5 bps keeps the unmeasured case on the expensive side.
+EQUITY_SPREAD_PRIOR_PCT = 0.05
+
+# Gate.
+# Costs may consume at most HALF the gross target move. Past that the trade is
+# mostly a bet that the fill comes in better than expected.
+MAX_COST_SHARE = 0.5
+# No unproven intraday setup has evidence of being right more than ~55% of the
+# time; a trade that needs more than that JUST TO BREAK EVEN after costs is a
+# fee generator, whatever its gross score says.
+MAX_BREAKEVEN_WIN_PCT = 55.0
+# Score: the scanner's former spread-only "liquidity" slot (same weight) now
+# prices the full expected cost. Fully earned at zero cost, zero at the
+# MAX_COST_SHARE ceiling.
+SCORE_SLOT = "liquidity"
+
+REFUSAL_PREFIX = "expected cost:"
+
+SIGMA_BASES = ("realized", "implied", "atr", "range", "prior")
+
+
+def _num(v: Any) -> Optional[float]:
+    if v is None or isinstance(v, bool) or v == "":
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _pos(v: Any) -> Optional[float]:
+    f = _num(v)
+    return f if f is not None and f > 0 else None
+
+
+def _parse_ts(v: Any) -> Optional[float]:
+    if not isinstance(v, str) or not v:
+        return None
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Volatility — per-second fractional σ, from the best measured source
+# ---------------------------------------------------------------------------
+def sigma_from_series(series: Iterable[Dict[str, Any]]) -> Optional[float]:
+    """Realized per-second σ from timestamped samples: √(mean(r²/Δt)) over
+    consecutive log returns. None with fewer than MIN_SIGMA_RETURNS usable
+    returns — a σ from three ticks is noise, not a measurement."""
+    pts: List[Tuple[float, float]] = []
+    for s in series or []:
+        if not isinstance(s, dict):
+            continue
+        px = _pos(s.get("last"))
+        ts = _parse_ts(s.get("ts"))
+        if px is not None and ts is not None:
+            pts.append((ts, px))
+    acc: List[float] = []
+    for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
+        dt = t1 - t0
+        if dt <= 0:
+            continue
+        r = math.log(p1 / p0)
+        acc.append(r * r / dt)
+    if len(acc) < MIN_SIGMA_RETURNS:
+        return None
+    return math.sqrt(sum(acc) / len(acc))
+
+
+def sigma_from_annual(vol_annual: Any) -> Optional[float]:
+    """Per-second σ from an annualized vol (decimal; a reading > 3 is read as
+    a percent — 45 means 45%)."""
+    v = _pos(vol_annual)
+    if v is None:
+        return None
+    if v > 3.0:
+        v = v / 100.0
+    return v / math.sqrt(TRADING_DAYS * SESSION_SECONDS)
+
+
+def sigma_from_atr_pct(atr_pct: Any) -> Optional[float]:
+    """Per-second σ from a DAILY ATR in percent of price."""
+    a = _pos(atr_pct)
+    if a is None:
+        return None
+    return (a / 100.0) / ATR_TO_SIGMA / math.sqrt(SESSION_SECONDS)
+
+
+def sigma_from_range(high: Any, low: Any, progress: Any = None) -> Optional[float]:
+    """Parkinson per-second σ from the session high/low so far, scaled by the
+    fraction of the session that produced it."""
+    h, lo = _pos(high), _pos(low)
+    if h is None or lo is None or h <= lo:
+        return None
+    frac = _pos(progress) or 1.0
+    frac = max(0.05, min(1.0, frac))
+    sigma_window = math.log(h / lo) / PARKINSON_DIVISOR
+    return sigma_window / math.sqrt(SESSION_SECONDS * frac)
+
+
+def resolve_sigma(series: Optional[Iterable[Dict[str, Any]]] = None, vol_annual: Any = None,
+                  atr_pct: Any = None, high: Any = None, low: Any = None,
+                  progress: Any = None) -> Tuple[float, str]:
+    """(per-second σ, basis). Priority: the name's own realized samples, then
+    implied vol, then ATR, then today's range, then the declared prior."""
+    for basis, value in (
+        ("realized", sigma_from_series(series) if series is not None else None),
+        ("implied", sigma_from_annual(vol_annual)),
+        ("atr", sigma_from_atr_pct(atr_pct)),
+        ("range", sigma_from_range(high, low, progress)),
+    ):
+        if value is not None and value > 0:
+            return value, basis
+    return sigma_from_annual(VOL_PRIOR_ANNUAL) or 0.0, "prior"
+
+
+def model_atm_premium(spot: float, vol_annual: float, days_to_expiry: float) -> float:
+    """Brenner–Subrahmanyam ATM premium ≈ 0.4·S·σ·√T — the same formula as
+    costedBacktest.modelAtmPremium."""
+    days = max(MIN_DAYS_TO_EXPIRY, float(days_to_expiry))
+    return 0.4 * spot * vol_annual * math.sqrt(days / 365.0)
+
+
+def itm_scale(delta: float) -> float:
+    """%-of-premium prior scale: 1 for ATM-ish, ITM_PCT_SCALE in the money."""
+    return ITM_PCT_SCALE if abs(delta) >= ITM_DELTA_MIN else 1.0
+
+
+def model_premium(spot: float, vol_annual: float, days_to_expiry: float,
+                  delta: Optional[float] = None) -> float:
+    """Modelled premium. No delta → the ATM approximation above (unchanged).
+    A declared delta → Black–Scholes (r = 0) at the strike that delta implies,
+    so an ITM contract is costed on its own, larger premium."""
+    if delta is None:
+        return model_atm_premium(spot, vol_annual, days_to_expiry)
+    days = max(MIN_DAYS_TO_EXPIRY, float(days_to_expiry))
+    t = days / 365.0
+    sd = vol_annual * math.sqrt(t)
+    if sd <= 0 or spot <= 0:
+        return model_atm_premium(spot, vol_annual, days_to_expiry)
+    call_delta = min(max(abs(delta), 1e-4), 1 - 1e-4)
+    # Invert N(d1) = Δ by bisection, then price the call at that strike (a put
+    # of the same |Δ| costs within a fraction of a percent of it at r = 0).
+    lo, hi = -10.0, 10.0
+    for _ in range(100):
+        mid = (lo + hi) / 2.0
+        if 0.5 * (1.0 + math.erf(mid / math.sqrt(2.0))) < call_delta:
+            lo = mid
+        else:
+            hi = mid
+    d1 = (lo + hi) / 2.0
+    d2 = d1 - sd
+    strike = spot * math.exp(-d1 * sd + 0.5 * sd * sd)
+    ncdf = lambda x: 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))  # noqa: E731
+    return spot * ncdf(d1) - strike * ncdf(d2)
+
+
+def fill_window_sec(signal_age_sec: Any = None) -> Tuple[float, str]:
+    """(seconds the underlying can move against the order, basis)."""
+    age = _num(signal_age_sec)
+    if age is None or age < 0:
+        return SIGNAL_TO_ORDER_SEC + ORDER_WORK_SEC, "prior"
+    return min(age, MAX_SIGNAL_AGE_SEC) + ORDER_WORK_SEC, "measured"
+
+
+# ---------------------------------------------------------------------------
+# The cost
+# ---------------------------------------------------------------------------
+def expected_cost(*, instrument: str, entry: Any, stop: Any, target: Any,
+                  bid: Any = None, ask: Any = None,
+                  option_bid: Any = None, option_ask: Any = None,
+                  option_premium: Any = None, delta: Any = None,
+                  option_spread_pct: Any = None,
+                  days_to_expiry: Any = None,
+                  sigma_sec: Optional[float] = None, sigma_basis: str = "prior",
+                  signal_age_sec: Any = None) -> Dict[str, Any]:
+    """Expected round-trip cost of one setup, in underlying $ and in R.
+
+    `instrument` is 'option' (a long call/put — the bot never sells premium on
+    entry) or 'stock'. Spread / premium / delta inputs are optional: whatever
+    the market did not report falls back to a labelled prior.
+
+    Returns `measured: False` only when the GEOMETRY is missing — without a
+    risk unit there is nothing to state the cost in."""
+    px, sp, tp = _pos(entry), _pos(stop), _pos(target)
+    out: Dict[str, Any] = {"measured": False, "instrument": instrument}
+    if px is None or sp is None or tp is None:
+        out["note"] = "cost unmeasured · entry/stop/target missing"
+        return out
+    risk = abs(px - sp)
+    reward = abs(tp - px)
+    if risk <= 0 or reward <= 0:
+        out["note"] = "cost unmeasured · zero stop or target distance"
+        return out
+
+    sigma = sigma_sec if (sigma_sec is not None and sigma_sec > 0) else (sigma_from_annual(VOL_PRIOR_ANNUAL) or 0.0)
+    basis_sigma = sigma_basis if (sigma_sec is not None and sigma_sec > 0 and sigma_basis in SIGMA_BASES) else "prior"
+    window, basis_window = fill_window_sec(signal_age_sec)
+    adverse = ADVERSE_SHARE * sigma * math.sqrt(window) * px
+
+    basis: Dict[str, str] = {"sigma": basis_sigma, "window": basis_window}
+    if instrument == "option":
+        d = _pos(delta)
+        d = min(1.0, abs(d)) if d is not None else MODEL_DELTA
+        basis["delta"] = "measured" if _pos(delta) is not None else "model"
+        ob, oa = _pos(option_bid), _pos(option_ask)
+        if ob is not None and oa is not None and oa > ob:
+            premium = (ob + oa) / 2.0
+            spread = oa - ob
+            basis["spread"] = basis["premium"] = "measured"
+        else:
+            measured_premium = _pos(option_premium)
+            if measured_premium is not None:
+                premium = measured_premium
+                basis["premium"] = "measured"
+            else:
+                vol_annual = sigma * math.sqrt(TRADING_DAYS * SESSION_SECONDS)
+                dte = _pos(days_to_expiry) or MODEL_DAYS_TO_EXPIRY
+                premium = model_premium(px, vol_annual, dte, d if _pos(delta) is not None else None)
+                basis["premium"] = "model"
+            # A spread measured as % of premium (the app's chain read) without
+            # the raw bid/ask still beats the prior.
+            measured_spread_pct = _num(option_spread_pct)
+            if measured_spread_pct is not None and measured_spread_pct >= 0:
+                spread = premium * measured_spread_pct / 100.0
+                basis["spread"] = "measured"
+            else:
+                spread = premium * OPTION_SPREAD_PRIOR_PCT * itm_scale(d) / 100.0
+                basis["spread"] = "prior"
+        fee = COMMISSION_PER_CONTRACT / 100.0          # per share of premium, one leg
+        slip = premium * OPTION_SLIP_PCT * itm_scale(d) / 100.0
+        # Premium costs → underlying-equivalent via delta.
+        spread_u = spread / d
+        entry_u = (0.5 * spread + slip + fee) / d
+        win_exit_u = (0.5 * spread + fee) / d
+        loss_exit_u = (spread + fee) / d
+        comps = {
+            "premium": round(premium, 4), "delta": round(d, 3),
+            "spread_premium": round(spread, 4),
+            "spread_pct_premium": round(spread / premium * 100.0, 2) if premium > 0 else None,
+            "slip_premium": round(slip, 4), "fee_per_leg": round(fee, 4),
+        }
+    else:
+        b, a = _pos(bid), _pos(ask)
+        if b is not None and a is not None and a > b:
+            spread = a - b
+            basis["spread"] = "measured"
+        else:
+            spread = px * EQUITY_SPREAD_PRIOR_PCT / 100.0
+            basis["spread"] = "prior"
+        spread_u = spread
+        entry_u = 0.5 * spread + EQUITY_TICK
+        win_exit_u = 0.5 * spread
+        loss_exit_u = spread + EQUITY_TICK
+        comps = {"spread": round(spread, 4), "tick": EQUITY_TICK}
+
+    win_cost = entry_u + adverse + win_exit_u
+    loss_cost = entry_u + adverse + loss_exit_u
+    rr = reward / risk
+    win_cost_r = win_cost / risk
+    loss_cost_r = loss_cost / risk
+    net_win_r = rr - win_cost_r
+    net_loss_r = 1.0 + loss_cost_r
+    breakeven = (net_loss_r / (net_win_r + net_loss_r)) if net_win_r > 0 else 1.0
+    out.update({
+        "measured": True,
+        "basis": basis,
+        "window_sec": round(window, 1),
+        "sigma_sec": sigma,
+        "components_u": {
+            "entry": round(entry_u, 5), "adverse": round(adverse, 5),
+            "win_exit": round(win_exit_u, 5), "loss_exit": round(loss_exit_u, 5),
+            "spread": round(spread_u, 5),
+        },
+        "components": comps,
+        "risk_u": round(risk, 5),
+        "reward_u": round(reward, 5),
+        "rr_gross": round(rr, 3),
+        "win_cost_r": round(win_cost_r, 4),
+        "loss_cost_r": round(loss_cost_r, 4),
+        "adverse_r": round(adverse / risk, 4),
+        "spread_r": round(spread_u / risk, 4),
+        "net_win_r": round(net_win_r, 4),
+        "net_loss_r": round(net_loss_r, 4),
+        "cost_share": round(win_cost / reward, 4),
+        "breakeven_win_pct": round(breakeven * 100.0, 2),
+        "breakeven_gross_pct": round(100.0 / (1.0 + rr), 2),
+    })
+    return out
+
+
+def net_ev_r(win_prob: float, cost: Dict[str, Any]) -> Optional[float]:
+    """Expected value in R AFTER the round trip at win probability p (0–1)."""
+    if not cost.get("measured"):
+        return None
+    p = max(0.0, min(1.0, float(win_prob)))
+    return round(p * float(cost["net_win_r"]) - (1.0 - p) * float(cost["net_loss_r"]), 4)
+
+
+def score_fill(cost: Optional[Dict[str, Any]]) -> Optional[float]:
+    """0–1 credit for the scanner's cost slot; None when unmeasured (the
+    caller falls back to the spread-only reading, never to full credit)."""
+    if not cost or not cost.get("measured"):
+        return None
+    return max(0.0, min(1.0, 1.0 - float(cost["cost_share"]) / MAX_COST_SHARE))
+
+
+def assess_cost(cost: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Gate verdict. Refuses when the round trip eats the target, takes more
+    than MAX_COST_SHARE of it, or pushes breakeven past MAX_BREAKEVEN_WIN_PCT.
+    Unmeasured (no geometry) → allowed with a note: other gates own that."""
+    if not cost or not cost.get("measured"):
+        return {"allowed": True, "measured": False, "reasons": [],
+                "note": (cost or {}).get("note") or "cost unmeasured"}
+    reasons: List[str] = []
+    detail = (f"{cost['win_cost_r']:.2f}R in / {cost['loss_cost_r']:.2f}R on a stop "
+              f"(adverse {cost['adverse_r']:.2f}R over {cost['window_sec']:.0f}s)")
+    if cost["net_win_r"] <= 0:
+        reasons.append(f"{REFUSAL_PREFIX} round trip {cost['win_cost_r']:.2f}R ≥ the "
+                       f"{cost['rr_gross']:.2f}R target · it loses even when right")
+    elif cost["cost_share"] > MAX_COST_SHARE:
+        reasons.append(f"{REFUSAL_PREFIX} {cost['cost_share'] * 100:.0f}% of the target move goes to "
+                       f"the fill (max {MAX_COST_SHARE * 100:.0f}%) · {detail}")
+    if cost["net_win_r"] > 0 and cost["breakeven_win_pct"] > MAX_BREAKEVEN_WIN_PCT:
+        reasons.append(f"{REFUSAL_PREFIX} needs {cost['breakeven_win_pct']:.0f}% wins to break even "
+                       f"(gross {cost['breakeven_gross_pct']:.0f}% · max {MAX_BREAKEVEN_WIN_PCT:.0f}%)")
+    return {
+        "allowed": not reasons,
+        "measured": True,
+        "reasons": reasons,
+        "note": (f"net {cost['net_win_r']:.2f}R win / −{cost['net_loss_r']:.2f}R loss · breakeven "
+                 f"{cost['breakeven_win_pct']:.0f}% (gross {cost['breakeven_gross_pct']:.0f}%)"),
+    }
+
+
+def summary(cost: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The compact record that rides on a signal and into the ledger."""
+    if not cost or not cost.get("measured"):
+        return None
+    return {k: cost.get(k) for k in (
+        "instrument", "basis", "window_sec", "rr_gross", "win_cost_r", "loss_cost_r",
+        "adverse_r", "spread_r", "net_win_r", "net_loss_r", "cost_share",
+        "breakeven_win_pct", "breakeven_gross_pct",
+    )}
+
+
+# Closes (with a recorded cost) before the calibration speaks. Below this a
+# win rate is a coin's opinion of itself.
+MIN_CALIBRATION_TRADES = 20
+
+
+def calibration(trades: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    """Live closes that recorded an expected cost at entry: the realized win
+    rate against the breakeven the model said those trades needed.
+
+    'short' means the setups taken are winning less often than their own
+    round trip requires — losing NET however good the gross geometry looked.
+    'covering' means the realized win rate clears the predicted breakeven.
+    Paper never reaches here (edge_trades reads live closes only)."""
+    rows = [t for t in trades or [] if isinstance(t, dict) and isinstance(t.get("cost"), dict)
+            and _num((t.get("cost") or {}).get("breakeven_win_pct")) is not None
+            and _num(t.get("ret")) is not None]
+    n = len(rows)
+    out: Dict[str, Any] = {"n": n, "min_trades": MIN_CALIBRATION_TRADES, "win_pct": None,
+                           "breakeven_pct": None, "breakeven_gross_pct": None,
+                           "mean_cost_r": None, "verdict": "insufficient"}
+    if n == 0:
+        return out
+    wins = sum(1 for t in rows if float(t["ret"]) > 0)
+    be = [float(t["cost"]["breakeven_win_pct"]) for t in rows]
+    beg = [float(t["cost"].get("breakeven_gross_pct") or 0.0) for t in rows]
+    costs = [float(t["cost"].get("loss_cost_r") or 0.0) for t in rows]
+    out.update({
+        "win_pct": round(wins / n * 100.0, 1),
+        "breakeven_pct": round(sum(be) / n, 1),
+        "breakeven_gross_pct": round(sum(beg) / n, 1),
+        "mean_cost_r": round(sum(costs) / n, 3),
+    })
+    if n >= MIN_CALIBRATION_TRADES:
+        out["verdict"] = "covering" if out["win_pct"] >= out["breakeven_pct"] else "short"
+    return out
+
+
+def thresholds() -> Dict[str, Any]:
+    return {
+        "adverse_share": round(ADVERSE_SHARE, 4),
+        "signal_to_order_sec": SIGNAL_TO_ORDER_SEC,
+        "order_work_sec": ORDER_WORK_SEC,
+        "vol_prior_annual": VOL_PRIOR_ANNUAL,
+        "commission_per_contract": COMMISSION_PER_CONTRACT,
+        "option_slip_pct": OPTION_SLIP_PCT,
+        "option_spread_prior_pct": OPTION_SPREAD_PRIOR_PCT,
+        "model_delta": MODEL_DELTA,
+        "itm_delta_min": ITM_DELTA_MIN,
+        "itm_pct_scale": ITM_PCT_SCALE,
+        "equity_spread_prior_pct": EQUITY_SPREAD_PRIOR_PCT,
+        "max_cost_share": MAX_COST_SHARE,
+        "max_breakeven_win_pct": MAX_BREAKEVEN_WIN_PCT,
+        "min_calibration_trades": MIN_CALIBRATION_TRADES,
+    }
+
+''')
+
+_bundle_load('core_book', r'''
+"""
+CORE BOOK — fewer setups, each with a reason to work, traded in the form that
+needs the fewest things to go right.
+==========================================================================
+
+WHY THIS EXISTS
+---------------
+Every scanner setup used to be tradable live: breakouts, breakdowns, momentum,
+momentum fades, VWAP reclaims and rejections — and the app's ORB / flag /
+mean-reversion family — all bought as at-the-money weekly options. That is the
+hardest zone for a retail book: chasing a move that is already visible, in an
+instrument whose spread, theta and gamma all charge the trade before the
+underlying has done anything. The cost model (cost_model.py) priced it: a 2R
+ATM weekly needs ~47% wins just to break even.
+
+Surviving books remove setups rather than add logic. This module is that
+removal, as policy:
+
+1. CORE THESES. Only three families trade live — each has a named
+   counterparty in edge.THESES that keeps arriving for structural reasons:
+     • vwap_benchmark       (VWAP reclaim / rejection) — benchmarked algos behind
+                             their VWAP have to chase.
+     • opening_imbalance    (ORB, GAP DAYS ONLY) — overnight information arrives
+                             as an imbalance the auction only partly clears.
+                             Without a real gap there is no imbalance to resolve,
+                             so a no-gap ORB is a breakout by another name.
+     • liquidity_provision  (mean reversion) — impatient flow pays whoever
+                             supplies the immediacy it demands.
+   Breakouts (stop_cluster_breakout) and momentum (information_diffusion) are
+   RETIRED from live trading. They are not deleted.
+
+2. RETIRED ≠ FORGOTTEN. A retired setup that would otherwise have traded (every
+   other quality gate passed) is SHADOW-TRACKED: a paper entry with its own
+   stop, target and expected cost, marked to market by the scanner's quotes
+   until it hits the stop, the target, or its thesis horizon. Shadows are paper:
+   they never count toward edge validation, learning cells or the evidence
+   class. Their only job is to answer one question honestly — was retiring this
+   setup a mistake?
+
+3. REINSTATED ONLY BY EVIDENCE. A retired family returns to live trading when
+   its shadow record, NET of the modelled round-trip cost, shows positive
+   expectancy over ≥ MIN_SHADOW_TRADES closes with t ≥ REINSTATE_T — the same
+   bar edge.py sets for out-of-sample validation. Status is a pure replay of the
+   ledger: no operator flag can reinstate a family, and an unreadable ledger
+   leaves retired families retired (retirement is the declared default, not a
+   reading).
+
+4. EXPRESSION. Option entries are re-expressed as an in-the-money contract
+   (|Δ| ≈ 0.70) with 14–30 days to expiry. The payoff tracks the underlying
+   almost linearly, theta per day is a fraction of a weekly's, and a premium
+   stop derived from the underlying stop means what it says. What it is NOT is
+   free: an ITM contract quotes a wider absolute spread per unit of delta than
+   an ATM weekly, and the cost model charges it on the contract's REAL quote at
+   the order. Share entries stay shares — already the most linear expression.
+
+Everything here is one-sided: it can refuse a live entry or re-express it, and
+never makes an entry larger. Pure functions; the bot owns all I/O.
+"""
+from __future__ import annotations
+
+import math
+import statistics
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+try:
+    import edge as edge_mod
+except ImportError:  # pragma: no cover - bundled build
+    edge_mod = None  # type: ignore
+
+# ---------------------------------------------------------------------------
+# Declared policy. Constants, with their reasoning — never tuned on the ledger.
+# ---------------------------------------------------------------------------
+CORE_THESES: Tuple[str, ...] = ("vwap_benchmark", "opening_imbalance", "liquidity_provision")
+RETIRED_THESES: Tuple[str, ...] = ("stop_cluster_breakout", "information_diffusion")
+
+# An ORB is only the opening-imbalance trade when there WAS an imbalance: a 1%
+# open-vs-prior-close gap is roughly a one-day 1σ move for a liquid large cap
+# (≈16% annualized), i.e. overnight information rather than noise. The
+# portfolio-risk layer already halves size ≥ 3% and pauses ≥ 8%.
+ORB_MIN_GAP_PCT = 1.0
+# Shadow key for an ORB taken on a non-gap day — tracked separately so the
+# evidence can say whether the gap condition is earning its keep.
+ORB_NO_GAP_KEY = "opening_imbalance/no_gap"
+
+# Reinstatement bar — the same sample and t-stat edge.py demands before it
+# calls a family proven out-of-sample (MIN_VALIDATION_TRADES = 30, t ≥ 2).
+MIN_SHADOW_TRADES = 30
+REINSTATE_T = 2.0
+# A shadow still open after this multiple of its thesis horizon is closed at
+# the mark: the thesis said the flow resolves within the horizon, and a trade
+# kept past it is a different trade.
+SHADOW_HORIZON_MULT = 2.0
+DEFAULT_HORIZON_MIN = 60.0
+# The forced-flatten window (ET minutes) — no shadow is held through the close.
+SHADOW_FLATTEN_MIN = 15 * 60 + 55
+
+# Expression: |Δ| 0.70 is the conventional "stock replacement" strike — 70% of
+# the share move per contract while still costing a fraction of 100 shares.
+EXPRESSION_DELTA = 0.70
+# 14–30 DTE: past two weeks theta per day is a small share of premium; inside
+# a month the contract is still a listed weekly/monthly with a real book.
+MIN_DTE = 14
+TARGET_DTE = 21
+MAX_DTE = 30
+# The delta band the snapped contract must land in. Wider than the target so a
+# listed strike grid ($1/$2.50/$5) can be honoured, narrow enough that an
+# accidental ATM or deep-ITM contract is refused rather than traded.
+DELTA_BAND = (0.60, 0.82)
+# When no σ was measured: the same declared prior cost_model uses.
+VOL_PRIOR_ANNUAL = 0.50
+
+REFUSAL_PREFIX = "core book:"
+SHADOW_ENTRY_EVENT = "shadow_entry"
+SHADOW_CLOSED_EVENT = "shadow_closed"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _num(value: Any) -> Optional[float]:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _norm_ppf(p: float) -> float:
+    """Inverse standard normal by bisection — exact enough (1e-10) and free of
+    rational-approximation constants nobody can check."""
+    p = min(max(p, 1e-9), 1 - 1e-9)
+    lo, hi = -10.0, 10.0
+    for _ in range(100):
+        mid = (lo + hi) / 2.0
+        if _norm_cdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def thesis_of(setup: Any) -> Optional[str]:
+    if edge_mod is None:
+        return None
+    tid, _ = edge_mod.thesis_for(setup)
+    return tid
+
+
+def _thesis_title(tid: Optional[str]) -> str:
+    if tid is None or edge_mod is None:
+        return "no thesis"
+    return str((edge_mod.THESES.get(tid) or {}).get("title") or tid).lower()
+
+
+def _horizon_min(tid: Optional[str]) -> float:
+    if tid is None or edge_mod is None:
+        return DEFAULT_HORIZON_MIN
+    return float((edge_mod.THESES.get(tid) or {}).get("horizon_minutes") or DEFAULT_HORIZON_MIN)
+
+
+def side_of(payload: Dict[str, Any]) -> str:
+    """'long' | 'short'. A SELL entry is a bearish entry (long PUT)."""
+    explicit = str((payload or {}).get("side") or "").lower()
+    if explicit in ("long", "short"):
+        return explicit
+    action = str((payload or {}).get("action") or "BUY").upper()
+    return "short" if action in ("SELL", "SELL_SHORT", "SHORT") else "long"
+
+
+def gap_of(payload: Dict[str, Any]) -> Optional[float]:
+    """The name's measured opening gap (%), from risk_context or edge_features."""
+    for key in ("risk_context", "edge_features"):
+        block = (payload or {}).get(key)
+        if isinstance(block, dict):
+            g = _num(block.get("gap_pct"))
+            if g is not None:
+                return g
+    return _num((payload or {}).get("gap_pct"))
+
+
+# ---------------------------------------------------------------------------
+# 1. Which book does a setup belong to?
+# ---------------------------------------------------------------------------
+def classify(setup: Any, side: str, gap_pct: Optional[float],
+             reinstated: Optional[Set[str]] = None) -> Dict[str, Any]:
+    """Core-book verdict for one entry.
+
+    Returns {book, thesis_id, shadow_key, allowed, reason, note}:
+      core        — a core family; allowed.
+      reinstated  — a retired family whose shadow record earned it back.
+      retired     — refused live; `shadow_key` names the paper record it joins.
+      unclassified — no thesis: not this module's call (edge.py refuses it).
+
+    Reasons are `·`-joined with no commas — one funnel segment each."""
+    reinstated = reinstated or set()
+    norm = edge_mod.normalize_setup(setup) if edge_mod is not None else str(setup or "").lower()
+    tid = thesis_of(setup)
+    base = {"setup": norm, "thesis_id": tid, "shadow_key": None, "allowed": True, "reason": "", "note": ""}
+    if tid is None:
+        return {**base, "book": "unclassified", "note": "no thesis — judged by the edge gate"}
+
+    if tid in RETIRED_THESES:
+        if tid in reinstated:
+            return {**base, "book": "reinstated",
+                    "note": f"{norm} reinstated — its shadow record earned it back"}
+        return {**base, "book": "retired", "shadow_key": tid, "allowed": False,
+                "reason": (f"{REFUSAL_PREFIX} {norm} is retired ({_thesis_title(tid)}) · "
+                           f"paper-tracked until its shadow record earns it back")}
+
+    if tid == "opening_imbalance":
+        aligned = None if gap_pct is None else (gap_pct if side == "long" else -gap_pct)
+        if aligned is None or aligned < ORB_MIN_GAP_PCT:
+            if ORB_NO_GAP_KEY in reinstated:
+                return {**base, "book": "reinstated", "note": "no-gap ORB reinstated by its shadow record"}
+            why = ("opening gap not measured" if gap_pct is None
+                   else f"opening gap {gap_pct:+.1f}% is not a ≥{ORB_MIN_GAP_PCT:g}% gap {'up' if side == 'long' else 'down'}")
+            return {**base, "book": "retired", "shadow_key": ORB_NO_GAP_KEY, "allowed": False,
+                    "reason": f"{REFUSAL_PREFIX} ORB trades gap days only · {why} · paper-tracked"}
+        return {**base, "book": "core", "note": f"gap day ({gap_pct:+.1f}%)"}
+
+    if tid in CORE_THESES:
+        return {**base, "book": "core", "note": _thesis_title(tid)}
+    # A thesis this module has not been told about: not core, not retired.
+    return {**base, "book": "unclassified", "note": f"thesis {tid} is outside the declared book"}
+
+
+# ---------------------------------------------------------------------------
+# 2. Shadow tracking (paper — never edge)
+# ---------------------------------------------------------------------------
+def shadow_entry(payload: Dict[str, Any], verdict: Dict[str, Any],
+                 cost: Optional[Dict[str, Any]], now_iso: str) -> Optional[Dict[str, Any]]:
+    """Ledger record for one shadow entry, or None when the geometry is not
+    readable (a shadow without a stop/target can never be marked honestly)."""
+    entry, stop, target = (_num((payload or {}).get(k)) for k in ("entry", "stop", "target"))
+    if stop is None:
+        stop = _num((payload or {}).get("stop_price"))
+    if entry is None or stop is None or target is None or entry <= 0 or abs(entry - stop) <= 0:
+        return None
+    side = side_of(payload)
+    if (side == "long" and not (stop < entry < target)) or (side == "short" and not (target < entry < stop)):
+        return None
+    ticker = str((payload or {}).get("ticker") or "").upper()
+    key = verdict.get("shadow_key") or verdict.get("thesis_id") or "unknown"
+    return {
+        "id": f"{ticker}:{key}:{now_iso}",
+        "ticker": ticker,
+        "setup": verdict.get("setup"),
+        "thesis_id": verdict.get("thesis_id"),
+        "shadow_key": key,
+        "side": side,
+        "entry": round(entry, 4),
+        "stop": round(stop, 4),
+        "target": round(target, 4),
+        "opened_at": now_iso,
+        "source": str((payload or {}).get("source") or "webhook"),
+        "horizon_min": _horizon_min(verdict.get("thesis_id")) * SHADOW_HORIZON_MULT,
+        # The expected round trip, in R — charged at the close so the record is
+        # NET. Unmeasured → None, and the close does not count as evidence.
+        "win_cost_r": _num((cost or {}).get("win_cost_r")) if (cost or {}).get("measured") else None,
+        "loss_cost_r": _num((cost or {}).get("loss_cost_r")) if (cost or {}).get("measured") else None,
+    }
+
+
+def _payload(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """A ledger record's body (`data`), or the record itself when flat."""
+    for key in ("data", "payload"):
+        if isinstance(ev.get(key), dict):
+            return ev[key]
+    return ev
+
+
+def _events(events: Iterable[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:
+    return [_payload(e) for e in (events or []) if isinstance(e, dict) and e.get("event") == name]
+
+
+def open_shadows(events: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Shadow entries with no close, by pure ledger replay."""
+    evs = list(events or [])
+    closed = {c.get("id") for c in _events(evs, SHADOW_CLOSED_EVENT)}
+    return [s for s in _events(evs, SHADOW_ENTRY_EVENT) if s.get("id") and s.get("id") not in closed]
+
+
+def has_open_shadow(events: Iterable[Dict[str, Any]], ticker: str, shadow_key: str) -> bool:
+    t = str(ticker or "").upper()
+    return any(s.get("ticker") == t and s.get("shadow_key") == shadow_key for s in open_shadows(events))
+
+
+def _parse_ts(value: Any) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def mark_shadow(shadow: Dict[str, Any], last: Any, now_et: datetime) -> Optional[Dict[str, Any]]:
+    """Close a shadow if its stop, target or horizon has been reached.
+
+    Marked on the scanner's sampled `last`, so a touch between samples is not
+    seen. Asymmetric on purpose: a print THROUGH the stop books the worse
+    print (a stop is a market order), a print through the target books the
+    target (a resting limit fills at its price, never better).
+
+    Exit cost: a target exit pays the limit-exit cost (win_cost_r); a stop or
+    time exit crosses the spread (loss_cost_r). Returns the shadow_closed
+    record, or None while still open."""
+    entry, stop, target = (_num(shadow.get(k)) for k in ("entry", "stop", "target"))
+    if entry is None or stop is None or target is None:
+        return None
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    sign = 1.0 if shadow.get("side") == "long" else -1.0
+    rr = abs(target - entry) / risk
+    opened = _parse_ts(shadow.get("opened_at"))
+    comparable = opened is not None and (opened.tzinfo is None) == (now_et.tzinfo is None)
+    opened_et = (opened.astimezone(now_et.tzinfo) if (comparable and opened is not None and opened.tzinfo is not None)
+                 else (opened if comparable else None))
+
+    px = _num(last)
+    # A shadow from an earlier session that was never marked: unmeasured, so it
+    # closes WITHOUT an R — never booked as flat.
+    if opened_et is not None and opened_et.date() < now_et.date():
+        return _close(shadow, None, None, "unmarked", now_et)
+    if px is None or px <= 0:
+        return None
+
+    r = sign * (px - entry) / risk
+    reason: Optional[str] = None
+    if r <= -1.0:
+        reason, r_gross = "stop", r
+    elif r >= rr:
+        reason, r_gross = "target", rr
+    else:
+        minutes_open = (now_et - opened_et).total_seconds() / 60.0 if opened_et is not None else None
+        horizon = _num(shadow.get("horizon_min")) or DEFAULT_HORIZON_MIN * SHADOW_HORIZON_MULT
+        if (now_et.hour * 60 + now_et.minute) >= SHADOW_FLATTEN_MIN:
+            reason, r_gross = "flatten", r
+        elif minutes_open is not None and minutes_open >= horizon:
+            reason, r_gross = "horizon", r
+        else:
+            return None
+    cost = _num(shadow.get("win_cost_r")) if reason == "target" else _num(shadow.get("loss_cost_r"))
+    r_net = None if cost is None else r_gross - cost
+    return _close(shadow, round(r_gross, 4), None if r_net is None else round(r_net, 4), reason, now_et, px)
+
+
+def _close(shadow: Dict[str, Any], r_gross: Optional[float], r_net: Optional[float],
+           reason: str, now_et: datetime, px: Optional[float] = None) -> Dict[str, Any]:
+    return {
+        "id": shadow.get("id"),
+        "ticker": shadow.get("ticker"),
+        "setup": shadow.get("setup"),
+        "thesis_id": shadow.get("thesis_id"),
+        "shadow_key": shadow.get("shadow_key"),
+        "side": shadow.get("side"),
+        "exit": px,
+        "r_gross": r_gross,
+        "r_net": r_net,
+        "reason": reason,
+        "closed_at": now_et.isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3. The shadow record and reinstatement
+# ---------------------------------------------------------------------------
+def _t_stat(xs: Sequence[float]) -> Optional[float]:
+    if len(xs) < 2:
+        return None
+    sd = statistics.stdev(xs)
+    if sd <= 0:
+        return None
+    return statistics.mean(xs) / (sd / math.sqrt(len(xs)))
+
+
+def shadow_record(events: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Per shadow key: net closes, expectancy, t, and the derived status.
+
+    Only closes with a NET R count — an unmarked close or one whose cost was
+    unmeasured is reported (`unmeasured`) but never evidence."""
+    evs = list(events or [])
+    keys = list(RETIRED_THESES) + [ORB_NO_GAP_KEY]
+    out: Dict[str, Dict[str, Any]] = {}
+    closes = _events(evs, SHADOW_CLOSED_EVENT)
+    opens = open_shadows(evs)
+    for key in keys:
+        mine = [c for c in closes if c.get("shadow_key") == key]
+        net = [float(c["r_net"]) for c in mine if _num(c.get("r_net")) is not None]
+        gross = [float(c["r_gross"]) for c in mine if _num(c.get("r_gross")) is not None]
+        t = _t_stat(net)
+        mean = statistics.mean(net) if net else None
+        earned = len(net) >= MIN_SHADOW_TRADES and mean is not None and mean > 0 and t is not None and t >= REINSTATE_T
+        if earned:
+            status = "reinstated"
+        elif len(net) >= MIN_SHADOW_TRADES:
+            status = "retired_confirmed" if (mean is not None and mean <= 0) else "retired"
+        else:
+            status = "retired"
+        out[key] = {
+            "key": key,
+            "title": _thesis_title(key.split("/")[0]) + (" (no gap)" if key == ORB_NO_GAP_KEY else ""),
+            "closes": len(net),
+            "unmeasured": len(mine) - len(net),
+            "open": sum(1 for s in opens if s.get("shadow_key") == key),
+            "mean_r_net": None if mean is None else round(mean, 4),
+            "mean_r_gross": round(statistics.mean(gross), 4) if gross else None,
+            "win_pct": round(100.0 * sum(1 for x in net if x > 0) / len(net), 1) if net else None,
+            "t": None if t is None else round(t, 2),
+            "needed": max(0, MIN_SHADOW_TRADES - len(net)),
+            "status": status,
+        }
+    return out
+
+
+def reinstated_keys(events: Iterable[Dict[str, Any]]) -> Set[str]:
+    return {k for k, v in shadow_record(events).items() if v["status"] == "reinstated"}
+
+
+# ---------------------------------------------------------------------------
+# 4. Expression: in-the-money, 14–30 DTE
+# ---------------------------------------------------------------------------
+def bs_delta(spot: float, strike: float, vol_annual: float, dte: float, right: str) -> Optional[float]:
+    """Black–Scholes delta, r = q = 0 (a three-week horizon makes carry noise)."""
+    s, k, v = _num(spot), _num(strike), _num(vol_annual)
+    if s is None or k is None or v is None or s <= 0 or k <= 0 or v <= 0:
+        return None
+    t = max(1.0, float(dte)) / 365.0
+    d1 = (math.log(s / k) + 0.5 * v * v * t) / (v * math.sqrt(t))
+    call = _norm_cdf(d1)
+    return round(call if str(right).upper() == "CALL" else call - 1.0, 4)
+
+
+def bs_price(spot: float, strike: float, vol_annual: float, dte: float, right: str) -> Optional[float]:
+    s, k, v = _num(spot), _num(strike), _num(vol_annual)
+    if s is None or k is None or v is None or s <= 0 or k <= 0 or v <= 0:
+        return None
+    t = max(1.0, float(dte)) / 365.0
+    sd = v * math.sqrt(t)
+    d1 = (math.log(s / k) + 0.5 * sd * sd) / sd
+    d2 = d1 - sd
+    call = s * _norm_cdf(d1) - k * _norm_cdf(d2)
+    return call if str(right).upper() == "CALL" else call - s + k
+
+
+def strike_for_delta(spot: float, vol_annual: float, dte: float, right: str,
+                     delta: float = EXPRESSION_DELTA) -> Optional[float]:
+    """The strike whose |Δ| is `delta` (r = 0). Call: N(d1) = Δ; put: N(d1) = 1 − |Δ|."""
+    s, v = _num(spot), _num(vol_annual)
+    if s is None or v is None or s <= 0 or v <= 0:
+        return None
+    t = max(1.0, float(dte)) / 365.0
+    target_call_delta = abs(delta) if str(right).upper() == "CALL" else 1.0 - abs(delta)
+    d1 = _norm_ppf(target_call_delta)
+    sd = v * math.sqrt(t)
+    return s * math.exp(-d1 * sd + 0.5 * sd * sd)
+
+
+def target_expiry(today: date) -> date:
+    """The requested expiry (the chain snap picks the nearest LISTED date)."""
+    return today + timedelta(days=TARGET_DTE)
+
+
+def pick_expiry(listed: Iterable[date], today: date) -> Optional[date]:
+    """Nearest listed expiry to TARGET_DTE inside [MIN_DTE, MAX_DTE], else None."""
+    inside = [d for d in (listed or []) if MIN_DTE <= (d - today).days <= MAX_DTE]
+    if not inside:
+        return None
+    return min(inside, key=lambda d: (abs((d - today).days - TARGET_DTE), d))
+
+
+def plan_expression(spot: Any, side: str, vol_annual: Any, today: date) -> Optional[Dict[str, Any]]:
+    """Requested ITM contract for an option entry: {right, expiry, strike, delta,
+    dte, vol_annual, vol_basis}. None when the spot is unreadable."""
+    s = _num(spot)
+    if s is None or s <= 0:
+        return None
+    v = _num(vol_annual)
+    basis = "measured"
+    if v is not None and v > 3.0:          # a percentage reading (35 → 0.35)
+        v = v / 100.0
+    if v is None or v <= 0:
+        v, basis = VOL_PRIOR_ANNUAL, "prior"
+    right = "CALL" if side == "long" else "PUT"
+    expiry = target_expiry(today)
+    dte = float((expiry - today).days)
+    strike = strike_for_delta(s, v, dte, right)
+    if strike is None:
+        return None
+    return {"right": right, "expiry": expiry.isoformat(), "strike": round(strike, 2),
+            "delta": EXPRESSION_DELTA if right == "CALL" else -EXPRESSION_DELTA,
+            "dte": dte, "vol_annual": round(v, 4), "vol_basis": basis}
+
+
+def check_expression(expiry: Any, today: date, delta: Any) -> Dict[str, Any]:
+    """Did the snapped contract land inside the declared expression?
+    {ok, dte, delta, reason}. An unparseable expiry fails closed."""
+    try:
+        exp = datetime.strptime(str(expiry)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return {"ok": False, "dte": None, "delta": None,
+                "reason": f"{REFUSAL_PREFIX} expiry {expiry!r} unreadable"}
+    dte = (exp - today).days
+    d = _num(delta)
+    reasons: List[str] = []
+    if not (MIN_DTE <= dte <= MAX_DTE):
+        reasons.append(f"no listed expiry in {MIN_DTE}–{MAX_DTE} DTE (nearest is {dte} DTE)")
+    if d is not None and not (DELTA_BAND[0] <= abs(d) <= DELTA_BAND[1]):
+        reasons.append(f"snapped contract |Δ| {abs(d):.2f} outside {DELTA_BAND[0]:.2f}–{DELTA_BAND[1]:.2f}")
+    return {"ok": not reasons, "dte": dte, "delta": d,
+            "reason": "" if not reasons else f"{REFUSAL_PREFIX} " + " · ".join(reasons)}
+
+
+def rescale_contracts(qty: Any, planned_delta: Any, new_delta: Any) -> int:
+    """Contracts that carry no MORE delta exposure than the plan did.
+
+    The app sized an ATM contract (|Δ| ≈ 0.5); the ITM contract carries more
+    per contract, so the count shrinks to hold the planned share-equivalent
+    exposure. Never grows. A single contract stays one — the priced-risk gate
+    then judges it in broker dollars."""
+    try:
+        q = int(qty)
+    except (TypeError, ValueError):
+        return 1
+    old, new = _num(planned_delta), _num(new_delta)
+    old = abs(old) if old else 0.5
+    new = abs(new) if new else EXPRESSION_DELTA
+    if q <= 1 or new <= old:
+        return max(1, q)
+    return max(1, min(q, int(math.floor(q * old / new))))
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+def thresholds() -> Dict[str, Any]:
+    return {
+        "core_theses": list(CORE_THESES),
+        "retired_theses": list(RETIRED_THESES),
+        "orb_min_gap_pct": ORB_MIN_GAP_PCT,
+        "min_shadow_trades": MIN_SHADOW_TRADES,
+        "reinstate_t": REINSTATE_T,
+        "shadow_horizon_mult": SHADOW_HORIZON_MULT,
+        "expression_delta": EXPRESSION_DELTA,
+        "min_dte": MIN_DTE, "target_dte": TARGET_DTE, "max_dte": MAX_DTE,
+        "delta_band": list(DELTA_BAND),
+    }
+
+
+def report(events: Iterable[Dict[str, Any]], *, enforced: bool, expression_enabled: bool) -> Dict[str, Any]:
+    evs = list(events or [])
+    record = shadow_record(evs)
+    core = []
+    if edge_mod is not None:
+        for tid in CORE_THESES:
+            t = edge_mod.THESES.get(tid) or {}
+            core.append({"thesis_id": tid, "title": t.get("title"), "setups": list(t.get("setups") or ()),
+                         "condition": f"gap ≥ {ORB_MIN_GAP_PCT:g}% in the trade's direction" if tid == "opening_imbalance" else None})
+    retired = []
+    for key, rec in record.items():
+        setups: List[str] = []
+        if edge_mod is not None and key in edge_mod.THESES:
+            setups = list(edge_mod.THESES[key].get("setups") or ())
+        elif key == ORB_NO_GAP_KEY:
+            setups = ["orb"]
+        retired.append({**rec, "setups": setups})
+    return {
+        "enforced": enforced,
+        "expression_enabled": expression_enabled,
+        "thresholds": thresholds(),
+        "core": core,
+        "retired": retired,
+        "open_shadows": open_shadows(evs)[:20],
+        "refused_live": sum(1 for e in evs if isinstance(e, dict) and e.get("event") == "entry_rejected"
+                            and any(str(r).startswith(REFUSAL_PREFIX) for r in (_payload(e).get("blocked_by") or []))),
+    }
+
+''')
+
 _bundle_load('scanner', r'''
 """
 Server-Side Market Scanner — the bot's own eyes.
@@ -4803,8 +7781,18 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 try:  # package-style import (python -m bot...) or flat (uvicorn main_bot:app)
     from .state_store import StateStore
+    from . import edge as edge_mod
+    from . import learning as learning_mod
+    from . import portfolio_risk as risk_mod
+    from . import cost_model as cost_mod
+    from . import core_book as core_mod
 except ImportError:
     from state_store import StateStore
+    import edge as edge_mod
+    import learning as learning_mod
+    import portfolio_risk as risk_mod
+    import cost_model as cost_mod
+    import core_book as core_mod
 
 logger = logging.getLogger("etrade-bot.scanner")
 
@@ -4856,6 +7844,42 @@ _SYMBOL_RE = re.compile(r"^[A-Z]{1,6}$")
 # threshold the bot silently overrides. main_bot injects its REAL (env-aware)
 # gate here at wiring time; the defaults mirror main_bot's own defaults.
 ENTRY_GATE_FLOORS: Dict[str, float] = {"min_score": 70.0, "min_rvol": 0.9}
+# Same reasoning for the edge thesis: main_bot's entry filter refuses a
+# candidate whose own economic thesis is absent, so the scanner must not
+# qualify one. main_bot sets this from EDGE_REQUIRE_THESIS at wiring time.
+THESIS_REQUIRED = True
+# And for the learning loop: a setup×regime cell the live record disabled is
+# refused by the entry filter, so the scanner does not qualify it either.
+# main_bot sets this from LEARNING_ENABLED at wiring time.
+LEARNING_ENFORCED = True
+# And for the expected-cost model: a setup whose spread + slippage + adverse
+# move eats the target is refused by the entry filter, so the scanner neither
+# qualifies nor ranks it on its gross geometry. main_bot sets this from
+# COST_MODEL_ENABLED at wiring time.
+COST_ENFORCED = True
+# CORE BOOK (core_book.py) — only the core theses dispatch; a retired setup
+# that would otherwise qualify is handed to the shadow tracker instead. Set by
+# main_bot from CORE_BOOK_ENABLED.
+CORE_ENFORCED = True
+# Option entries (the scanner's shorts, as long puts) are costed and hinted as
+# the ITM 14–30 DTE contract the bot will actually trade. Set by main_bot from
+# ITM_EXPRESSION_ENABLED.
+ITM_EXPRESSION = True
+
+# CORE DETECTORS — the two core setups the scanner could not see before.
+# ORB is only judged inside the opening-imbalance window (the thesis requires
+# ≤ 90 session minutes) and after the 30-minute opening range has formed.
+ORB_RANGE_MINUTES = 30
+ORB_WINDOW_END_MINUTES = 90
+# Mean reversion: price ≥ 1% away from the session VWAP (several times a liquid
+# name's typical intraday spread to VWAP) and the latest sample turning back.
+REVERSION_MIN_STRETCH_PCT = 1.0
+# The extreme the flush printed must be recent — the last N samples.
+REVERSION_LOOKBACK = 10
+# Stop beyond the flush extreme by a small buffer (fraction of price).
+REVERSION_STOP_BUFFER = 0.001
+# A reversion whose VWAP target pays less than this many R is not worth the round trip.
+REVERSION_MIN_RR = 1.5
 
 # Floors this bot shipped BEFORE configs recorded their own provenance. A stored
 # value equal to one of these was almost certainly inherited from the gate of
@@ -5100,6 +8124,9 @@ def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
             "previous_close": num(all_q, "previousClose"),
             "total_volume": num(all_q, "totalVolume"),
             "avg_daily_volume": num(all_q, "volume10Day"),
+            # Top-of-book size — the order-book imbalance feature (edge.py).
+            "bid_size": num(all_q, "bidSize"),
+            "ask_size": num(all_q, "askSize"),
         })
     return out
 
@@ -5204,6 +8231,91 @@ def detect_setup_side(
     return None
 
 
+def _ts_et(sample: Dict[str, Any], tz: Any) -> Optional[datetime]:
+    try:
+        ts = datetime.fromisoformat(str(sample.get("ts")).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(tz) if tz is not None else ts
+
+
+def opening_range(series: List[Dict[str, Any]], now_et: datetime) -> Optional[Tuple[float, float]]:
+    """(high, low) of TODAY's sampled prices in the first ORB_RANGE_MINUTES,
+    or None when fewer than MIN_SAMPLES were observed there (unmeasured)."""
+    open_m = 9 * 60 + 30
+    prices: List[float] = []
+    for s in series:
+        ts = _ts_et(s, now_et.tzinfo)
+        if ts is None or ts.date() != now_et.date() or s.get("last") is None:
+            continue
+        m = ts.hour * 60 + ts.minute
+        if open_m <= m < open_m + ORB_RANGE_MINUTES:
+            prices.append(float(s["last"]))
+    if len(prices) < MIN_SAMPLES:
+        return None
+    return max(prices), min(prices)
+
+
+def detect_core_setup(
+    series: List[Dict[str, Any]],
+    quote: Dict[str, Any],
+    vwap: Optional[float],
+    now_et: Optional[datetime],
+) -> Optional[Tuple[str, str, float, float]]:
+    """(setup, side, stop, target) for the two core setups detect_setup_side
+    cannot see, or None.
+
+    ORB (opening imbalance): a gap ≥ core_book.ORB_MIN_GAP_PCT, inside the
+    opening-imbalance window, breaking the 30-minute range IN THE GAP'S
+    DIRECTION. Stop at the range midpoint (a resolved imbalance should not
+    give back half the range), target 2R.
+
+    Mean reversion (liquidity provision): stretched ≥ 1% from the sampled
+    VWAP with the latest sample turning back toward it. Stop beyond the
+    recent flush extreme, target = the VWAP itself — the value the pressure
+    pushed price away from. Refused below REVERSION_MIN_RR."""
+    if now_et is None or len(series) < MIN_SAMPLES:
+        return None
+    last = quote.get("last")
+    if last is None:
+        return None
+    px = float(last)
+    minutes = now_et.hour * 60 + now_et.minute - (9 * 60 + 30)
+
+    gap = risk_mod.gap_pct(quote.get("open"), quote.get("previous_close"))
+    if gap is not None and abs(gap) >= core_mod.ORB_MIN_GAP_PCT and ORB_RANGE_MINUTES <= minutes <= ORB_WINDOW_END_MINUTES:
+        rng = opening_range(series, now_et)
+        if rng is not None:
+            hi, lo = rng
+            mid = (hi + lo) / 2.0
+            floor = px * 0.004
+            if gap > 0 and px > hi:
+                stop = round(min(mid, px - floor), 2)
+                return ("orb", "long", stop, round(px + 2 * (px - stop), 2))
+            if gap < 0 and px < lo:
+                stop = round(max(mid, px + floor), 2)
+                return ("orb", "short", stop, round(max(0.01, px - 2 * (stop - px)), 2))
+
+    prior = [float(s["last"]) for s in series if s.get("last") is not None]
+    if vwap and vwap > 0 and minutes >= 30 and len(prior) >= 2:
+        stretch = (px - vwap) / vwap * 100.0
+        prev = prior[-1]
+        recent = prior[-REVERSION_LOOKBACK:]
+        if stretch <= -REVERSION_MIN_STRETCH_PCT and px > prev:
+            stop = round(min(recent + [px]) * (1 - REVERSION_STOP_BUFFER), 2)
+            target = round(vwap, 2)
+            if px - stop > 0 and (target - px) / (px - stop) >= REVERSION_MIN_RR:
+                return ("mean reversion", "long", stop, target)
+        if stretch >= REVERSION_MIN_STRETCH_PCT and px < prev:
+            stop = round(max(recent + [px]) * (1 + REVERSION_STOP_BUFFER), 2)
+            target = round(vwap, 2)
+            if stop - px > 0 and (px - target) / (stop - px) >= REVERSION_MIN_RR:
+                return ("mean reversion", "short", stop, target)
+    return None
+
+
 def detect_setup(
     series: List[Dict[str, Any]],
     quote: Dict[str, Any],
@@ -5235,6 +8347,7 @@ def score_factors(
     vwap_distance_pct: Optional[float],
     spread: Optional[float],
     max_spread_pct: float,
+    cost: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Per-factor attribution of a candidate's score.
 
@@ -5244,11 +8357,18 @@ def score_factors(
     exactly, so a user can see which single measurement is holding a candidate
     below the gate instead of staring at an unexplained number.
 
-    A missing measurement earns 0 — never an assumed midpoint."""
+    A missing measurement earns 0 — never an assumed midpoint.
+
+    `cost` (cost_model.expected_cost) turns the liquidity slot into the FULL
+    expected cost — spread + slippage + adverse move over the fill window, as a
+    share of the target move — at the same weight. The spread alone is a
+    fraction of what a fill costs; ranking on it ranked setups on gross
+    geometry. Without a measured cost the slot keeps its spread reading."""
     def clamp01(x: float) -> float:
         return max(0.0, min(1.0, x))
 
     ceiling = max(max_spread_pct, 0.01)
+    cost_fill = cost_mod.score_fill(cost)
     readings: List[Tuple[str, str, Optional[float], float, str, float]] = [
         ("rvol", "Relative volume", rvol, FULL_RVOL,
          "x", clamp01(((rvol or 0.0) - 1.0) / (FULL_RVOL - 1.0))),
@@ -5260,11 +8380,14 @@ def score_factors(
         ("vwap", "Lead over VWAP", vwap_distance_pct, FULL_VWAP_PCT,
          "%", clamp01((vwap_distance_pct or 0.0) / FULL_VWAP_PCT)),
         ("liquidity", "Spread", spread, ceiling,
-         "%", clamp01(1.0 - (spread if spread is not None else ceiling) / ceiling)),
+         "%", clamp01(1.0 - (spread if spread is not None else ceiling) / ceiling))
+        if cost_fill is None or cost is None else
+        # Reading = % of the target move the fill eats; fully earned at 0.
+        ("cost", "Expected cost", float(cost["cost_share"]) * 100.0, 0.0, "%", cost_fill),
     ]
     out: List[Dict[str, Any]] = []
     for key, label, value, target, unit, fill in readings:
-        weight = SCORE_WEIGHTS[key]
+        weight = _factor_weight(key)
         out.append({
             "key": key,
             "label": label,
@@ -5285,6 +8408,7 @@ def score_candidate(
     vwap_distance_pct: Optional[float],
     spread: Optional[float],
     max_spread_pct: float,
+    cost: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Composite 55–100 score from MEASURED factors only.
 
@@ -5292,9 +8416,15 @@ def score_candidate(
     mapped onto 55..100. A candidate strong on every measured dimension lands
     in the low 90s — nothing is padded to clear a threshold, and a missing
     factor contributes 0 rather than an assumed value."""
-    factors = score_factors(rvol, change_from_open_pct, vwap_distance_pct, spread, max_spread_pct)
-    blended = sum(SCORE_WEIGHTS[f["key"]] * f["fill"] for f in factors)
+    factors = score_factors(rvol, change_from_open_pct, vwap_distance_pct, spread, max_spread_pct, cost)
+    blended = sum(_factor_weight(f["key"]) * f["fill"] for f in factors)
     return int(round(SCORE_BASE + SCORE_SPAN * blended))
+
+
+def _factor_weight(key: str) -> float:
+    """The cost factor occupies the liquidity slot — same weight, so the
+    score anatomy (BASE + SPAN, weights summing to 1) is unchanged."""
+    return SCORE_WEIGHTS[cost_mod.SCORE_SLOT if key == "cost" else key]
 
 
 def risk_levels(entry: float, series: List[Dict[str, Any]], side: str = "long") -> Tuple[float, float]:
@@ -5351,13 +8481,91 @@ def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) ->
         "source": "bot_scanner",
         "timestamp": candidate["ts"],
     }
+    # The measured context the entry filter re-judges the thesis against —
+    # and that rides into the ledger so validation can segment by regime.
+    if isinstance(candidate.get("edge_features"), dict):
+        payload["edge_features"] = dict(candidate["edge_features"])
+    # Gap / crisis / book-depth readings the portfolio-risk layer sizes on.
+    if isinstance(candidate.get("risk_context"), dict):
+        payload["risk_context"] = dict(candidate["risk_context"])
+    # The scanner's own expected-cost estimate and the volatility it was
+    # measured on — the bot re-prices the cost itself, but on the scanner's
+    # realized σ rather than a coarser fallback.
+    if isinstance(candidate.get("cost"), dict):
+        payload["cost_estimate"] = dict(candidate["cost"])
+    # The underlying's two-sided quote the share cost was priced from.
+    if quote.get("bid") is not None and quote.get("ask") is not None:
+        payload["underlying_bid"] = quote.get("bid")
+        payload["underlying_ask"] = quote.get("ask")
+    if candidate.get("sigma_sec") is not None:
+        payload["cost_context"] = {"sigma_sec": candidate["sigma_sec"], "sigma_basis": candidate.get("sigma_basis")}
     if side == "short":
         payload["instrument"] = "option"
         payload["option_right"] = "PUT"
         payload["option_contracts"] = 1
         payload["strike_hint"] = round(float(candidate["entry"]))
         payload["expiration_hint"] = candidate.get("expiry") or next_friday_expiry(_utcnow())
+        if ITM_EXPRESSION:
+            # The contract the bot will actually trade: ITM (|Δ| 0.70), 14–30
+            # DTE. Hints only — the bot re-plans and snaps to a listed one.
+            sigma = candidate.get("sigma_sec")
+            vol = (float(sigma) * math.sqrt(cost_mod.TRADING_DAYS * cost_mod.SESSION_SECONDS)
+                   if sigma else None)
+            plan = core_mod.plan_expression(candidate["entry"], "short", vol, _utcnow().date())
+            if plan is not None:
+                payload["strike_hint"] = plan["strike"]
+                payload["expiration_hint"] = plan["expiry"]
+                payload["option_delta"] = plan["delta"]
     return payload
+
+
+def build_risk_context(quote: Dict[str, Any], quotes_by_symbol: Dict[str, Any]) -> Dict[str, Any]:
+    """The portfolio-risk readings this pass MEASURED (None otherwise): the
+    name's opening gap, SPY's range and gap, the displayed book and the day's
+    volume. No VIX here — the scanner reads quotes, not the index."""
+    spy = (quotes_by_symbol or {}).get(edge_mod.BENCHMARK) or {}
+    spy_range = edge_mod.spy_range_pct(spy) if spy else None
+    return risk_mod.sanitize_risk_context({
+        "gap_pct": risk_mod.gap_pct(quote.get("open"), quote.get("previous_close")),
+        "spy_range_pct": round(spy_range, 3) if spy_range is not None else None,
+        "spy_gap_pct": risk_mod.gap_pct(spy.get("open"), spy.get("previous_close")) if spy else None,
+        "bid_size": quote.get("bid_size"),
+        "ask_size": quote.get("ask_size"),
+        "volume": quote.get("total_volume"),
+    })
+
+
+def expected_cost_for(
+    quote: Dict[str, Any],
+    series: List[Dict[str, Any]],
+    side: str,
+    stop: float,
+    target: float,
+    progress: float,
+    now_et: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """The candidate's expected round-trip cost in the instrument it will
+    actually trade: a long as shares, a short as a LONG PUT (build_signal).
+
+    σ comes from the scanner's own timestamped samples, else today's range;
+    the put's spread/premium are priors until the bot snaps a real contract
+    (it re-prices the cost on the real quote at the order)."""
+    sigma, basis = cost_mod.resolve_sigma(
+        series=series, high=quote.get("high"), low=quote.get("low"), progress=progress,
+    )
+    instrument = "stock" if side == "long" else "option"
+    dte: Optional[float] = None
+    delta: Optional[float] = None
+    if instrument == "option" and ITM_EXPRESSION:
+        dte, delta = float(core_mod.TARGET_DTE), core_mod.EXPRESSION_DELTA
+    elif instrument == "option" and now_et is not None:
+        expiry = datetime.fromisoformat(next_friday_expiry(now_et)).date()
+        dte = float(max(1, (expiry - now_et.date()).days))
+    return cost_mod.expected_cost(
+        instrument=instrument, entry=quote.get("last"), stop=stop, target=target,
+        bid=quote.get("bid"), ask=quote.get("ask"), days_to_expiry=dte, delta=delta,
+        sigma_sec=sigma, sigma_basis=basis,
+    )
 
 
 def evaluate_quote(
@@ -5365,18 +8573,28 @@ def evaluate_quote(
     series: List[Dict[str, Any]],
     cfg: Dict[str, Any],
     progress: float,
+    context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Turn one broker reading + its rolling series into a scored candidate.
 
     Always returns a record (so /scanner/status can show WHY a ticker didn't
-    qualify); `qualifies` is only true when every measured requirement is met."""
+    qualify); `qualifies` is only true when every measured requirement is met.
+
+    `context` = {"quotes": {symbol: quote}, "now_et": datetime} — the rest of
+    the pass's quotes, for relative strength vs SPY and sector peers and the
+    volatility regime. Without it no edge features are measured and the
+    thesis is not judged here (the entry filter still judges it)."""
     last = float(quote["last"])
     rvol = compute_rvol(quote.get("total_volume"), quote.get("avg_daily_volume"), progress)
     spread = spread_pct(quote.get("bid"), quote.get("ask"))
     vwap = sampled_vwap(series)
     change_open = pct_change(last, quote.get("open"))
     vwap_dist = pct_change(last, vwap) if vwap else None
-    hit = detect_setup_side(series, quote, vwap)
+    now_et = (context or {}).get("now_et")
+    # Core detectors first (ORB on a gap day, mean reversion) — they carry
+    # their own structural stop/target. Then the legacy family.
+    core_hit = detect_core_setup(series, quote, vwap, now_et)
+    hit = (core_hit[0], core_hit[1]) if core_hit is not None else detect_setup_side(series, quote, vwap)
     setup = hit[0] if hit is not None else None
     side = hit[1] if hit is not None else "long"
     # Side-adjusted readings: a short earns momentum/VWAP credit from movement
@@ -5384,8 +8602,19 @@ def evaluate_quote(
     # itself is unchanged — the app renders the same math.
     momo_reading = change_open if side == "long" else (None if change_open is None else -change_open)
     vwap_reading = vwap_dist if side == "long" else (None if vwap_dist is None else -vwap_dist)
-    factors = score_factors(rvol, momo_reading, vwap_reading, spread, float(cfg["max_spread_pct"]))
-    score = score_candidate(rvol, momo_reading, vwap_reading, spread, float(cfg["max_spread_pct"]))
+    if core_hit is not None:
+        stop, target = core_hit[2], core_hit[3]
+    else:
+        stop, target = risk_levels(last, series + [quote], side)
+    # EXPECTED COST before the score: spread + slippage + the adverse move over
+    # the fill window, charged against THIS candidate's own stop/target. Only
+    # computed for a named setup (no setup → no trade to cost).
+    cost: Optional[Dict[str, Any]] = None
+    if setup is not None:
+        cost = expected_cost_for(quote, series, side, stop, target, progress, (context or {}).get("now_et"))
+    cost_verdict = cost_mod.assess_cost(cost) if cost is not None else None
+    factors = score_factors(rvol, momo_reading, vwap_reading, spread, float(cfg["max_spread_pct"]), cost)
+    score = score_candidate(rvol, momo_reading, vwap_reading, spread, float(cfg["max_spread_pct"]), cost)
 
     reasons: List[str] = []
     if len(series) < MIN_SAMPLES:
@@ -5404,8 +8633,42 @@ def evaluate_quote(
         reasons.append("no setup")
     if score < int(cfg["min_score"]):
         reasons.append(f"score {score} < {cfg['min_score']}")
+    if COST_ENFORCED and cost_verdict is not None and not cost_verdict["allowed"]:
+        reasons.extend(cost_verdict["reasons"])
 
-    stop, target = risk_levels(last, series + [quote], side)
+    features: Optional[Dict[str, Any]] = None
+    thesis: Optional[Dict[str, Any]] = None
+    if context is not None and context.get("now_et") is not None:
+        features = edge_mod.build_features(
+            quote["symbol"], quote, dict(context.get("quotes") or {}), context["now_et"], rvol=rvol,
+        )
+        features["side"] = side
+        if setup is not None:
+            thesis = edge_mod.evaluate_thesis(setup, side, features)
+            if THESIS_REQUIRED and not thesis["ok"]:
+                reasons.append(thesis["reason"])
+
+    learned: Optional[Dict[str, Any]] = None
+    snapshot = (context or {}).get("learning")
+    if isinstance(snapshot, dict) and setup is not None:
+        learned = learning_mod.entry_verdict(snapshot, setup, (features or {}).get("vol_regime"))
+        if LEARNING_ENFORCED and not learned["allowed"]:
+            reasons.extend(learned["reasons"])
+
+    risk_context = build_risk_context(quote, (context or {}).get("quotes") or {})
+
+    # CORE BOOK — judged last so `shadow_eligible` means exactly: every other
+    # gate passed and only the retirement kept this off the live book.
+    book: Optional[Dict[str, Any]] = None
+    shadow_eligible = False
+    if setup is not None:
+        reinstated = (context or {}).get("core_reinstated")
+        book = core_mod.classify(setup, side, risk_context.get("gap_pct"),
+                                 set(reinstated) if reinstated else set())
+        if not book["allowed"]:
+            shadow_eligible = not reasons and book.get("shadow_key") is not None
+            if CORE_ENFORCED:
+                reasons.append(book["reason"])
     return {
         "ticker": quote["symbol"],
         "side": side,
@@ -5423,6 +8686,26 @@ def evaluate_quote(
         "score_factors": factors,
         "points_to_gate": max(0, int(cfg["min_score"]) - score),
         "samples": len(series),
+        "edge_features": features,
+        "risk_context": risk_context,
+        "cost": cost_mod.summary(cost),
+        "sigma_sec": (cost or {}).get("sigma_sec") if (cost or {}).get("measured") else None,
+        "sigma_basis": ((cost or {}).get("basis") or {}).get("sigma") if (cost or {}).get("measured") else None,
+        "cost_verdict": (
+            {"allowed": cost_verdict["allowed"], "note": cost_verdict["note"]}
+            if cost_verdict is not None else None
+        ),
+        "thesis": thesis,
+        "book": (
+            {"book": book["book"], "thesis_id": book["thesis_id"], "shadow_key": book["shadow_key"],
+             "allowed": book["allowed"], "note": book["note"] or book["reason"]}
+            if book is not None else None
+        ),
+        "shadow_eligible": shadow_eligible,
+        "learning": (
+            {"allowed": learned["allowed"], "weight": learned["weight"], "notes": learned["notes"]}
+            if learned is not None else None
+        ),
         "qualifies": not reasons,
         "blocked_by": reasons,
         "ts": _utcnow().isoformat(),
@@ -5445,6 +8728,11 @@ class Scanner:
         now_et: Callable[[], datetime],
         alert: Optional[Callable[..., Awaitable[None]]] = None,
         stop_flag: Callable[[], bool] = lambda: False,
+        learning: Optional[Callable[[], Dict[str, Any]]] = None,
+        shadow: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Awaitable[Any]]] = None,
+        shadow_mark: Optional[Callable[[Dict[str, Dict[str, Any]], datetime], Awaitable[Any]]] = None,
+        shadow_symbols: Optional[Callable[[], Awaitable[List[str]]]] = None,
+        core_reinstated: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.state = state
         self.fetch_quotes = fetch_quotes
@@ -5454,6 +8742,17 @@ class Scanner:
         self.now_et = now_et
         self.alert = alert
         self.stop_flag = stop_flag
+        self.learning = learning
+        # CORE BOOK shadow tracking (paper — never edge): record a retired
+        # setup that would have qualified, mark open shadows on each pass's
+        # quotes, fetch quotes for shadows outside the universe, and read the
+        # families the shadow record has reinstated.
+        self.shadow = shadow
+        self.shadow_mark = shadow_mark
+        self.shadow_symbols = shadow_symbols
+        self.core_reinstated = core_reinstated
+        # Cadence stretch from the book's learning weight (1.0 = as configured).
+        self.throttle: float = 1.0
         self._config: Dict[str, Any] = dict(DEFAULT_CONFIG)
 
     # ---- config -----------------------------------------------------------
@@ -5543,10 +8842,22 @@ class Scanner:
     async def scan_once(self) -> Dict[str, Any]:
         cfg = self._config
         universe: List[str] = list(cfg["universe"])
+        # SPY is the relative-strength benchmark and the volatility-regime
+        # proxy. Fetched even when the user's universe omits it, but then it
+        # is context only — never a candidate.
+        fetch_list = universe + ([edge_mod.BENCHMARK] if edge_mod.BENCHMARK not in universe else [])
+        # Open shadows outside the universe still need a mark.
+        if self.shadow_symbols is not None:
+            try:
+                for sym in await self.shadow_symbols():
+                    if sym and sym not in fetch_list:
+                        fetch_list.append(sym)
+            except Exception as e:
+                logger.warning(f"shadow symbols unavailable this pass: {e}")
         quotes: List[Dict[str, Any]] = []
         errors: List[str] = []
-        for i in range(0, len(universe), QUOTE_CHUNK):
-            chunk = universe[i:i + QUOTE_CHUNK]
+        for i in range(0, len(fetch_list), QUOTE_CHUNK):
+            chunk = fetch_list[i:i + QUOTE_CHUNK]
             try:
                 quotes.extend(parse_quotes(await self.fetch_quotes(chunk)))
             except Exception as e:
@@ -5554,10 +8865,36 @@ class Scanner:
                 logger.warning(f"scanner quote fetch failed for {len(chunk)} symbols: {e}")
 
         progress = session_progress(self.now_et())
+        context: Dict[str, Any] = {"quotes": {q["symbol"]: q for q in quotes}, "now_et": self.now_et()}
+        # LEARNING LOOP — one snapshot per pass. Unreadable → no learning
+        # verdicts and no throttle (fails open, like the entry filter).
+        snapshot: Optional[Dict[str, Any]] = None
+        if self.learning is not None:
+            try:
+                snapshot = self.learning()
+            except Exception as e:
+                logger.warning(f"learning snapshot unavailable this pass: {e}")
+        if snapshot is not None:
+            context["learning"] = snapshot
+            self.throttle = float(snapshot.get("scanner_throttle") or 1.0) if LEARNING_ENFORCED else 1.0
+        else:
+            self.throttle = 1.0
+        if self.core_reinstated is not None:
+            try:
+                context["core_reinstated"] = set(self.core_reinstated() or ())
+            except Exception as e:
+                # Unreadable → nothing reinstated: retirement is the declared default.
+                logger.warning(f"core-book reinstatement unreadable this pass: {e}")
+        if self.shadow_mark is not None:
+            try:
+                await self.shadow_mark(context["quotes"], context["now_et"])
+            except Exception as e:
+                logger.warning(f"shadow marking failed this pass: {e}")
         candidates: List[Dict[str, Any]] = []
         for quote in quotes:
             series = await self._series(quote["symbol"])
-            candidates.append(evaluate_quote(quote, series, cfg, progress))
+            if quote["symbol"] in universe:
+                candidates.append(evaluate_quote(quote, series, cfg, progress, context))
             await self._append_sample(quote)
 
         candidates.sort(key=lambda c: (c["qualifies"], c["score"]), reverse=True)
@@ -5573,6 +8910,16 @@ class Scanner:
             used = None
 
         for cand in candidates:
+            if cand.get("shadow_eligible") and self.shadow is not None:
+                quote = next((q for q in quotes if q["symbol"] == cand["ticker"]), None)
+                # Shadows are recorded on the same real-time tape a live entry
+                # would need — a delayed print would bias the paper record.
+                if quote is not None and quote.get("realtime"):
+                    try:
+                        await self.shadow(build_signal(quote, cand, "paper"), cand.get("book") or {})
+                        cand["dispatch"] = "shadow-tracked (retired setup)"
+                    except Exception as e:
+                        logger.warning(f"shadow record failed for {cand['ticker']}: {e}")
             if not cand["qualifies"]:
                 continue
             if cfg["mode"] != "live":
@@ -5633,6 +8980,8 @@ class Scanner:
             "qualifying": sum(1 for c in candidates if c["qualifies"]),
             "emitted": emitted,
             "emits_today": used,
+            "learning_throttle": round(self.throttle, 2),
+            "book_weight": (snapshot or {}).get("book_weight"),
             "errors": errors[:5],
             "candidates": candidates[:12],
         }
@@ -5680,6 +9029,9 @@ class Scanner:
                 elif not self.is_market_open():
                     delay = 300
                 else:
+                    # A book the live record shows losing looks less often
+                    # (stretch = 1 / book weight, ≤ 4×, applied to the NEXT wait).
+                    delay = int(round(delay * max(1.0, min(learning_mod.MAX_THROTTLE, self.throttle))))
                     lock = self.state.lock(SCANNER_LOCK, ttl_ms=max(30_000, delay * 2000))
                     if await lock.try_acquire():
                         try:
@@ -6617,6 +9969,11 @@ try:  # package-style import (python -m bot.main_bot) or flat (uvicorn main_bot:
     from . import scanner as scanner_mod
     from . import study
     from . import econ_calendar
+    from . import edge
+    from . import learning
+    from . import portfolio_risk
+    from . import cost_model
+    from . import core_book
 except ImportError:
     from state_store import (
         StateStore, LockNotAcquired, sanitize_conn_url, unreplaced_placeholders,
@@ -6631,6 +9988,11 @@ except ImportError:
     import scanner as scanner_mod
     import study
     import econ_calendar
+    import edge
+    import learning
+    import portfolio_risk
+    import cost_model
+    import core_book
 
 load_dotenv()
 
@@ -6752,6 +10114,63 @@ SETUP_VETO_WIN_RATE = float(os.getenv("SETUP_VETO_WIN_RATE", "50"))
 # How much ledger history the veto reads. Bounded so the entry path never
 # walks an unbounded file while a signal is waiting.
 SETUP_VETO_LOOKBACK = int(os.getenv("SETUP_VETO_LOOKBACK", "1500"))
+# EDGE DISCIPLINE (edge.py) — thesis, out-of-sample validation and decay.
+# A live entry must name a setup whose written economic thesis is present in
+# the measured features; a thesis family whose out-of-sample record shows NO
+# edge, that measurably loses in the current volatility regime, or whose
+# CUSUM decay monitor has alarmed, is refused. Set EDGE_REQUIRE_THESIS=false
+# to keep the validation/decay refusals but stop refusing on the thesis
+# itself (e.g. while an older app that sends no edge_features is still live).
+EDGE_REQUIRE_THESIS = os.getenv("EDGE_REQUIRE_THESIS", "true").strip().lower() not in {"false", "0", "no"}
+EDGE_LOOKBACK = int(os.getenv("EDGE_LOOKBACK", "3000"))
+# {thesis_id: epoch} — an operator reinstatement restarts that family's
+# decay monitor from this moment (see POST /edge/reinstate).
+EDGE_REINSTATED_KEY = "edge:reinstated"
+# LEARNING LOOP (learning.py) — live closes → expectancy per setup×regime cell
+# → size weight / disablement → probation re-test. Weights only ever SHRINK
+# size; a disabled cell refuses entries until its cooldown re-test. false =
+# report only (the cells are still computed and shown, nothing is enforced).
+LEARNING_ENABLED = os.getenv("LEARNING_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+# PORTFOLIO RISK (portfolio_risk.py) — correlation-weighted exposure across
+# underlyings, regime/gap-scaled sizing with a crisis pause, order-book
+# capacity, and the evidence class ("proven +EV in this regime" vs "merely
+# permitted"). false = report only: every verdict is computed, logged and
+# stamped into the ledger, nothing is shrunk or refused.
+PORTFOLIO_RISK_ENABLED = os.getenv("PORTFOLIO_RISK_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+# true = only PROVEN entries trade; PERMITTED ones are refused outright.
+# Default false: until ~30 live closes nothing can be proven, so this would
+# halt the evidence-gathering that could ever prove anything.
+REQUIRE_PROVEN_EV = os.getenv("REQUIRE_PROVEN_EV", "false").strip().lower() in {"true", "1", "yes"}
+# EXPECTED COST (cost_model.py) — spread + slippage + the adverse move over
+# the fill window, charged against the setup's own stop/target BEFORE it is
+# scored or dispatched, and re-priced on the snapped contract's real quote.
+# false = report only (computed, stamped into the ledger, nothing refused).
+COST_MODEL_ENABLED = os.getenv("COST_MODEL_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+# CORE BOOK (core_book.py) — only three thesis families trade live: VWAP
+# benchmark (reclaim/rejection), opening imbalance (ORB on gap days only) and
+# liquidity provision (mean reversion). Breakouts and momentum are RETIRED and
+# shadow-tracked on paper; a family returns only when its shadow record, net
+# of cost, earns it back (≥ 30 closes, t ≥ 2). false = report only.
+CORE_BOOK_ENABLED = os.getenv("CORE_BOOK_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+# Option entries are re-expressed as an ITM contract (|Δ| ≈ 0.70, 14–30 DTE)
+# before the chain snap. false = trade the contract the sender asked for.
+ITM_EXPRESSION_ENABLED = os.getenv("ITM_EXPRESSION_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+# How much ledger the shadow replay reads. Shadows accumulate slowly (one per
+# ticker×family at a time), so this is generous.
+CORE_LOOKBACK = int(os.getenv("CORE_LOOKBACK", "6000"))
+
+
+def _env_unit_weight(name: str, default: float) -> float:
+    """A size weight from env, clamped to (0, 1] — a weight may only shrink."""
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return min(1.0, max(0.05, value)) if math.isfinite(value) else default
+
+
+# Size of a PERMITTED (not-forbidden, unproven) entry relative to a PROVEN one.
+EV_UNPROVEN_WEIGHT = _env_unit_weight("EV_UNPROVEN_WEIGHT", portfolio_risk.UNPROVEN_WEIGHT)
 # Evidence imported from the app's settled journal (see /setup/evidence). The
 # veto starts with no memory of its own, so without a seed it needs ~20 fresh
 # trades PER SETUP before it can refuse anything — a month of trading during
@@ -7783,6 +11202,394 @@ async def restore_policy() -> None:
     await apply_policy_patch(payload, "app (restored)")
 
 
+async def _edge_reinstated() -> Dict[str, float]:
+    """{thesis_id: epoch} operator reinstatements. Unreadable → {}."""
+    try:
+        raw = await state.get(EDGE_REINSTATED_KEY)
+        parsed = json.loads(raw) if raw else {}
+    except Exception as e:
+        logger.warning(f"edge reinstatement map unreadable: {e}")
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        str(k): float(v) for k, v in parsed.items()
+        if str(k) in edge.THESES and isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+
+
+def _edge_trades() -> List[dict]:
+    """Live closes with thesis, interval and regime — sign-corrected ledger."""
+    return edge.edge_trades(_corrected_ledger(EDGE_LOOKBACK), _ENTRY_ABANDONED_EVENTS)
+
+
+async def _assess_edge_entry(p: dict) -> Dict[str, Any]:
+    try:
+        trades = _edge_trades()
+    except Exception as e:
+        logger.warning(f"edge ledger unreadable (validation/decay skipped, thesis still judged): {e}")
+        trades = []
+    feats = _payload_edge(p)
+    return edge.assess_edge_gate(
+        p.get("setup"), feats["side"], feats, trades, await _edge_reinstated(), EDGE_REQUIRE_THESIS,
+    )
+
+
+def _learning_snapshot() -> Dict[str, Any]:
+    """Every learning cell, replayed from the sign-corrected LIVE ledger (closes
+    plus operator resets). Raises on an unreadable ledger — callers fail open."""
+    records = _corrected_ledger(EDGE_LOOKBACK)
+    trades = edge.edge_trades(records, _ENTRY_ABANDONED_EVENTS)
+    return learning.learning_state(trades, learning.resets_from_ledger(records), _utcnow().timestamp())
+
+
+def _assess_learning_entry(p: dict) -> Dict[str, Any]:
+    """Learning-loop verdict for an entry: allowed? at what size weight? Keyed
+    on the setup and the volatility regime measured at entry. With
+    LEARNING_ENABLED=false the verdict is computed and reported, never applied."""
+    feats = _payload_edge(p)
+    verdict = learning.entry_verdict(_learning_snapshot(), p.get("setup"), feats.get("vol_regime"))
+    verdict["enforced"] = LEARNING_ENABLED
+    if not LEARNING_ENABLED:
+        verdict["would_refuse"] = not verdict["allowed"]
+        verdict["allowed"], verdict["weight"] = True, 1.0
+    return verdict
+
+
+async def _announce_learning_transitions(ticker: str) -> None:
+    """After a close: tell the operator when it moved a learning cell (disabled,
+    passed or failed a re-test). Observability only — never raises."""
+    try:
+        snapshot = _learning_snapshot()
+        closed_at = _utcnow().timestamp() - 5.0
+        for key, cell in snapshot["cells"].items():
+            last = (cell.get("history") or [None])[-1]
+            if not last or float(last["ts"]) < closed_at or last["to"] == learning.PROBATION:
+                continue
+            level = "critical" if last["to"] == learning.DISABLED else "info"
+            await alerts.send(
+                level, "learning_transition",
+                f"🧠 {ticker} close moved learning cell '{key}' → {last['to'].upper()}: {last['why']}"
+                + (f" — re-test opens {learning._iso(last.get('until'))}" if last.get("until") else ""),
+                dedupe_key=f"learning:{key}:{last['to']}",
+            )
+    except Exception as e:
+        logger.debug(f"learning transition check skipped: {e}")
+
+
+def _apply_learning_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]]) -> int:
+    """Shrink an ENTRY's size by the learning weight; stamp what happened on
+    `ctx` (it rides into the position_opened record). Never below one unit —
+    `floor_bound` records when the cut could not bite."""
+    if not ctx or not LEARNING_ENABLED:
+        return qty
+    sized, floor_bound = learning.apply_weight(qty, float(ctx.get("weight") or 1.0))
+    ctx.update({"requested_qty": int(qty), "sized_qty": int(sized), "floor_bound": floor_bound})
+    if sized != qty or floor_bound:
+        logger.warning(
+            f"🧠 LEARNING {symbol}: size {qty} → {sized} (weight {ctx.get('weight')}) "
+            f"{'— one-unit floor, cut did not fully bite ' if floor_bound else ''}"
+            f"— {'; '.join(ctx.get('notes') or [])}"
+        )
+    return sized
+
+
+async def _assess_portfolio_risk(
+    p: dict,
+    edge_verdict: Optional[Dict[str, Any]] = None,
+    learning_snapshot: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Book-, regime- and evidence-level verdict for ONE entry (capacity is
+    judged later, at the real quote). Returns allowed/reasons/weight plus every
+    sub-verdict. Each input that cannot be read degrades honestly:
+      * no positions/account → correlation not judged (noted, not refused),
+      * no ledger → evidence class PERMITTED (unknown evidence is not proof),
+      * no regime reading → sized as not-known-to-be-calm.
+    With PORTFOLIO_RISK_ENABLED=false the verdict is computed and reported,
+    never applied."""
+    feats = _payload_edge(p)
+    regime = feats.get("vol_regime")
+    ctx = portfolio_risk.sanitize_risk_context(p.get("risk_context"))
+    notes: List[str] = []
+    reasons: List[str] = []
+
+    sizing = portfolio_risk.assess_regime_sizing(ctx, regime)
+    reasons.extend(sizing["reasons"])
+    notes.extend(sizing["notes"])
+
+    corr: Optional[Dict[str, Any]] = None
+    try:
+        positions = await state.all_positions()
+        account_ref = await _risk_account_reference()
+        risk_pct = live_policy("risk_per_trade_pct")
+        nominal = account_ref * (risk_pct / 100.0)
+        new_risk = max(nominal, estimate_entry_risk_usd(p) or 0.0)
+        corr = portfolio_risk.assess_correlation(
+            p.get("ticker"), portfolio_risk.payload_direction(p), new_risk,
+            portfolio_risk.book_rows(positions, position_risk_usd), account_ref,
+            risk_pct, PORTFOLIO_HEAT_PCT, sizing["regime"] or regime,
+        )
+        reasons.extend(corr["reasons"])
+    except Exception as e:
+        notes.append(f"correlation not judged ({str(e)[:60]})")
+        logger.warning(f"portfolio correlation unavailable (non-fatal): {e}")
+
+    try:
+        if edge_verdict is None:
+            edge_verdict = await _assess_edge_entry(p)
+        thesis_id = ((edge_verdict or {}).get("thesis") or {}).get("thesis")
+        validation = (edge_verdict or {}).get("validation")
+        if learning_snapshot is None:
+            learning_snapshot = _learning_snapshot()
+        cell = (learning_snapshot.get("cells") or {}).get(learning.cell_key(p.get("setup"), regime))
+        ev = portfolio_risk.classify_ev(thesis_id, validation, sizing["regime"] or regime, cell)
+    except Exception as e:
+        ev = {"ev_class": portfolio_risk.PERMITTED,
+              "gaps": [f"evidence unreadable ({str(e)[:60]}) — not proven"], "evidence": []}
+    ev_weight = 1.0 if ev["ev_class"] == portfolio_risk.PROVEN else EV_UNPROVEN_WEIGHT
+    if ev["ev_class"] != portfolio_risk.PROVEN:
+        if REQUIRE_PROVEN_EV:
+            reasons.append("not proven +EV in this regime (REQUIRE_PROVEN_EV) · " + " · ".join(ev["gaps"][:2]))
+        elif ev_weight < 1.0:
+            notes.append(f"permitted, not proven → ×{ev_weight:g} ({ev['gaps'][0] if ev['gaps'] else 'unproven'})")
+
+    weight = 0.0 if reasons else round(sizing["weight"] * ev_weight, 3)
+    out: Dict[str, Any] = {
+        "allowed": not reasons, "reasons": reasons, "weight": weight, "notes": notes,
+        "enforced": PORTFOLIO_RISK_ENABLED, "ev": ev, "ev_weight": ev_weight,
+        "regime": sizing, "correlation": corr, "context": ctx,
+    }
+    if not PORTFOLIO_RISK_ENABLED:
+        out["would_refuse"] = not out["allowed"]
+        out["allowed"], out["weight"] = True, 1.0
+    return out
+
+
+def _apply_risk_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]]) -> int:
+    """Shrink an ENTRY by the regime × evidence weight (after the learning
+    weight). Same one-unit floor and `floor_bound` honesty as learning."""
+    if not ctx or not PORTFOLIO_RISK_ENABLED:
+        return qty
+    sized, floor_bound = learning.apply_weight(qty, float(ctx.get("weight") or 1.0))
+    ctx.update({"requested_qty": int(qty), "sized_qty": int(sized), "floor_bound": floor_bound})
+    if sized != qty or floor_bound:
+        logger.warning(
+            f"🧩 RISK {symbol}: size {qty} → {sized} (weight {ctx.get('weight')}) "
+            f"{'— one-unit floor, cut did not fully bite ' if floor_bound else ''}"
+            f"— {'; '.join(ctx.get('notes') or [])}"
+        )
+    return sized
+
+
+def _apply_capacity(symbol: str, qty: int, instrument: str, liquidity: Optional[Dict[str, Any]],
+                    ctx: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Cap an ENTRY to what the displayed book and the day's flow can absorb.
+    Stamps the verdict on `ctx["capacity"]`. Report-only when disabled."""
+    verdict = portfolio_risk.assess_capacity(qty, instrument, liquidity)
+    if ctx is not None:
+        ctx["capacity"] = {k: verdict[k] for k in ("allowed", "qty", "requested_qty", "caps", "consumption", "reason")}
+    if not PORTFOLIO_RISK_ENABLED:
+        verdict = {**verdict, "allowed": True, "qty": qty}
+    if verdict["reason"]:
+        logger.warning(f"📊 CAPACITY {symbol}: {verdict['reason']}")
+    return verdict
+
+
+def _signal_age_sec(p: dict) -> Optional[float]:
+    """Seconds since the payload's own timestamp (the price its entry was
+    read at). None when absent/unparseable or more than a minute in the
+    future (a skewed sender clock is not a measurement)."""
+    raw = (p or {}).get("timestamp")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    age = (_utcnow() - ts).total_seconds()
+    if age < -60:
+        return None
+    return max(0.0, age)
+
+
+def _payload_days_to_expiry(p: dict) -> Optional[float]:
+    hint = cost_model._pos((p or {}).get("days_to_expiry_hint"))
+    if hint is not None:
+        return hint
+    raw = (p or {}).get("expiration_hint") or (p or {}).get("expiry")
+    if isinstance(raw, str) and raw:
+        try:
+            exp = datetime.fromisoformat(raw[:10]).date()
+        except ValueError:
+            return None
+        return float(max(1, (exp - _utcnow().astimezone(_ET_ZONE).date()).days))
+    return None
+
+
+def _assess_expected_cost(p: dict, option_quote: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Expected round-trip cost of a payload (cost_model.expected_cost) and
+    its gate verdict.
+
+    σ: the sender's measured `cost_context` (scanner realized σ, app implied
+    vol or ATR), else the declared prior. Window: the payload's measured age
+    plus the order's working time. Option spread/premium/delta: the snapped
+    contract's REAL quote when `option_quote` is given, else the payload's
+    chain snapshot, else priors.
+
+    With COST_MODEL_ENABLED=false the verdict is computed and reported with
+    `would_refuse`, nothing is refused."""
+    ctx = (p or {}).get("cost_context") if isinstance((p or {}).get("cost_context"), dict) else {}
+    sigma = cost_model._pos(ctx.get("sigma_sec"))
+    basis = str(ctx.get("sigma_basis") or "")
+    if sigma is None or basis not in cost_model.SIGMA_BASES:
+        sigma, basis = cost_model.resolve_sigma(
+            vol_annual=ctx.get("vol_annual"), atr_pct=ctx.get("atr_pct"),
+        )
+    instrument = "option" if str((p or {}).get("instrument") or "").lower() == "option" else "stock"
+    q = option_quote or {}
+    # Before the snap, an option entry that WILL be re-expressed is costed as
+    # the ITM contract it becomes — the sender's chain snapshot, premium and
+    # delta describe a different contract and are not this trade's inputs.
+    pending_itm = (instrument == "option" and not q and ITM_EXPRESSION_ENABLED
+                   and not isinstance((p or {}).get("_expression"), dict))
+    cost = cost_model.expected_cost(
+        instrument=instrument,
+        entry=p.get("entry"), stop=p.get("stop") or p.get("stop_price"), target=p.get("target"),
+        bid=p.get("underlying_bid"), ask=p.get("underlying_ask"),
+        option_bid=None if pending_itm else (q.get("bid") if q else p.get("option_bid")),
+        option_ask=None if pending_itm else (q.get("ask") if q else p.get("option_ask")),
+        option_premium=None if (q or pending_itm) else p.get("option_limit_price"),
+        delta=(core_book.EXPRESSION_DELTA if pending_itm
+               else (q.get("delta") if q.get("delta") is not None else p.get("option_delta"))),
+        days_to_expiry=float(core_book.TARGET_DTE) if pending_itm else _payload_days_to_expiry(p),
+        sigma_sec=sigma, sigma_basis=basis,
+        signal_age_sec=_signal_age_sec(p),
+    )
+    verdict = cost_model.assess_cost(cost)
+    verdict["cost"] = cost
+    verdict["enforced"] = COST_MODEL_ENABLED
+    if not COST_MODEL_ENABLED and not verdict["allowed"]:
+        verdict["would_refuse"] = True
+        verdict["allowed"] = True
+    return verdict
+
+
+# ==================== CORE BOOK ====================
+def _core_events() -> List[dict]:
+    """The ledger slice the shadow record replays (raw: shadows carry no P&L
+    the sign corrections touch)."""
+    return trade_ledger.recent(CORE_LOOKBACK)
+
+
+def _core_reinstated() -> set:
+    """Families the shadow record has earned back. Unreadable → none:
+    retirement is the declared default, not a reading that can fail open."""
+    try:
+        return core_book.reinstated_keys(_core_events())
+    except Exception as e:
+        logger.warning(f"core book: shadow record unreadable ({e}) — nothing reinstated")
+        return set()
+
+
+async def _measured_gap_pct(ticker: Any) -> Optional[float]:
+    """The name's opening gap from E*TRADE's own quote (open vs previous
+    close), or None when it cannot be read — never a guessed zero."""
+    sym = str(ticker or "").upper().strip()
+    if not sym:
+        return None
+    try:
+        quotes = scanner_mod.parse_quotes(await _scanner_fetch_quotes([sym]))
+    except Exception as e:
+        logger.warning(f"core book: gap read failed for {sym}: {e}")
+        return None
+    for q in quotes:
+        if str(q.get("symbol") or "").upper() == sym:
+            return portfolio_risk.gap_pct(q.get("open"), q.get("previous_close"))
+    return None
+
+
+async def _assess_core_book(p: dict) -> Dict[str, Any]:
+    """core_book.classify on a payload. An ORB that arrives without a gap
+    reading (the app measures none) has it read from the broker's quote; an
+    unreadable gap stays unmeasured and the ORB is not a gap-day trade.
+    CORE_BOOK_ENABLED=false reports the verdict with `would_refuse`."""
+    gap = core_book.gap_of(p or {})
+    if gap is None and core_book.thesis_of((p or {}).get("setup")) == "opening_imbalance":
+        gap = await _measured_gap_pct((p or {}).get("ticker"))
+        if gap is not None:
+            rc = dict(p.get("risk_context") or {}) if isinstance(p.get("risk_context"), dict) else {}
+            rc["gap_pct"] = gap
+            p["risk_context"] = rc
+    verdict = core_book.classify(
+        (p or {}).get("setup"), core_book.side_of(p or {}), gap, _core_reinstated(),
+    )
+    verdict["enforced"] = CORE_BOOK_ENABLED
+    if not CORE_BOOK_ENABLED and not verdict["allowed"]:
+        verdict["would_refuse"] = True
+        verdict["allowed"] = True
+    return verdict
+
+
+async def _record_shadow(p: dict, verdict: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Append one paper shadow entry for a retired setup that would otherwise
+    have traded. One open shadow per ticker × family (a scanner pass every
+    minute must not stack the same idea 60 times). Never raises."""
+    try:
+        key = verdict.get("shadow_key")
+        if not key:
+            return None
+        if core_book.has_open_shadow(_core_events(), (p or {}).get("ticker"), key):
+            return None
+        try:
+            cost = _assess_expected_cost(p)["cost"]
+        except Exception as e:
+            logger.warning(f"shadow cost unavailable ({e}) — recorded without a net R")
+            cost = None
+        rec = core_book.shadow_entry(p, verdict, cost, _utcnow().isoformat())
+        if rec is None:
+            return None
+        await trade_ledger.record(core_book.SHADOW_ENTRY_EVENT, rec)
+        logger.info(f"👻 Shadow entry {rec['ticker']} {rec['setup']} ({rec['shadow_key']}) — paper only")
+        return rec
+    except Exception as e:
+        logger.warning(f"shadow record failed: {e}")
+        return None
+
+
+async def _scanner_shadow(payload: Dict[str, Any], book: Dict[str, Any]) -> None:
+    verdict = {**(book or {}), "setup": edge.normalize_setup((payload or {}).get("setup"))}
+    await _record_shadow(payload, verdict)
+
+
+async def _scanner_shadow_mark(quotes: Dict[str, Dict[str, Any]], now_et: datetime) -> int:
+    """Mark every open shadow on this pass's quotes; returns closes booked."""
+    closed = 0
+    for shadow in core_book.open_shadows(_core_events()):
+        quote = (quotes or {}).get(str(shadow.get("ticker") or "")) or {}
+        close = core_book.mark_shadow(shadow, quote.get("last"), now_et)
+        if close is not None:
+            await trade_ledger.record(core_book.SHADOW_CLOSED_EVENT, close)
+            closed += 1
+    return closed
+
+
+async def _scanner_shadow_symbols() -> List[str]:
+    return sorted({str(s.get("ticker")) for s in core_book.open_shadows(_core_events()) if s.get("ticker")})
+
+
+def _payload_vol_annual(p: dict) -> Optional[float]:
+    """Annualized σ from the sender's cost_context (None = unmeasured)."""
+    ctx = (p or {}).get("cost_context") if isinstance((p or {}).get("cost_context"), dict) else {}
+    sigma = cost_model._pos(ctx.get("sigma_sec"))
+    if sigma is None:
+        sigma, basis = cost_model.resolve_sigma(vol_annual=ctx.get("vol_annual"), atr_pct=ctx.get("atr_pct"))
+        if basis == "prior":
+            return None
+    return sigma * math.sqrt(cost_model.TRADING_DAYS * cost_model.SESSION_SECONDS) if sigma else None
+
+
 async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     """Server-side re-filter mirroring the Rork app's gating, evaluated against
     the reconciled Redis state (single source of truth). Quality checks apply
@@ -7844,6 +11651,71 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
                 logger.warning(f"📕 SETUP VETO — {verdict['reason']}")
         except Exception as e:
             logger.warning(f"setup expectancy veto unavailable (non-fatal, entry not blocked): {e}")
+        # EDGE DISCIPLINE — thesis present in the measured features, family not
+        # condemned out-of-sample, not losing in this volatility regime, not
+        # retired by the decay monitor. The ledger read fails OPEN (an
+        # unreadable history is not evidence); the thesis itself is judged on
+        # the payload alone and fails CLOSED — a missing reason to trade is a
+        # reason not to.
+        edge_verdict: Optional[Dict[str, Any]] = None
+        try:
+            edge_verdict = await _assess_edge_entry(p)
+            if not edge_verdict["allowed"]:
+                blocked.extend(edge_verdict["reasons"])
+                logger.warning(f"🧭 EDGE — {'; '.join(edge_verdict['reasons'])}")
+        except Exception as e:
+            blocked.append(f"edge gate unavailable ({str(e)[:80]}) — thesis could not be checked")
+            logger.error(f"edge gate error (entry refused): {e}")
+        # CORE BOOK — only the core thesis families trade live; a retired one
+        # is refused here and (by the dispatch path) shadow-tracked on paper.
+        # Judged on the payload alone, so it fails CLOSED like the thesis.
+        try:
+            core_verdict = await _assess_core_book(p)
+            p["_core_book"] = {k: core_verdict.get(k) for k in
+                               ("book", "setup", "thesis_id", "shadow_key", "allowed", "reason")}
+            if not core_verdict["allowed"]:
+                blocked.append(core_verdict["reason"])
+                logger.warning(f"📚 CORE BOOK — {core_verdict['reason']}")
+            elif core_verdict.get("would_refuse"):
+                logger.warning(f"📚 CORE BOOK (report only) would refuse: {core_verdict['reason']}")
+        except Exception as e:
+            blocked.append(f"{core_book.REFUSAL_PREFIX} unavailable ({str(e)[:80]})")
+            logger.error(f"core book error (entry refused): {e}")
+        # LEARNING LOOP — a setup×regime cell the live record has disabled is
+        # refused until its cooldown re-test. Fails OPEN: an unreadable ledger
+        # is not evidence that a cell is bad.
+        try:
+            learned = _assess_learning_entry(p)
+            if not learned["allowed"]:
+                blocked.extend(learned["reasons"])
+                logger.warning(f"🧠 LEARNING — {'; '.join(learned['reasons'])}")
+        except Exception as e:
+            logger.warning(f"learning loop unavailable (non-fatal, entry not blocked): {e}")
+        # PORTFOLIO RISK — correlated exposure across underlyings, the crisis /
+        # gap pause, and (with REQUIRE_PROVEN_EV) the evidence class. Sizing
+        # weights and order-book capacity are applied at placement.
+        try:
+            book_risk = await _assess_portfolio_risk(p, edge_verdict=edge_verdict)
+            if not book_risk["allowed"]:
+                blocked.extend(book_risk["reasons"])
+                logger.warning(f"🧩 PORTFOLIO RISK — {'; '.join(book_risk['reasons'])}")
+            elif book_risk.get("would_refuse"):
+                logger.warning(f"🧩 PORTFOLIO RISK (report only) would refuse: {book_risk['reasons']}")
+        except Exception as e:
+            logger.warning(f"portfolio risk unavailable (non-fatal, entry not blocked): {e}")
+        # EXPECTED COST — the round trip (spread, slippage, adverse move over
+        # the fill window) charged against THIS setup's stop/target. Pure
+        # arithmetic on the payload; unmeasured inputs fall back to declared
+        # conservative priors, never to a free fill.
+        try:
+            cost_verdict = _assess_expected_cost(p)
+            if not cost_verdict["allowed"]:
+                blocked.extend(cost_verdict["reasons"])
+                logger.warning(f"💸 EXPECTED COST — {'; '.join(cost_verdict['reasons'])}")
+            elif cost_verdict.get("would_refuse"):
+                logger.warning(f"💸 EXPECTED COST (report only) would refuse: {cost_verdict['reasons']}")
+        except Exception as e:
+            logger.warning(f"expected-cost model unavailable (non-fatal, entry not blocked): {e}")
         # EVENT WINDOW — the same window the risk desk flattens the book in.
         # Opening a position the desk is about to close pays two spreads for
         # nothing and rides the release in between.
@@ -15492,7 +19364,8 @@ async def _alert_entry_fill(ticker: str, guard: dict, filled: int) -> None:
 # ==================== POSITION LEDGER (Redis-backed) ====================
 async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Optional[float],
                        target: Optional[float], contract: Optional[dict],
-                       action: str = "BUY", setup: Optional[str] = None) -> None:
+                       action: str = "BUY", setup: Optional[str] = None,
+                       edge_ctx: Optional[dict] = None) -> None:
     # The setup label rides on the position and into the ledger so the trade
     # can be attributed when it settles. Without it the bot writes a history it
     # can never learn from: every close lands in an anonymous pile and the
@@ -15507,6 +19380,9 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         "ts": _utcnow().isoformat(),
         "contract": contract,
         "setup": setup_label,
+        # The measured context at entry (edge.py) — rides to the close so the
+        # outcome can be validated per volatility regime and thesis.
+        "edge": edge_ctx or None,
     })
     await state.incr_trades_today()
     await trade_ledger.record("position_opened", {
@@ -15516,7 +19392,55 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         "target": float(target) if target else None,
         "contract": contract,
         "setup": setup_label,
+        "edge": edge_ctx or None,
     })
+
+
+def _payload_edge(payload: dict) -> Dict[str, Any]:
+    """The entry's edge context: sanitized payload features, the thesis side
+    from the SIGNAL direction (a bearish put is the short side of its thesis),
+    the payload's own RVOL when the features omit it, and the session clock
+    read HERE — the bot's clock is authoritative, not the sender's."""
+    feats = edge.sanitize_features((payload or {}).get("edge_features"))
+    if feats.get("rvol") is None:
+        feats["rvol"] = edge._num((payload or {}).get("rvol"))
+    feats["session_minutes"] = edge.session_minutes(_utcnow().astimezone(_ET_ZONE))
+    feats["side"] = edge.side_of((payload or {}).get("action"))
+    tid, _ = edge.thesis_for((payload or {}).get("setup"))
+    feats["thesis"] = tid
+    # The learning loop's sizing decision, when execute_live_order made one —
+    # so the study can see which trades were taken small and why.
+    learned = (payload or {}).get("_learning")
+    if isinstance(learned, dict):
+        feats["learning"] = {
+            k: learned.get(k) for k in
+            ("weight", "cells", "notes", "requested_qty", "sized_qty", "floor_bound")
+        }
+    # The portfolio-risk verdict: evidence class (so live outcomes can be split
+    # proven vs permitted), regime/gap weight, correlated exposure, capacity.
+    risk = (payload or {}).get("_risk")
+    if isinstance(risk, dict):
+        ev = risk.get("ev") or {}
+        corr = risk.get("correlation") or {}
+        feats["risk"] = {
+            "ev_class": ev.get("ev_class"),
+            "ev_gaps": (ev.get("gaps") or [])[:3],
+            "weight": risk.get("weight"),
+            "regime_weight": (risk.get("regime") or {}).get("weight"),
+            "ev_weight": risk.get("ev_weight"),
+            "notes": risk.get("notes"),
+            "cluster": corr.get("cluster"),
+            "correlated_pct": corr.get("correlated_pct"),
+            "capacity": risk.get("capacity"),
+            "requested_qty": risk.get("requested_qty"),
+            "sized_qty": risk.get("sized_qty"),
+            "floor_bound": risk.get("floor_bound"),
+        }
+    # The expected round trip the entry was judged on (cost_model.summary).
+    cost = (payload or {}).get("_cost")
+    if isinstance(cost, dict):
+        feats["cost"] = cost_model.summary(cost.get("cost"))
+    return feats
 
 
 def _order_verb_side(verb: Any, closing: bool) -> Optional[float]:
@@ -15776,6 +19700,10 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         # the close arrives from a path that never saw the original signal
         # (reconciler capture, protective stop fill, emergency flatten).
         "setup": (str((pos or {}).get("setup") or "").strip() or None),
+        # Entry context + holding interval for out-of-sample validation and
+        # regime segmentation (edge.py). Missing stays missing.
+        "edge": (pos or {}).get("edge") if isinstance((pos or {}).get("edge"), dict) else None,
+        "opened_at": (pos or {}).get("ts") or None,
         # WATER MARK — the best this position ever showed before the exit, as
         # observed by the trail poller. This is what separates "the exit gave
         # back a real move" from "the signal never worked": without it a losing
@@ -15795,6 +19723,7 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         # against an underlying R (the −564.85R class of bug).
         "peak_basis": "premium" if is_option else "underlying",
     })
+    await _announce_learning_transitions(ticker)
     # SELL ALERT — every close path in the bot funnels through `_record_close`
     # (protective stop fill, signalled close, trailing exit, emergency flatten,
     # panic exit, reconciler capture), so wiring the alert here means no real
@@ -16942,8 +20871,13 @@ async def _priced_option_risk_gate(symbol: str, premium: Any, qty: Any,
 
 
 # ==================== CONTRACT SNAP ====================
-def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_put: str):
+def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_put: str,
+                          liquidity_out: Optional[Dict[str, Any]] = None):
     """Snap a requested option expiry/strike to REAL listed contract values.
+
+    `liquidity_out`, when given, is filled with the snapped leg's displayed
+    bid/ask sizes, the day's volume and open interest (None when the chain
+    did not report them) — the capacity check's inputs.
 
     Returns (expiry, strike, bid, ask). bid/ask are the REAL quote of the
     snapped contract straight from E*TRADE's chain (0.0 when unavailable) —
@@ -17030,6 +20964,23 @@ def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_
                     f"— snapping to {nearest}"
                 )
             snapped_strike = nearest
+            if liquidity_out is not None:
+                for out_key, leg_key in (("bid_size", "bidSize"), ("ask_size", "askSize"),
+                                         ("volume", "volume"), ("open_interest", "openInterest")):
+                    try:
+                        raw = best_leg.get(leg_key)
+                        liquidity_out[out_key] = float(raw) if raw is not None else None
+                    except (TypeError, ValueError):
+                        liquidity_out[out_key] = None
+                # The chain's own delta for the snapped leg (E*TRADE OptionGreeks),
+                # None when not reported — never a modelled stand-in here.
+                try:
+                    greeks = best_leg.get("OptionGreeks") or {}
+                    raw_delta = greeks.get("delta") if isinstance(greeks, dict) else None
+                    d = float(raw_delta) if raw_delta is not None else None
+                    liquidity_out["delta"] = d if d is not None and math.isfinite(d) and 0 < abs(d) <= 1 else None
+                except (TypeError, ValueError):
+                    liquidity_out["delta"] = None
             try:
                 real_bid = max(0.0, float(best_leg.get("bid") or 0))
                 real_ask = max(0.0, float(best_leg.get("ask") or 0))
@@ -17099,6 +21050,43 @@ async def execute_live_order(payload: dict):
         if not _is_market_open() and not bool(payload.get("force_execute")):
             raise Exception("market closed — entry refused (exchange-aware calendar)")
 
+    # LEARNING LOOP SIZING — entries only, never a probe. Re-judged here (a
+    # queued job may run after a close moved a cell). A disabled cell refuses;
+    # otherwise the weight shrinks the size below. Ledger failure → full size.
+    learning_ctx: Optional[Dict[str, Any]] = None
+    if not is_close and not _is_connectivity_test(payload):
+        try:
+            learning_ctx = _assess_learning_entry(payload)
+        except Exception as e:
+            logger.warning(f"learning sizing unavailable for {ticker} (full size): {e}")
+        if learning_ctx is not None:
+            if not learning_ctx["allowed"]:
+                raise Exception("; ".join(learning_ctx["reasons"]) or "learning loop: cell disabled")
+            payload["_learning"] = learning_ctx
+
+    # PORTFOLIO RISK — re-judged here for the same reason: the book a queued
+    # job lands in is not the book it was filtered against. Correlation and
+    # the crisis/gap pause refuse; regime × evidence shrink the size below;
+    # capacity is capped at the real quote. Unreadable inputs degrade per
+    # _assess_portfolio_risk — never a silent full-size pass on a refusal.
+    risk_ctx: Optional[Dict[str, Any]] = None
+    if not is_close and not _is_connectivity_test(payload):
+        try:
+            risk_ctx = await _assess_portfolio_risk(payload)
+        except Exception as e:
+            logger.warning(f"portfolio risk unavailable for {ticker} (unweighted): {e}")
+        if risk_ctx is not None:
+            if not risk_ctx["allowed"]:
+                raise Exception("; ".join(risk_ctx["reasons"]) or "portfolio risk: entry refused")
+            payload["_risk"] = risk_ctx
+        # The expected cost as filtered — stamped so the ledger can later set
+        # the cost the model PREDICTED against the fill that happened. An
+        # option entry re-prices it on the snapped contract below.
+        try:
+            payload["_cost"] = _assess_expected_cost(payload)
+        except Exception as e:
+            logger.warning(f"expected-cost model unavailable for {ticker}: {e}")
+
     tokens = load_tokens()
     if not tokens:
         logger.error("❌ No E*TRADE tokens available")
@@ -17148,6 +21136,51 @@ async def execute_live_order(payload: dict):
             # every live ENTRY raise UnboundLocalError at the priced-risk gate
             # before an order could ever be placed.
             sym_u = str(symbol).upper()
+            if not is_exit:
+                quantity = _apply_learning_weight(sym_u, quantity, learning_ctx)
+                quantity = _apply_risk_weight(sym_u, quantity, risk_ctx)
+            # The snapped contract's own book: displayed sizes, volume, OI.
+            contract_liquidity: Dict[str, Any] = {}
+
+            # EXPRESSION (core_book) — an option ENTRY is re-planned as the ITM
+            # contract (|Δ| ≈ 0.70, 14–30 DTE) before the chain snap. The
+            # sender's strike/expiry only said "options, this direction".
+            # HELD-CONTRACT TRUTH — a close sells what the account HOLDS. The
+            # sender's strike/expiry is the contract it PLANNED; once the bot
+            # re-expresses (or merely snaps) an entry, those differ, and a
+            # SELL_CLOSE on the planned contract is a close of nothing.
+            if is_exit:
+                try:
+                    held = (await state.get_position(sym_u) or {}).get("contract") or {}
+                except Exception as e:
+                    held = {}
+                    logger.warning(f"[CLOSE] {sym_u} tracked contract unreadable ({e}) — using the payload's")
+                if isinstance(held, dict) and held.get("strike") and held.get("expiration"):
+                    if (str(held.get("expiration"))[:10] != str(expiry or "")[:10]
+                            or abs(float(held["strike"]) - float(strike or 0)) > 1e-9):
+                        logger.warning(
+                            f"[CLOSE] {sym_u} closing the HELD {held.get('right')} {held['strike']} "
+                            f"{held['expiration']} — payload named {strike} {expiry}"
+                        )
+                    strike, expiry = float(held["strike"]), str(held["expiration"])[:10]
+                    if held.get("right") in ("CALL", "PUT"):
+                        call_put = held["right"]
+
+            expression: Optional[Dict[str, Any]] = None
+            expression_vol: Optional[float] = None
+            if not is_exit and ITM_EXPRESSION_ENABLED and not _is_connectivity_test(payload):
+                expression_vol = _payload_vol_annual(payload)
+                expression = core_book.plan_expression(
+                    payload.get("entry"), "long" if call_put == "CALL" else "short",
+                    expression_vol, _utcnow().astimezone(_ET_ZONE).date(),
+                )
+                if expression is not None:
+                    logger.info(
+                        f"🎯 {symbol} re-expressed {call_put} {strike} {expiry} → "
+                        f"{expression['strike']} {expression['expiry']} (|Δ| {core_book.EXPRESSION_DELTA:.2f}, "
+                        f"σ {expression['vol_basis']})"
+                    )
+                    strike, expiry = expression["strike"], expression["expiry"]
 
             if not strike or not expiry:
                 raise Exception(f"Missing strike or expiration for option order. Got strike={strike}, expiry={expiry}")
@@ -17161,8 +21194,81 @@ async def execute_live_order(payload: dict):
                 dev=is_sandbox,
             )
             expiry, strike, real_bid, real_ask = await asyncio.to_thread(
-                _snap_option_contract, market, symbol, expiry, float(strike), call_put
+                _snap_option_contract, market, symbol, expiry, float(strike), call_put, contract_liquidity
             )
+
+            if expression is not None:
+                today_et = _utcnow().astimezone(_ET_ZONE).date()
+                chain_delta = contract_liquidity.get("delta")
+                try:
+                    dte_now = max(1, (datetime.strptime(str(expiry)[:10], "%Y-%m-%d").date() - today_et).days)
+                except ValueError:
+                    dte_now = core_book.TARGET_DTE
+                model_delta = core_book.bs_delta(
+                    payload.get("entry"), strike, expression_vol or core_book.VOL_PRIOR_ANNUAL, dte_now, call_put,
+                )
+                new_delta = chain_delta if chain_delta is not None else model_delta
+                check = core_book.check_expression(expiry, today_et, new_delta)
+                if not check["ok"]:
+                    await trade_ledger.record("entry_expression_refused", {
+                        "ticker": sym_u, "expiry": expiry, "strike": strike,
+                        "delta": new_delta, "dte": check["dte"], "reason": check["reason"],
+                    })
+                    await alerts.send(
+                        "warning", "entry_expression_refused",
+                        f"{symbol}: no live ticket — {check['reason']}.",
+                        dedupe_key=f"expression_refused:{symbol}",
+                    )
+                    return {"status": "refused", "reason": check["reason"],
+                            "code": "expression", "paper": True}
+                planned_qty = quantity
+                quantity = core_book.rescale_contracts(quantity, payload.get("option_delta"), new_delta)
+                # The sender's premium, premium stop and delta described the
+                # contract it planned, not this one. The bot prices the entry
+                # off the REAL quote and the stop from the underlying geometry
+                # (filled-shape gate) — so the stale levels are retired, kept
+                # only for the audit trail.
+                payload["_expression"] = {
+                    "planned": {"strike": payload.get("strike_hint") or payload.get("strike"),
+                                "expiry": _resolve_expiry_string(payload),
+                                "delta": payload.get("option_delta"),
+                                "limit": payload.get("option_limit_price"),
+                                "stop": payload.get("option_stop_price"),
+                                "contracts": planned_qty},
+                    "strike": strike, "expiry": expiry, "dte": check["dte"],
+                    "delta": new_delta, "delta_basis": "chain" if chain_delta is not None else "model",
+                    "vol_basis": expression["vol_basis"], "contracts": quantity,
+                }
+                payload["strike_hint"] = strike
+                payload["expiration_hint"] = expiry
+                payload["option_delta"] = new_delta
+                payload["option_limit_price"] = None
+                payload["option_stop_price"] = None
+                payload.pop("limit_price", None)
+                logger.info(
+                    f"🎯 {symbol} expression {strike} {expiry} ({check['dte']} DTE) Δ {new_delta} "
+                    f"({payload['_expression']['delta_basis']}) — {planned_qty} → {quantity} contract(s)"
+                )
+
+            # EXPECTED COST on the REAL contract. The entry filter priced the
+            # spread from the app's chain snapshot (or a prior, for scanner
+            # puts); this is the quote the order will actually cross. A policy
+            # verdict — returned, never raised (no circuit-breaker feed).
+            if not is_exit and real_bid > 0 and real_ask > real_bid and not _is_connectivity_test(payload):
+                cost_verdict = _assess_expected_cost(payload, {"bid": real_bid, "ask": real_ask})
+                payload["_cost"] = cost_verdict
+                if not cost_verdict["allowed"]:
+                    reason = "; ".join(cost_verdict["reasons"])
+                    await trade_ledger.record("entry_cost_refused", {
+                        "ticker": sym_u, "bid": real_bid, "ask": real_ask,
+                        "cost": cost_model.summary(cost_verdict["cost"]),
+                    })
+                    await alerts.send(
+                        "warning", "entry_cost_refused",
+                        f"{symbol}: no live ticket — {reason}.",
+                        dedupe_key=f"cost_refused:{symbol}",
+                    )
+                    return {"status": "refused", "reason": reason, "code": "expected_cost", "paper": True}
 
             # A LIMIT with a real premium is the most reliable for options; fall
             # back to MARKET only if no premium was supplied. NOTE: the app's
@@ -17490,6 +21596,31 @@ async def execute_live_order(payload: dict):
                     quantity = int(risk_check["qty"])
                     common["quantity"] = quantity
 
+                # CAPACITY — the last size decision, on the snapped contract's
+                # REAL book: never lift more of the offer, or more of the day's
+                # flow, than the contract can absorb. A refusal is a policy
+                # verdict (returned, never raised — no circuit-breaker feed).
+                capacity = _apply_capacity(sym_u, quantity, "option", contract_liquidity, risk_ctx)
+                if not capacity["allowed"]:
+                    await trade_ledger.record("entry_capacity_refused", {
+                        "ticker": sym_u, "qty_requested": quantity,
+                        "caps": capacity["caps"], "inputs": capacity["inputs"],
+                    })
+                    await alerts.send(
+                        "warning", "entry_capacity_refused",
+                        f"{symbol}: no live ticket — {capacity['reason']}.",
+                        dedupe_key=f"capacity_refused:{symbol}",
+                    )
+                    return {"status": "refused", "reason": capacity["reason"],
+                            "code": "capacity", "paper": True}
+                if capacity["qty"] < quantity:
+                    await trade_ledger.record("entry_capacity_capped", {
+                        "ticker": sym_u, "qty_requested": quantity, "qty_placed": capacity["qty"],
+                        "caps": capacity["caps"], "inputs": capacity["inputs"],
+                    })
+                    quantity = int(capacity["qty"])
+                    common["quantity"] = quantity
+
             logger.info(f"📤 Placing OPTION: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
             if is_exit:
                 # Closes must always cover the full tracked position — never clamp.
@@ -17549,6 +21680,7 @@ async def execute_live_order(payload: dict):
                     str(symbol).upper(), quantity,
                     payload.get("entry"), payload.get("stop") or payload.get("stop_price"),
                     payload.get("target"), contract, "BUY", payload.get("setup"),
+                    edge_ctx=_payload_edge(payload),
                 )
                 # OPTION STOP PROTECTION — async guard task (state in Redis,
                 # survives restarts): poll the fill, then rest a SELL_CLOSE
@@ -17820,6 +21952,19 @@ async def execute_live_order(payload: dict):
                         "fail-closed sizing: position_size_shares missing/invalid and cannot size "
                         "from live equity — refusing to default to 1 share"
                     )
+            quantity = _apply_learning_weight(symbol, quantity, learning_ctx)
+            quantity = _apply_risk_weight(symbol, quantity, risk_ctx)
+            # CAPACITY — equities carry the sender's quote (risk_context): the
+            # displayed offer and the day's volume.
+            capacity = _apply_capacity(symbol, quantity, "stock", (risk_ctx or {}).get("context"), risk_ctx)
+            if not capacity["allowed"]:
+                await trade_ledger.record("entry_capacity_refused", {
+                    "ticker": symbol, "qty_requested": quantity,
+                    "caps": capacity["caps"], "inputs": capacity["inputs"],
+                })
+                return {"status": "refused", "reason": capacity["reason"], "code": "capacity", "paper": True}
+            if capacity["qty"] < quantity:
+                quantity = int(capacity["qty"])
 
             if str(action or "BUY").upper() != "BUY":
                 # A bare SELL with no tracked position would OPEN a naked short
@@ -17873,7 +22018,8 @@ async def execute_live_order(payload: dict):
                     logger.info(f"✅ ATOMIC OTOCO accepted for {symbol} — entry + protective stop in ONE request")
                     await _record_api_success()
                     await _record_open(symbol, quantity, entry_px or None, stop_px or None,
-                                       payload.get("target"), None, action, payload.get("setup"))
+                                       payload.get("target"), None, action, payload.get("setup"),
+                                       edge_ctx=_payload_edge(payload))
                     return {"status": "success", "response": final, "otoco": True}
                 except OTOCOUnsupported as e:
                     logger.warning(
@@ -17896,7 +22042,7 @@ async def execute_live_order(payload: dict):
             await _record_api_success()
 
             await _record_open(symbol, quantity, entry_px or None, stop_px or None, payload.get("target"), None, action,
-                               payload.get("setup"))
+                               payload.get("setup"), edge_ctx=_payload_edge(payload))
             entry_order_id = _order_id_from_place(final)
             if stop_px > 0:
                 # Arm the stop guard: poll the entry fill, then rest a real STOP
@@ -19008,6 +23154,11 @@ async def _start_scanner() -> None:
     # _passes_entry_filters() a millisecond later — a loop that burns the
     # daily signal budget and never places a trade.
     gate = scanner_mod.set_entry_gate_floors(MIN_SCORE, MIN_RVOL)
+    scanner_mod.THESIS_REQUIRED = EDGE_REQUIRE_THESIS
+    scanner_mod.LEARNING_ENFORCED = LEARNING_ENABLED
+    scanner_mod.COST_ENFORCED = COST_MODEL_ENABLED
+    scanner_mod.CORE_ENFORCED = CORE_BOOK_ENABLED
+    scanner_mod.ITM_EXPRESSION = ITM_EXPRESSION_ENABLED
     logger.info(f"🔭 Scanner floors bound to entry gate — score ≥ {gate['min_score']}, rvol ≥ {gate['min_rvol']}")
     scanner = scanner_mod.Scanner(
         state,
@@ -19018,6 +23169,11 @@ async def _start_scanner() -> None:
         _scanner_now_et,
         alert=alerts.send,
         stop_flag=lambda: _worker_stop,
+        learning=_learning_snapshot,
+        shadow=_scanner_shadow,
+        shadow_mark=_scanner_shadow_mark,
+        shadow_symbols=_scanner_shadow_symbols,
+        core_reinstated=_core_reinstated,
     )
     # Stored config wins (survives restarts, changed live from the app); env
     # vars only seed the very first boot.
@@ -19651,6 +23807,12 @@ async def process_signal(pd: dict) -> dict:
             return {"status": "rejected", "reason": "market_closed", "signal_id": sig_key}
         ok, blocked = await _passes_entry_filters(pd)
         if not ok:
+            # A retired setup that passed EVERY other gate is the idea the core
+            # book removed — paper-track it so the evidence can prove the
+            # removal right or wrong. Anything else blocked it on its own.
+            core_v = pd.get("_core_book") if isinstance(pd.get("_core_book"), dict) else {}
+            if core_v.get("shadow_key") and blocked == [core_v.get("reason")]:
+                await _record_shadow(pd, core_v)
             await state.set(sig_key, "rejected", ex=86400)
             await trade_ledger.record("entry_rejected", {
                 "ticker": str(pd.get("ticker") or "").upper(),
@@ -19954,6 +24116,17 @@ async def status():
             "min_rvol": live_policy("min_rvol"),
             "min_mtf": live_policy("min_mtf"),
             "allowed_setups": sorted(_LIVE_POLICY.get("allowed_setups") or []),
+            # The edge thesis gate (edge.py) — the app mirrors it only when on.
+            "require_thesis": EDGE_REQUIRE_THESIS,
+            # The learning loop (learning.py) — disabled cells refused, sizes cut.
+            "learning_enabled": LEARNING_ENABLED,
+            "portfolio_risk_enabled": PORTFOLIO_RISK_ENABLED,
+            "cost_model_enabled": COST_MODEL_ENABLED,
+            # Core book (core_book.py): retired families refused + shadow-tracked;
+            # option entries re-expressed ITM 14–30 DTE.
+            "core_book_enabled": CORE_BOOK_ENABLED,
+            "itm_expression_enabled": ITM_EXPRESSION_ENABLED,
+            "require_proven_ev": REQUIRE_PROVEN_EV,
             "risk_per_trade_pct": live_policy("risk_per_trade_pct"),
             "daily_loss_limit_pct": live_policy("daily_loss_limit_pct"),
             "policy": {
@@ -20334,6 +24507,184 @@ async def ledger_corrections():
                 if isinstance(t, dict):
                     targets.append(t)
     return {"migration": _last_pnl_migration, "corrections": targets}
+
+
+@app.get("/edge/report")
+async def edge_report_endpoint():
+    """Every setup family's written thesis, its out-of-sample verdict (purged
+    k-fold + anchored walk-forward, deflated for the families searched,
+    segmented by volatility regime) and its decay-monitor state. Read-only;
+    built from the sign-corrected ledger of LIVE closes only."""
+    reinstated = await _edge_reinstated()
+    try:
+        trades = _edge_trades()
+    except Exception as e:
+        logger.warning(f"edge report: ledger unreadable: {e}")
+        return {"available": False, "reason": "ledger unreadable", "theses": []}
+    report = edge.edge_report(trades, reinstated)
+    report["available"] = True
+    report["require_thesis"] = EDGE_REQUIRE_THESIS
+    report["reinstated"] = reinstated
+    return report
+
+
+@app.post("/edge/reinstate")
+async def edge_reinstate(
+    thesis: str = Query(...),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Operator decision: bring a RETIRED thesis family back. Restarts its
+    decay monitor from now — the closes that retired it stay in the ledger and
+    in its out-of-sample validation, which can still refuse it as `no_edge`."""
+    await _require_control_auth(x_rork_secret, "/edge/reinstate")
+    tid = str(thesis or "").strip()
+    if tid not in edge.THESES:
+        raise HTTPException(status_code=404, detail=f"unknown thesis '{tid}' — one of {sorted(edge.THESES)}")
+    current = await _edge_reinstated()
+    current[tid] = _utcnow().timestamp()
+    await state.set(EDGE_REINSTATED_KEY, json.dumps(current))
+    await alerts.send(
+        "warning", "edge_reinstated",
+        f"Edge family '{edge.THESES[tid]['title']}' reinstated by operator — decay monitor restarted",
+    )
+    return {"status": "reinstated", "thesis": tid, "since": current[tid]}
+
+
+@app.get("/learning/report")
+async def learning_report_endpoint():
+    """The learning loop's every cell (setup × volatility regime, setup-wide,
+    and the book): state, size weight, trailing expectancy, strikes, cooldown
+    and recent transitions. Read-only; replayed from the LIVE ledger."""
+    try:
+        snapshot = _learning_snapshot()
+    except Exception as e:
+        logger.warning(f"learning report: ledger unreadable: {e}")
+        return {"available": False, "reason": "ledger unreadable", "cells": []}
+    report = learning.learning_report(snapshot)
+    report["available"] = True
+    report["enforced"] = LEARNING_ENABLED
+    return report
+
+
+@app.get("/risk/portfolio")
+async def portfolio_risk_endpoint():
+    """The open book as ONE risk: per-cluster long/short exposure, net
+    direction, correlation-weighted risk next to the plain heat sum, the
+    limits every entry is judged against, and live outcomes split by evidence
+    class (proven +EV vs merely permitted). Read-only."""
+    try:
+        positions = await state.all_positions()
+        account_ref = await _risk_account_reference()
+    except Exception as e:
+        logger.warning(f"portfolio risk report: book unreadable: {e}")
+        return {"available": False, "reason": "book unreadable"}
+    book = portfolio_risk.book_rows(positions, position_risk_usd)
+    risk_pct = live_policy("risk_per_trade_pct")
+    report: Dict[str, Any] = {
+        "available": True,
+        "enforced": PORTFOLIO_RISK_ENABLED,
+        "require_proven_ev": REQUIRE_PROVEN_EV,
+        "ev_unproven_weight": EV_UNPROVEN_WEIGHT,
+        "account_usd": round(account_ref, 2),
+        # No live regime reading lives on the bot between entries — the book
+        # is judged at the conservative (stressed) correlations.
+        "book": portfolio_risk.book_report(book, account_ref, None),
+        "limits": {
+            "risk_per_trade_pct": risk_pct,
+            "heat_cap_pct": PORTFOLIO_HEAT_PCT,
+            "correlated_limit_pct": round(min(
+                PORTFOLIO_HEAT_PCT, portfolio_risk.CORRELATED_RISK_MULT * risk_pct,
+            ), 3),
+        },
+        "thresholds": {**portfolio_risk.thresholds(), "unproven_weight": EV_UNPROVEN_WEIGHT},
+        "ev_outcomes": None,
+    }
+    try:
+        report["ev_outcomes"] = portfolio_risk.ev_outcomes(_edge_trades())
+    except Exception as e:
+        logger.warning(f"portfolio risk report: ledger unreadable: {e}")
+    return report
+
+
+@app.get("/cost/report")
+async def cost_report():
+    """The expected-cost model in the open: the latest scanner candidates'
+    gross vs net-of-cost breakeven, how many entries the real-quote re-price
+    refused, and the live calibration — realized win rate against the
+    breakeven the model said those trades needed. Read-only."""
+    report: Dict[str, Any] = {
+        "available": True,
+        "enforced": COST_MODEL_ENABLED,
+        "thresholds": cost_model.thresholds(),
+        "candidates": [],
+        "refused_recent": None,
+        "calibration": None,
+    }
+    if scanner is not None:
+        try:
+            last = await scanner.last_report() or {}
+            for c in last.get("candidates") or []:
+                if isinstance(c, dict) and isinstance(c.get("cost"), dict):
+                    report["candidates"].append({
+                        "ticker": c.get("ticker"), "setup": c.get("setup"), "side": c.get("side"),
+                        "score": c.get("score"), "qualifies": c.get("qualifies"),
+                        "cost": c.get("cost"), "verdict": c.get("cost_verdict"),
+                    })
+        except Exception as e:
+            logger.warning(f"cost report: scanner report unreadable: {e}")
+    try:
+        records = _corrected_ledger(EDGE_LOOKBACK)
+        report["refused_recent"] = sum(
+            1 for r in records if isinstance(r, dict) and r.get("event") == "entry_cost_refused"
+        )
+        report["calibration"] = cost_model.calibration(
+            edge.edge_trades(records, _ENTRY_ABANDONED_EVENTS)
+        )
+    except Exception as e:
+        logger.warning(f"cost report: ledger unreadable: {e}")
+    return report
+
+
+@app.get("/core/report")
+async def core_report():
+    """The core book in the open: which families trade live, which are
+    retired, each retired family's NET shadow record against the bar that
+    would reinstate it, the open shadows, and how many live entries the book
+    refused. Read-only — nothing here can reinstate a family."""
+    try:
+        return {"available": True, **core_book.report(
+            _core_events(), enforced=CORE_BOOK_ENABLED, expression_enabled=ITM_EXPRESSION_ENABLED,
+        )}
+    except Exception as e:
+        logger.warning(f"core report: ledger unreadable: {e}")
+        return {"available": False, "enforced": CORE_BOOK_ENABLED,
+                "expression_enabled": ITM_EXPRESSION_ENABLED,
+                "thresholds": core_book.thresholds(), "reason": "ledger unreadable"}
+
+
+@app.post("/learning/reset")
+async def learning_reset(
+    cell: str = Query(...),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Operator decision: put a cell into PROBATION now (small size, judged on
+    fresh closes only). Never a shortcut back to full size. Appended to the
+    ledger, so the replay — and the audit trail — both see it."""
+    await _require_control_auth(x_rork_secret, "/learning/reset")
+    raw = str(cell or "").strip().lower()
+    if "|" not in raw:
+        raise HTTPException(status_code=400, detail="cell must look like 'setup|regime' (regime may be '*')")
+    setup, regime = raw.split("|", 1)
+    key = learning.cell_key(setup, regime)
+    if key == learning.BOOK:
+        raise HTTPException(status_code=400, detail="the book cell is throttle-only and cannot be reset")
+    await trade_ledger.record(learning.RESET_EVENT, {"cell": key})
+    await alerts.send(
+        "warning", "learning_cell_reset",
+        f"Learning cell '{key}' reset by operator — re-test at "
+        f"{learning.PROBATION_WEIGHT:g}× size for {learning.PROBATION_TRADES} closes",
+    )
+    return {"status": "probation", "cell": key}
 
 
 @app.post("/trail/native")
