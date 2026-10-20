@@ -10059,7 +10059,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.67.0-event-flatten"
+BOT_VERSION = "5.68.0-entry-paths"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -23221,6 +23221,7 @@ async def start_worker():
     asyncio.create_task(trailing_worker())
     asyncio.create_task(risk_desk_worker())
     asyncio.create_task(app_eyes_worker())
+    asyncio.create_task(entry_paths_worker())
     await _start_scanner()
 
 
@@ -23546,6 +23547,96 @@ def _compare_books(
     )
 
 
+# OPEN-BELL ENTRY-PATH CHECK. On 2026-10-19 the session ran with NO engine able
+# to place a live entry: the scanner was shadow (demoted at boot, origination
+# not authorized) and the app held every entry in paper behind its competence
+# gates. Each layer was individually correct and nothing said the sum was zero.
+# One minute after the bell (the app heartbeats every 60s, so a fresh beat has
+# had time to land) the bot asks "can anything trade live today?" once per
+# session and pages when the answer is no. Read-only: it never changes a mode.
+ENTRY_PATH_CHECK_MINUTE_ET = 9 * 60 + 31
+ENTRY_PATH_ALERT_KEY_FMT = "entry_paths_alerted:{}"
+
+
+def assess_entry_paths(
+    scanner_mode: Any,
+    allow_autonomous: bool,
+    heartbeat: Optional[dict],
+    now: float,
+    live_trading: bool,
+    killed: bool,
+    broker_linked: bool,
+    stale_after: int = APP_LINK_STALE_SECONDS,
+) -> Dict[str, Any]:
+    """Which engines can place a LIVE entry right now, and why not.
+
+    Two doors exist: the bot's own scanner (only in mode "live" AND with
+    origination authorized) and app dispatch (a fresh heartbeat, armed, and
+    reporting mode "live"). Account-wide blockers close both.
+
+    Unknown is not live: a missing or stale heartbeat, an unreadable mode or an
+    unknown armed state proves nothing, so that door reads closed with the
+    reason named. Pure: no I/O, fully unit-testable.
+    """
+    blockers: List[str] = []
+    if not live_trading:
+        blockers.append("LIVE_TRADING=false on the bot — it places no real orders")
+    if killed:
+        blockers.append("kill switch is active")
+    if not broker_linked:
+        blockers.append("E*TRADE is not linked on the bot")
+
+    mode = str(scanner_mode or "").lower().strip()
+    if mode == "live" and allow_autonomous:
+        scan_ok, scan_why = True, "scanner live and authorized to originate"
+    elif mode == "live":
+        scan_ok, scan_why = False, ("scanner set live but origination is not authorized "
+                                    "(SCANNER_ALLOW_AUTONOMOUS_ENTRY=false) — measure-only")
+    elif mode == "shadow":
+        scan_ok, scan_why = False, "scanner is shadow (measure-only)"
+    elif mode == "off":
+        scan_ok, scan_why = False, "scanner is off"
+    else:
+        scan_ok, scan_why = False, "scanner mode unknown"
+
+    app_ok = False
+    if not isinstance(heartbeat, dict):
+        app_why = "app not connected (no heartbeat)"
+    else:
+        try:
+            received = float(heartbeat.get("received_epoch") or 0)
+        except (TypeError, ValueError):
+            received = 0.0
+        app_mode = str(heartbeat.get("mode") or "").lower()
+        if received <= 0:
+            app_why = "app not connected (no heartbeat)"
+        elif now - received > stale_after:
+            app_why = f"app silent for {int((now - received) // 60)} min — not dispatching"
+        elif heartbeat.get("armed") is not True:
+            app_why = ("app auto-entry is disarmed" if heartbeat.get("armed") is False
+                       else "app armed state unknown")
+        elif app_mode == "live":
+            app_ok, app_why = True, "app armed and dispatching LIVE"
+        elif heartbeat.get("paper_reason") == "readiness_gates":
+            app_why = ("app LIVE LOCKED by its competence gates — entries fill on paper "
+                       "on the phone and never reach the bot")
+        else:
+            app_why = f"app is in {app_mode or 'unknown'} mode"
+
+    paths = [
+        {"engine": "scanner", "can_enter_live": scan_ok and not blockers, "reason": scan_why},
+        {"engine": "app", "can_enter_live": app_ok and not blockers, "reason": app_why},
+    ]
+    any_live = any(p["can_enter_live"] for p in paths)
+    if any_live:
+        summary = "Live entries from: " + " · ".join(
+            p["engine"] for p in paths if p["can_enter_live"])
+    else:
+        parts = blockers + [f"{p['engine']}: {p['reason']}" for p in paths]
+        summary = "NO ENGINE CAN PLACE A LIVE ENTRY — " + " · ".join(parts)
+    return {"any_live": any_live, "blockers": blockers, "paths": paths, "summary": summary}
+
+
 def assess_app_link(
     heartbeat: Optional[dict],
     tracked: Dict[str, dict],
@@ -23725,6 +23816,53 @@ async def _load_app_heartbeat() -> Optional[dict]:
     except Exception as e:
         logger.debug(f"app heartbeat read failed: {e}")
         return None
+
+
+async def _entry_paths_snapshot() -> Dict[str, Any]:
+    """Live read of `assess_entry_paths`. A read failure is reported, never
+    papered over as "live" — nor as a page-worthy "dead" (any_live None)."""
+    try:
+        return assess_entry_paths(
+            scanner.config.get("mode") if scanner else None,
+            SCANNER_ALLOW_AUTONOMOUS_ENTRY,
+            await _load_app_heartbeat(),
+            time.time(),
+            LIVE_TRADING,
+            await state.is_killed(),
+            load_tokens() is not None,
+        )
+    except Exception as e:
+        logger.warning(f"entry path assessment failed: {e}")
+        return {"any_live": None, "blockers": [], "paths": [], "summary": None, "error": str(e)}
+
+
+async def entry_paths_worker():
+    """Once per session, one minute after the bell: page when NO engine can
+    place a live entry. Read-only — it never changes a mode or a gate."""
+    while not _worker_stop:
+        try:
+            now_et = _scanner_now_et()
+            minute = now_et.hour * 60 + now_et.minute
+            if _is_market_open() and minute >= ENTRY_PATH_CHECK_MINUTE_ET:
+                key = ENTRY_PATH_ALERT_KEY_FMT.format(now_et.date().isoformat())
+                if not await state.get(key):
+                    snap = await _entry_paths_snapshot()
+                    if snap.get("any_live") is not None:
+                        await state.set(key, "1", ex=86_400)
+                        if snap["any_live"]:
+                            logger.info(f"🔔 Open-bell check — {snap['summary']}")
+                        else:
+                            logger.error(f"🔔 Open-bell check — {snap['summary']}")
+                            await trade_ledger.record("no_live_entry_path", {
+                                "paths": snap["paths"], "blockers": snap["blockers"],
+                            })
+                            await alerts.send(
+                                "critical", "no_live_entry_path", snap["summary"],
+                                dedupe_key=key, force_deliver=True,
+                            )
+        except Exception as e:
+            logger.error(f"[ENTRY PATHS] loop error: {e}")
+        await asyncio.sleep(30)
 
 
 async def _app_link_snapshot() -> Dict[str, Any]:
@@ -24105,6 +24243,9 @@ async def status():
         "broker_linked": load_tokens() is not None,
         **_token_session_fields(),
         "scanner": await scanner.status() if scanner else None,
+        # WHO CAN PLACE A LIVE ENTRY RIGHT NOW — the bot is the arbiter; the
+        # app renders this verbatim instead of guessing (assess_entry_paths).
+        "entry_paths": await _entry_paths_snapshot(),
         # THE GATE AS IT IS ACTUALLY ENFORCED. These are live-policy values, so
         # a gate the app pushed reads back as the app's number; `policy` beside
         # them names the source, the sync time, and anything the bot refused or
@@ -24386,7 +24527,25 @@ async def scanner_config_set(
     if scanner is None:
         raise HTTPException(503, "scanner not initialized")
     before = scanner.config["mode"]
-    cfg = await scanner.set_config(body or {})
+    patch = dict(body or {})
+    # SAME CEILING AS BOOT. This endpoint used to accept mode=live whatever
+    # SCANNER_ALLOW_AUTONOMOUS_ENTRY said, so the app could flip the scanner
+    # live after the close and the next restart demoted it to shadow again —
+    # the operator never knew which state the open would find. Now a live
+    # request without authorization is clamped here and the refusal is said.
+    mode_refused: Optional[str] = None
+    if "mode" in patch:
+        allowed_mode, demoted = permitted_scanner_mode(
+            patch.get("mode"), SCANNER_ALLOW_AUTONOMOUS_ENTRY
+        )
+        if demoted:
+            mode_refused = (
+                "scanner live refused: SCANNER_ALLOW_AUTONOMOUS_ENTRY=false on the bot "
+                "· kept shadow (measure-only) · live entries come only from app dispatch"
+            )
+            logger.warning(f"🔒 {mode_refused}")
+        patch["mode"] = allowed_mode
+    cfg = await scanner.set_config(patch)
     if cfg["mode"] != before:
         await trade_ledger.record("scanner_mode_changed", {"from": before, "to": cfg["mode"]})
         await alerts.send(
@@ -24396,7 +24555,10 @@ async def scanner_config_set(
             f"({len(cfg['universe'])} symbols)",
             dedupe_key="scanner_mode",
         )
-    return await scanner.status()
+    out = await scanner.status()
+    if mode_refused:
+        out = {**out, "mode_refused": mode_refused}
+    return out
 
 
 @app.post("/scanner/scan")
