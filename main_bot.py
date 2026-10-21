@@ -7861,6 +7861,9 @@ COST_ENFORCED = True
 # that would otherwise qualify is handed to the shadow tracker instead. Set by
 # main_bot from CORE_BOOK_ENABLED.
 CORE_ENFORCED = True
+# Setup gate: withdraw snapshot-only core labels the tape does not confirm.
+# main_bot sets this from SETUP_GATES_ENABLED (default off: labels stand).
+TAPE_WITHDRAWS_LABELS = True
 # Option entries (the scanner's shorts, as long puts) are costed and hinted as
 # the ITM 14–30 DTE contract the bot will actually trade. Set by main_bot from
 # ITM_EXPRESSION_ENABLED.
@@ -8760,7 +8763,7 @@ def evaluate_quote(
     core_hit = (plan["setup"], plan["side"], plan["stop"], plan["target"]) if plan is not None else None
     hit = (core_hit[0], core_hit[1]) if core_hit is not None else detect_setup_side(series, quote, vwap)
     withdrawn: Optional[str] = None
-    if core_hit is None and hit is not None and tape["measured"] and hit[0] in TAPE_OWNED_SETUPS:
+    if TAPE_WITHDRAWS_LABELS and core_hit is None and hit is not None and tape["measured"] and hit[0] in TAPE_OWNED_SETUPS:
         withdrawn, hit = hit[0], None
     setup = hit[0] if hit is not None else None
     side = hit[1] if hit is not None else "long"
@@ -10236,7 +10239,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.69.0-tape-reader"
+BOT_VERSION = "5.70.0-all-setups"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -10268,6 +10271,15 @@ MIN_MTF = int(os.getenv("MIN_MTF", "1"))
 # 10-stage filter, so the allowlist only added silent failure. Empty set =
 # every classified setup is tradable. Set ALLOWED_SETUPS env to a
 # comma-separated list to re-enable name filtering.
+# SETUP GATES MASTER SWITCH (5.70.0) — operator decision: any and all setups
+# may dispatch. Every refusal based ONLY on which setup a signal is (the
+# allowlist, the per-setup Wilson veto, thesis-on-file and edge
+# validation/decay, learning setup×regime cells, the core book, the scanner's
+# tape label withdrawal) defaults to report-only. Each sub-flag below still
+# honours its own env var; SETUP_GATES_ENABLED=true restores them all.
+# Untouched by this switch: kill switch, risk per trade, day halt, stops,
+# portfolio heat, score/rvol/mtf, real-time quotes, the cost gate.
+SETUP_GATES_ENABLED = os.getenv("SETUP_GATES_ENABLED", "false").strip().lower() in {"true", "1", "yes"}
 ALLOWED_SETUPS = {
     s.strip().lower()
     for s in os.getenv("ALLOWED_SETUPS", "").split(",")
@@ -10285,7 +10297,7 @@ ALLOWED_SETUPS = {
 # most generous reading of its record is worse than a coin. A thin ugly sample
 # (3 losses in 5) is UNCERTAIN, not condemned, and stays tradable. These are
 # the same constants the app's `setupPriors` uses; the two must not drift.
-SETUP_VETO_ENABLED = os.getenv("SETUP_VETO_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+SETUP_VETO_ENABLED = os.getenv("SETUP_VETO_ENABLED", os.getenv("SETUP_GATES_ENABLED", "false")).strip().lower() not in {"false", "0", "no"}
 SETUP_VETO_MIN_TRADES = int(os.getenv("SETUP_VETO_MIN_TRADES", "20"))
 SETUP_VETO_WIN_RATE = float(os.getenv("SETUP_VETO_WIN_RATE", "50"))
 # How much ledger history the veto reads. Bounded so the entry path never
@@ -10298,7 +10310,7 @@ SETUP_VETO_LOOKBACK = int(os.getenv("SETUP_VETO_LOOKBACK", "1500"))
 # CUSUM decay monitor has alarmed, is refused. Set EDGE_REQUIRE_THESIS=false
 # to keep the validation/decay refusals but stop refusing on the thesis
 # itself (e.g. while an older app that sends no edge_features is still live).
-EDGE_REQUIRE_THESIS = os.getenv("EDGE_REQUIRE_THESIS", "true").strip().lower() not in {"false", "0", "no"}
+EDGE_REQUIRE_THESIS = os.getenv("EDGE_REQUIRE_THESIS", os.getenv("SETUP_GATES_ENABLED", "false")).strip().lower() not in {"false", "0", "no"}
 EDGE_LOOKBACK = int(os.getenv("EDGE_LOOKBACK", "3000"))
 # {thesis_id: epoch} — an operator reinstatement restarts that family's
 # decay monitor from this moment (see POST /edge/reinstate).
@@ -10307,7 +10319,7 @@ EDGE_REINSTATED_KEY = "edge:reinstated"
 # → size weight / disablement → probation re-test. Weights only ever SHRINK
 # size; a disabled cell refuses entries until its cooldown re-test. false =
 # report only (the cells are still computed and shown, nothing is enforced).
-LEARNING_ENABLED = os.getenv("LEARNING_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+LEARNING_ENABLED = os.getenv("LEARNING_ENABLED", os.getenv("SETUP_GATES_ENABLED", "false")).strip().lower() not in {"false", "0", "no"}
 # PORTFOLIO RISK (portfolio_risk.py) — correlation-weighted exposure across
 # underlyings, regime/gap-scaled sizing with a crisis pause, order-book
 # capacity, and the evidence class ("proven +EV in this regime" vs "merely
@@ -10328,7 +10340,7 @@ COST_MODEL_ENABLED = os.getenv("COST_MODEL_ENABLED", "true").strip().lower() not
 # liquidity provision (mean reversion). Breakouts and momentum are RETIRED and
 # shadow-tracked on paper; a family returns only when its shadow record, net
 # of cost, earns it back (≥ 30 closes, t ≥ 2). false = report only.
-CORE_BOOK_ENABLED = os.getenv("CORE_BOOK_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+CORE_BOOK_ENABLED = os.getenv("CORE_BOOK_ENABLED", os.getenv("SETUP_GATES_ENABLED", "false")).strip().lower() not in {"false", "0", "no"}
 # Option entries are re-expressed as an ITM contract (|Δ| ≈ 0.70, 14–30 DTE)
 # before the chain snap. false = trade the contract the sender asked for.
 ITM_EXPRESSION_ENABLED = os.getenv("ITM_EXPRESSION_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
@@ -11814,7 +11826,10 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
         setup = p.get("setup")
         allowed_setups = set(_LIVE_POLICY.get("allowed_setups") or [])
         if isinstance(setup, str) and setup.strip() and allowed_setups and setup.lower().strip() not in allowed_setups:
-            blocked.append(f"setup '{setup}' not allowlisted")
+            if SETUP_GATES_ENABLED:
+                blocked.append(f"setup '{setup}' not allowlisted")
+            else:
+                logger.info(f"setup gate off (report only): setup '{setup}' not allowlisted")
         # SETUP EXPECTANCY VETO — the only gate here that asks what actually
         # HAPPENED the last times this setup was traded, instead of how good it
         # looks right now. Reads the bot's own ledger; refuses only a setup
@@ -11838,11 +11853,17 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
         try:
             edge_verdict = await _assess_edge_entry(p)
             if not edge_verdict["allowed"]:
-                blocked.extend(edge_verdict["reasons"])
-                logger.warning(f"🧭 EDGE — {'; '.join(edge_verdict['reasons'])}")
+                if SETUP_GATES_ENABLED:
+                    blocked.extend(edge_verdict["reasons"])
+                    logger.warning(f"🧭 EDGE — {'; '.join(edge_verdict['reasons'])}")
+                else:
+                    logger.info(f"🧭 EDGE (setup gate off, report only) — {'; '.join(edge_verdict['reasons'])}")
         except Exception as e:
-            blocked.append(f"edge gate unavailable ({str(e)[:80]}) — thesis could not be checked")
-            logger.error(f"edge gate error (entry refused): {e}")
+            if SETUP_GATES_ENABLED:
+                blocked.append(f"edge gate unavailable ({str(e)[:80]}) — thesis could not be checked")
+                logger.error(f"edge gate error (entry refused): {e}")
+            else:
+                logger.warning(f"edge gate error (setup gate off, entry not refused): {e}")
         # CORE BOOK — only the core thesis families trade live; a retired one
         # is refused here and (by the dispatch path) shadow-tracked on paper.
         # Judged on the payload alone, so it fails CLOSED like the thesis.
@@ -23335,6 +23356,7 @@ async def _start_scanner() -> None:
     scanner_mod.LEARNING_ENFORCED = LEARNING_ENABLED
     scanner_mod.COST_ENFORCED = COST_MODEL_ENABLED
     scanner_mod.CORE_ENFORCED = CORE_BOOK_ENABLED
+    scanner_mod.TAPE_WITHDRAWS_LABELS = SETUP_GATES_ENABLED
     scanner_mod.ITM_EXPRESSION = ITM_EXPRESSION_ENABLED
     logger.info(f"🔭 Scanner floors bound to entry gate — score ≥ {gate['min_score']}, rvol ≥ {gate['min_rvol']}")
     scanner = scanner_mod.Scanner(
@@ -24433,9 +24455,11 @@ async def status():
             "min_score_trending": live_policy("min_score_trending"),
             "min_rvol": live_policy("min_rvol"),
             "min_mtf": live_policy("min_mtf"),
-            "allowed_setups": sorted(_LIVE_POLICY.get("allowed_setups") or []),
+            # Enforced allowlist: empty while the setup gates are off.
+            "allowed_setups": sorted(_LIVE_POLICY.get("allowed_setups") or []) if SETUP_GATES_ENABLED else [],
             # The edge thesis gate (edge.py) — the app mirrors it only when on.
             "require_thesis": EDGE_REQUIRE_THESIS,
+            "setup_gates_enabled": SETUP_GATES_ENABLED,
             # The learning loop (learning.py) — disabled cells refused, sizes cut.
             "learning_enabled": LEARNING_ENABLED,
             "portfolio_risk_enabled": PORTFOLIO_RISK_ENABLED,
