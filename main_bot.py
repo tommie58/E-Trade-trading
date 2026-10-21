@@ -8258,62 +8258,222 @@ def opening_range(series: List[Dict[str, Any]], now_et: datetime) -> Optional[Tu
     return max(prices), min(prices)
 
 
+# ---------------------------------------------------------------------------
+# Session tape reader — the bot's eyes, mirrored by expo/services/tapeReader.ts
+# (constants asserted equal by expo/__tests__/tapeParity.test.ts).
+#
+# The app reads closed 1-minute bars; the scanner reads its own quote
+# snapshots. Same rules, adapted: today's regular-session samples only, a
+# breakout must be FRESH (the previous sample was still inside the level),
+# and a break needs the volume rate since the last sample to be at least the
+# session's average rate. Unmeasured volume fails a breakout CLOSED.
+# ---------------------------------------------------------------------------
+# Floor on any structural stop, as a share of price — a stop inside the
+# spread-and-noise band is a coin flip, not a level.
+TAPE_STOP_FLOOR_PCT = 0.004
+# Breakout setups (ORB, VWAP reclaim/rejection) target 2R from their stop.
+TAPE_BREAK_TARGET_R = 2
+# A VWAP reclaim's stop goes under the low of the last few observations.
+TAPE_VWAP_SWING_SAMPLES = 5
+# A breakout trigger needs at least the session's average volume rate.
+TAPE_TRIGGER_VOLUME_MULT = 1.0
+# No new entries in the last 30 minutes — the bot flattens at 3:55 PM and a
+# 2R plan has no room to work.
+TAPE_NO_NEW_ENTRY_AFTER_MIN = 15 * 60 + 30
+_SESSION_OPEN_MIN = 9 * 60 + 30
+_SESSION_CLOSE_MIN = 16 * 60
+# Setups only the tape may name once it is readable — a snapshot-only label
+# for these is withdrawn so the bot never trades a pattern it did not see.
+TAPE_OWNED_SETUPS = ("orb", "vwap reclaim", "vwap rejection", "mean reversion")
+
+
+def session_series(series: List[Dict[str, Any]], now_et: datetime) -> List[Dict[str, Any]]:
+    """Today's regular-session samples with a price. A sample whose time
+    cannot be read is dropped — an unknown time is not "today"."""
+    out: List[Dict[str, Any]] = []
+    for s in series:
+        ts = _ts_et(s, now_et.tzinfo)
+        if ts is None or ts.date() != now_et.date() or s.get("last") is None:
+            continue
+        m = ts.hour * 60 + ts.minute
+        if _SESSION_OPEN_MIN <= m < _SESSION_CLOSE_MIN and ts <= now_et:
+            out.append(s)
+    return out
+
+
+def volume_pace(today: List[Dict[str, Any]], quote: Dict[str, Any], now_et: datetime) -> Optional[float]:
+    """Volume rate since the last sample ÷ the session's average rate, or None
+    when either side is unmeasured."""
+    pts: List[Tuple[datetime, float]] = []
+    for s in today:
+        ts = _ts_et(s, now_et.tzinfo)
+        v = s.get("total_volume")
+        if ts is not None and v is not None:
+            pts.append((ts, float(v)))
+    cur = quote.get("total_volume")
+    if len(pts) < 2 or cur is None:
+        return None
+    (t0, v0), (t1, v1) = pts[0], pts[-1]
+    span = (t1 - t0).total_seconds()
+    gap = (now_et - t1).total_seconds()
+    if span <= 0 or gap <= 0 or v1 <= v0 or float(cur) < v1:
+        return None
+    avg_rate = (v1 - v0) / span
+    return round(((float(cur) - v1) / gap) / avg_rate, 2)
+
+
+def _tape_plan(setup: str, side: str, entry: float, stop: float, target: float, why: List[str]) -> Optional[Dict[str, Any]]:
+    risk = entry - stop if side == "long" else stop - entry
+    reward = target - entry if side == "long" else entry - target
+    if risk <= 0 or reward <= 0:
+        return None
+    return {"setup": setup, "side": side, "entry": round(entry, 2), "stop": round(stop, 2),
+            "target": round(target, 2), "rr": round(reward / risk, 2), "why": why}
+
+
+def read_tape(
+    series: List[Dict[str, Any]],
+    quote: Dict[str, Any],
+    now_et: Optional[datetime],
+    vwap: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Read today's session the way a day trader does.
+
+    Returns {measured, unmeasured_reason, levels, plan, watching}. `plan` is
+    the ONE core setup on the tape now (ORB → VWAP reclaim/rejection → mean
+    reversion, the app's order) with its structural stop and target, or None.
+    `watching` names the exact levels being waited on. `vwap` overrides the
+    session VWAP (tests); otherwise it is built from today's samples only —
+    yesterday's prints are not today's average price."""
+    def unmeasured(why: str) -> Dict[str, Any]:
+        return {"measured": False, "unmeasured_reason": why, "levels": {}, "plan": None, "watching": []}
+
+    if now_et is None:
+        return unmeasured("no session clock")
+    now_min = now_et.hour * 60 + now_et.minute
+    minutes = now_min - _SESSION_OPEN_MIN
+    if minutes < 0 or now_min >= _SESSION_CLOSE_MIN:
+        return unmeasured("market closed — no session to read")
+    last = quote.get("last")
+    if last is None:
+        return unmeasured("no last trade")
+    today = session_series(series, now_et)
+    if len(today) < MIN_SAMPLES:
+        return unmeasured(f"only {len(today)} session samples — too early to read")
+
+    px = float(last)
+    prev = float(today[-1]["last"])
+    if vwap is None:
+        vwap = sampled_vwap(today)
+    rng = opening_range(today, now_et) if minutes >= ORB_RANGE_MINUTES else None
+    gap = risk_mod.gap_pct(quote.get("open"), quote.get("previous_close"))
+    change_open = pct_change(px, quote.get("open"))
+    pace = volume_pace(today, quote, now_et)
+    volume_ok = pace is not None and pace >= TAPE_TRIGGER_VOLUME_MULT
+    vol_note = f"volume {pace:.1f}× the session rate" if pace is not None else "volume unmeasured"
+    stretch = ((px - vwap) / vwap * 100.0) if vwap else None
+    levels = {
+        "vwap": round(vwap, 2) if vwap else None,
+        "or_high": round(rng[0], 2) if rng else None,
+        "or_low": round(rng[1], 2) if rng else None,
+        "gap_pct": gap,
+        "stretch_pct": round(stretch, 3) if stretch is not None else None,
+        "volume_pace": pace,
+        "samples": len(today),
+    }
+    watching: List[str] = []
+
+    def done(plan: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return {"measured": True, "unmeasured_reason": None, "levels": levels, "plan": plan, "watching": watching}
+
+    if now_min >= TAPE_NO_NEW_ENTRY_AFTER_MIN:
+        watching.append("Last 30 minutes — no new entries; the bot flattens at 3:55 PM")
+        return done()
+    floor = px * TAPE_STOP_FLOOR_PCT
+
+    # 1. ORB — gap days only, inside the window, FRESH break in the gap's direction.
+    gap_day = gap is not None and abs(gap) >= core_mod.ORB_MIN_GAP_PCT
+    if gap_day and rng is not None and minutes <= ORB_WINDOW_END_MINUTES:
+        hi, lo = rng
+        mid = (hi + lo) / 2.0
+        if gap > 0 and px > hi and prev <= hi:
+            if volume_ok:
+                stop = min(mid, px - floor)
+                p = _tape_plan("orb", "long", px, stop, px + TAPE_BREAK_TARGET_R * (px - stop),
+                               [f"+{gap:.1f}% gap up", f"broke the opening range high {hi:.2f}", vol_note])
+                if p:
+                    return done(p)
+            else:
+                watching.append(f"ORB long broke {hi:.2f} on light volume — waiting for real volume")
+        elif gap < 0 and px < lo and prev >= lo:
+            if volume_ok:
+                stop = max(mid, px + floor)
+                p = _tape_plan("orb", "short", px, stop, max(0.01, px - TAPE_BREAK_TARGET_R * (stop - px)),
+                               [f"{gap:.1f}% gap down", f"broke the opening range low {lo:.2f}", vol_note])
+                if p:
+                    return done(p)
+            else:
+                watching.append(f"ORB short broke {lo:.2f} on light volume — waiting for real volume")
+        elif gap > 0 and px <= hi:
+            watching.append(f"Gap-up ORB: long above {hi:.2f}")
+        elif gap < 0 and px >= lo:
+            watching.append(f"Gap-down ORB: put below {lo:.2f}")
+
+    # 2. VWAP reclaim / rejection — crossed VWAP since the last sample, the day agrees.
+    if vwap:
+        swing = [float(s["last"]) for s in today[-TAPE_VWAP_SWING_SAMPLES:]]
+        if prev < vwap <= px and (change_open or 0) > 0:
+            if volume_ok:
+                stop = min(min(swing), px * (1 - TAPE_STOP_FLOOR_PCT))
+                p = _tape_plan("vwap reclaim", "long", px, stop, px + TAPE_BREAK_TARGET_R * (px - stop),
+                               [f"back above VWAP {vwap:.2f}", f"up {change_open:.2f}% from the open", vol_note])
+                if p:
+                    return done(p)
+            else:
+                watching.append(f"VWAP reclaim at {vwap:.2f} on light volume — needs confirmation")
+        elif prev > vwap >= px and (change_open or 0) < 0:
+            if volume_ok:
+                stop = max(max(swing), px * (1 + TAPE_STOP_FLOOR_PCT))
+                p = _tape_plan("vwap rejection", "short", px, stop,
+                               max(0.01, px - TAPE_BREAK_TARGET_R * (stop - px)),
+                               [f"lost VWAP {vwap:.2f}", f"down {abs(change_open or 0):.2f}% from the open", vol_note])
+                if p:
+                    return done(p)
+            else:
+                watching.append(f"VWAP rejection at {vwap:.2f} on light volume — needs confirmation")
+
+    # 3. Mean reversion — stretched ≥1% from VWAP, turning back; target the VWAP.
+    if vwap and minutes >= ORB_RANGE_MINUTES and stretch is not None:
+        recent = [float(s["last"]) for s in today[-REVERSION_LOOKBACK:]]
+        if stretch <= -REVERSION_MIN_STRETCH_PCT and px > prev:
+            p = _tape_plan("mean reversion", "long", px, min(recent + [px]) * (1 - REVERSION_STOP_BUFFER), vwap,
+                           [f"stretched {stretch:.2f}% below VWAP", "turning up", f"target VWAP {vwap:.2f}"])
+            if p and p["rr"] >= REVERSION_MIN_RR:
+                return done(p)
+            if p:
+                watching.append(f"Reversion long pays only {p['rr']:.1f}R — needs ≥ {REVERSION_MIN_RR}R")
+        elif stretch >= REVERSION_MIN_STRETCH_PCT and px < prev:
+            p = _tape_plan("mean reversion", "short", px, max(recent + [px]) * (1 + REVERSION_STOP_BUFFER), vwap,
+                           [f"stretched +{stretch:.2f}% above VWAP", "turning down", f"target VWAP {vwap:.2f}"])
+            if p and p["rr"] >= REVERSION_MIN_RR:
+                return done(p)
+            if p:
+                watching.append(f"Reversion short pays only {p['rr']:.1f}R — needs ≥ {REVERSION_MIN_RR}R")
+    return done()
+
+
 def detect_core_setup(
     series: List[Dict[str, Any]],
     quote: Dict[str, Any],
     vwap: Optional[float],
     now_et: Optional[datetime],
 ) -> Optional[Tuple[str, str, float, float]]:
-    """(setup, side, stop, target) for the two core setups detect_setup_side
-    cannot see, or None.
-
-    ORB (opening imbalance): a gap ≥ core_book.ORB_MIN_GAP_PCT, inside the
-    opening-imbalance window, breaking the 30-minute range IN THE GAP'S
-    DIRECTION. Stop at the range midpoint (a resolved imbalance should not
-    give back half the range), target 2R.
-
-    Mean reversion (liquidity provision): stretched ≥ 1% from the sampled
-    VWAP with the latest sample turning back toward it. Stop beyond the
-    recent flush extreme, target = the VWAP itself — the value the pressure
-    pushed price away from. Refused below REVERSION_MIN_RR."""
-    if now_et is None or len(series) < MIN_SAMPLES:
+    """(setup, side, stop, target) of the core setup on the tape, or None —
+    a thin view of `read_tape` (which carries the full rules)."""
+    plan = read_tape(series, quote, now_et, vwap)["plan"]
+    if plan is None:
         return None
-    last = quote.get("last")
-    if last is None:
-        return None
-    px = float(last)
-    minutes = now_et.hour * 60 + now_et.minute - (9 * 60 + 30)
-
-    gap = risk_mod.gap_pct(quote.get("open"), quote.get("previous_close"))
-    if gap is not None and abs(gap) >= core_mod.ORB_MIN_GAP_PCT and ORB_RANGE_MINUTES <= minutes <= ORB_WINDOW_END_MINUTES:
-        rng = opening_range(series, now_et)
-        if rng is not None:
-            hi, lo = rng
-            mid = (hi + lo) / 2.0
-            floor = px * 0.004
-            if gap > 0 and px > hi:
-                stop = round(min(mid, px - floor), 2)
-                return ("orb", "long", stop, round(px + 2 * (px - stop), 2))
-            if gap < 0 and px < lo:
-                stop = round(max(mid, px + floor), 2)
-                return ("orb", "short", stop, round(max(0.01, px - 2 * (stop - px)), 2))
-
-    prior = [float(s["last"]) for s in series if s.get("last") is not None]
-    if vwap and vwap > 0 and minutes >= 30 and len(prior) >= 2:
-        stretch = (px - vwap) / vwap * 100.0
-        prev = prior[-1]
-        recent = prior[-REVERSION_LOOKBACK:]
-        if stretch <= -REVERSION_MIN_STRETCH_PCT and px > prev:
-            stop = round(min(recent + [px]) * (1 - REVERSION_STOP_BUFFER), 2)
-            target = round(vwap, 2)
-            if px - stop > 0 and (target - px) / (px - stop) >= REVERSION_MIN_RR:
-                return ("mean reversion", "long", stop, target)
-        if stretch >= REVERSION_MIN_STRETCH_PCT and px < prev:
-            stop = round(max(recent + [px]) * (1 + REVERSION_STOP_BUFFER), 2)
-            target = round(vwap, 2)
-            if stop - px > 0 and (px - target) / (stop - px) >= REVERSION_MIN_RR:
-                return ("mean reversion", "short", stop, target)
-    return None
+    return (plan["setup"], plan["side"], plan["stop"], plan["target"])
 
 
 def detect_setup(
@@ -8591,10 +8751,17 @@ def evaluate_quote(
     change_open = pct_change(last, quote.get("open"))
     vwap_dist = pct_change(last, vwap) if vwap else None
     now_et = (context or {}).get("now_et")
-    # Core detectors first (ORB on a gap day, mean reversion) — they carry
-    # their own structural stop/target. Then the legacy family.
-    core_hit = detect_core_setup(series, quote, vwap, now_et)
+    # The tape reader first: ORB on a gap day, VWAP reclaim/rejection, mean
+    # reversion — each with its own structural stop/target. Then the legacy
+    # (retired, shadow-tracked) family. A readable tape OWNS the core labels:
+    # a snapshot-only VWAP cross it did not confirm is withdrawn, never sent.
+    tape = read_tape(series, quote, now_et)
+    plan = tape["plan"]
+    core_hit = (plan["setup"], plan["side"], plan["stop"], plan["target"]) if plan is not None else None
     hit = (core_hit[0], core_hit[1]) if core_hit is not None else detect_setup_side(series, quote, vwap)
+    withdrawn: Optional[str] = None
+    if core_hit is None and hit is not None and tape["measured"] and hit[0] in TAPE_OWNED_SETUPS:
+        withdrawn, hit = hit[0], None
     setup = hit[0] if hit is not None else None
     side = hit[1] if hit is not None else "long"
     # Side-adjusted readings: a short earns momentum/VWAP credit from movement
@@ -8630,7 +8797,7 @@ def evaluate_quote(
     elif spread > float(cfg["max_spread_pct"]):
         reasons.append(f"spread {spread}% > {cfg['max_spread_pct']}%")
     if setup is None:
-        reasons.append("no setup")
+        reasons.append(f"no setup ({withdrawn} not confirmed by the tape)" if withdrawn else "no setup")
     if score < int(cfg["min_score"]):
         reasons.append(f"score {score} < {cfg['min_score']}")
     if COST_ENFORCED and cost_verdict is not None and not cost_verdict["allowed"]:
@@ -8702,6 +8869,16 @@ def evaluate_quote(
             if book is not None else None
         ),
         "shadow_eligible": shadow_eligible,
+        # What the eyes see: session levels, the plan (if any), and the exact
+        # levels being watched. Display only — nothing reads it to decide.
+        "tape": {
+            "measured": tape["measured"],
+            "unmeasured_reason": tape["unmeasured_reason"],
+            "levels": tape["levels"],
+            "why": plan["why"] if plan is not None else [],
+            "rr": plan["rr"] if plan is not None else None,
+            "watching": tape["watching"][:3],
+        },
         "learning": (
             {"allowed": learned["allowed"], "weight": learned["weight"], "notes": learned["notes"]}
             if learned is not None else None
@@ -10059,7 +10236,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.68.0-entry-paths"
+BOT_VERSION = "5.69.0-tape-reader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
