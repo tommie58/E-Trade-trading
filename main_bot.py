@@ -10002,6 +10002,301 @@ def next_event_after(day_key: str) -> Optional[str]:
 
 ''')
 
+_bundle_load('massive', r'''
+"""
+Massive (formerly Polygon.io) market-data adapter for the bot.
+==============================================================
+
+WHY AN ADAPTER AND NOT A REWRITE
+--------------------------------
+Every quote consumer in the bot (scanner.parse_quotes, normalize_quote_response,
+the entitlement judge, the edge features) already speaks E*TRADE's
+QuoteResponse shape. Massive's snapshot is translated INTO that shape here, so
+the downstream gates — realtime refusal, rvol, book imbalance — run unchanged
+and identically on either feed. One translation point; zero forked logic.
+
+HONESTY RULES
+-------------
+- A field Massive did not return is OMITTED, never zero-filled: parse_quotes
+  turns a missing key into None ("unmeasured"), which is what the gates expect.
+- `quoteStatus` is REALTIME only when the last trade print is younger than
+  REALTIME_MAX_AGE_S. A delayed key (or a stalled feed) therefore reads as
+  DELAYED and the live gate refuses it — the plan name is not evidence, the
+  timestamp is.
+- `volume10Day` (the rvol denominator) is not in the snapshot; it is computed
+  from daily aggregates once per day per symbol and cached. A failed fetch
+  leaves it absent (rvol unmeasured), never guessed.
+
+Pure translators (no I/O) are unit-tested in test_bot_fixes.py.
+"""
+from __future__ import annotations
+
+import math
+import os
+import time
+from datetime import date, timedelta
+from typing import Any, Dict, List, Optional
+
+BASE_URL = os.getenv("MASSIVE_BASE_URL", "https://api.massive.com").rstrip("/")
+
+# A real-time plan prints within seconds during the session. 90s tolerates a
+# thin name between trades without letting a 15-minute delayed feed (900s)
+# anywhere near "REALTIME". Declared, not tuned.
+REALTIME_MAX_AGE_S = 90.0
+
+# The rvol denominator: E*TRADE's `volume10Day` is a 10-session average.
+ADV_SESSIONS = 10
+
+# Snapshot requests are batched; Massive accepts a comma list of tickers.
+BATCH_SIZE = 100
+
+HTTP_TIMEOUT_S = 6.0
+
+
+def api_key() -> str:
+    return (os.getenv("MASSIVE_API_KEY") or "").strip()
+
+
+def enabled() -> bool:
+    """Massive is the primary quote feed whenever a key is configured, unless
+    explicitly switched off with MASSIVE_ENABLED=false."""
+    flag = os.getenv("MASSIVE_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+    return flag and bool(api_key())
+
+
+def _num(val: Any) -> Optional[float]:
+    if val is None or val == "":
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _ts_seconds(raw: Any) -> Optional[float]:
+    """Massive timestamps arrive in ns (trades/quotes) or ms (aggs). Normalise
+    to epoch seconds by magnitude."""
+    v = _num(raw)
+    if v is None or v <= 0:
+        return None
+    if v > 1e17:   # nanoseconds
+        return v / 1e9
+    if v > 1e14:   # microseconds
+        return v / 1e6
+    if v > 1e11:   # milliseconds
+        return v / 1e3
+    return v
+
+
+def snapshot_to_quote_data(
+    ticker: Dict[str, Any],
+    now_s: float,
+    adv: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """One Massive snapshot ticker → one E*TRADE-shaped QuoteData entry.
+    Returns None when there is no usable last price."""
+    if not isinstance(ticker, dict):
+        return None
+    symbol = str(ticker.get("ticker") or "").upper().strip()
+    if not symbol:
+        return None
+    last_trade = ticker.get("lastTrade") or {}
+    last_quote = ticker.get("lastQuote") or {}
+    day = ticker.get("day") or {}
+    prev = ticker.get("prevDay") or {}
+    minute = ticker.get("min") or {}
+
+    price = _num(last_trade.get("p"))
+    trade_ts = _ts_seconds(last_trade.get("t"))
+    if price is None or price <= 0:
+        # Pre-open the day bar is empty; the minute bar may still carry a close.
+        price = _num(minute.get("c"))
+        trade_ts = _ts_seconds(minute.get("t")) or trade_ts
+    if price is None or price <= 0:
+        return None
+
+    age = (now_s - trade_ts) if trade_ts is not None else None
+    status = "REALTIME" if (age is not None and age <= REALTIME_MAX_AGE_S) else "DELAYED"
+
+    all_q: Dict[str, Any] = {"lastTrade": price}
+
+    def put(key: str, val: Optional[float], positive: bool = True) -> None:
+        if val is None:
+            return
+        if positive and val <= 0:
+            return
+        all_q[key] = val
+
+    put("bid", _num(last_quote.get("p")))
+    put("ask", _num(last_quote.get("P")))
+    put("bidSize", _num(last_quote.get("s")))
+    put("askSize", _num(last_quote.get("S")))
+    put("open", _num(day.get("o")))
+    put("high", _num(day.get("h")))
+    put("low", _num(day.get("l")))
+    put("previousClose", _num(prev.get("c")))
+    # Day volume: prefer the day bar, fall back to the cumulative minute volume.
+    vol = _num(day.get("v"))
+    if vol is None or vol <= 0:
+        vol = _num(minute.get("av"))
+    put("totalVolume", vol)
+    put("changeClose", _num(ticker.get("todaysChange")), positive=False)
+    put("changeClosePercentage", _num(ticker.get("todaysChangePerc")), positive=False)
+    put("volume10Day", adv)
+
+    return {
+        "Product": {"symbol": symbol},
+        "quoteStatus": status,
+        "dateTimeUTC": int(trade_ts) if trade_ts is not None else None,
+        "source": "massive",
+        "All": all_q,
+    }
+
+
+def snapshot_to_quote_response(
+    payload: Dict[str, Any],
+    now_s: Optional[float] = None,
+    adv_by_symbol: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """A Massive multi-ticker snapshot → an E*TRADE QuoteResponse."""
+    now = time.time() if now_s is None else now_s
+    adv_by_symbol = adv_by_symbol or {}
+    rows: List[Dict[str, Any]] = []
+    tickers = (payload or {}).get("tickers")
+    if not isinstance(tickers, list):
+        single = (payload or {}).get("ticker")
+        tickers = [single] if isinstance(single, dict) else []
+    for t in tickers:
+        sym = str((t or {}).get("ticker") or "").upper()
+        entry = snapshot_to_quote_data(t, now, adv_by_symbol.get(sym))
+        if entry is not None:
+            rows.append(entry)
+    return {"QuoteResponse": {"QuoteData": rows}}
+
+
+def average_daily_volume(aggs_payload: Dict[str, Any], today_iso: str, sessions: int = ADV_SESSIONS) -> Optional[float]:
+    """Mean volume of the last `sessions` COMPLETED daily bars (today's partial
+    bar excluded — including it would drag the denominator down every morning
+    and inflate rvol). None when fewer than half the sessions are present."""
+    results = (aggs_payload or {}).get("results")
+    if not isinstance(results, list):
+        return None
+    vols: List[float] = []
+    for bar in results:
+        if not isinstance(bar, dict):
+            continue
+        ts = _ts_seconds(bar.get("t"))
+        if ts is None:
+            continue
+        # Daily bars are stamped at midnight ET ≈ 04:00/05:00 UTC; the UTC date matches.
+        bar_day = time.strftime("%Y-%m-%d", time.gmtime(ts))
+        if bar_day >= today_iso:
+            continue
+        v = _num(bar.get("v"))
+        if v is not None and v > 0:
+            vols.append(v)
+    vols = vols[-sessions:]
+    if len(vols) < max(1, sessions // 2):
+        return None
+    return sum(vols) / len(vols)
+
+
+class MassiveClient:
+    """Async quote fetcher. Holds the per-day ADV cache."""
+
+    def __init__(self) -> None:
+        self._adv: Dict[str, float] = {}
+        self._adv_day: Optional[str] = None
+        self.last_ok_at: Optional[float] = None
+        self.last_error: Optional[str] = None
+        self.calls = 0
+        self.failures = 0
+
+    def _headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {api_key()}"}
+
+    async def _get(self, client: Any, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        self.calls += 1
+        resp = await client.get(f"{BASE_URL}{path}", params=params or {}, headers=self._headers())
+        if resp.status_code == 401 or resp.status_code == 403:
+            raise RuntimeError(f"Massive rejected the API key (HTTP {resp.status_code})")
+        if resp.status_code == 429:
+            raise RuntimeError("Massive rate limit (HTTP 429)")
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Massive HTTP {resp.status_code}")
+        return resp.json()
+
+    async def _refresh_adv(self, client: Any, symbols: List[str]) -> None:
+        today = date.today().isoformat()
+        if self._adv_day != today:
+            self._adv = {}
+            self._adv_day = today
+        missing = [s for s in symbols if s not in self._adv]
+        if not missing:
+            return
+        frm = (date.today() - timedelta(days=21)).isoformat()
+        for sym in missing:
+            try:
+                data = await self._get(
+                    client,
+                    f"/v2/aggs/ticker/{sym}/range/1/day/{frm}/{today}",
+                    {"adjusted": "true", "sort": "asc", "limit": 50},
+                )
+            except Exception:
+                continue  # unmeasured stays absent; retried next call
+            adv = average_daily_volume(data, today)
+            if adv is not None:
+                self._adv[sym] = adv
+
+    async def fetch_quote_response(self, symbols: List[str]) -> Dict[str, Any]:
+        """Massive snapshot for `symbols`, returned in E*TRADE QuoteResponse shape.
+        Raises on transport/auth failure so the caller can fall back."""
+        import httpx  # local: keeps the pure translators importable without httpx
+
+        syms = [s.strip().upper() for s in symbols if s and s.strip()]
+        if not syms:
+            return {"QuoteResponse": {"QuoteData": []}}
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
+                tickers: List[Dict[str, Any]] = []
+                for i in range(0, len(syms), BATCH_SIZE):
+                    chunk = syms[i:i + BATCH_SIZE]
+                    data = await self._get(
+                        client,
+                        "/v2/snapshot/locale/us/markets/stocks/tickers",
+                        {"tickers": ",".join(chunk)},
+                    )
+                    got = data.get("tickers")
+                    if isinstance(got, list):
+                        tickers.extend(got)
+                await self._refresh_adv(client, syms)
+        except Exception as e:
+            self.failures += 1
+            self.last_error = str(e)[:200]
+            raise
+        out = snapshot_to_quote_response({"tickers": tickers}, adv_by_symbol=self._adv)
+        if not out["QuoteResponse"]["QuoteData"]:
+            self.failures += 1
+            self.last_error = "Massive returned no priced tickers"
+            raise RuntimeError(self.last_error)
+        self.last_ok_at = time.time()
+        self.last_error = None
+        return out
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "enabled": enabled(),
+            "key_configured": bool(api_key()),
+            "last_ok_at": self.last_ok_at,
+            "last_error": self.last_error,
+            "calls": self.calls,
+            "failures": self.failures,
+            "adv_cached": len(self._adv),
+        }
+
+''')
+
 # =========================================================================
 # main_bot.py source follows (its `from x import y` calls resolve to the
 # embedded modules registered in sys.modules above).
@@ -10154,6 +10449,7 @@ try:  # package-style import (python -m bot.main_bot) or flat (uvicorn main_bot:
     from . import portfolio_risk
     from . import cost_model
     from . import core_book
+    from . import massive
 except ImportError:
     from state_store import (
         StateStore, LockNotAcquired, sanitize_conn_url, unreplaced_placeholders,
@@ -10173,6 +10469,7 @@ except ImportError:
     import portfolio_risk
     import cost_model
     import core_book
+    import massive
 
 load_dotenv()
 
@@ -10239,7 +10536,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.70.0-all-setups"
+BOT_VERSION = "5.71.0-massive"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -23284,7 +23581,29 @@ async def _startup_reconcile() -> None:
 scanner: Optional[scanner_mod.Scanner] = None
 
 
+# Massive (ex-Polygon) is the scanner's PRIMARY quote feed when MASSIVE_API_KEY
+# is set; E*TRADE is the fallback. massive.py translates its snapshot into the
+# E*TRADE QuoteResponse shape, so parse_quotes and every gate run unchanged.
+massive_client = massive.MassiveClient()
+_scanner_quote_source: Dict[str, Any] = {"last": None, "at": None, "fallback_reason": None}
+
+
 async def _scanner_fetch_quotes(symbols: List[str]) -> Dict[str, Any]:
+    """Batched quote read for the scanner: Massive first, E*TRADE fallback."""
+    if massive.enabled():
+        try:
+            resp = await massive_client.fetch_quote_response(list(symbols))
+            _scanner_quote_source.update({"last": "massive", "at": _utcnow().isoformat(), "fallback_reason": None})
+            return resp
+        except Exception as e:
+            logger.warning(f"Massive quote fetch failed ({e}) — falling back to E*TRADE")
+            _scanner_quote_source["fallback_reason"] = str(e)[:200]
+    resp = await _scanner_fetch_etrade_quotes(symbols)
+    _scanner_quote_source.update({"last": "etrade", "at": _utcnow().isoformat()})
+    return resp
+
+
+async def _scanner_fetch_etrade_quotes(symbols: List[str]) -> Dict[str, Any]:
     """Batched E*TRADE quote read for the scanner (same client/backoff path as
     the app-facing /etrade/quote endpoint)."""
     tokens = load_tokens()
@@ -24442,6 +24761,8 @@ async def status():
         "broker_linked": load_tokens() is not None,
         **_token_session_fields(),
         "scanner": await scanner.status() if scanner else None,
+        # WHERE THE SCANNER'S PRICES COME FROM: Massive (primary) or E*TRADE.
+        "market_data": {**massive_client.status(), "scanner_feed": dict(_scanner_quote_source)},
         # WHO CAN PLACE A LIVE ENTRY RIGHT NOW — the bot is the arbiter; the
         # app renders this verbatim instead of guessing (assess_entry_paths).
         "entry_paths": await _entry_paths_snapshot(),
