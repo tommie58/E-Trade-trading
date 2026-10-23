@@ -4179,6 +4179,18 @@ MARKET_CLOSE_MINUTE = 16 * 60
 DEFAULT_MAX_HOLD_HOURS = 8.0
 
 
+def contract_expires_by(expiry: Any, today: Any) -> bool:
+    """True when the contract expires on/before `today` — or when either date
+    is unreadable (fail toward closing: an unknown expiry is not a long-dated
+    one). Both are compared as ISO YYYY-MM-DD strings."""
+    exp = str(expiry or "")[:10]
+    day = str(today or "")[:10]
+    iso = lambda v: len(v) == 10 and v[4] == "-" and v[7] == "-" and v.replace("-", "").isdigit()
+    if not iso(exp) or not iso(day):
+        return True
+    return exp <= day
+
+
 def plan_scheduled_exit(
     held_seconds: Any,
     et_minutes: Any,
@@ -4187,6 +4199,8 @@ def plan_scheduled_exit(
     eod_enabled: bool = True,
     time_exit_enabled: bool = True,
     close_minute: Any = None,
+    expiry: Any = None,
+    today: Any = None,
 ) -> Dict[str, Any]:
     """Do the CLOCK-driven exits fire? Returns
     ``{"fire": bool, "reason": str|None, "detail": str}``.
@@ -4201,6 +4215,13 @@ def plan_scheduled_exit(
 
       MAX HOLD — a position that has reached neither target nor stop in
         `max_hold_hours` is not working. Holding it longer only pays theta.
+
+    EXPIRING-ONLY: the flatten exists to stop a contract expiring worthless,
+    so it fires only for a contract whose `expiry` (YYYY-MM-DD) is `today`
+    (ET date) or earlier. A longer-dated contract (the 14-30 DTE expression)
+    is left to its stop / trail / targets and is held overnight. An UNKNOWN
+    expiry or date is treated as expiring today and closed — not knowing the
+    expiry must never be the reason a 0DTE contract rides into the bell.
 
     The EOD flatten OUTRANKS the max-hold timer: inside the window everything
     goes regardless of age, so an aging position never escapes the window by
@@ -4222,7 +4243,7 @@ def plan_scheduled_exit(
         close = float(MARKET_CLOSE_MINUTE)
     window_open = close - (MARKET_CLOSE_MINUTE - EOD_FLATTEN_MINUTE)
 
-    if eod_enabled and minutes is not None and not is_weekend:
+    if eod_enabled and minutes is not None and not is_weekend and contract_expires_by(expiry, today):
         if window_open <= minutes < close:
             hh, mm = divmod(int(minutes), 60)
             return {
@@ -18987,6 +19008,10 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
         # A half day closes at 13:00 — the flatten must land at 12:40, not
         # hours after the bell when the contract is already stuck.
         close_minute=_session_close_minute(now_et),
+        # 3:40 flatten applies only to a contract expiring TODAY; a longer-
+        # dated contract is held and left to its stop/trail/targets.
+        expiry=contract.get("expiration"),
+        today=now_et.date().isoformat(),
     )
     if not verdict["fire"] and EVENT_FLATTEN_ENABLED:
         # EVENT FLATTEN rides the same close path: it is a decision about the
