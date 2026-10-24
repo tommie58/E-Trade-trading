@@ -10557,7 +10557,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.71.0-massive"
+BOT_VERSION = "5.72.0-massive"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -14955,7 +14955,9 @@ def build_preflight(*,
                     webhook_secret_set: bool = False,
                     session_source: Optional[str] = None,
                     killed: bool = False,
-                    breaker_open: bool = False) -> Dict[str, Any]:
+                    breaker_open: bool = False,
+                    massive_status: Optional[Dict[str, Any]] = None,
+                    scanner_feed: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Can this bot actually place a real order right now — and if not, WHY?
 
     Every precondition for live trading already existed somewhere: a log line, a
@@ -15029,6 +15031,28 @@ def build_preflight(*,
             "etrade.com → Customer Service → Market Data Agreements. Until then every live entry is "
             "refused at dispatch (protective exits still run — getting out is never gated on price age).",
             blocking=True)
+
+    # SCANNER FEED — which market data the scanner is actually reading. Never
+    # blocking: when Massive is missing or failing the scanner falls back to
+    # E*TRADE quotes, so trading still works; this only says which feed it is.
+    # Omitted entirely when the caller does not pass the Massive status.
+    if massive_status is not None:
+        feed = scanner_feed or {}
+        last = feed.get("last")
+        reason = feed.get("fallback_reason")
+        if not massive_status.get("key_configured"):
+            add("scanner_feed", False, "MASSIVE_API_KEY not set — scanner reads E*TRADE quotes",
+                "Set MASSIVE_API_KEY on the bot host (exact name, all caps) and redeploy.")
+        elif not massive_status.get("enabled"):
+            add("scanner_feed", False, "Massive switched off (MASSIVE_ENABLED=false) — scanner reads E*TRADE quotes",
+                "Remove MASSIVE_ENABLED=false on the bot host to use Massive again.")
+        elif last == "massive":
+            add("scanner_feed", True, f"Massive feeding the scanner (last pass {feed.get('at') or 'unknown'})")
+        elif last == "etrade" and reason:
+            add("scanner_feed", False, f"Massive failed, scanner fell back to E*TRADE: {reason}",
+                "Check the Massive key and plan at massive.com; the bot retries Massive every scan.")
+        else:
+            add("scanner_feed", True, "Massive key set — waiting for the first scanner pass (market hours)")
 
     add("webhook_secret", bool(webhook_secret_set),
         "webhook authentication enabled" if webhook_secret_set else "WEBHOOK_SECRET is not set",
@@ -24694,6 +24718,8 @@ async def _current_preflight() -> Dict[str, Any]:
         session_source=_token_source,
         killed=await state.is_killed() if state else False,
         breaker_open=await _breaker_is_open(),
+        massive_status=massive_client.status(),
+        scanner_feed=dict(_scanner_quote_source),
     )
 
 
