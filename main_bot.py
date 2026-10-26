@@ -7677,6 +7677,20 @@ def check_expression(expiry: Any, today: date, delta: Any) -> Dict[str, Any]:
             "reason": "" if not reasons else f"{REFUSAL_PREFIX} " + " · ".join(reasons)}
 
 
+def sender_contract_fits(strike: Any, expiry: Any, delta: Any, today: date) -> bool:
+    """Did the SENDER already choose a contract inside the expression?
+
+    The app picks its strike from the real chain's exchange greeks at the
+    same |Δ| 0.70 / 14–30 DTE target, and shows the user THAT contract. When
+    it fits, the bot trades it instead of re-planning from a model σ — so the
+    contract the app dispatched is the contract that fills. An unmeasured
+    delta never fits (re-plan as before): fit is proven, not assumed."""
+    k = _num(strike)
+    if k is None or k <= 0 or _num(delta) is None:
+        return False
+    return bool(check_expression(expiry, today, delta)["ok"])
+
+
 def rescale_contracts(qty: Any, planned_delta: Any, new_delta: Any) -> int:
     """Contracts that carry no MORE delta exposure than the plan did.
 
@@ -8645,17 +8659,18 @@ def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) ->
     entries from live account equity, the configured risk percent and the stop
     distance, which is strictly safer than a scanner-side guess.
 
-    SHORT candidates are expressed as a LONG PUT (one contract): the bot
-    refuses bare short-equity entries (a naked short at the broker), and a
-    bought put caps the worst case at the premium paid. Strike and expiry are
-    hints only — the bot snaps both to a contract that actually exists and
-    prices the entry from the REAL bid/ask."""
+    OPTIONS ONLY — the account never trades shares. A LONG candidate is a
+    bought CALL, a SHORT candidate a bought PUT (one contract each; the bot
+    refuses naked shorts and any share entry). A bought option caps the worst
+    case at the premium paid. Strike and expiry are hints only — the bot
+    snaps both to a contract that actually exists and prices the entry from
+    the REAL bid/ask."""
     side = str(candidate.get("side") or "long")
     payload: Dict[str, Any] = {
         "ticker": candidate["ticker"],
         "action": "BUY" if side == "long" else "SELL",
         "mode": mode,
-        "instrument": "stock",
+        "instrument": "option",
         "entry": candidate["entry"],
         "stop": candidate["stop"],
         "target": candidate["target"],
@@ -8683,23 +8698,21 @@ def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) ->
         payload["underlying_ask"] = quote.get("ask")
     if candidate.get("sigma_sec") is not None:
         payload["cost_context"] = {"sigma_sec": candidate["sigma_sec"], "sigma_basis": candidate.get("sigma_basis")}
-    if side == "short":
-        payload["instrument"] = "option"
-        payload["option_right"] = "PUT"
-        payload["option_contracts"] = 1
-        payload["strike_hint"] = round(float(candidate["entry"]))
-        payload["expiration_hint"] = candidate.get("expiry") or next_friday_expiry(_utcnow())
-        if ITM_EXPRESSION:
-            # The contract the bot will actually trade: ITM (|Δ| 0.70), 14–30
-            # DTE. Hints only — the bot re-plans and snaps to a listed one.
-            sigma = candidate.get("sigma_sec")
-            vol = (float(sigma) * math.sqrt(cost_mod.TRADING_DAYS * cost_mod.SESSION_SECONDS)
-                   if sigma else None)
-            plan = core_mod.plan_expression(candidate["entry"], "short", vol, _utcnow().date())
-            if plan is not None:
-                payload["strike_hint"] = plan["strike"]
-                payload["expiration_hint"] = plan["expiry"]
-                payload["option_delta"] = plan["delta"]
+    payload["option_right"] = "PUT" if side == "short" else "CALL"
+    payload["option_contracts"] = 1
+    payload["strike_hint"] = round(float(candidate["entry"]))
+    payload["expiration_hint"] = candidate.get("expiry") or next_friday_expiry(_utcnow())
+    if ITM_EXPRESSION:
+        # The contract the bot will actually trade: ITM (|Δ| 0.70), 14–30
+        # DTE. Hints only — the bot re-plans and snaps to a listed one.
+        sigma = candidate.get("sigma_sec")
+        vol = (float(sigma) * math.sqrt(cost_mod.TRADING_DAYS * cost_mod.SESSION_SECONDS)
+               if sigma else None)
+        plan = core_mod.plan_expression(candidate["entry"], side, vol, _utcnow().date())
+        if plan is not None:
+            payload["strike_hint"] = plan["strike"]
+            payload["expiration_hint"] = plan["expiry"]
+            payload["option_delta"] = plan["delta"]
     return payload
 
 
@@ -8729,7 +8742,8 @@ def expected_cost_for(
     now_et: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """The candidate's expected round-trip cost in the instrument it will
-    actually trade: a long as shares, a short as a LONG PUT (build_signal).
+    actually trade: a long as a bought CALL, a short as a bought PUT
+    (build_signal — options only, never shares).
 
     σ comes from the scanner's own timestamped samples, else today's range;
     the put's spread/premium are priors until the bot snaps a real contract
@@ -8737,7 +8751,7 @@ def expected_cost_for(
     sigma, basis = cost_mod.resolve_sigma(
         series=series, high=quote.get("high"), low=quote.get("low"), progress=progress,
     )
-    instrument = "stock" if side == "long" else "option"
+    instrument = "option"
     dte: Optional[float] = None
     delta: Optional[float] = None
     if instrument == "option" and ITM_EXPRESSION:
@@ -10557,7 +10571,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.72.0-massive"
+BOT_VERSION = "5.73.0-options-only"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -10662,6 +10676,25 @@ CORE_BOOK_ENABLED = os.getenv("CORE_BOOK_ENABLED", os.getenv("SETUP_GATES_ENABLE
 # Option entries are re-expressed as an ITM contract (|Δ| ≈ 0.70, 14–30 DTE)
 # before the chain snap. false = trade the contract the sender asked for.
 ITM_EXPRESSION_ENABLED = os.getenv("ITM_EXPRESSION_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+# OPTIONS ONLY — the account trades option contracts, never shares. Every
+# ENTRY whose instrument is not "option" is refused at the last gate before
+# the broker (closes still pass: a share position that already exists must
+# stay sellable). Default ON; OPTIONS_ONLY=false is the only way to re-open
+# the share path.
+OPTIONS_ONLY = os.getenv("OPTIONS_ONLY", "true").strip().lower() not in {"false", "0", "no"}
+
+
+def entry_instrument_permitted(instrument: Any, is_close: bool, options_only: bool) -> Tuple[bool, str]:
+    """(allowed, reason) for an order's instrument. Pure. Closes always pass;
+    with options_only, an entry must be explicitly "option" — a missing or
+    unreadable instrument fails closed (it would otherwise default to shares)."""
+    if is_close or not options_only:
+        return True, ""
+    if str(instrument or "").strip().lower() == "option":
+        return True, ""
+    shown = str(instrument or "").strip().lower() or "unspecified"
+    return False, (f"options-only: share entries are disabled (instrument={shown}) — "
+                   "this account trades option contracts only")
 # How much ledger the shadow replay reads. Shadows accumulate slowly (one per
 # ticker×family at a time), so this is generous.
 CORE_LOOKBACK = int(os.getenv("CORE_LOOKBACK", "6000"))
@@ -21586,6 +21619,19 @@ async def execute_live_order(payload: dict):
         )
         return {"status": "refused", "reason": origin_reason}
 
+    # INSTRUMENT GATE — options only. Checked on the RAW payload field so a
+    # payload with no instrument (which used to default to shares) refuses.
+    inst_ok, inst_reason = entry_instrument_permitted(payload.get("instrument"), is_close, OPTIONS_ONLY)
+    if not inst_ok:
+        logger.error(f"🚫 {ticker} {action} — {inst_reason}")
+        await trade_ledger.record("entry_refused_instrument", {
+            "ticker": ticker,
+            "action": action,
+            "instrument": str(payload.get("instrument") or "") or None,
+            "reason": inst_reason,
+        })
+        return {"status": "refused", "reason": inst_reason, "code": "options_only"}
+
     await check_risk_limits(is_close=is_close)
 
     if not is_close:
@@ -21712,13 +21758,29 @@ async def execute_live_order(payload: dict):
 
             expression: Optional[Dict[str, Any]] = None
             expression_vol: Optional[float] = None
+            # APP ↔ BOT CONTRACT ALIGNMENT — when the sender's own contract is
+            # already inside the expression (measured |Δ| in band, 14–30 DTE),
+            # the bot trades THAT contract with the sender's limit and stop,
+            # instead of re-planning from a model σ and filling a different
+            # strike than the one the app showed.
+            sender_honored = False
             if not is_exit and ITM_EXPRESSION_ENABLED and not _is_connectivity_test(payload):
                 expression_vol = _payload_vol_annual(payload)
                 expression = core_book.plan_expression(
                     payload.get("entry"), "long" if call_put == "CALL" else "short",
                     expression_vol, _utcnow().astimezone(_ET_ZONE).date(),
                 )
-                if expression is not None:
+                sender_honored = expression is not None and core_book.sender_contract_fits(
+                    strike, expiry, payload.get("option_delta"), _utcnow().astimezone(_ET_ZONE).date(),
+                )
+                if sender_honored and expression is not None:
+                    expression = {**expression, "strike": float(strike), "expiry": str(expiry)[:10],
+                                  "vol_basis": "sender"}
+                    logger.info(
+                        f"🎯 {symbol} honoring the sender's {call_put} {strike} {expiry} "
+                        f"(Δ {payload.get('option_delta')} already inside the expression)"
+                    )
+                elif expression is not None:
                     logger.info(
                         f"🎯 {symbol} re-expressed {call_put} {strike} {expiry} → "
                         f"{expression['strike']} {expression['expiry']} (|Δ| {core_book.EXPRESSION_DELTA:.2f}, "
@@ -21766,7 +21828,15 @@ async def execute_live_order(payload: dict):
                     return {"status": "refused", "reason": check["reason"],
                             "code": "expression", "paper": True}
                 planned_qty = quantity
-                quantity = core_book.rescale_contracts(quantity, payload.get("option_delta"), new_delta)
+                # Same contract the sender priced (honored, and the chain snap
+                # did not move it) → its limit, stop and count stay valid.
+                same_contract = bool(
+                    sender_honored
+                    and str(expiry)[:10] == str(expression["expiry"])[:10]
+                    and abs(float(strike) - float(expression["strike"])) < 1e-9
+                )
+                if not same_contract:
+                    quantity = core_book.rescale_contracts(quantity, payload.get("option_delta"), new_delta)
                 # The sender's premium, premium stop and delta described the
                 # contract it planned, not this one. The bot prices the entry
                 # off the REAL quote and the stop from the underlying geometry
@@ -21782,13 +21852,15 @@ async def execute_live_order(payload: dict):
                     "strike": strike, "expiry": expiry, "dte": check["dte"],
                     "delta": new_delta, "delta_basis": "chain" if chain_delta is not None else "model",
                     "vol_basis": expression["vol_basis"], "contracts": quantity,
+                    "sender_contract": same_contract,
                 }
                 payload["strike_hint"] = strike
                 payload["expiration_hint"] = expiry
                 payload["option_delta"] = new_delta
-                payload["option_limit_price"] = None
-                payload["option_stop_price"] = None
-                payload.pop("limit_price", None)
+                if not same_contract:
+                    payload["option_limit_price"] = None
+                    payload["option_stop_price"] = None
+                    payload.pop("limit_price", None)
                 logger.info(
                     f"🎯 {symbol} expression {strike} {expiry} ({check['dte']} DTE) Δ {new_delta} "
                     f"({payload['_expression']['delta_basis']}) — {planned_qty} → {quantity} contract(s)"
