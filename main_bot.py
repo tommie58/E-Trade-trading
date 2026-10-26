@@ -7847,10 +7847,24 @@ QUOTE_CHUNK = 20
 
 MODES = ("off", "shadow", "live")
 
+# The app's scanner watchlist (WATCHLIST_SYMBOLS in expo/services/stockApi.ts),
+# same symbols, same order. The bot watches exactly what the app watches so a
+# setup the app sees is a setup the bot can see. scannerParity.test.ts asserts it.
 DEFAULT_UNIVERSE = [
-    "AAPL", "NVDA", "TSLA", "MSFT", "META", "AMZN", "AMD", "GOOGL",
-    "PLTR", "NFLX", "AVGO", "MU", "COIN", "SMCI", "SPY", "QQQ",
+    "AAPL", "NVDA", "TSLA", "MSFT", "META", "AMZN", "AMD", "SPY",
+    "QQQ", "GOOGL", "PLTR", "ARM", "NFLX", "AVGO", "MU", "INTC",
+    "MSTR", "CRM", "ORCL", "UBER", "SHOP", "COIN", "SMCI", "IWM",
 ]
+
+# Default universes this bot SHIPPED before. A stored universe equal (as a set)
+# to one of these was inherited, not typed by the operator, so it follows the
+# current default. Any other stored list is the operator's choice and stands.
+LEGACY_UNIVERSES: Tuple[frozenset, ...] = (
+    frozenset({
+        "AAPL", "NVDA", "TSLA", "MSFT", "META", "AMZN", "AMD", "GOOGL",
+        "PLTR", "NFLX", "AVGO", "MU", "COIN", "SMCI", "SPY", "QQQ",
+    }),
+)
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "mode": "shadow",
@@ -7994,7 +8008,10 @@ def normalize_config(raw: Any) -> Dict[str, Any]:
             cfg["mode"] = mode
         if raw.get("universe") is not None:
             cleaned = parse_universe(raw["universe"])
-            if cleaned:
+            if cleaned and frozenset(cleaned) in LEGACY_UNIVERSES:
+                # Inherited old default → follow the app's watchlist.
+                cfg["universe"] = list(DEFAULT_UNIVERSE)
+            elif cleaned:
                 cfg["universe"] = cleaned
         for key, lo, hi, cast in (
             ("interval_seconds", 20, 600, int),
@@ -10571,7 +10588,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.73.0-options-only"
+BOT_VERSION = "5.74.0-scanner-parity"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -23791,7 +23808,12 @@ async def _start_scanner() -> None:
     # and every candidate it dispatched would be rejected by
     # _passes_entry_filters() a millisecond later — a loop that burns the
     # daily signal budget and never places a trade.
-    gate = scanner_mod.set_entry_gate_floors(MIN_SCORE, MIN_RVOL)
+    # Bind to the LIVE policy, not the env defaults: restore_policy() has
+    # already adopted the app's synced gate (e.g. rvol 1.5), and re-binding to
+    # the env MIN_RVOL here silently loosened the scanner back to 0.9 at boot.
+    gate = scanner_mod.set_entry_gate_floors(
+        live_policy("min_score"), live_policy("min_rvol"),
+    )
     scanner_mod.THESIS_REQUIRED = EDGE_REQUIRE_THESIS
     scanner_mod.LEARNING_ENFORCED = LEARNING_ENABLED
     scanner_mod.COST_ENFORCED = COST_MODEL_ENABLED
