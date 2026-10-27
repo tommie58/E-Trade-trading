@@ -3836,10 +3836,19 @@ MIN_GIVEBACK_LOCK_R = 1.0
 GIVEBACK_COST_MULT = 3
 # Multiple of the bid/ask spread the trail must always clear.
 SPREAD_FLOOR_MULT = 1.5
+# COST-AWARE BREAKEVEN (5.76.0). A "breakeven" stop resting AT the fill price
+# is not breakeven: the entry paid the ask, the stop sells into the bid, and a
+# stop becomes a market order that fills a tick or two through its trigger.
+# Every scratch exit therefore booked a small LOSS — a mechanical reason a
+# run of breakeven exits reads as "0 wins". The lock now sits one full
+# spread above entry (below for shorts) so a scratch nets ~zero after the
+# round trip. Capped so it never rests inside the spread floor below the
+# water mark, and never below entry. Unknown spread → no cushion (entry).
+BREAKEVEN_SPREAD_MULT = 1.0
 # MFE percent at which the profit-lock floor starts protecting part of the run.
-# Deliberately ABOVE BREAKEVEN_TRIGGER_PCT: the band between them is where a
-# young trade is held at entry to keep working.
-PROFIT_LOCK_TRIGGER_PCT = 0.2
+# Above BREAKEVEN_TRIGGER_PCT: between +8% and +12% a young trade is held at
+# (cost-aware) breakeven to keep working.
+PROFIT_LOCK_TRIGGER_PCT = 0.12
 
 # Profit-lock ladder: (minimum MFE percent, fraction of the run locked in).
 #
@@ -3868,11 +3877,13 @@ PROFIT_LOCK_TRIGGER_PCT = 0.2
 # Once a real R rung governs ("protect" at +1R and above) that rung owns the
 # stop and this floor stands down.
 #
-# STARTS AT +20%, NOT AT THE BREAKEVEN TRIGGER. Between +8% and +20% the engine
-# deliberately holds the position at entry so it can keep working. Locking 15%
-# of a +10% run on a $4.90 premium protects about $0.07 while pulling the stop
-# into the noise a young trade needs to breathe through. This ladder is for the
-# band where the give-back is measured in HUNDREDS of dollars.
+# STARTS AT +12% (5.76.0, was +20%). The options-only book prices its premium
+# stop at ~15% of the fill, so 1R ≈ +15% and the R ladder's "protect" rung
+# engages there. With the old +20% start, everything between +8% and +15%
+# was protected only by breakeven — the dead band where a run was handed back
+# whole. The +12% rung locks 25%: at +15% that is +3.75%, exactly what
+# "protect" (0.75R trail from +1R) locks, so the hand-off is continuous.
+# This is derived from the stop geometry, not fitted to any trade sample.
 #
 # INVARIANT: every lock is strictly below the keep at the same rung of
 # GIVEBACK_LADDER, so the floor always sits BELOW the harvest level and
@@ -3882,7 +3893,8 @@ PROFIT_LOCK_TRIGGER_PCT = 0.2
 # test reads both files and fails if they drift.
 PROFIT_LOCK_LADDER = (
     (0.30, 0.40),
-    (PROFIT_LOCK_TRIGGER_PCT, 0.35),
+    (0.20, 0.35),
+    (PROFIT_LOCK_TRIGGER_PCT, 0.25),
 )
 
 # Multiple of the round-trip spread a BROKER-NATIVE trailing stop must clear.
@@ -4515,7 +4527,17 @@ def compute_trail_level(
     raw = (water_mark - distance) if is_buy else (water_mark + distance)
 
     if r_multiple >= BREAKEVEN_TRIGGER_R or mfe_percent >= BREAKEVEN_TRIGGER_PCT:
-        raw = max(raw, entry) if is_buy else min(raw, entry)
+        # Cost-aware breakeven: entry plus one spread, never inside the
+        # spread floor below the water mark, never below entry.
+        be_level = entry
+        if spread_f is not None and spread_f > 0:
+            be_gap = min(risk, SPREAD_FLOOR_MULT * spread_f)
+            cushion = BREAKEVEN_SPREAD_MULT * spread_f
+            if is_buy:
+                be_level = max(entry, min(entry + cushion, water_mark - be_gap))
+            else:
+                be_level = min(entry, max(entry - cushion, water_mark + be_gap))
+        raw = max(raw, be_level) if is_buy else min(raw, be_level)
 
     # Profit-lock floor: raise the worst acceptable exit above a scratch as the
     # run extends. Only where the R ladder has NOT engaged - once "protect" or
@@ -7208,7 +7230,7 @@ removal, as policy:
    reading).
 
 4. EXPRESSION. Option entries are re-expressed as an in-the-money contract
-   (|Δ| ≈ 0.70) with 1–30 days to expiry (best expiry chosen). The payoff tracks the underlying
+   (|Δ| ≈ 0.60) with 1–30 days to expiry (best expiry chosen). The payoff tracks the underlying
    almost linearly, theta per day is a fraction of a weekly's, and a premium
    stop derived from the underlying stop means what it says. What it is NOT is
    free: an ITM contract quotes a wider absolute spread per unit of delta than
@@ -7257,9 +7279,12 @@ DEFAULT_HORIZON_MIN = 60.0
 # The forced-flatten window (ET minutes) — no shadow is held through the close.
 SHADOW_FLATTEN_MIN = 15 * 60 + 55
 
-# Expression: |Δ| 0.70 is the conventional "stock replacement" strike — 70% of
-# the share move per contract while still costing a fraction of 100 shares.
-EXPRESSION_DELTA = 0.70
+# Expression: |Δ| 0.60 (5.76.0, operator's choice — was 0.70). Still in the
+# money, still ~60% of the share move per contract, but the premium is roughly
+# a quarter to a third cheaper, so more names fit inside the per-trade risk
+# budget. Less intrinsic value means a little more of the premium is time
+# value — the best-expiry θ score already charges for that.
+EXPRESSION_DELTA = 0.60
 # 1–30 DTE window (5.75.0, operator's choice): any listed weekly from
 # tomorrow out to a month. 0DTE stays out — a same-day contract is the one the
 # 3:40 expiry flatten exists to kill, so buying one is buying a forced exit.
@@ -7291,7 +7316,7 @@ MAX_EXPIRY_CANDIDATES = 6
 # The delta band the snapped contract must land in. Wider than the target so a
 # listed strike grid ($1/$2.50/$5) can be honoured, narrow enough that an
 # accidental ATM or deep-ITM contract is refused rather than traded.
-DELTA_BAND = (0.60, 0.82)
+DELTA_BAND = (0.55, 0.72)  # around 0.60: still ITM (ATM ≈ 0.50 is refused); room above for a coarse strike grid
 # When no σ was measured: the same declared prior cost_model uses.
 VOL_PRIOR_ANNUAL = 0.50
 
@@ -7766,7 +7791,7 @@ def sender_contract_fits(strike: Any, expiry: Any, delta: Any, today: date) -> b
     """Did the SENDER already choose a contract inside the expression?
 
     The app picks its strike from the real chain's exchange greeks at the
-    same |Δ| 0.70 target and its expiry by the same best-expiry score, and shows the user THAT contract. When
+    same |Δ| 0.60 target and its expiry by the same best-expiry score, and shows the user THAT contract. When
     it fits, the bot trades it instead of re-planning from a model σ — so the
     contract the app dispatched is the contract that fills. An unmeasured
     delta never fits (re-plan as before): fit is proven, not assumed."""
@@ -9583,7 +9608,17 @@ select
   o.underlying_entry,
   o.underlying_stop,
   o.underlying_target,
-  (c.fix is not null)                               as sign_corrected
+  (c.fix is not null)                               as sign_corrected,
+  -- 5.77.0 entry telemetry, appended LAST so CREATE OR REPLACE upgrades in
+  -- place. Older closes predate it and read null — unmeasured, never zero.
+  bot_private.bot_num(e.data->>'entry_score')            as entry_score,
+  bot_private.bot_num(e.data->>'entry_rvol')             as entry_rvol,
+  nullif(e.data->>'entry_mtf', '')                  as entry_mtf,
+  bot_private.bot_num(e.data->>'entry_mtf_aligned')      as entry_mtf_aligned,
+  bot_private.bot_ts(e.data->>'entry_time')              as entry_time,
+  bot_private.bot_num(e.data->>'entry_session_minutes')  as entry_session_minutes,
+  bot_private.bot_num(e.data->>'hold_seconds')           as hold_seconds,
+  bot_private.bot_num(e.data->>'hold_minutes')           as hold_minutes
 from bot_private.bot_ledger_events e
 left join lateral (
   select t.value as fix
@@ -10678,7 +10713,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.75.0-best-expiry"
+BOT_VERSION = "5.77.0-entry-telemetry"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -10780,7 +10815,7 @@ COST_MODEL_ENABLED = os.getenv("COST_MODEL_ENABLED", "true").strip().lower() not
 # shadow-tracked on paper; a family returns only when its shadow record, net
 # of cost, earns it back (≥ 30 closes, t ≥ 2). false = report only.
 CORE_BOOK_ENABLED = os.getenv("CORE_BOOK_ENABLED", os.getenv("SETUP_GATES_ENABLED", "false")).strip().lower() not in {"false", "0", "no"}
-# Option entries are re-expressed as an ITM contract (|Δ| ≈ 0.70, best expiry in 1–30 DTE)
+# Option entries are re-expressed as an ITM contract (|Δ| ≈ 0.60, best expiry in 1–30 DTE)
 # before the chain snap. false = trade the contract the sender asked for.
 ITM_EXPRESSION_ENABLED = os.getenv("ITM_EXPRESSION_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
 # OPTIONS ONLY — the account trades option contracts, never shares. Every
@@ -20049,7 +20084,8 @@ async def _alert_entry_fill(ticker: str, guard: dict, filled: int) -> None:
 async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Optional[float],
                        target: Optional[float], contract: Optional[dict],
                        action: str = "BUY", setup: Optional[str] = None,
-                       edge_ctx: Optional[dict] = None) -> None:
+                       edge_ctx: Optional[dict] = None,
+                       entry_signal: Optional[dict] = None) -> None:
     # The setup label rides on the position and into the ledger so the trade
     # can be attributed when it settles. Without it the bot writes a history it
     # can never learn from: every close lands in an anonymous pile and the
@@ -20067,6 +20103,9 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         # The measured context at entry (edge.py) — rides to the close so the
         # outcome can be validated per volatility regime and thesis.
         "edge": edge_ctx or None,
+        # The signal's own readings at entry (score, rvol, mtf) — stamped on
+        # every close so entry quality can be measured against outcome.
+        "entry_signal": entry_signal or None,
     })
     await state.incr_trades_today()
     await trade_ledger.record("position_opened", {
@@ -20077,7 +20116,63 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         "contract": contract,
         "setup": setup_label,
         "edge": edge_ctx or None,
+        "entry_signal": entry_signal or None,
     })
+
+
+def _mtf_parts(raw: Any) -> Tuple[Optional[int], Optional[int]]:
+    """'4/5' → (4, 5). Anything unreadable → (None, None): an unparseable
+    alignment is UNKNOWN, never zero timeframes aligned."""
+    text = str(raw or "").strip()
+    if not text or "/" not in text:
+        return None, None
+    head, _, tail = text.partition("/")
+    try:
+        aligned, total = int(head.strip()), int(tail.strip())
+    except ValueError:
+        return None, None
+    if total <= 0 or aligned < 0 or aligned > total:
+        return None, None
+    return aligned, total
+
+
+def _entry_signal(payload: dict) -> Dict[str, Any]:
+    """The decision inputs the entry was gated on, as the signal sent them:
+    score, relative volume and multi-timeframe alignment. Each is recorded
+    only when it was actually MEASURED — a missing reading stays null so a
+    later study can never mistake "not measured" for a score of 0."""
+    p = payload or {}
+    score = edge._num(p.get("score"))
+    rvol = edge._num(p.get("rvol"))
+    if rvol is None and isinstance(p.get("edge_features"), dict):
+        rvol = edge._num(p["edge_features"].get("rvol"))
+    mtf_raw = p.get("mtf_alignment")
+    aligned, total = _mtf_parts(mtf_raw)
+    return {
+        "score": round(score, 2) if score is not None else None,
+        "rvol": round(rvol, 3) if rvol is not None else None,
+        "mtf": str(mtf_raw).strip() if aligned is not None else None,
+        "mtf_aligned": aligned,
+        "mtf_total": total,
+        "source": (str(p.get("source") or "").strip() or None),
+    }
+
+
+def _hold_seconds(opened_at: Any, closed_at: datetime) -> Optional[float]:
+    """Seconds between the recorded open and this close, or None when the open
+    time is missing/unreadable or lands after the close (clock skew, a stale
+    record). An unknown hold is never a zero-second hold."""
+    text = str(opened_at or "").strip()
+    if not text:
+        return None
+    try:
+        opened = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=timezone.utc)
+    held = (closed_at - opened).total_seconds()
+    return round(held, 1) if held >= 0 else None
 
 
 def _payload_edge(payload: dict) -> Dict[str, Any]:
@@ -20354,6 +20449,11 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
             await state.adjust_balance(exit_px * 100.0 * qty)
         except Exception as e:
             logger.warning(f"balance credit failed (non-fatal): {e}")
+    _closed_at = _utcnow()
+    _sig = (pos or {}).get("entry_signal") if isinstance((pos or {}).get("entry_signal"), dict) else {}
+    _hold = _hold_seconds((pos or {}).get("ts"), _closed_at)
+    _edge_ctx = (pos or {}).get("edge") if isinstance((pos or {}).get("edge"), dict) else {}
+    _entry_session_minutes = edge._num(_edge_ctx.get("session_minutes"))
     await trade_ledger.record("position_closed", {
         "ticker": ticker,
         # On the premium basis, entry/exit are BOTH premiums so a replay
@@ -20388,6 +20488,20 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         # regime segmentation (edge.py). Missing stays missing.
         "edge": (pos or {}).get("edge") if isinstance((pos or {}).get("edge"), dict) else None,
         "opened_at": (pos or {}).get("ts") or None,
+        # ENTRY QUALITY + TIMING (5.77.0) — on EVERY close, so score / rvol /
+        # mtf / time-of-day / hold can be measured against outcome later.
+        # Read from the tracked position; a close for a position the bot never
+        # opened itself (adopted, reconciled) leaves them null, not zero.
+        "entry_score": _sig.get("score"),
+        "entry_rvol": _sig.get("rvol"),
+        "entry_mtf": _sig.get("mtf"),
+        "entry_mtf_aligned": _sig.get("mtf_aligned"),
+        "entry_mtf_total": _sig.get("mtf_total"),
+        "entry_time": (pos or {}).get("ts") or None,
+        "entry_session_minutes": _entry_session_minutes,
+        "closed_at": _closed_at.isoformat(),
+        "hold_seconds": _hold,
+        "hold_minutes": round(_hold / 60.0, 2) if _hold is not None else None,
         # WATER MARK — the best this position ever showed before the exit, as
         # observed by the trail poller. This is what separates "the exit gave
         # back a real move" from "the signal never worked": without it a losing
@@ -21557,7 +21671,7 @@ async def _priced_option_risk_gate(symbol: str, premium: Any, qty: Any,
 # ==================== CONTRACT SNAP ====================
 def _best_expression_contract(market, symbol: str, spot: Any, vol_annual: Any,
                               right: str, today: date) -> Optional[Dict[str, Any]]:
-    """BEST EXPIRY (core_book.pick_best_expiry) — price the |Δ|≈0.70 contract
+    """BEST EXPIRY (core_book.pick_best_expiry) — price the |Δ|≈0.60 contract
     on every weekly in the 1–30 DTE window from E*TRADE's own chain and return
     the cheapest to hold: {expiry, strike, bid, ask, theta, delta, cost, dte,
     considered, scored}. None when nothing could be measured — the caller then
@@ -21926,7 +22040,7 @@ async def execute_live_order(payload: dict):
             contract_liquidity: Dict[str, Any] = {}
 
             # EXPRESSION (core_book) — an option ENTRY is re-planned as the ITM
-            # contract (|Δ| ≈ 0.70, best expiry in 1–30 DTE) before the chain snap. The
+            # contract (|Δ| ≈ 0.60, best expiry in 1–30 DTE) before the chain snap. The
             # sender's strike/expiry only said "options, this direction".
             # HELD-CONTRACT TRUTH — a close sells what the account HOLDS. The
             # sender's strike/expiry is the contract it PLANNED; once the bot
@@ -22520,6 +22634,7 @@ async def execute_live_order(payload: dict):
                     payload.get("entry"), payload.get("stop") or payload.get("stop_price"),
                     payload.get("target"), contract, "BUY", payload.get("setup"),
                     edge_ctx=_payload_edge(payload),
+                    entry_signal=_entry_signal(payload),
                 )
                 # OPTION STOP PROTECTION — async guard task (state in Redis,
                 # survives restarts): poll the fill, then rest a SELL_CLOSE
@@ -22858,7 +22973,8 @@ async def execute_live_order(payload: dict):
                     await _record_api_success()
                     await _record_open(symbol, quantity, entry_px or None, stop_px or None,
                                        payload.get("target"), None, action, payload.get("setup"),
-                                       edge_ctx=_payload_edge(payload))
+                                       edge_ctx=_payload_edge(payload),
+                                       entry_signal=_entry_signal(payload))
                     return {"status": "success", "response": final, "otoco": True}
                 except OTOCOUnsupported as e:
                     logger.warning(
@@ -22881,7 +22997,8 @@ async def execute_live_order(payload: dict):
             await _record_api_success()
 
             await _record_open(symbol, quantity, entry_px or None, stop_px or None, payload.get("target"), None, action,
-                               payload.get("setup"), edge_ctx=_payload_edge(payload))
+                               payload.get("setup"), edge_ctx=_payload_edge(payload),
+                               entry_signal=_entry_signal(payload))
             entry_order_id = _order_id_from_place(final)
             if stop_px > 0:
                 # Arm the stop guard: poll the entry fill, then rest a real STOP
