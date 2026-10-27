@@ -7208,7 +7208,7 @@ removal, as policy:
    reading).
 
 4. EXPRESSION. Option entries are re-expressed as an in-the-money contract
-   (|Δ| ≈ 0.70) with 14–30 days to expiry. The payoff tracks the underlying
+   (|Δ| ≈ 0.70) with 1–30 days to expiry (best expiry chosen). The payoff tracks the underlying
    almost linearly, theta per day is a fraction of a weekly's, and a premium
    stop derived from the underlying stop means what it says. What it is NOT is
    free: an ITM contract quotes a wider absolute spread per unit of delta than
@@ -7260,11 +7260,34 @@ SHADOW_FLATTEN_MIN = 15 * 60 + 55
 # Expression: |Δ| 0.70 is the conventional "stock replacement" strike — 70% of
 # the share move per contract while still costing a fraction of 100 shares.
 EXPRESSION_DELTA = 0.70
-# 14–30 DTE: past two weeks theta per day is a small share of premium; inside
-# a month the contract is still a listed weekly/monthly with a real book.
-MIN_DTE = 14
-TARGET_DTE = 21
+# 1–30 DTE window (5.75.0, operator's choice): any listed weekly from
+# tomorrow out to a month. 0DTE stays out — a same-day contract is the one the
+# 3:40 expiry flatten exists to kill, so buying one is buying a forced exit.
+# Inside the window the expiry is CHOSEN, not fixed: see pick_best_expiry.
+MIN_DTE = 1
 MAX_DTE = 30
+# The fallback when no candidate could be MEASURED (no two-sided quote, no
+# published delta/theta): the old fixed target. Unmeasured is never "best".
+TARGET_DTE = 21
+
+# BEST-EXPIRY SCORE — the cost of HOLDING the contract for the trade, as a
+# fraction of its premium:  spread/mid  +  HOLD_DAYS × |θ|/mid.
+#   • spread is paid once (in and out ≈ one full spread),
+#   • θ is paid per day held. The core theses resolve inside the session, so
+#     one day of decay is the honest carry for a trade the bot may hold to
+#     the next open. Short dates win on spread when they are liquid; longer
+#     dates win when short-dated θ would eat more than the spread saves.
+HOLD_DAYS = 1.0
+# A contract whose spread is more than 10% of its mid is not a market a
+# day-trade can cross and recover from — it is refused as a candidate.
+MAX_EXPIRY_SPREAD_PCT = 0.10
+# A measured open interest under 100 contracts is a book that cannot absorb
+# an exit at size. Unmeasured OI does not block (the two-sided quote is the
+# proof a market exists), but it never counts as depth either.
+MIN_EXPIRY_OI = 100.0
+# At most this many weekly expiries are priced per entry — each one is a chain
+# call made while the order waits. A 1–30 DTE window holds 4–5 weeklies.
+MAX_EXPIRY_CANDIDATES = 6
 # The delta band the snapped contract must land in. Wider than the target so a
 # listed strike grid ($1/$2.50/$5) can be honoured, narrow enough that an
 # accidental ATM or deep-ITM contract is refused rather than traded.
@@ -7584,7 +7607,7 @@ def reinstated_keys(events: Iterable[Dict[str, Any]]) -> Set[str]:
 
 
 # ---------------------------------------------------------------------------
-# 4. Expression: in-the-money, 14–30 DTE
+# 4. Expression: in-the-money, best expiry in 1–30 DTE
 # ---------------------------------------------------------------------------
 def bs_delta(spot: float, strike: float, vol_annual: float, dte: float, right: str) -> Optional[float]:
     """Black–Scholes delta, r = q = 0 (a three-week horizon makes carry noise)."""
@@ -7635,6 +7658,68 @@ def pick_expiry(listed: Iterable[date], today: date) -> Optional[date]:
     return min(inside, key=lambda d: (abs((d - today).days - TARGET_DTE), d))
 
 
+def weekly_candidates(listed: Iterable[date], today: date) -> List[date]:
+    """The expiries the best-expiry pick prices: inside [MIN_DTE, MAX_DTE],
+    ONE per week — the week's LAST listed date (the Friday weekly, or the
+    Thursday when Friday is a holiday). The app can only know those dates
+    without a chain, so both sides choose from the same set. Nearest first,
+    capped at MAX_EXPIRY_CANDIDATES."""
+    by_week: Dict[Tuple[int, int], date] = {}
+    for d in (listed or []):
+        if not isinstance(d, date) or not (MIN_DTE <= (d - today).days <= MAX_DTE):
+            continue
+        key = tuple(d.isocalendar()[:2])
+        if key not in by_week or d > by_week[key]:
+            by_week[key] = d  # type: ignore[index]
+    return sorted(by_week.values())[:MAX_EXPIRY_CANDIDATES]
+
+
+def expiry_cost(bid: Any, ask: Any, theta: Any, delta: Any, open_interest: Any = None) -> Optional[float]:
+    """Holding cost of one candidate contract as a fraction of its mid
+    (spread/mid + HOLD_DAYS·|θ|/mid), or None when it cannot be MEASURED or is
+    not tradeable: no two-sided quote, no published θ or Δ, |Δ| outside
+    DELTA_BAND, spread wider than MAX_EXPIRY_SPREAD_PCT, or measured OI under
+    MIN_EXPIRY_OI. None never reads as cheap."""
+    b, a, th, d = _num(bid), _num(ask), _num(theta), _num(delta)
+    if b is None or a is None or th is None or d is None or b <= 0 or a < b:
+        return None
+    if not (DELTA_BAND[0] <= abs(d) <= DELTA_BAND[1]):
+        return None
+    oi = _num(open_interest)
+    if oi is not None and oi < MIN_EXPIRY_OI:
+        return None
+    mid = (a + b) / 2.0
+    spread_pct = (a - b) / mid
+    if spread_pct > MAX_EXPIRY_SPREAD_PCT:
+        return None
+    return round(spread_pct + HOLD_DAYS * abs(th) / mid, 6)
+
+
+def pick_best_expiry(candidates: Iterable[Dict[str, Any]], today: date) -> Optional[Dict[str, Any]]:
+    """The cheapest-to-hold candidate: {expiry, strike, cost, dte, considered,
+    scored, ...row}. Ties → nearer TARGET_DTE, then the earlier date. None when
+    no candidate could be scored (the caller falls back to TARGET_DTE)."""
+    rows = list(candidates or [])
+    scored: List[Tuple[float, int, str, Dict[str, Any]]] = []
+    for row in rows:
+        try:
+            exp = datetime.strptime(str(row.get("expiry"))[:10], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        dte = (exp - today).days
+        if not (MIN_DTE <= dte <= MAX_DTE):
+            continue
+        cost = expiry_cost(row.get("bid"), row.get("ask"), row.get("theta"),
+                           row.get("delta"), row.get("open_interest"))
+        if cost is None:
+            continue
+        scored.append((cost, abs(dte - TARGET_DTE), exp.isoformat(), {**row, "dte": dte, "cost": cost}))
+    if not scored:
+        return None
+    best = min(scored, key=lambda t: (t[0], t[1], t[2]))[3]
+    return {**best, "expiry": str(best["expiry"])[:10], "considered": len(rows), "scored": len(scored)}
+
+
 def plan_expression(spot: Any, side: str, vol_annual: Any, today: date) -> Optional[Dict[str, Any]]:
     """Requested ITM contract for an option entry: {right, expiry, strike, delta,
     dte, vol_annual, vol_basis}. None when the spot is unreadable."""
@@ -7681,7 +7766,7 @@ def sender_contract_fits(strike: Any, expiry: Any, delta: Any, today: date) -> b
     """Did the SENDER already choose a contract inside the expression?
 
     The app picks its strike from the real chain's exchange greeks at the
-    same |Δ| 0.70 / 14–30 DTE target, and shows the user THAT contract. When
+    same |Δ| 0.70 target and its expiry by the same best-expiry score, and shows the user THAT contract. When
     it fits, the bot trades it instead of re-planning from a model σ — so the
     contract the app dispatched is the contract that fills. An unmeasured
     delta never fits (re-plan as before): fit is proven, not assumed."""
@@ -7723,6 +7808,8 @@ def thresholds() -> Dict[str, Any]:
         "shadow_horizon_mult": SHADOW_HORIZON_MULT,
         "expression_delta": EXPRESSION_DELTA,
         "min_dte": MIN_DTE, "target_dte": TARGET_DTE, "max_dte": MAX_DTE,
+        "hold_days": HOLD_DAYS, "max_expiry_spread_pct": MAX_EXPIRY_SPREAD_PCT,
+        "min_expiry_oi": MIN_EXPIRY_OI,
         "delta_band": list(DELTA_BAND),
     }
 
@@ -7914,7 +8001,7 @@ CORE_ENFORCED = True
 # main_bot sets this from SETUP_GATES_ENABLED (default off: labels stand).
 TAPE_WITHDRAWS_LABELS = True
 # Option entries (the scanner's shorts, as long puts) are costed and hinted as
-# the ITM 14–30 DTE contract the bot will actually trade. Set by main_bot from
+# the ITM 1–30 DTE contract the bot will actually trade. Set by main_bot from
 # ITM_EXPRESSION_ENABLED.
 ITM_EXPRESSION = True
 
@@ -8720,8 +8807,8 @@ def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) ->
     payload["strike_hint"] = round(float(candidate["entry"]))
     payload["expiration_hint"] = candidate.get("expiry") or next_friday_expiry(_utcnow())
     if ITM_EXPRESSION:
-        # The contract the bot will actually trade: ITM (|Δ| 0.70), 14–30
-        # DTE. Hints only — the bot re-plans and snaps to a listed one.
+        # The contract the bot will actually trade: ITM (|Δ| 0.70), best
+        # expiry in 1–30 DTE. Hints only — the bot picks and snaps a listed one.
         sigma = candidate.get("sigma_sec")
         vol = (float(sigma) * math.sqrt(cost_mod.TRADING_DAYS * cost_mod.SESSION_SECONDS)
                if sigma else None)
@@ -8730,6 +8817,9 @@ def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) ->
             payload["strike_hint"] = plan["strike"]
             payload["expiration_hint"] = plan["expiry"]
             payload["option_delta"] = plan["delta"]
+            # A plan, not a chain reading: the bot must not "honor" it as a
+            # chosen contract — it runs the best-expiry pick instead.
+            payload["option_delta_basis"] = "model"
     return payload
 
 
@@ -10588,7 +10678,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.74.0-scanner-parity"
+BOT_VERSION = "5.75.0-best-expiry"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -10690,7 +10780,7 @@ COST_MODEL_ENABLED = os.getenv("COST_MODEL_ENABLED", "true").strip().lower() not
 # shadow-tracked on paper; a family returns only when its shadow record, net
 # of cost, earns it back (≥ 30 closes, t ≥ 2). false = report only.
 CORE_BOOK_ENABLED = os.getenv("CORE_BOOK_ENABLED", os.getenv("SETUP_GATES_ENABLED", "false")).strip().lower() not in {"false", "0", "no"}
-# Option entries are re-expressed as an ITM contract (|Δ| ≈ 0.70, 14–30 DTE)
+# Option entries are re-expressed as an ITM contract (|Δ| ≈ 0.70, best expiry in 1–30 DTE)
 # before the chain snap. false = trade the contract the sender asked for.
 ITM_EXPRESSION_ENABLED = os.getenv("ITM_EXPRESSION_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
 # OPTIONS ONLY — the account trades option contracts, never shares. Every
@@ -21465,6 +21555,92 @@ async def _priced_option_risk_gate(symbol: str, premium: Any, qty: Any,
 
 
 # ==================== CONTRACT SNAP ====================
+def _best_expression_contract(market, symbol: str, spot: Any, vol_annual: Any,
+                              right: str, today: date) -> Optional[Dict[str, Any]]:
+    """BEST EXPIRY (core_book.pick_best_expiry) — price the |Δ|≈0.70 contract
+    on every weekly in the 1–30 DTE window from E*TRADE's own chain and return
+    the cheapest to hold: {expiry, strike, bid, ask, theta, delta, cost, dte,
+    considered, scored}. None when nothing could be measured — the caller then
+    keeps the TARGET_DTE plan. Best effort and read-only: a chain failure on
+    one expiry drops that candidate, never the order."""
+    s = core_book._num(spot)
+    v = core_book._num(vol_annual)
+    if v is not None and v > 3.0:
+        v = v / 100.0
+    if s is None or s <= 0:
+        return None
+    if v is None or v <= 0:
+        v = core_book.VOL_PRIOR_ANNUAL
+    try:
+        resp = _sync_etrade_call(market.get_option_expire_date, symbol, resp_format="json", source="option_expiry")
+        raw_dates = (((resp or {}).get("OptionExpireDateResponse") or {}).get("ExpirationDate")) or []
+        if isinstance(raw_dates, dict):
+            raw_dates = [raw_dates]
+        listed = []
+        for entry in raw_dates:
+            try:
+                listed.append(date(int(entry["year"]), int(entry["month"]), int(entry["day"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    except Exception as e:
+        logger.warning(f"best-expiry skipped for {symbol} (expiry list unreadable: {e})")
+        return None
+    rows: List[Dict[str, Any]] = []
+    for exp in core_book.weekly_candidates(listed, today):
+        dte = max(1, (exp - today).days)
+        k = core_book.strike_for_delta(s, v, dte, right)
+        if k is None:
+            continue
+        try:
+            chains = _sync_etrade_call(
+                market.get_option_chains, symbol, expiry_date=exp, chain_type=right,
+                strike_price_near=int(round(k)), no_of_strikes=10,
+                resp_format="json", source="option_chain",
+            )
+        except Exception as e:
+            logger.warning(f"best-expiry: {symbol} {exp} chain unreadable ({e}) — candidate dropped")
+            continue
+        pairs = (((chains or {}).get("OptionChainResponse") or {}).get("OptionPair")) or []
+        if isinstance(pairs, dict):
+            pairs = [pairs]
+        legs: List[Dict[str, Any]] = []
+        for pair in pairs:
+            leg = pair.get("Call") or pair.get("Put") or {}
+            greeks = leg.get("OptionGreeks") if isinstance(leg.get("OptionGreeks"), dict) else {}
+            strike_v = core_book._num(leg.get("strikePrice"))
+            if strike_v is None:
+                continue
+            d = core_book._num(greeks.get("delta"))
+            legs.append({
+                "expiry": exp.isoformat(), "strike": strike_v,
+                "bid": core_book._num(leg.get("bid")), "ask": core_book._num(leg.get("ask")),
+                "theta": core_book._num(greeks.get("theta")),
+                "delta": d if d is not None and 0 < abs(d) <= 1 else None,
+                "open_interest": core_book._num(leg.get("openInterest")),
+            })
+        measured = [lg for lg in legs if lg["delta"] is not None]
+        if measured:
+            rows.append(min(measured, key=lambda lg: abs(abs(lg["delta"]) - core_book.EXPRESSION_DELTA)))
+        elif legs:
+            # No published Δ — the candidate is kept for the record but cannot
+            # score (expiry_cost needs a measured Δ).
+            rows.append(min(legs, key=lambda lg: abs(lg["strike"] - k)))
+    best = core_book.pick_best_expiry(rows, today)
+    summary = ", ".join(
+        f"{r['expiry']}:{'——' if core_book.expiry_cost(r['bid'], r['ask'], r['theta'], r['delta'], r['open_interest']) is None else round(100 * core_book.expiry_cost(r['bid'], r['ask'], r['theta'], r['delta'], r['open_interest']), 1)}%"
+        for r in rows
+    )
+    if best is not None:
+        logger.info(
+            f"🗓️ {symbol} best expiry {best['expiry']} ({best['dte']} DTE, {right} {best['strike']}, "
+            f"hold cost {best['cost'] * 100:.1f}% of premium) — priced {summary or 'nothing'}"
+        )
+    else:
+        logger.info(f"🗓️ {symbol} best expiry: nothing measurable ({summary or 'no candidates'}) — "
+                    f"keeping the {core_book.TARGET_DTE} DTE plan")
+    return best
+
+
 def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_put: str,
                           liquidity_out: Optional[Dict[str, Any]] = None):
     """Snap a requested option expiry/strike to REAL listed contract values.
@@ -21750,7 +21926,7 @@ async def execute_live_order(payload: dict):
             contract_liquidity: Dict[str, Any] = {}
 
             # EXPRESSION (core_book) — an option ENTRY is re-planned as the ITM
-            # contract (|Δ| ≈ 0.70, 14–30 DTE) before the chain snap. The
+            # contract (|Δ| ≈ 0.70, best expiry in 1–30 DTE) before the chain snap. The
             # sender's strike/expiry only said "options, this direction".
             # HELD-CONTRACT TRUTH — a close sells what the account HOLDS. The
             # sender's strike/expiry is the contract it PLANNED; once the bot
@@ -21776,7 +21952,7 @@ async def execute_live_order(payload: dict):
             expression: Optional[Dict[str, Any]] = None
             expression_vol: Optional[float] = None
             # APP ↔ BOT CONTRACT ALIGNMENT — when the sender's own contract is
-            # already inside the expression (measured |Δ| in band, 14–30 DTE),
+            # already inside the expression (measured |Δ| in band, 1–30 DTE),
             # the bot trades THAT contract with the sender's limit and stop,
             # instead of re-planning from a model σ and filling a different
             # strike than the one the app showed.
@@ -21787,8 +21963,15 @@ async def execute_live_order(payload: dict):
                     payload.get("entry"), "long" if call_put == "CALL" else "short",
                     expression_vol, _utcnow().astimezone(_ET_ZONE).date(),
                 )
-                sender_honored = expression is not None and core_book.sender_contract_fits(
-                    strike, expiry, payload.get("option_delta"), _utcnow().astimezone(_ET_ZONE).date(),
+                # A MODEL delta (the scanner's plan hint) proves nothing about
+                # the listed contract — only a sender that read a real chain is
+                # honored; everyone else gets the best-expiry pick.
+                sender_honored = (
+                    expression is not None
+                    and str(payload.get("option_delta_basis") or "").lower() != "model"
+                    and core_book.sender_contract_fits(
+                        strike, expiry, payload.get("option_delta"), _utcnow().astimezone(_ET_ZONE).date(),
+                    )
                 )
                 if sender_honored and expression is not None:
                     expression = {**expression, "strike": float(strike), "expiry": str(expiry)[:10],
@@ -21798,6 +21981,27 @@ async def execute_live_order(payload: dict):
                         f"(Δ {payload.get('option_delta')} already inside the expression)"
                     )
                 elif expression is not None:
+                    # BEST EXPIRY in 1–30 DTE from the broker's own chain; the
+                    # TARGET_DTE plan stands only when nothing was measurable.
+                    try:
+                        pick_market = pyetrade.ETradeMarket(
+                            CONSUMER_KEY, CONSUMER_SECRET,
+                            tokens["oauth_token"], tokens["oauth_token_secret"],
+                            dev=is_sandbox,
+                        )
+                        best = await asyncio.to_thread(
+                            _best_expression_contract, pick_market, symbol, payload.get("entry"),
+                            expression_vol, call_put, _utcnow().astimezone(_ET_ZONE).date(),
+                        )
+                    except Exception as e:
+                        best = None
+                        logger.warning(f"best-expiry pick failed for {symbol} ({e}) — keeping the plan")
+                    if best is not None:
+                        expression = {**expression, "strike": float(best["strike"]),
+                                      "expiry": best["expiry"], "expiry_basis": "best",
+                                      "expiry_cost": best["cost"]}
+                    else:
+                        expression = {**expression, "expiry_basis": "target"}
                     logger.info(
                         f"🎯 {symbol} re-expressed {call_put} {strike} {expiry} → "
                         f"{expression['strike']} {expression['expiry']} (|Δ| {core_book.EXPRESSION_DELTA:.2f}, "
@@ -21870,6 +22074,8 @@ async def execute_live_order(payload: dict):
                     "delta": new_delta, "delta_basis": "chain" if chain_delta is not None else "model",
                     "vol_basis": expression["vol_basis"], "contracts": quantity,
                     "sender_contract": same_contract,
+                    "expiry_basis": "sender" if sender_honored else expression.get("expiry_basis", "target"),
+                    "expiry_cost": expression.get("expiry_cost"),
                 }
                 payload["strike_hint"] = strike
                 payload["expiration_hint"] = expiry
@@ -24931,7 +25137,7 @@ async def status():
             "portfolio_risk_enabled": PORTFOLIO_RISK_ENABLED,
             "cost_model_enabled": COST_MODEL_ENABLED,
             # Core book (core_book.py): retired families refused + shadow-tracked;
-            # option entries re-expressed ITM 14–30 DTE.
+            # option entries re-expressed ITM, best expiry in 1–30 DTE.
             "core_book_enabled": CORE_BOOK_ENABLED,
             "itm_expression_enabled": ITM_EXPRESSION_ENABLED,
             "require_proven_ev": REQUIRE_PROVEN_EV,
