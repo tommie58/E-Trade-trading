@@ -10713,7 +10713,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.77.0-entry-telemetry"
+BOT_VERSION = "5.79.0-stop-loop"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -11045,6 +11045,23 @@ DAILY_LOSS_FLATTEN_ENABLED = os.getenv("DAILY_LOSS_FLATTEN_ENABLED", "true").low
 # with the bot as the only live guardian it runs here, off `econ_calendar`
 # (a mirror of the app's schedule, parity-tested).
 EVENT_FLATTEN_ENABLED = os.getenv("EVENT_FLATTEN_ENABLED", "true").lower() == "true"
+# EXIT RETRY BACKOFF (5.79). A clock or target exit cancels the resting stop,
+# tries the close, and re-arms the stop when the close fails. Retrying that on
+# every 30s pass IS a cancel/re-arm loop: ORCL 2026-10-28 re-sent its stop 92
+# times inside the FOMC window, every cycle leaving the contract unprotected
+# for seconds, and the last re-arm landed below the market and filled $0.88
+# under the stop. A failed exit now waits before trying again, doubling.
+EXIT_RETRY_BASE_SECONDS = 120.0    # 4 passes: long enough for a transient broker reject to clear
+EXIT_RETRY_MAX_SECONDS = 600.0     # a decision exit still gets a few honest tries per event window
+EXIT_RETRY_EOD_MAX_SECONDS = 60.0  # the 3:40 flatten has a hard deadline (4:00 bell) — retry each minute
+EXIT_RETRY_MAX_FAILS = 3           # then decision exits give up and leave the stop resting (EOD never gives up)
+# STOP CHURN BREAKER (5.79). Independent of WHY a path wants the stop off: a
+# healthy trail replaces a handful of times per hour; this many cancels in this
+# window is a loop, and every cancel is an unprotected gap. Discretionary
+# cancels (trail, target, scale-out, event/max-hold) are refused past it; the
+# resting stop stays. The 3:40 expiry flatten is exempt — expiry is worse.
+STOP_CHURN_WINDOW_SECONDS = 900.0
+STOP_CHURN_MAX_CANCELS = 6
 # GUARDIAN HEARTBEAT. How often the risk desk loop beats, and how old that beat
 # may be before /healthz reports the guardian as NOT green. The app refuses to
 # arm live money on anything but a green guardian.
@@ -11213,6 +11230,38 @@ FILLED_SHAPE_PREFIX = "filled shape cannot pay"
 # nothing about risk. Set APP_EXIT_AUTHORITY=true only to restore the old
 # two-tier behaviour deliberately.
 APP_EXIT_AUTHORITY = os.getenv("APP_EXIT_AUTHORITY", "false").lower() == "true"
+# ---- APP DECIDES (5.78, operator directive 2026-10-28) ----------------------
+# The app is the final decision maker for APP-ORIGIN trades: entries, exits and
+# the contract. For those dispatches the bot may refuse an entry for exactly
+# three reasons the operator named -- the kill switch, relative volume not
+# verified (rvol measured and >= the live floor) and setup verification
+# (allowlisted setup + multi-timeframe alignment). Everything else the bot
+# used to re-decide (score, edge thesis, core book, learning cells, event
+# window, daily lock, loss streak, max positions, heat, concentration, cost,
+# spread, filled shape, priced risk, capacity, re-expression / best-expiry
+# swap) stands down: the app already decided, and two deciders disagreeing
+# about the same trade is how the app showed one contract and the bot bought
+# another.
+#
+# What still holds, because it is MECHANICS rather than a decision:
+#   * options only (never shares);
+#   * the contract must exist on the broker's chain -- an unlisted strike or
+#     expiry is refused, never silently swapped for a neighbour;
+#   * one position per ticker (positions are keyed by ticker; a second buy
+#     would overwrite the first one's record and orphan its stop);
+#   * the runaway dispatch-loop breaker and the broker funds clamp;
+#   * duplicate-signal idempotency.
+#
+# Exits: the app owns them while it PROVES it is guarding the position
+# (assess_guard_proof). The bot's own ratchet, premium take-profit, scale-out,
+# max-hold and event flatten stand down for that position. The app's stop
+# level ALWAYS rests at the broker as the backup, and the moment the app goes
+# dark the bot's trail takes the position back. The expiry-day 3:40 flatten
+# and the daily-loss flatten (which engages the kill switch) still run --
+# those protect against the phone being asleep at the worst moment.
+#
+# Scanner-origin entries keep every gate. APP_DECIDES=false restores 5.77.
+APP_DECIDES = os.getenv("APP_DECIDES", "true").strip().lower() not in {"false", "0", "no"}
 # Deliberately WIDER than OPTION_STOP_MAX_HAIRCUT_PCT: that clamp bounds a
 # tactical stop meant to pay 1.5:1, while this is the disaster floor and is not
 # supposed to be reachable by noise.
@@ -11618,6 +11667,88 @@ def entry_origin_permitted(
         f"origination refused: entry originated by '{src}', not the app — "
         "entries must come from an app (AI Autopilot) dispatch"
     )
+
+
+def app_decides_entry(origin: Any, is_close: bool, enabled: bool) -> bool:
+    """Is this an APP-ORIGIN entry the app has final say over? (See APP_DECIDES.)
+
+    Closes are never 'entries'; scanner or unlabeled origins never qualify.
+    Pure: no I/O, fully unit-testable.
+    """
+    if not enabled or is_close:
+        return False
+    return str(origin or "").strip().lower() == DISPATCH_ORIGIN_APP
+
+
+def assess_app_entry_gates(
+    p: dict,
+    min_rvol: float,
+    min_mtf: float,
+    allowed_setups: Any,
+    setup_gates_enabled: bool,
+) -> List[str]:
+    """The ONLY quality refusals an app-decided entry can meet: volume
+    verification and setup verification (allowlist + timeframe alignment).
+
+    Fails CLOSED on the payload: an unmeasured rvol or an unparseable mtf is a
+    refusal, because 'verified' cannot mean 'not looked at'. Same wording as
+    the full filter so the app's refusal text reads the same either way.
+    Pure: no I/O, fully unit-testable.
+    """
+    blocked: List[str] = []
+    rvol = p.get("rvol")
+    if rvol is None or isinstance(rvol, bool):
+        blocked.append("rvol not measured (volume feed gap) — live entry needs a real reading")
+    elif not isinstance(rvol, (int, float)) or not math.isfinite(float(rvol)):
+        blocked.append("rvol unreadable — live entry needs a real reading")
+    elif rvol < min_rvol:
+        blocked.append(f"rvol {rvol} < {min_rvol:g}")
+    mtf = p.get("mtf_alignment")
+    if isinstance(mtf, str) and mtf.strip():
+        try:
+            if int(mtf.split("/")[0]) < min_mtf:
+                blocked.append(f"mtf {mtf} < {min_mtf:g}/5")
+        except (ValueError, IndexError):
+            blocked.append("mtf_alignment unparseable")
+    elif min_mtf > 0:
+        blocked.append("mtf alignment not reported — setup alignment unverified")
+    setup = p.get("setup")
+    allowed = {str(s).lower().strip() for s in (allowed_setups or [])}
+    if setup_gates_enabled and allowed:
+        if not isinstance(setup, str) or not setup.strip():
+            blocked.append("setup not reported — setup unverified")
+        elif setup.lower().strip() not in allowed:
+            blocked.append(f"setup '{setup}' not allowlisted")
+    return blocked
+
+
+def contract_matches(requested: Any, listed: Any) -> bool:
+    """Is the listed (expiry, strike) the SAME contract the app asked for?
+
+    Unreadable inputs are not a match — an app-decided entry refuses rather
+    than buying something it cannot prove is the app's contract.
+    Pure: no I/O, fully unit-testable.
+    """
+    try:
+        req_exp, req_strike = str(requested[0])[:10], float(requested[1])
+        got_exp, got_strike = str(listed[0])[:10], float(listed[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return False
+    if not (math.isfinite(req_strike) and math.isfinite(got_strike)):
+        return False
+    return bool(req_exp) and req_exp == got_exp and abs(req_strike - got_strike) < 1e-6
+
+
+def plan_app_exit_standdown(enabled: bool, pos: Any, guarded: bool) -> bool:
+    """Should the bot's DISCRETIONARY exits stand down for this position?
+
+    Only for an app-decided position while the app provably guards it. A dark
+    or non-guarding app hands the position straight back to the bot.
+    Pure: no I/O, fully unit-testable.
+    """
+    if not enabled or not isinstance(pos, dict) or not pos.get("app_decides"):
+        return False
+    return bool(guarded)
 
 
 def _is_close_payload(p: dict) -> bool:
@@ -12291,6 +12422,36 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
         blocked.append("kill switch active")
 
     is_probe = _is_connectivity_test(p)
+
+    # APP DECIDES (see APP_DECIDES): an app-origin entry meets only the kill
+    # switch, volume verification and setup verification -- plus the
+    # mechanics that are not decisions (one position per ticker, the runaway
+    # dispatch-loop breaker). Every other gate below is the bot second-guessing
+    # a decision the app already made, and stands down.
+    if app_decides_entry(p.get(DISPATCH_ORIGIN_FIELD), False, APP_DECIDES):
+        if not is_probe:
+            blocked.extend(assess_app_entry_gates(
+                p, live_policy("min_rvol"), live_policy("min_mtf"),
+                _LIVE_POLICY.get("allowed_setups") or [], SETUP_GATES_ENABLED,
+            ))
+        try:
+            daily_m = await state.get_daily()
+            if daily_m["trades_today"] >= RUNAWAY_TRADE_CIRCUIT_BREAKER:
+                blocked.append(
+                    f"runaway circuit breaker: {daily_m['trades_today']} entries today — this is a "
+                    f"dispatch loop, not a trading day"
+                )
+        except Exception as e:
+            logger.warning(f"daily counter unreadable (runaway breaker skipped): {e}")
+        ticker_m = str(p.get("ticker") or "").upper()
+        if ticker_m and ticker_m in (await state.all_positions()):
+            blocked.append(f"already in {ticker_m}")
+        if blocked:
+            logger.warning(f"📱 APP DECIDES — {ticker_m or 'entry'} refused: {' · '.join(blocked)}")
+        else:
+            logger.info(f"📱 APP DECIDES — {ticker_m or 'entry'} passed kill switch, volume and setup checks")
+        return len(blocked) == 0, blocked
+
     if not is_probe:
         regime = str(p.get("regime") or "").lower()
         score = p.get("score")
@@ -18841,6 +19002,11 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
     runner_qty = int(split["runner_qty"])
     stop_order_id = pos.get("stop_order_id")
 
+    if not await _exit_retry_gate(ticker, pos, "scale_out"):
+        return False
+    if stop_order_id and not await _stop_churn_gate(ticker, pos, "scale_out"):
+        return False
+
     # The resting stop covers the FULL size. It must come off before a partial
     # close, or the stop and the scale-out can both fill and oversell into a
     # naked short. CANCEL_FILLED means the stop beat us — the position is flat
@@ -18884,6 +19050,7 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
         close_id = await _place_option_market_close(ticker, contract, scale_qty)
     except Exception as e:
         logger.error(f"[SCALE-OUT] {ticker} partial close FAILED: {e} — re-arming the full stop")
+        await _note_exit_failure(ticker, pos, "scale_out")
         try:
             await _reconcile_rearm_guard(ticker, pos)
         except Exception as re:
@@ -19064,6 +19231,11 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
     native_id = pos.get("native_trail_order_id")
     resting_id = stop_order_id or native_id
 
+    if not await _exit_retry_gate(ticker, pos, "take_profit"):
+        return False
+    if resting_id and not await _stop_churn_gate(ticker, pos, "take_profit"):
+        return False
+
     if resting_id:
         # The resting order already pledges the contracts. Selling while it
         # rests earns E*TRADE 3004 on the one exit we most wanted.
@@ -19104,6 +19276,7 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
         close_id = await _place_option_market_close(ticker, contract, qty)
     except Exception as e:
         logger.error(f"[TAKE PROFIT] {ticker} close FAILED: {e} — re-arming protection")
+        await _note_exit_failure(ticker, pos, "take_profit")
         try:
             await _reconcile_rearm_guard(ticker, pos)
         except Exception as re:
@@ -19157,6 +19330,133 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
         dedupe_key=f"tp:{ticker}:{close_id}",
     )
     return True
+
+
+def plan_exit_retry(record: Any, reason: str, now_s: float) -> Dict[str, Any]:
+    """May an exit that already FAILED for this position try again now?
+
+    `record` is `pos["exit_retry"]`: {reason: {"fails": n, "last": epoch_s}}.
+    Backoff doubles from EXIT_RETRY_BASE_SECONDS, capped per reason. Decision
+    exits stop trying after EXIT_RETRY_MAX_FAILS (the stop keeps resting);
+    the expiry-day flatten never gives up. An unreadable record allows the
+    try — the stop-churn breaker still bounds the damage.
+    """
+    try:
+        entry = dict((record or {}).get(reason) or {})
+        fails = int(entry.get("fails") or 0)
+        last = float(entry.get("last") or 0.0)
+    except (TypeError, ValueError, AttributeError):
+        return {"allowed": True, "exhausted": False, "fails": 0, "wait_s": 0.0}
+    if fails <= 0:
+        return {"allowed": True, "exhausted": False, "fails": 0, "wait_s": 0.0}
+    is_eod = reason == "eod_flatten"
+    if not is_eod and fails >= EXIT_RETRY_MAX_FAILS:
+        return {"allowed": False, "exhausted": True, "fails": fails, "wait_s": None}
+    cap = EXIT_RETRY_EOD_MAX_SECONDS if is_eod else EXIT_RETRY_MAX_SECONDS
+    wait = min(cap, EXIT_RETRY_BASE_SECONDS * (2 ** (fails - 1)))
+    remaining = last + wait - float(now_s)
+    if remaining > 0:
+        return {"allowed": False, "exhausted": False, "fails": fails, "wait_s": round(remaining, 1)}
+    return {"allowed": True, "exhausted": False, "fails": fails, "wait_s": 0.0}
+
+
+def record_exit_failure(record: Any, reason: str, now_s: float) -> Dict[str, Any]:
+    """New `exit_retry` record with one more failure stamped for `reason`."""
+    try:
+        out = {str(k): dict(v) for k, v in dict(record or {}).items() if isinstance(v, dict)}
+    except (TypeError, ValueError):
+        out = {}
+    prev = out.get(reason) or {}
+    try:
+        fails = int(prev.get("fails") or 0)
+    except (TypeError, ValueError):
+        fails = 0
+    out[reason] = {"fails": fails + 1, "last": float(now_s)}
+    return out
+
+
+def assess_stop_churn(cancel_times: Any, now_s: float) -> Dict[str, Any]:
+    """Has this position's protective stop been cancelled too often lately?
+
+    Returns {"blocked", "recent", "times"} where `times` is the trimmed list
+    of cancel stamps still inside STOP_CHURN_WINDOW_SECONDS.
+    """
+    times: List[float] = []
+    for t in list(cancel_times or []) if isinstance(cancel_times, (list, tuple)) else []:
+        try:
+            f = float(t)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= float(now_s) - f <= STOP_CHURN_WINDOW_SECONDS:
+            times.append(f)
+    return {"blocked": len(times) >= STOP_CHURN_MAX_CANCELS, "recent": len(times), "times": times}
+
+
+async def _stop_churn_gate(ticker: str, pos: dict, who: str) -> bool:
+    """Record a discretionary cancel of the resting stop, or refuse it when
+    the stop has been churned too often. Refusal leaves the stop resting."""
+    now = time.time()
+    verdict = assess_stop_churn(pos.get("stop_cancel_times"), now)
+    if verdict["blocked"]:
+        logger.warning(
+            f"[STOP CHURN] {ticker} {who} wanted the stop off but it was cancelled "
+            f"{verdict['recent']}× in {STOP_CHURN_WINDOW_SECONDS / 60:.0f} min — leaving it resting"
+        )
+        await alerts.send(
+            "critical", "stop_churn_blocked",
+            f"{ticker}: the protective stop was cancelled and re-sent {verdict['recent']} times in "
+            f"{STOP_CHURN_WINDOW_SECONDS / 60:.0f} minutes — the bot stopped touching it so the position "
+            f"stays protected. Last attempt: {who}. Check the position and close it yourself if you want out.",
+            dedupe_key=f"stop_churn:{ticker}",
+        )
+        return False
+    pos["stop_cancel_times"] = verdict["times"] + [now]
+    try:
+        await state.set_position(ticker, pos)
+    except Exception as e:
+        logger.warning(f"[STOP CHURN] {ticker} cancel stamp not persisted: {e}")
+    return True
+
+
+async def _exit_retry_gate(ticker: str, pos: dict, reason: str) -> bool:
+    """Back off an exit that already failed for this position."""
+    retry = plan_exit_retry(pos.get("exit_retry"), reason, time.time())
+    if retry["allowed"]:
+        return True
+    if retry["exhausted"]:
+        if not pos.get(f"exit_gave_up_{reason}"):
+            pos[f"exit_gave_up_{reason}"] = True
+            await state.set_position(ticker, pos)
+            logger.error(f"[{reason.upper()}] {ticker} failed {retry['fails']}× — giving up, stop stays resting")
+            await alerts.send(
+                "critical", f"{reason}_gave_up",
+                f"{ticker}: the {reason.replace('_', ' ')} close failed {retry['fails']} times, so the bot "
+                f"stopped retrying and left the protective stop resting. Close it yourself if you want out.",
+                dedupe_key=f"{reason}:gaveup:{ticker}",
+            )
+    return False
+
+
+async def _note_exit_failure(ticker: str, pos: dict, reason: str) -> None:
+    pos["exit_retry"] = record_exit_failure(pos.get("exit_retry"), reason, time.time())
+    try:
+        await state.set_position(ticker, pos)
+    except Exception as e:
+        logger.warning(f"[{reason.upper()}] {ticker} retry stamp not persisted: {e}")
+
+
+async def _app_owns_exit(ticker: str, pos: dict) -> bool:
+    """Does the APP own this position's discretionary exits right now?
+    Any failure answers False — the bot keeps the exit, the safe direction."""
+    if not APP_DECIDES or not isinstance(pos, dict) or not pos.get("app_decides"):
+        return False
+    try:
+        eyes = await _app_link_snapshot()
+        proof = assess_guard_proof(eyes, ticker, pos.get("stop_armed_at"), time.time())
+        return plan_app_exit_standdown(APP_DECIDES, pos, bool(proof.get("guarded")))
+    except Exception as e:
+        logger.warning(f"[APP DECIDES] {ticker} guard proof unreadable — bot keeps the exit: {e}")
+        return False
 
 
 async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
@@ -19224,9 +19524,18 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
                        "detail": f"{event['reason']} — not riding a binary release"}
     if not verdict["fire"]:
         return False
+    # The expiry-day flatten always runs (a phone asleep at 3:40 must not let a
+    # contract expire). Max hold and the event flatten are decisions — the app
+    # makes those for a position it is guarding.
+    if str(verdict.get("reason")) != "eod_flatten" and await _app_owns_exit(ticker, pos):
+        return False
 
     reason = str(verdict["reason"])
+    if not await _exit_retry_gate(ticker, pos, reason):
+        return False
     resting_id = pos.get("stop_order_id") or pos.get("native_trail_order_id")
+    if resting_id and reason != "eod_flatten" and not await _stop_churn_gate(ticker, pos, reason):
+        return False
     if resting_id:
         # Same cancel-before-close discipline as every other exit: the resting
         # order pledges the contracts, so selling under it earns E*TRADE 3004.
@@ -19281,10 +19590,15 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
         close_id = await _place_option_market_close(ticker, contract, qty)
     except Exception as e:
         logger.error(f"[{reason.upper()}] {ticker} close FAILED: {e} — re-arming protection")
+        pos["exit_retry"] = record_exit_failure(pos.get("exit_retry"), reason, time.time())
         try:
             await _reconcile_rearm_guard(ticker, pos)
         except Exception as re:
             logger.error(f"[{reason.upper()}] {ticker} stop re-arm after failed close ALSO failed: {re}")
+            try:
+                await state.set_position(ticker, pos)
+            except Exception:
+                pass
         await alerts.send(
             "critical", f"{reason}_failed",
             f"{ticker}: the {reason.replace('_', ' ')} close FAILED ({e}) — "
@@ -21941,6 +22255,10 @@ async def execute_live_order(payload: dict):
 
     await check_risk_limits(is_close=is_close)
 
+    # APP DECIDES — an app-origin entry: the bot executes the app's decision
+    # (its exact contract and size) instead of re-deciding it. See APP_DECIDES.
+    app_decides = app_decides_entry(payload.get(DISPATCH_ORIGIN_FIELD), is_close, APP_DECIDES)
+
     if not is_close:
         if await state.is_killed():
             raise Exception("kill switch active — entry refused")
@@ -21951,7 +22269,7 @@ async def execute_live_order(payload: dict):
     # queued job may run after a close moved a cell). A disabled cell refuses;
     # otherwise the weight shrinks the size below. Ledger failure → full size.
     learning_ctx: Optional[Dict[str, Any]] = None
-    if not is_close and not _is_connectivity_test(payload):
+    if not is_close and not app_decides and not _is_connectivity_test(payload):
         try:
             learning_ctx = _assess_learning_entry(payload)
         except Exception as e:
@@ -21968,10 +22286,11 @@ async def execute_live_order(payload: dict):
     # _assess_portfolio_risk — never a silent full-size pass on a refusal.
     risk_ctx: Optional[Dict[str, Any]] = None
     if not is_close and not _is_connectivity_test(payload):
-        try:
-            risk_ctx = await _assess_portfolio_risk(payload)
-        except Exception as e:
-            logger.warning(f"portfolio risk unavailable for {ticker} (unweighted): {e}")
+        if not app_decides:
+            try:
+                risk_ctx = await _assess_portfolio_risk(payload)
+            except Exception as e:
+                logger.warning(f"portfolio risk unavailable for {ticker} (unweighted): {e}")
         if risk_ctx is not None:
             if not risk_ctx["allowed"]:
                 raise Exception("; ".join(risk_ctx["reasons"]) or "portfolio risk: entry refused")
@@ -22071,7 +22390,12 @@ async def execute_live_order(payload: dict):
             # instead of re-planning from a model σ and filling a different
             # strike than the one the app showed.
             sender_honored = False
-            if not is_exit and ITM_EXPRESSION_ENABLED and not _is_connectivity_test(payload):
+            if not is_exit and app_decides:
+                logger.info(
+                    f"📱 {symbol} APP DECIDES — buying the app's {call_put} {strike} {expiry} "
+                    f"x{quantity} as sent (no re-expression, no best-expiry swap)"
+                )
+            if not is_exit and not app_decides and ITM_EXPRESSION_ENABLED and not _is_connectivity_test(payload):
                 expression_vol = _payload_vol_annual(payload)
                 expression = core_book.plan_expression(
                     payload.get("entry"), "long" if call_put == "CALL" else "short",
@@ -22134,9 +22458,24 @@ async def execute_live_order(payload: dict):
                 tokens["oauth_token"], tokens["oauth_token_secret"],
                 dev=is_sandbox,
             )
+            app_contract = (str(expiry)[:10], float(strike))
             expiry, strike, real_bid, real_ask = await asyncio.to_thread(
                 _snap_option_contract, market, symbol, expiry, float(strike), call_put, contract_liquidity
             )
+            if not is_exit and app_decides and not contract_matches(app_contract, (expiry, strike)):
+                # The app picked a contract the broker does not list. Buying the
+                # nearest neighbour would be the bot deciding — refuse instead.
+                reason = (
+                    f"the app's contract {call_put} {app_contract[1]:g} {app_contract[0]} is not listed "
+                    f"at the broker (nearest is {float(strike):g} {str(expiry)[:10]}) — not substituting"
+                )
+                logger.warning(f"⛔ {symbol} {reason}")
+                await trade_ledger.record("entry_contract_unlisted", {
+                    "ticker": sym_u, "app_strike": app_contract[1], "app_expiry": app_contract[0],
+                    "listed_strike": float(strike), "listed_expiry": str(expiry)[:10],
+                })
+                return {"status": "refused", "reason": reason,
+                        "code": "contract_unlisted", "paper": True}
 
             if expression is not None:
                 today_et = _utcnow().astimezone(_ET_ZONE).date()
@@ -22210,7 +22549,10 @@ async def execute_live_order(payload: dict):
             if not is_exit and real_bid > 0 and real_ask > real_bid and not _is_connectivity_test(payload):
                 cost_verdict = _assess_expected_cost(payload, {"bid": real_bid, "ask": real_ask})
                 payload["_cost"] = cost_verdict
-                if not cost_verdict["allowed"]:
+                if not cost_verdict["allowed"] and app_decides:
+                    # Recorded for the study, never a refusal: the app decided.
+                    logger.info(f"📱 {symbol} cost model would refuse ({'; '.join(cost_verdict['reasons'])}) — app decides")
+                elif not cost_verdict["allowed"]:
                     reason = "; ".join(cost_verdict["reasons"])
                     await trade_ledger.record("entry_cost_refused", {
                         "ticker": sym_u, "bid": real_bid, "ask": real_ask,
@@ -22340,7 +22682,9 @@ async def execute_live_order(payload: dict):
                 # chosen. A refusal is a policy verdict (returned, never
                 # raised) so it cannot feed the API circuit breaker.
                 spread_gate = plan_spread_gate(real_bid, real_ask, payload.get("max_spread_pct"))
-                if spread_gate["ok"] is False:
+                if spread_gate["ok"] is False and app_decides:
+                    logger.info(f"📱 {symbol} {spread_gate['reason']} — app decides, not refusing")
+                elif spread_gate["ok"] is False:
                     logger.warning(f"⛔ {symbol} {spread_gate['reason']}")
                     await trade_ledger.record("entry_spread_refused", {
                         "ticker": sym_u, "real_bid": real_bid or None, "real_ask": real_ask or None,
@@ -22410,6 +22754,13 @@ async def execute_live_order(payload: dict):
                     limit_price, quantity,
                     float(common.get("limitPrice") or 0) or float(real_ask or 0),
                 )
+                if app_decides and reprice["action"] != "proceed":
+                    # The app sized this on its own quote; the size stands.
+                    logger.info(
+                        f"📱 {symbol} real premium drift {reprice.get('drift_pct')}% vs the app's "
+                        f"estimate — app decides, keeping {quantity} contract(s)"
+                    )
+                    reprice = {**reprice, "action": "proceed"}
                 if reprice["action"] == "reject":
                     await trade_ledger.record("entry_reprice_rejected", {
                         "ticker": str(symbol).upper(),
@@ -22457,7 +22808,7 @@ async def execute_live_order(payload: dict):
                     quantity = reprice["qty"]
                     common["quantity"] = quantity
 
-            if not is_exit:
+            if not is_exit and not app_decides:
                 # FILLED-SHAPE GATE — the trade must still pay 1.5R at the REAL
                 # ask, not at the app's limit. Runs on E*TRADE's own quote,
                 # after the reprice, before any dollars are budgeted. Returns
@@ -22636,6 +22987,17 @@ async def execute_live_order(payload: dict):
                     edge_ctx=_payload_edge(payload),
                     entry_signal=_entry_signal(payload),
                 )
+                if app_decides:
+                    # Marks the position as the APP's to exit while it guards
+                    # it (plan_app_exit_standdown). Best effort: a failed stamp
+                    # leaves the bot managing the exit, the safe direction.
+                    try:
+                        stamped = await state.get_position(sym_u)
+                        if stamped is not None:
+                            stamped["app_decides"] = True
+                            await state.set_position(sym_u, stamped)
+                    except Exception as e:
+                        logger.warning(f"{sym_u} app_decides stamp failed (bot keeps the exit): {e}")
                 # OPTION STOP PROTECTION — async guard task (state in Redis,
                 # survives restarts): poll the fill, then rest a SELL_CLOSE
                 # STOP on the same OCC contract.
@@ -22708,7 +23070,10 @@ async def execute_live_order(payload: dict):
                     )["guarded"])
                     placement = plan_broker_stop_placement(
                         stop_premium, fill_ref, app_has_eyes,
-                        OPTION_BACKSTOP_HAIRCUT_PCT, APP_EXIT_AUTHORITY,
+                        # APP DECIDES: the guard claim only stands the bot's
+                        # discretionary exits down; it never widens the
+                        # broker stop. The app's tactical level always rests.
+                        OPTION_BACKSTOP_HAIRCUT_PCT, APP_EXIT_AUTHORITY and not APP_DECIDES,
                     )
                     resting_premium = float(placement["level"] or stop_premium)
                     await _arm_stop_guard(
@@ -23330,6 +23695,16 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     if mark <= 0:
         return
 
+    # APP DECIDES — while the app provably guards an app-decided position it
+    # owns the exit: no bot take-profit, scale-out or ratchet. The app's stop
+    # keeps resting at the broker; a dark app hands the position straight back.
+    if await _app_owns_exit(ticker, pos):
+        logger.debug(
+            f"[TRAIL] {ticker} app-decided and guarded by the app — bot exits standing down "
+            f"(broker backup stop still resting; watermark still tracked)"
+        )
+        return
+
     # NATIVE TRAIL STAND-DOWN. When a broker-native trailing stop covers this
     # leg, E*TRADE ratchets it server-side and it IS the protection. Placed
     # AFTER the watermark so instrumentation never depends on who owns the
@@ -23407,6 +23782,11 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         return
 
     if not replace:
+        await state.set_position(ticker, pos)
+        return
+
+    if not await _stop_churn_gate(ticker, pos, "trail_ratchet"):
+        # The current stop keeps resting; the watermark updates still persist.
         await state.set_position(ticker, pos)
         return
 
@@ -24945,7 +25325,12 @@ async def process_signal(pd: dict) -> dict:
             return {"status": "rejected", "reason": "; ".join(blocked), "signal_id": sig_key}
         cooldown_key = f"cooldown:{str(pd.get('ticker') or '').upper()}"
         # NX write doubles as the existence check — atomic even across workers.
-        if not await state.set(cooldown_key, "1", ex=TICKER_COOLDOWN_MINUTES * 60, nx=True):
+        # The re-entry cooldown is a timing DECISION, so an app-decided entry
+        # skips it (duplicates are still caught by the idempotency key above
+        # and the one-position-per-ticker check in the filters).
+        if app_decides_entry(pd.get(DISPATCH_ORIGIN_FIELD), is_close, APP_DECIDES):
+            pass
+        elif not await state.set(cooldown_key, "1", ex=TICKER_COOLDOWN_MINUTES * 60, nx=True):
             await state.set(sig_key, "cooldown", ex=86400)
             await _record_dispatch_verdict(pd, "cooldown", "ticker_in_cooldown")
             return {"status": "cooldown", "reason": "ticker_in_cooldown", "signal_id": sig_key}
