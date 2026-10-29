@@ -7987,7 +7987,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "min_rvol": 0.9,
     "max_spread_pct": 0.35,
     "min_price": 5.0,
-    "risk_pct": 2.0,
+    # No `risk_pct` (removed 5.80): the scanner never sized anything with it —
+    # sizing is `risk_per_trade_pct` in the live policy — and a stored 0.5 made
+    # the real risk limit look four times smaller than it is. A stored value
+    # is now simply ignored.
 }
 
 # Symbols may never exceed this — one pasted watchlist must not blow the
@@ -8131,7 +8134,6 @@ def normalize_config(raw: Any) -> Dict[str, Any]:
             ("min_rvol", ENTRY_GATE_FLOORS["min_rvol"], 10.0, float),
             ("max_spread_pct", 0.01, 5.0, float),
             ("min_price", 0.0, 10_000.0, float),
-            ("risk_pct", 0.05, 5.0, float),
         ):
             if raw.get(key) is None:
                 continue
@@ -10379,6 +10381,58 @@ def average_daily_volume(aggs_payload: Dict[str, Any], today_iso: str, sessions:
     return sum(vols) / len(vols)
 
 
+def occ_option_ticker(underlying: Any, expiry_iso: Any, call_put: Any, strike: Any) -> Optional[str]:
+    """Massive/OCC option ticker, e.g. O:ORCL261106P00250000. None when any
+    part is unusable — never a guessed contract. Pure."""
+    root = str(underlying or "").strip().upper()
+    exp = str(expiry_iso or "").strip()[:10]
+    side = str(call_put or "").strip().upper()[:1]
+    k = _num(strike)
+    if not root or len(exp) != 10 or exp[4] != "-" or exp[7] != "-" or side not in ("C", "P"):
+        return None
+    if k is None or k <= 0:
+        return None
+    return f"O:{root}{exp[2:4]}{exp[5:7]}{exp[8:10]}{side}{int(round(k * 1000)):08d}"
+
+
+def option_snapshot_to_quote(payload: Any, now_s: float) -> Dict[str, Any]:
+    """Judge Massive's option-contract snapshot as a payoff-check quote.
+
+    Bid and ask come from the SAME `last_quote` object (never mixed across
+    feeds). `live` only when both sides are positive, ask >= bid, the feed
+    does not call itself DELAYED, and the quote is younger than
+    REALTIME_MAX_AGE_S. Returns {live, bid, ask, age_s, timeframe, reason}.
+    Pure.
+    """
+    out: Dict[str, Any] = {"live": False, "bid": None, "ask": None, "age_s": None,
+                           "timeframe": None, "reason": ""}
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if isinstance(results, list):
+        results = results[0] if results else None
+    q = results.get("last_quote") if isinstance(results, dict) else None
+    if not isinstance(q, dict):
+        out["reason"] = "Massive returned no quote for this contract"
+        return out
+    bid, ask = _num(q.get("bid")), _num(q.get("ask"))
+    tf = str(q.get("timeframe") or "").upper() or None
+    ts = _ts_seconds(q.get("last_updated"))
+    age = (float(now_s) - ts) if ts is not None else None
+    out.update({"bid": bid, "ask": ask, "timeframe": tf,
+                "age_s": round(age, 1) if age is not None else None})
+    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+        out["reason"] = "Massive quote is not two-sided"
+    elif tf == "DELAYED":
+        out["reason"] = "Massive quote is DELAYED (plan lacks real-time options)"
+    elif age is None:
+        out["reason"] = "Massive quote has no timestamp"
+    elif age > REALTIME_MAX_AGE_S:
+        out["reason"] = f"Massive quote is {int(age)}s old"
+    else:
+        out["live"] = True
+        out["reason"] = "Massive real-time quote"
+    return out
+
+
 class MassiveClient:
     """Async quote fetcher. Holds the per-day ADV cache."""
 
@@ -10460,6 +10514,31 @@ class MassiveClient:
         self.last_ok_at = time.time()
         self.last_error = None
         return out
+
+    async def fetch_option_quote(self, underlying: str, expiry_iso: str, call_put: str,
+                                 strike: float) -> Dict[str, Any]:
+        """Live bid/ask for ONE option contract. Never raises: a failure comes
+        back as {live: False, reason} so the caller can refuse honestly."""
+        if not enabled():
+            return {"live": False, "bid": None, "ask": None, "age_s": None,
+                    "timeframe": None, "reason": "no Massive key configured"}
+        occ = occ_option_ticker(underlying, expiry_iso, call_put, strike)
+        if occ is None:
+            return {"live": False, "bid": None, "ask": None, "age_s": None,
+                    "timeframe": None, "reason": "contract could not be named for Massive"}
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
+                data = await self._get(client, f"/v3/snapshot/options/{str(underlying).strip().upper()}/{occ}")
+        except Exception as e:
+            self.failures += 1
+            self.last_error = str(e)[:200]
+            msg = str(e)
+            if "401" in msg or "403" in msg:
+                msg += " — the Massive plan may not include options"
+            return {"live": False, "bid": None, "ask": None, "age_s": None,
+                    "timeframe": None, "reason": f"Massive option quote unavailable ({msg[:160]})"}
+        return option_snapshot_to_quote(data, time.time())
 
     def status(self) -> Dict[str, Any]:
         return {
@@ -10713,7 +10792,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.79.0-stop-loop"
+BOT_VERSION = "5.80.0-safety-rails"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -11062,6 +11141,27 @@ EXIT_RETRY_MAX_FAILS = 3           # then decision exits give up and leave the s
 # resting stop stays. The 3:40 expiry flatten is exempt — expiry is worse.
 STOP_CHURN_WINDOW_SECONDS = 900.0
 STOP_CHURN_MAX_CANCELS = 6
+# NO SLOW BLEED (5.80). After EXIT_RETRY_MAX_FAILS a decision exit used to stop
+# for good and leave the original stop resting — a position the bot had decided
+# to close could then drift all the way down to that stop. Now:
+#   * it keeps trying, slowly: one attempt every EXIT_RETRY_SLOW_SECONDS. Four
+#     tries an hour is well under the churn breaker (6 cancels / 15 min), so a
+#     structural reject can never rebuild the ORCL loop;
+#   * ONCE, at the give-up, the resting stop is pulled up to
+#     bid x (1 - GIVEUP_STOP_CUSHION_PCT%), only when that is TIGHTER. The
+#     broker then holds an exit that no longer depends on our close order. 5%
+#     sits outside one normal spread on a liquid contract (so it is not an
+#     instant market sell on noise) and caps further bleed at ~5% of premium.
+EXIT_RETRY_SLOW_SECONDS = 900.0
+GIVEUP_STOP_CUSHION_PCT = 5.0
+# Only close DECISIONS tighten the stop at give-up. A failed scale-out does not
+# mean we want out of the runner.
+GIVEUP_TIGHTEN_REASONS = frozenset({"event_flatten", "max_hold", "take_profit"})
+# WHO WINS (5.80). Bot and app closes for one ticker are serialized by the same
+# per-ticker lock; whoever takes it first wins. A close that arrives for a
+# position the OTHER side closed inside this window stands down instead of
+# sending a SELL_CLOSE against nothing. 300s covers a slow fill + reconcile.
+RECENT_CLOSE_STANDDOWN_SECONDS = 300
 # GUARDIAN HEARTBEAT. How often the risk desk loop beats, and how old that beat
 # may be before /healthz reports the guardian as NOT green. The app refuses to
 # arm live money on anything but a green guardian.
@@ -11273,6 +11373,15 @@ APP_EYES_INTERVAL_SECONDS = int(os.getenv("APP_EYES_INTERVAL_SECONDS", "30"))
 # APP_LINK_STALE_SECONDS) or every entry would demote itself before the first
 # report could arrive.
 APP_GUARD_PROOF_GRACE_SECONDS = int(os.getenv("APP_GUARD_PROOF_GRACE_SECONDS", "240"))
+
+# How old the app's EXIT-ENGINE tick may be (age at send + seconds since the
+# heartbeat landed) before the bot stops standing down for it. A heartbeat
+# proves the phone answers; this proves the loop that fires exits still turns.
+# The loop ticks every 30s and the heartbeat lands every ~60s, so a healthy
+# app reads <= ~90s; 150s is five missed ticks — never flaps on a slow beat,
+# and stays well under APP_LINK_STALE_SECONDS (210) so a frozen loop is caught
+# before the link even looks dark. Missing = NOT guarded (bot keeps exits).
+APP_EXIT_TICK_MAX_AGE_SECONDS = 150
 
 # ---- Per-name risk ceiling: REMOVED 2026-09-09 ----
 # `MAX_RISK_PCT_OF_OBJECTIVE` (10) and `per_name_risk_room()` stood here and
@@ -11749,6 +11858,33 @@ def plan_app_exit_standdown(enabled: bool, pos: Any, guarded: bool) -> bool:
     if not enabled or not isinstance(pos, dict) or not pos.get("app_decides"):
         return False
     return bool(guarded)
+
+
+def summarize_exit_rules(positions: Any, enabled: bool) -> Dict[str, Any]:
+    """Which rulebook each open position follows (5.80 visibility).
+
+    * "app_decides" — opened by the app under 5.78+: the app's stop rests and
+      the app runs target/trail/time exits while it provably guards it.
+    * "legacy_bot" — opened before the 5.78 redeploy (or with APP_DECIDES off):
+      the bot's own trail, take-profit, scale-out and event flatten apply.
+    Returns {rows: [{ticker, rules, label}], legacy: [...], app: [...]}. Pure.
+    """
+    rows: List[Dict[str, Any]] = []
+    items = positions.items() if isinstance(positions, dict) else []
+    for ticker, pos in sorted(items, key=lambda kv: str(kv[0])):
+        p = pos if isinstance(pos, dict) else {}
+        app = bool(enabled and p.get("app_decides"))
+        rows.append({
+            "ticker": str(ticker).upper(),
+            "rules": "app_decides" if app else "legacy_bot",
+            "label": ("app decides exits (bot backs up if the app goes quiet)" if app
+                      else "old rules — bot trail, take-profit and event flatten"),
+        })
+    return {
+        "rows": rows,
+        "legacy": [r["ticker"] for r in rows if r["rules"] == "legacy_bot"],
+        "app": [r["ticker"] for r in rows if r["rules"] == "app_decides"],
+    }
 
 
 def _is_close_payload(p: dict) -> bool:
@@ -14155,6 +14291,9 @@ async def app_heartbeat(
         "exit_armed": bool(data.get("exit_armed")) if isinstance(data.get("exit_armed"), bool) else None,
         "guarding": data.get("guarding") if isinstance(data.get("guarding"), list) else None,
         "guarding_truncated": data.get("guarding_truncated") is True,
+        # Age of the app's exit-engine loop tick AT SEND (app 5.80+). Null when
+        # absent or malformed — never defaulted to 0 (that would read as fresh).
+        "exit_tick_age_s": _finite_nonneg(data.get("exit_tick_age_s")),
         "mode": str(data.get("mode") or "").lower() or None,
         # Whitelisted: the only accepted reason is the app's readiness hold.
         "paper_reason": ("readiness_gates"
@@ -15820,7 +15959,7 @@ def derive_armed_option_stop(explicit: Any, fill_ref: Any,
         basis = "pct_default"
     if stop is None or stop <= 0:
         return None, "none"
-    return _round_to_option_tick(stop, "down"), basis
+    return _round_stop_toward_market(stop), basis
 
 
 def tighten_to_shape_stop(derived: Optional[float], shape_stop: Any) -> Optional[float]:
@@ -16034,13 +16173,11 @@ def plan_explain_option(payload: dict, real_bid: Any, real_ask: Any,
                 repriced = True
                 notes.append(f"App limit {desired} outside real market [{bid}, {ask}] — repricing to ask")
             desired = ask
-        quote_tick = _option_tick_from_quote(desired, bid, ask)
-        priced = _round_to_option_tick(desired, "up", quote_tick)
-        if priced > ask >= desired:
-            on_ask = _round_to_option_tick(ask, "down", quote_tick)
-            if on_ask >= bid:
-                priced = on_ask
-        fill = priced
+        limit_plan = plan_option_entry_limit(desired, bid, ask)
+        if limit_plan["over_ask"]:
+            notes.append(f"Limit {limit_plan['price']} is one {limit_plan['tick']:.2f} step over the "
+                         f"{ask} offer — the grid every contract accepts")
+        fill = limit_plan["price"]
     elif desired is not None:
         fill = _round_to_option_tick(desired)
 
@@ -16199,7 +16336,7 @@ def plan_broker_stop_placement(
         return {"level": tactical, "tier": "tactical", "basis": "app_tactical",
                 "reason": "no usable entry premium for a backstop; resting the tactical stop"}
 
-    backstop = _round_to_option_tick(entry * (1.0 - backstop_haircut_pct / 100.0), "down")
+    backstop = _round_stop_toward_market(entry * (1.0 - backstop_haircut_pct / 100.0))
     if not backstop or backstop <= 0 or backstop >= tactical:
         return {"level": tactical, "tier": "tactical", "basis": "app_tactical",
                 "reason": "backstop would sit at/inside the tactical stop; resting the tactical stop"}
@@ -16213,6 +16350,26 @@ def plan_broker_stop_placement(
             f"{backstop:.2f} ({backstop_haircut_pct:.0f}% below {entry:.2f})"
         ),
     }
+
+
+def _finite_nonneg(value: Any) -> Optional[float]:
+    """A finite, non-negative float, else None. Pure."""
+    if isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) and out >= 0 else None
+
+
+def _exit_tick_age_now(age_at_send: Any, seconds_since: Any) -> Optional[float]:
+    """The app's exit-tick age right now, or None when either part is unknown. Pure."""
+    a = _finite_nonneg(age_at_send)
+    s = _finite_nonneg(seconds_since)
+    if a is None or s is None:
+        return None
+    return round(a + s, 1)
 
 
 def assess_guard_proof(
@@ -16266,6 +16423,20 @@ def assess_guard_proof(
         # but it is also not proof, and this tier requires proof.
         return {"guarded": False,
                 "reason": "the app is too old to report exit-engine state"}
+
+    # The exit loop itself must be turning, not just the network stack. An
+    # unmeasured tick is not proof (unknown is not fresh).
+    try:
+        tick_age = float(link.get("exit_tick_age_s"))
+    except (TypeError, ValueError):
+        tick_age = None
+    if tick_age is None or not math.isfinite(tick_age):
+        return {"guarded": False,
+                "reason": "the app does not report its exit-engine tick — the bot keeps its exits"}
+    if tick_age > APP_EXIT_TICK_MAX_AGE_SECONDS:
+        return {"guarded": False,
+                "reason": (f"the app's exit engine last ran {int(tick_age)}s ago "
+                           f"(> {APP_EXIT_TICK_MAX_AGE_SECONDS}s) — the bot keeps its exits")}
 
     symbol = str(ticker or "").strip().upper()
     guarding = link.get("guarding")
@@ -17443,7 +17614,102 @@ def _raw_client(tokens: Dict[str, str]) -> ETradeAsyncClient:
     )
 
 
+_TICK_REJECT_RE = re.compile(r"(?i)(?:code|error)\D{0,12}2040(?!\d)|valid increment|price increment")
+# The grid EVERY listed option accepts at every price: a multiple of both the
+# $0.05 (sub-$3) and $0.10 (≥$3) increments. The one-shot retry lands here.
+UNIVERSAL_OPTION_TICK = 0.10
+_BUY_ACTIONS = {"BUY", "BUY_OPEN", "BUY_CLOSE", "BUY_TO_COVER"}
+
+
+def plan_tick_retry(kind: str, common: Dict[str, Any], error_text: str,
+                    bid: Any = None) -> Optional[Dict[str, Any]]:
+    """One re-price after an E*TRADE 2040 (price not in a valid increment).
+
+    Snaps every price on the order to the $0.10 grid — the only grid valid for
+    every contract — in the direction that keeps the order honest:
+      * BUY limits round UP (still marketable), SELL limits round DOWN;
+      * a SELL stop rounds UP — toward the market — unless that reaches the
+        bid (2084), then down; a BUY stop mirrors it.
+    None when this is not a tick rejection, not an option, or nothing would
+    change (re-sending the same price would only earn the same 2040). Pure.
+    """
+    if kind != "option" or not _TICK_REJECT_RE.search(str(error_text or "")):
+        return None
+    action = str(common.get("orderAction") or "").upper()
+    is_buy = action in _BUY_ACTIONS
+    changes: Dict[str, Any] = {}
+    for field in ("limitPrice", "stopPrice"):
+        try:
+            v = float(common.get(field) or 0)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(v) or v <= 0 or _is_on_grid(v, UNIVERSAL_OPTION_TICK):
+            continue
+        if field == "limitPrice":
+            new = _round_to_option_tick(v, "up" if is_buy else "down", UNIVERSAL_OPTION_TICK)
+        elif is_buy:
+            new = _round_to_option_tick(v, "down", UNIVERSAL_OPTION_TICK)
+        else:
+            new = _round_stop_toward_market(v, bid, UNIVERSAL_OPTION_TICK)
+        if new is not None and new > 0 and abs(new - v) > 1e-9:
+            changes[field] = new
+    if not changes:
+        return None
+    cid = str(common.get("clientOrderId") or "")
+    # A rejected order may still burn its clientOrderId (same as the 8400 path).
+    changes["clientOrderId"] = (cid[:19] + "T") if cid else str(uuid.uuid4().int)[:18]
+    return {"changes": changes,
+            "tried": {k: common.get(k) for k in ("limitPrice", "stopPrice") if common.get(k) is not None}}
+
+
 async def _place_order_smart(kind: str, common: dict, tokens: Dict[str, str]) -> Any:
+    """Place an order; on an E*TRADE 2040 (bad price increment) re-price ONCE
+    onto the $0.10 grid and stop. `common` is updated IN PLACE to the order
+    actually sent, so callers read the real price and clientOrderId.
+
+    The exact rejection text is written to the ledger with the quote at the
+    time (`order_tick_rejected`) — so the real increment rule is learned from
+    E*TRADE's own words instead of guessed."""
+    try:
+        return await _place_order_once(kind, common, tokens)
+    except Exception as e:
+        text = str(e)
+        if kind != "option" or not _TICK_REJECT_RE.search(text):
+            raise
+        contract = {"right": common.get("callPut"), "strike": common.get("strikePrice"),
+                    "expiration": common.get("expiryDate")}
+        try:
+            bid, ask = await _current_bid_ask(str(common.get("symbol") or ""), contract)
+        except Exception:
+            bid, ask = 0.0, 0.0
+        plan = plan_tick_retry(kind, common, text, bid)
+        record = {
+            "ticker": str(common.get("symbol") or ""), "order_action": common.get("orderAction"),
+            "price_type": common.get("priceType"),
+            "contract": {k: common.get(k) for k in ("callPut", "strikePrice", "expiryDate")},
+            "tried": {k: common.get(k) for k in ("limitPrice", "stopPrice") if common.get(k) is not None},
+            "error": text[:600], "bid": bid or None, "ask": ask or None,
+            "retry": (plan or {}).get("changes"),
+        }
+        logger.error(f"[TICK 2040] {record['ticker']} {record['order_action']} {record['tried']} "
+                     f"rejected: {text[:300]} — quote {bid}/{ask}; retry {record['retry']}")
+        if plan is None:
+            record["outcome"] = "no_retry"
+            await trade_ledger.record("order_tick_rejected", record)
+            raise
+        common.update(plan["changes"])
+        try:
+            placed = await _place_order_once(kind, common, tokens)
+        except Exception as e2:
+            record.update(outcome="retry_rejected", retry_error=str(e2)[:600])
+            await trade_ledger.record("order_tick_rejected", record)
+            raise
+        record["outcome"] = "retry_accepted"
+        await trade_ledger.record("order_tick_rejected", record)
+        return placed
+
+
+async def _place_order_once(kind: str, common: dict, tokens: Dict[str, str]) -> Any:
     """Primary path: raw async JSON payload against E*TRADE's Order API
     (full control, true multi-leg capable). Fallback: pyetrade flat kwargs —
     the proven v4 path. `common` uses the flat pyetrade vocabulary so both
@@ -17582,6 +17848,8 @@ async def _place_entry_with_funds_clamp(
     effective_client_id = str(common.get("clientOrderId") or "")
     try:
         final = await _place_order_smart(kind, common, tokens)
+        # A 2040 re-price rotates the id in place — hand back the one SENT.
+        effective_client_id = str(common.get("clientOrderId") or effective_client_id)
     except Exception as e:
         max_qty = _max_qty_from_insufficient_funds(str(e))
         if max_qty is None:
@@ -18479,7 +18747,9 @@ async def _place_option_protective_stop(ticker: str, contract: dict, qty: int, s
         raise Exception(f"option guard for {ticker} missing contract details")
     acct_key = await _resolve_account_id_key(tokens)
     client_id = str(uuid.uuid4().int)[:18]
-    stop_px = _round_to_option_tick(float(stop_premium), "down")
+    stop_px = _round_stop_toward_market(stop_premium)
+    if stop_px is None:
+        raise Exception(f"option guard for {ticker}: unusable stop premium {stop_premium!r}")
     common = dict(
         resp_format="json",
         accountIdKey=acct_key,
@@ -18504,10 +18774,19 @@ async def _place_option_protective_stop(ticker: str, contract: dict, qty: int, s
         if "2084" not in str(e):
             raise
         bid, _ask = await _current_bid_ask(ticker, contract)
-        if bid > 0.02:
-            adjusted = _round_to_option_tick(min(stop_px, bid - 0.01), "down")
-        else:
-            adjusted = _round_to_option_tick(stop_px * 0.9, "down")
+        if not (bid > 0.02):
+            # NEVER GUESS A LOOSER STOP. This used to drop the stop 10% blind
+            # when no bid was readable — moving protection AWAY from the market
+            # on no evidence at all. Keep the level, surface it, and let the
+            # reconciler re-arm against a real bid.
+            await alerts.send(
+                "critical", "option_stop_2084_no_bid",
+                f"{ticker}: protective stop {stop_px:.2f} rejected (2084 — must rest below the bid) and "
+                f"no live bid is readable — NOT loosening it blind; the reconciler re-arms on a real bid",
+                dedupe_key=f"stop_2084_no_bid:{ticker}",
+            )
+            raise
+        adjusted = _round_to_option_tick(min(stop_px, bid - 0.01), "down")
         if adjusted <= 0 or adjusted >= stop_px:
             raise
         logger.warning(
@@ -18519,6 +18798,9 @@ async def _place_option_protective_stop(ticker: str, contract: dict, qty: int, s
         common["stopPrice"] = adjusted
         common["clientOrderId"] = client_id
         placed = await _place_order_smart("option", common, tokens)
+    # A 2040 retry inside _place_order_smart may have moved the level / id.
+    stop_px = float(common.get("stopPrice") or stop_px)
+    client_id = str(common.get("clientOrderId") or client_id)
     order_id = _order_id_from_place(placed)
     logger.info(
         f"[STOP GUARD] option protective stop RESTING at broker: SELL_CLOSE {ticker} "
@@ -18568,7 +18850,8 @@ async def _arm_native_trail(ticker: str, offset: Optional[float] = None) -> dict
     spread = (ask - bid) if (bid > 0 and ask > 0 and ask >= bid) else None
 
     if offset is None:
-        tick = (_option_tick_from_quote(bid or entry, bid, ask) or 0.05) if is_option else 0.01
+        tick = (_option_tick_from_quote(bid or entry, bid, ask)
+                or _safe_option_tick(bid or entry)) if is_option else 0.01
         plan = trailing_engine.native_trail_offset(spread, risk=risk, tick=tick)
         if not plan["ok"]:
             raise Exception(f"{ticker}: {plan['detail']}")
@@ -18593,7 +18876,7 @@ async def _arm_native_trail(ticker: str, offset: Optional[float] = None) -> dict
         raise Exception(f"{ticker}: no live bid — cannot set the trail's initial trigger")
     # E*TRADE rejects stopPrice: 0 (error 7), so the initial trigger is sent
     # explicitly: one full offset below the bid the trail references.
-    trigger = (_round_to_option_tick(bid - offset_value, "down")
+    trigger = ((_round_stop_toward_market(bid - offset_value, bid) or 0.0)
                if is_option else round(bid - offset_value, 2))
     if trigger <= 0:
         raise Exception(f"{ticker}: trail offset {offset_value:.2f} exceeds the {bid:.2f} bid")
@@ -18877,7 +19160,7 @@ async def _place_option_market_close(ticker: str, contract: dict, qty: int) -> O
 
 
 async def _place_option_limit_entry(ticker: str, contract: dict, qty: int,
-                                    limit: float, client_id: str) -> Optional[str]:
+                                    limit: float, client_id: str) -> Tuple[Optional[str], str]:
     """BUY_OPEN LIMIT for `qty` contracts — the entry-chase replacement order.
 
     Deliberately mirrors `_place_option_market_close` instead of reusing the
@@ -18887,6 +19170,10 @@ async def _place_option_limit_entry(ticker: str, contract: dict, qty: int,
 
     The limit rounds DOWN to a tradable tick, because a ceiling that rounds up
     is not a ceiling (see `floorPremium` in the app's executionQuality.ts).
+
+    Returns (order_id, client_id_sent): a 2040 re-price inside
+    `_place_order_smart` rotates the clientOrderId, and the guard must track
+    the id that actually rests at the broker.
     """
     tokens = load_tokens()
     if not tokens:
@@ -18911,7 +19198,7 @@ async def _place_option_limit_entry(ticker: str, contract: dict, qty: int,
         expiryDate=str(contract["expiration"])[:10],
     )
     placed = await _place_order_smart("option", common, tokens)
-    return _order_id_from_place(placed)
+    return _order_id_from_place(placed), str(common.get("clientOrderId") or client_id)
 
 
 def _mark_trusted_for_harvest(ticker: str, contract: Optional[dict], label: str) -> bool:
@@ -19351,13 +19638,72 @@ def plan_exit_retry(record: Any, reason: str, now_s: float) -> Dict[str, Any]:
         return {"allowed": True, "exhausted": False, "fails": 0, "wait_s": 0.0}
     is_eod = reason == "eod_flatten"
     if not is_eod and fails >= EXIT_RETRY_MAX_FAILS:
-        return {"allowed": False, "exhausted": True, "fails": fails, "wait_s": None}
+        # Exhausted is not abandoned (5.80): one slow try per window.
+        remaining = last + EXIT_RETRY_SLOW_SECONDS - float(now_s)
+        if remaining > 0:
+            return {"allowed": False, "exhausted": True, "fails": fails, "wait_s": round(remaining, 1)}
+        return {"allowed": True, "exhausted": True, "fails": fails, "wait_s": 0.0}
     cap = EXIT_RETRY_EOD_MAX_SECONDS if is_eod else EXIT_RETRY_MAX_SECONDS
     wait = min(cap, EXIT_RETRY_BASE_SECONDS * (2 ** (fails - 1)))
     remaining = last + wait - float(now_s)
     if remaining > 0:
         return {"allowed": False, "exhausted": False, "fails": fails, "wait_s": round(remaining, 1)}
     return {"allowed": True, "exhausted": False, "fails": fails, "wait_s": 0.0}
+
+
+def plan_giveup_stop(current_stop: Any, bid: Any) -> Optional[float]:
+    """Where the resting stop goes when a close decision has failed out.
+
+    bid x (1 - GIVEUP_STOP_CUSHION_PCT%), rounded DOWN to a valid tick, and
+    only when that is strictly tighter than the stop already resting. None =
+    leave the stop alone (no bid, or not tighter). Never loosens. Pure.
+    """
+    try:
+        b = float(bid)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(b) or b <= 0:
+        return None
+    target = _round_stop_toward_market(b * (1.0 - GIVEUP_STOP_CUSHION_PCT / 100.0), b)
+    if target is None or not (0 < target < b):
+        return None
+    try:
+        c = float(current_stop) if current_stop is not None else None
+    except (TypeError, ValueError):
+        c = None
+    if c is not None and math.isfinite(c) and c > 0 and target <= c + 0.005:
+        return None
+    return round(target, 2)
+
+
+def plan_close_standdown(pos: Any, recent_close: Any, now_s: float) -> Optional[str]:
+    """WHO WINS when the bot and the app both try to close one ticker.
+
+    The rule, in order:
+      1. The broker's resting stop outranks both — it is never stood down, and
+         a close that finds it already filled books that fill and stops.
+      2. Bot and app closes share one per-ticker lock, so they never interleave.
+         The FIRST to take it wins.
+      3. The second one re-reads the position under the lock. If it is gone and
+         a close was booked inside RECENT_CLOSE_STANDDOWN_SECONDS, it stands
+         down (returns a reason) instead of selling against nothing.
+    `recent_close` is the {"at", "reason"} marker `_record_close` leaves. An
+    unreadable marker never stands a close down — refusing a close is the
+    dangerous direction. Pure.
+    """
+    if isinstance(pos, dict) and pos:
+        return None
+    if not isinstance(recent_close, dict):
+        return None
+    try:
+        at = float(recent_close.get("at"))
+    except (TypeError, ValueError):
+        return None
+    age = float(now_s) - at
+    if not math.isfinite(age) or age < 0 or age > RECENT_CLOSE_STANDDOWN_SECONDS:
+        return None
+    why = str(recent_close.get("reason") or "another close")
+    return f"already closed {int(age)}s ago ({why}) — standing down, nothing left to sell"
 
 
 def record_exit_failure(record: Any, reason: str, now_s: float) -> Dict[str, Any]:
@@ -19421,20 +19767,91 @@ async def _stop_churn_gate(ticker: str, pos: dict, who: str) -> bool:
 async def _exit_retry_gate(ticker: str, pos: dict, reason: str) -> bool:
     """Back off an exit that already failed for this position."""
     retry = plan_exit_retry(pos.get("exit_retry"), reason, time.time())
-    if retry["allowed"]:
-        return True
-    if retry["exhausted"]:
-        if not pos.get(f"exit_gave_up_{reason}"):
-            pos[f"exit_gave_up_{reason}"] = True
-            await state.set_position(ticker, pos)
-            logger.error(f"[{reason.upper()}] {ticker} failed {retry['fails']}× — giving up, stop stays resting")
-            await alerts.send(
-                "critical", f"{reason}_gave_up",
-                f"{ticker}: the {reason.replace('_', ' ')} close failed {retry['fails']} times, so the bot "
-                f"stopped retrying and left the protective stop resting. Close it yourself if you want out.",
-                dedupe_key=f"{reason}:gaveup:{ticker}",
-            )
-    return False
+    if retry["exhausted"] and not pos.get(f"exit_gave_up_{reason}"):
+        pos[f"exit_gave_up_{reason}"] = True
+        await state.set_position(ticker, pos)
+        tightened: Optional[float] = None
+        if reason in GIVEUP_TIGHTEN_REASONS:
+            try:
+                tightened = await _tighten_stop_after_giveup(ticker, pos, reason)
+            except Exception as e:
+                logger.error(f"[{reason.upper()}] {ticker} give-up stop tighten failed: {e}")
+        logger.error(
+            f"[{reason.upper()}] {ticker} failed {retry['fails']}× — slowing to one try per "
+            f"{EXIT_RETRY_SLOW_SECONDS / 60:.0f} min"
+            + (f", stop pulled up to {tightened:.2f}" if tightened else ", stop unchanged")
+        )
+        await alerts.send(
+            "critical", f"{reason}_gave_up",
+            f"{ticker}: the {reason.replace('_', ' ')} close failed {retry['fails']} times. The bot now "
+            f"retries once every {EXIT_RETRY_SLOW_SECONDS / 60:.0f} minutes"
+            + (f" and pulled the protective stop up to {tightened:.2f} (about "
+               f"{GIVEUP_STOP_CUSHION_PCT:.0f}% under the bid) so it can't bleed far."
+               if tightened else "; the protective stop is still resting.")
+            + " Close it yourself if you want out now.",
+            dedupe_key=f"{reason}:gaveup:{ticker}",
+        )
+        # The stop just moved — never cancel it again in the same pass.
+        return False
+    return bool(retry["allowed"])
+
+
+async def _tighten_stop_after_giveup(ticker: str, pos: dict, reason: str) -> Optional[float]:
+    """Pull the resting option stop up toward the market, once, after a close
+    decision failed out. Returns the new stop, or None when nothing moved.
+    Every branch leaves a stop resting or books the close it found."""
+    contract = dict(pos.get("contract") or {})
+    stop_id = pos.get("stop_order_id")
+    try:
+        qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
+    except (TypeError, ValueError):
+        qty = 0
+    if not contract.get("right") or not stop_id or qty < 1 or pos.get("native_trail_order_id"):
+        return None
+    current = pos.get("trail") or pos.get("stop_premium")
+    bid, _ask = await _current_bid_ask(ticker, contract)
+    target = plan_giveup_stop(current, bid)
+    if target is None:
+        logger.info(f"[{reason.upper()}] {ticker} give-up: no tighter stop available (bid={bid}, stop={current})")
+        return None
+    if not await _stop_churn_gate(ticker, pos, f"{reason}_giveup_tighten"):
+        return None
+    outcome = await _cancel_order_verified(stop_id, expected_qty=qty)
+    if outcome == CANCEL_FILLED:
+        await _finish_guard(ticker, "closed_by_stop")
+        fill = await _resolve_exit_fill(stop_id)
+        if fill:
+            await _record_close(ticker, None, {"ticker": ticker, "action": pos.get("action") or "BUY"},
+                                exit_premium=fill, close_reason="stop_fill")
+        else:
+            await _defer_close_to_reconciler(ticker, stop_id, "option stop executed — fill price unavailable")
+        return None
+    if outcome == CANCEL_PARTIAL:
+        remaining = await _handle_partial_stop_fill(ticker, stop_id, current, "giveup_stop_partial")
+        if remaining > 0:
+            fresh = await state.get_position(ticker)
+            if fresh:
+                await _reconcile_rearm_guard(ticker, dict(fresh))
+        else:
+            await _finish_guard(ticker, "closed_by_stop")
+        return None
+    if outcome != CANCEL_CONFIRMED:
+        return None
+    try:
+        info = await _place_option_protective_stop(ticker, contract, qty, target)
+    except Exception as e:
+        logger.error(f"[{reason.upper()}] {ticker} tighter stop {target:.2f} rejected ({e}) — re-arming the old one")
+        await _reconcile_rearm_guard(ticker, dict(pos))
+        return None
+    pos["stop_order_id"] = info["order_id"]
+    pos["trail"] = float(info["stop"])
+    pos["stop_premium"] = float(info["stop"])
+    pos["giveup_stop"] = {"reason": reason, "stop": float(info["stop"]), "bid": float(bid), "at": time.time()}
+    await state.set_position(ticker, pos)
+    await trade_ledger.record("giveup_stop_tightened", {
+        "ticker": ticker, "reason": reason, "from": current, "to": float(info["stop"]), "bid": float(bid),
+    })
+    return float(info["stop"])
 
 
 async def _note_exit_failure(ticker: str, pos: dict, reason: str) -> None:
@@ -19910,7 +20327,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 ticker, chase_attempts=attempt, chase_client_id=new_client,
                             ) or guard
                             try:
-                                new_id = await _place_option_limit_entry(
+                                new_id, new_client = await _place_option_limit_entry(
                                     ticker, dict(guard.get("contract") or {}),
                                     chase_qty, float(chase["next_limit"]), new_client,
                                 )
@@ -20661,6 +21078,16 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
     missing number. It is passed explicitly (never inferred from a falsy exit)
     so that an absent price can never masquerade as a total loss."""
     pos = await state.delete_position(ticker)
+    # WHO WINS marker: a second closer (bot or app) arriving for this ticker
+    # inside RECENT_CLOSE_STANDDOWN_SECONDS stands down. Best effort.
+    try:
+        await state.set(
+            f"recent_close:{str(ticker).upper()}",
+            json.dumps({"at": time.time(), "reason": close_reason or ("expired" if expired else "close")}),
+            ex=RECENT_CLOSE_STANDDOWN_SECONDS * 2,
+        )
+    except Exception as e:
+        logger.debug(f"recent-close marker not stored for {ticker}: {e}")
     entry = float((pos or {}).get("entry") or payload.get("entry") or 0)
     # NO GUESSED EXITS — exit_px is the caller's REAL fill or the payload's
     # explicit exit_price, nothing else. The old `… or limit_price or entry`
@@ -21843,26 +22270,100 @@ def _is_on_grid(value: float, tick: float) -> bool:
     return abs(round(value / tick) * tick - value) < 1e-6
 
 
+def _safe_option_tick(price: float) -> float:
+    """The grid every listed option accepts: $0.05 below $3.00, $0.10 at/above.
+
+    The ONE place that rule lives for tick choice, so the entry pricer and the
+    native-trail sizer can never drift apart. Pure -- no I/O.
+    """
+    try:
+        p = float(price or 0)
+    except (TypeError, ValueError):
+        p = 0.0
+    return 0.05 if p < 3.0 else 0.10
+
+
 def _option_tick_from_quote(price: float, bid: float, ask: float) -> Optional[float]:
     """The finest increment the LIVE QUOTE proves this contract accepts.
 
-    Returns 0.01 when either side of the quote is off the conservative grid,
-    otherwise None (meaning: keep the safe $0.05/$0.10 grid). Pure -- no I/O.
+    Returns 0.01 or None (None = keep the safe $0.05/$0.10 grid). Pure.
 
-    Conservative by construction: a penny quote can only ever be produced by a
-    venue that accepts penny orders, so this never invents permission that the
-    exchange has not already demonstrated. When the quote is missing or already
-    on the grid, nothing changes.
+    BELOW $3.00 a side off the nickel grid proves pennies — a penny quote can
+    only come from a venue that accepts penny orders (AMD 2.32/2.42 bought at
+    2.42 instead of 2.45 through the offer).
+
+    AT/ABOVE $3.00 THE QUOTE PROVES NOTHING (5.80). A quote shows what was
+    QUOTED, not what E*TRADE accepts for this name: penny-pilot names tick
+    $0.05 there, non-pilot names $0.10, and SPY/QQQ/IWM-class names $0.01 —
+    and every reading of the quote we tried was a guess that could earn
+    Error 2040 (4.15/4.25 read as pennies priced 4.13). The $0.10 grid is the
+    one increment EVERY listed option accepts at that price, so above $3 the
+    bot always uses it: at worst a few cents, never a rejection.
     """
-    coarse = 0.05 if float(price or 0) < 3.0 else 0.10
+    try:
+        p = float(price or 0)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(p) or p >= 3.0:
+        return None
     for side in (bid, ask):
         try:
             value = float(side or 0)
         except (TypeError, ValueError):
             continue
-        if value > 0 and not _is_on_grid(value, coarse):
+        if value > 0 and math.isfinite(value) and not _is_on_grid(value, 0.05):
             return 0.01
     return None
+
+
+def plan_option_entry_limit(desired: float, bid: float, ask: float) -> Dict[str, Any]:
+    """BUY_OPEN limit on a grid the broker accepts, without parking BELOW the offer.
+
+    Rounds `desired` (already inside [bid, ask]) UP onto the tick grid. Above
+    $3 that grid is $0.10, so a $3.07 ask prices at $3.10 — ONE step over the
+    offer. That is allowed on purpose: a marketable limit fills AT the ask,
+    so the extra cents are a ceiling, not a price paid. Snapping down to $3.00
+    instead would rest under the offer and may simply never fill.
+
+    Never more than one step over the ask: anything further (only reachable
+    on a malformed quote) falls back to the highest on-grid price ≤ ask.
+    Returns {price, tick, over_ask}. Pure.
+    """
+    tick = _option_tick_from_quote(desired, bid, ask)
+    priced = _round_to_option_tick(desired, "up", tick)
+    step = tick or _safe_option_tick(priced)
+    over_ask = bool(ask and ask > 0 and priced > ask + 1e-9)
+    if over_ask and priced - ask >= step - 1e-9:
+        on_ask = _round_to_option_tick(ask, "down", tick)
+        if bid and on_ask >= bid:
+            priced, over_ask = on_ask, False
+    return {"price": priced, "tick": step, "over_ask": over_ask}
+
+
+def _round_stop_toward_market(stop: Any, bid: Any = None, tick: Optional[float] = None) -> Optional[float]:
+    """Tick-round a protective SELL stop TOWARD the market — never away.
+
+    Rounding a stop DOWN onto the grid loosened it by up to a full tick every
+    time it was placed (up to $0.09 a contract on the $0.10 grid). It now rounds
+    UP — tighter. The one exception is E*TRADE's own rule: a sell stop must rest
+    BELOW the live bid (Error 2084). When the rounded-up level would sit at or
+    above a known bid, the nearest legal level is the one rounded down.
+    None when the stop is unusable. Pure.
+    """
+    try:
+        s_ = float(stop)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(s_) or s_ <= 0:
+        return None
+    up = _round_to_option_tick(s_, "up", tick)
+    try:
+        b = float(bid) if bid is not None else 0.0
+    except (TypeError, ValueError):
+        b = 0.0
+    if not math.isfinite(b) or b <= 0 or up < b - 1e-9:
+        return up
+    return _round_to_option_tick(s_, "down", tick)
 
 
 def _round_to_option_tick(price: float, direction: str = "nearest", tick: Optional[float] = None) -> float:
@@ -22069,6 +22570,137 @@ def _best_expression_contract(market, symbol: str, spot: Any, vol_annual: Any,
     return best
 
 
+# ==================== HARD SIZE CAP (5.80) ====================
+# The last word on size, for EVERY entry including app-decided ones. It never
+# resizes — a ticket that breaks it is refused outright, because a size this far
+# off the plan means some upstream number is wrong, and quietly shrinking it
+# would hide that. Declared from policy, never tuned on the ledger:
+#   * HARD_RISK_CAP_PCT: 2x the 2% per-trade policy, measured INCLUDING a stop
+#     gap. The plan plus a gap as bad as ORCL's must still fit; a 3x plan never.
+#   * STOP_GAP_ALLOWANCE_PCT: stops do not fill at their price on a gap. ORCL
+#     2026-10-28: stop 10.60, filled 9.72 = 8.3% of the stop. 10% rounds that up.
+#   * HARD_NOTIONAL_CAP_PCT: a long option can go to zero; no single ticket may
+#     spend more than a quarter of the account on premium.
+#   * HARD_MAX_CONTRACTS: an absolute count no plan on this account needs.
+HARD_RISK_CAP_PCT = 4.0
+STOP_GAP_ALLOWANCE_PCT = 10.0
+HARD_NOTIONAL_CAP_PCT = 25.0
+HARD_MAX_CONTRACTS = int(os.getenv("HARD_MAX_CONTRACTS", "20"))
+
+
+def assess_hard_size_cap(premium: Any, stop_premium: Any, qty: Any, equity: Any) -> Dict[str, Any]:
+    """Refuse (never resize) an option entry that is too big for the account.
+
+    Risk per contract = (premium - stop) + a STOP_GAP_ALLOWANCE_PCT gap on the
+    stop; with no usable stop the whole premium is at risk. Fails CLOSED: an
+    unknown premium, quantity or account size refuses — the cap exists for the
+    moment some number is wrong. Returns {allowed, reason, risk_usd,
+    risk_cap_usd, notional_usd, notional_cap_usd, qty}. Pure.
+    """
+    def num(v: Any) -> Optional[float]:
+        if isinstance(v, bool):
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if math.isfinite(f) else None
+
+    out: Dict[str, Any] = {"allowed": False, "reason": "", "risk_usd": None, "risk_cap_usd": None,
+                           "notional_usd": None, "notional_cap_usd": None, "qty": None}
+    p, s, q, eq = num(premium), num(stop_premium), num(qty), num(equity)
+    problems: List[str] = []
+    if p is None or p <= 0:
+        problems.append("premium unknown")
+    if q is None or q < 1 or int(q) != q:
+        problems.append("contract count unknown")
+    if eq is None or eq <= 0:
+        problems.append("account size unknown")
+    if problems:
+        out["reason"] = "hard size cap cannot verify the ticket — " + " · ".join(problems)
+        return out
+    qty_i = int(q)
+    if s is not None and 0 < s < p:
+        per = (p - s) + s * STOP_GAP_ALLOWANCE_PCT / 100.0
+    else:
+        per = p
+    per = min(per, p)  # a long option can never lose more than its premium
+    risk = round(per * 100.0 * qty_i, 2)
+    notional = round(p * 100.0 * qty_i, 2)
+    risk_cap = round(eq * HARD_RISK_CAP_PCT / 100.0, 2)
+    notional_cap = round(eq * HARD_NOTIONAL_CAP_PCT / 100.0, 2)
+    out.update({"risk_usd": risk, "risk_cap_usd": risk_cap, "notional_usd": notional,
+                "notional_cap_usd": notional_cap, "qty": qty_i})
+    if qty_i > HARD_MAX_CONTRACTS:
+        problems.append(f"{qty_i} contracts > hard max {HARD_MAX_CONTRACTS}")
+    if risk > risk_cap:
+        problems.append(f"risk incl. a {STOP_GAP_ALLOWANCE_PCT:.0f}% stop gap ${risk:,.0f} > "
+                        f"{HARD_RISK_CAP_PCT:g}% of the account (${risk_cap:,.0f})")
+    if notional > notional_cap:
+        problems.append(f"premium outlay ${notional:,.0f} > {HARD_NOTIONAL_CAP_PCT:g}% of the "
+                        f"account (${notional_cap:,.0f})")
+    if problems:
+        out["reason"] = "hard size cap — " + " · ".join(problems)
+        return out
+    out["allowed"] = True
+    out["reason"] = (f"hard size cap ok — risk ${risk:,.0f}/${risk_cap:,.0f} · "
+                     f"outlay ${notional:,.0f}/${notional_cap:,.0f}")
+    return out
+
+
+def select_payoff_quote(massive_quote: Any, etrade_bid: Any, etrade_ask: Any,
+                        etrade_quote_type: Any) -> Dict[str, Any]:
+    """Which bid/ask may the payoff check price the trade on?
+
+    1. Massive's real-time option quote (bid AND ask from that one feed).
+    2. Else E*TRADE's chain quote, but ONLY when the chain says REALTIME — an
+       account without the real-time agreement gets 15-minute-old quotes.
+    3. Else nothing: the caller refuses. Never mixes sides across feeds.
+    Returns {bid, ask, source, reason}. Pure.
+    """
+    def num(v: Any) -> Optional[float]:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if math.isfinite(f) else None
+
+    mq = massive_quote if isinstance(massive_quote, dict) else {}
+    mb, ma = num(mq.get("bid")), num(mq.get("ask"))
+    if mq.get("live") is True and mb is not None and ma is not None and 0 < mb <= ma:
+        return {"bid": mb, "ask": ma, "source": "massive", "reason": "Massive real-time quote"}
+    eb, ea = num(etrade_bid), num(etrade_ask)
+    qt = str(etrade_quote_type or "").strip().upper()
+    et_live = qt.startswith("REAL")
+    if et_live and eb is not None and ea is not None and 0 < eb <= ea:
+        return {"bid": eb, "ask": ea, "source": "etrade", "reason": "E*TRADE real-time chain quote"}
+    m_why = str(mq.get("reason") or "no Massive quote")
+    e_why = (f"E*TRADE quote is {qt}" if qt and not et_live
+             else "E*TRADE quote is not two-sided" if et_live
+             else "E*TRADE did not say its quote is real-time")
+    return {"bid": None, "ask": None, "source": None,
+            "reason": f"no live quote to check the payoff on — {m_why} · {e_why}"}
+
+
+async def _hard_cap_equity() -> Optional[float]:
+    """Broker equity, else the tracked balance, else None. Unlike the risk
+    reference there is NO env fallback: the hard cap refuses on an unknown
+    account rather than measuring against an imagined one."""
+    try:
+        live = await _live_equity()
+        if live is not None and math.isfinite(live) and live > 0:
+            return float(live)
+    except Exception as e:
+        logger.warning(f"hard size cap: live equity unavailable ({e})")
+    try:
+        tracked = await state.tracked_balance()
+        if tracked is not None and math.isfinite(tracked) and tracked > 0:
+            return float(tracked)
+    except Exception as e:
+        logger.warning(f"hard size cap: tracked balance unavailable ({e})")
+    return None
+
+
 def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_put: str,
                           liquidity_out: Optional[Dict[str, Any]] = None):
     """Snap a requested option expiry/strike to REAL listed contract values.
@@ -22143,6 +22775,10 @@ def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_
             source="option_chain",
         )
         pairs = (((chains or {}).get("OptionChainResponse") or {}).get("OptionPair")) or []
+        if liquidity_out is not None:
+            # REALTIME vs DELAYED, as the chain itself reports it. None when absent.
+            qt = ((chains or {}).get("OptionChainResponse") or {}).get("quoteType")
+            liquidity_out["quote_type"] = str(qt).upper() if qt else None
         if isinstance(pairs, dict):
             pairs = [pairs]
         strikes = []
@@ -22462,6 +23098,9 @@ async def execute_live_order(payload: dict):
             expiry, strike, real_bid, real_ask = await asyncio.to_thread(
                 _snap_option_contract, market, symbol, expiry, float(strike), call_put, contract_liquidity
             )
+            # The contract as the broker lists it — read by the payoff-quote
+            # lookup below (shared scope, so no branch borrows the other's names).
+            snapped_contract = (str(expiry)[:10], call_put, float(strike))
             if not is_exit and app_decides and not contract_matches(app_contract, (expiry, strike)):
                 # The app picked a contract the broker does not list. Buying the
                 # nearest neighbour would be the bot deciding — refuse instead.
@@ -22594,6 +23233,16 @@ async def execute_live_order(payload: dict):
                 # FIRST (same discipline as equity) so the close can never
                 # double-sell against it.
                 pos = await state.get_position(sym_u) or {}
+                if not pos:
+                    try:
+                        raw_marker = await state.get(f"recent_close:{sym_u}")
+                        marker = json.loads(raw_marker) if raw_marker else None
+                    except Exception:
+                        marker = None
+                    standdown = plan_close_standdown(pos, marker, time.time())
+                    if standdown:
+                        logger.info(f"[CLOSE] {sym_u} {standdown}")
+                        return {"status": "refused", "reason": standdown, "code": "exit_in_flight"}
                 # CLOSE QUANTITY TRUTH — cover what the account actually holds.
                 # The payload count is stale whenever the entry was resized.
                 cover_qty = _close_cover_qty(pos, quantity)
@@ -22666,7 +23315,7 @@ async def execute_live_order(payload: dict):
                     common["limitPrice"] = _round_to_option_tick(desired, "down")
                 elif payload.get("broker_stop") and broker_stop_level and float(broker_stop_level) > 0:
                     common["priceType"] = "STOP"
-                    common["stopPrice"] = _round_to_option_tick(float(broker_stop_level), "down")
+                    common["stopPrice"] = _round_stop_toward_market(broker_stop_level, real_bid)
                     logger.info(f"Placing resting broker-side STOP close at {common['stopPrice']}")
                 else:
                     # CROSSING LIMIT off the live bid, placed below with a
@@ -22716,18 +23365,13 @@ async def execute_live_order(payload: dict):
                     common["priceType"] = "LIMIT"
                     # Believe the quote's own granularity before rounding UP
                     # past the offer (see _option_tick_from_quote).
-                    quote_tick = _option_tick_from_quote(desired, real_bid, real_ask)
-                    priced = _round_to_option_tick(desired, "up", quote_tick)
-                    if priced > real_ask >= desired:
-                        # Never pay through the offer to satisfy a tick grid:
-                        # the ask is, by definition, a fillable price.
-                        on_ask = _round_to_option_tick(real_ask, "down", quote_tick)
-                        if on_ask >= real_bid:
-                            logger.info(
-                                f"entry tick: {priced} would cross above the {real_ask} "
-                                f"offer — using {on_ask} instead"
-                            )
-                            priced = on_ask
+                    limit_plan = plan_option_entry_limit(desired, real_bid, real_ask)
+                    priced = limit_plan["price"]
+                    if limit_plan["over_ask"]:
+                        logger.info(
+                            f"entry tick: {priced} is one {limit_plan['tick']:.2f} step over the "
+                            f"{real_ask} offer — the only grid every contract accepts; fills at the ask"
+                        )
                     common["limitPrice"] = priced
                 elif desired is not None:
                     # No real quote available — at minimum fix the tick size.
@@ -22808,24 +23452,49 @@ async def execute_live_order(payload: dict):
                     quantity = reprice["qty"]
                     common["quantity"] = quantity
 
-            if not is_exit and not app_decides:
+            shape_stop = None
+            if not is_exit:
+                # PAYOFF QUOTE (5.80) — the 1.5R check is only as true as the
+                # bid/ask it runs on. Massive's real-time option quote first;
+                # E*TRADE's chain only when it says REALTIME; else refuse.
+                # Applies to app-decided entries too: the app chose the trade,
+                # but nobody pays 1.5R on a 15-minute-old quote.
+                massive_q = await massive_client.fetch_option_quote(sym_u, *snapped_contract)
+                pq = select_payoff_quote(massive_q, real_bid, real_ask, contract_liquidity.get("quote_type"))
+                if pq["source"] is None:
+                    logger.warning(f"⛔ {symbol} {pq['reason']}")
+                    await trade_ledger.record("entry_quote_refused", {
+                        "ticker": sym_u,
+                        "massive": {k: massive_q.get(k) for k in ("bid", "ask", "age_s", "timeframe", "reason")},
+                        "etrade_bid": real_bid or None,
+                        "etrade_ask": real_ask or None,
+                        "etrade_quote_type": contract_liquidity.get("quote_type"),
+                    })
+                    await alerts.send(
+                        "warning", "entry_quote_refused",
+                        f"{symbol}: no live ticket — {pq['reason']}.",
+                        dedupe_key=f"quote_refused:{symbol}",
+                    )
+                    return {"status": "refused", "reason": pq["reason"],
+                            "code": "no_live_quote", "paper": True}
                 # FILLED-SHAPE GATE — the trade must still pay 1.5R at the REAL
-                # ask, not at the app's limit. Runs on E*TRADE's own quote,
-                # after the reprice, before any dollars are budgeted. Returns
-                # (never raises): a dead shape is a policy verdict, not a sick
-                # broker, so it must not feed the API circuit breaker.
+                # ask, not at the app's limit. After the reprice, before any
+                # dollars are budgeted. Returns (never raises): a dead shape is
+                # a policy verdict, not a sick broker, so it must not feed the
+                # API circuit breaker.
                 shape = plan_filled_shape(
                     payload.get("entry"), payload.get("stop"), payload.get("target"),
-                    real_bid, real_ask, payload.get("option_delta"),
+                    pq["bid"], pq["ask"], payload.get("option_delta"),
                 )
                 if not shape["live"]:
-                    logger.warning(f"⛔ {symbol} {shape['reason']}")
+                    logger.warning(f"⛔ {symbol} {shape['reason']} [{pq['source']}]")
                     await trade_ledger.record("entry_shape_refused", {
                         "ticker": sym_u,
                         "code": shape["code"],
+                        "quote_source": pq["source"],
                         "estimate": float(limit_price or 0) or None,
-                        "real_bid": real_bid or None,
-                        "real_ask": real_ask or None,
+                        "real_bid": pq["bid"],
+                        "real_ask": pq["ask"],
                         "stop_premium": shape["stop"],
                         "net_win": shape["net_win"],
                         "net_loss": shape["net_loss"],
@@ -22839,9 +23508,10 @@ async def execute_live_order(payload: dict):
                     )
                     return {"status": "refused", "reason": shape["reason"],
                             "code": shape["code"], "paper": True}
-                logger.info(f"✅ {symbol} {shape['reason']}")
+                logger.info(f"✅ {symbol} {shape['reason']} [{pq['source']}]")
                 shape_stop = shape["stop"]
 
+            if not is_exit and not app_decides:
                 # POST-PRICING RISK RECHECK — the last gate that sees the REAL
                 # contract. Every gate before this one judged an option payload
                 # that had no premium in it yet, so they measured a nominal
@@ -22924,6 +23594,33 @@ async def execute_live_order(payload: dict):
                     })
                     quantity = int(capacity["qty"])
                     common["quantity"] = quantity
+
+            if not is_exit:
+                # HARD SIZE CAP (5.80) — last gate before the broker, every
+                # entry, app-decided ones included. Refuses, never resizes.
+                cap_premium = float(common.get("limitPrice") or 0) or float(real_ask or 0)
+                cap_stop, _cap_basis = derive_armed_option_stop(
+                    payload.get("option_stop_price"), cap_premium, payload.get("option_limit_price"),
+                )
+                if not app_decides:
+                    cap_stop = tighten_to_shape_stop(cap_stop, shape_stop)
+                cap = assess_hard_size_cap(cap_premium, cap_stop, quantity, await _hard_cap_equity())
+                if not cap["allowed"]:
+                    logger.error(f"⛔ {symbol} {cap['reason']}")
+                    await trade_ledger.record("entry_hard_cap_refused", {
+                        "ticker": sym_u, "premium": cap_premium or None, "stop_premium": cap_stop,
+                        "qty": quantity, "risk_usd": cap["risk_usd"], "risk_cap_usd": cap["risk_cap_usd"],
+                        "notional_usd": cap["notional_usd"], "notional_cap_usd": cap["notional_cap_usd"],
+                        "app_decides": bool(app_decides),
+                    })
+                    await alerts.send(
+                        "critical", "entry_hard_cap_refused",
+                        f"{symbol}: entry REFUSED — {cap['reason']}.",
+                        dedupe_key=f"hard_cap:{symbol}",
+                    )
+                    return {"status": "refused", "reason": cap["reason"],
+                            "code": "hard_size_cap", "paper": True}
+                logger.info(f"✅ {symbol} {cap['reason']}")
 
             logger.info(f"📤 Placing OPTION: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
             if is_exit:
@@ -23763,7 +24460,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
 
     new_stop = plan["new_stop"]
     if is_option:
-        new_stop = _round_to_option_tick(new_stop, "down")
+        new_stop = _round_stop_toward_market(new_stop, bid) or float(plan["current_stop"])
     replace = plan["should_replace"] and new_stop > float(plan["current_stop"]) if is_buy \
         else plan["should_replace"] and new_stop < float(plan["current_stop"])
 
@@ -24665,6 +25362,29 @@ async def on_startup():
     # session is the most expensive failure mode here, because it looks like a
     # quiet tape rather than a broken deployment.
     await _announce_preflight()
+    # OLD-RULES AUDIT (5.80) — after every deploy, say which open positions
+    # still follow the legacy bot rules, so none of them surprises anyone.
+    await _announce_exit_rules()
+
+
+async def _announce_exit_rules() -> None:
+    """Log every open position's rulebook; alert when any follow the old rules.
+    Never raises."""
+    try:
+        summary = summarize_exit_rules(await state.all_positions(), APP_DECIDES)
+        for r in summary["rows"]:
+            logger.info(f"[exit-rules] {r['ticker']}: {r['label']}")
+        if summary["legacy"]:
+            names = ", ".join(summary["legacy"])
+            await alerts.send(
+                "warning", "legacy_exit_rules",
+                f"{len(summary['legacy'])} open position(s) still follow the OLD exit rules "
+                f"(bot trail, take-profit and event flatten): {names}. They were opened before this "
+                f"version. Check them in E*TRADE; they keep these rules until closed.",
+                dedupe_key=f"legacy_rules:{BOT_VERSION}:{names}",
+            )
+    except Exception as e:
+        logger.warning(f"exit-rules audit failed (non-fatal): {e}")
 
 
 async def _announce_preflight() -> None:
@@ -25048,6 +25768,7 @@ def assess_app_link(
         "exit_armed": None,
         "guarding": [],
         "guarding_truncated": False,
+        "exit_tick_age_s": None,
         "divergences": [],
     }
     open_count = len(tracked)
@@ -25100,6 +25821,9 @@ def assess_app_link(
             if str(s or "").strip()
         }) if isinstance(heartbeat.get("guarding"), list) else [],
         "guarding_truncated": heartbeat.get("guarding_truncated") is True,
+        # Tick age NOW = age at send + time since the beat landed. Unknown on
+        # either side stays unknown.
+        "exit_tick_age_s": _exit_tick_age_now(heartbeat.get("exit_tick_age_s"), seconds_since),
     })
 
     if stale and open_count > 0 and not killed:
@@ -25586,6 +26310,8 @@ async def status():
         "version": BOT_VERSION,
         "market_open": _is_market_open(),
         "open_positions": await state.all_positions(),
+        # Which rulebook each open position follows (app_decides vs legacy_bot).
+        "exit_rules": summarize_exit_rules(await state.all_positions(), APP_DECIDES),
         "stop_guards": await state.all_guards(),
         "trades_today": daily["trades_today"],
         "realized_pnl_today_pct": daily["realized_pnl_today_pct"],
@@ -26265,7 +26991,8 @@ async def arm_native_trail(
         risk = (entry - base_stop) if (entry > 0 and base_stop > 0) else None
         bid, ask = await _current_bid_ask(ticker, contract if is_option else None)
         spread = (ask - bid) if (bid > 0 and ask > 0 and ask >= bid) else None
-        tick = (_option_tick_from_quote(bid or entry, bid, ask) or 0.05) if is_option else 0.01
+        tick = (_option_tick_from_quote(bid or entry, bid, ask)
+                or _safe_option_tick(bid or entry)) if is_option else 0.01
         plan = trailing_engine.native_trail_offset(spread, risk=risk, tick=tick)
         return {
             "dry_run": True, "ticker": ticker,
