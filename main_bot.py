@@ -10433,6 +10433,67 @@ def option_snapshot_to_quote(payload: Any, now_s: float) -> Dict[str, Any]:
     return out
 
 
+def option_quotes_to_quote(payload: Any, now_s: float) -> Dict[str, Any]:
+    """Judge Massive's `/v3/quotes/{optionsTicker}` NBBO tick history as a
+    live quote. Same verdict shape and rules as option_snapshot_to_quote.
+
+    The NEWEST record is chosen by `sip_timestamp`, never by list position:
+    the endpoint's default `order=asc` returns the OLDEST ticks first (the
+    docs example hands back a quote from more than a year ago). Bid and ask
+    come from that ONE record. This endpoint carries no `timeframe` flag, so
+    the exchange timestamp is the only evidence of liveness — a delayed plan's
+    newest tick is ~15 minutes old and fails the age check. Pure.
+    """
+    out: Dict[str, Any] = {"live": False, "bid": None, "ask": None, "age_s": None,
+                           "timeframe": None, "reason": "", "endpoint": "quotes"}
+    results = payload.get("results") if isinstance(payload, dict) else None
+    rows = [r for r in results if isinstance(r, dict)] if isinstance(results, list) else []
+    best: Optional[Dict[str, Any]] = None
+    best_ts: Optional[float] = None
+    for r in rows:
+        ts = _ts_seconds(r.get("sip_timestamp"))
+        if ts is None:
+            continue
+        if best_ts is None or ts > best_ts:
+            best, best_ts = r, ts
+    if best is None:
+        out["reason"] = "Massive quotes feed returned no timestamped quote"
+        return out
+    bid, ask = _num(best.get("bid_price")), _num(best.get("ask_price"))
+    age = float(now_s) - best_ts if best_ts is not None else None
+    out.update({"bid": bid, "ask": ask, "age_s": round(age, 1) if age is not None else None})
+    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+        out["reason"] = "Massive quotes feed is not two-sided"
+    elif age is None:
+        out["reason"] = "Massive quote has no timestamp"
+    elif age > REALTIME_MAX_AGE_S:
+        out["reason"] = f"Massive quote is {int(age)}s old"
+    elif age < -REALTIME_MAX_AGE_S:
+        out["reason"] = "Massive quote is timestamped in the future (clock skew)"
+    else:
+        out["live"] = True
+        out["reason"] = "Massive real-time quote (NBBO quotes feed)"
+    return out
+
+
+def pick_option_quote(quotes_verdict: Any, snapshot_verdict: Any) -> Dict[str, Any]:
+    """The quotes feed (true NBBO ticks) wins when live; else the snapshot
+    when live; else a refusal naming BOTH reasons. Each verdict's bid/ask stay
+    together — sides are never mixed across endpoints. Pure."""
+    qv = quotes_verdict if isinstance(quotes_verdict, dict) else {}
+    sv = snapshot_verdict if isinstance(snapshot_verdict, dict) else {}
+    if qv.get("live") is True:
+        return dict(qv)
+    if sv.get("live") is True:
+        return {**sv, "endpoint": "snapshot"}
+    base = dict(sv) if sv else dict(qv)
+    base["live"] = False
+    base["endpoint"] = None
+    reasons = [str(v.get("reason") or "") for v in (qv, sv) if v.get("reason")]
+    base["reason"] = " · ".join(reasons) or "no Massive quote"
+    return base
+
+
 class MassiveClient:
     """Async quote fetcher. Holds the per-day ADV cache."""
 
@@ -10526,19 +10587,42 @@ class MassiveClient:
         if occ is None:
             return {"live": False, "bid": None, "ask": None, "age_s": None,
                     "timeframe": None, "reason": "contract could not be named for Massive"}
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-                data = await self._get(client, f"/v3/snapshot/options/{str(underlying).strip().upper()}/{occ}")
-        except Exception as e:
+        def failed(e: Exception, what: str) -> Dict[str, Any]:
             self.failures += 1
             self.last_error = str(e)[:200]
             msg = str(e)
             if "401" in msg or "403" in msg:
-                msg += " — the Massive plan may not include options"
+                msg += " — the Massive plan may not include this options data"
             return {"live": False, "bid": None, "ask": None, "age_s": None,
-                    "timeframe": None, "reason": f"Massive option quote unavailable ({msg[:160]})"}
-        return option_snapshot_to_quote(data, time.time())
+                    "timeframe": None, "reason": f"Massive {what} unavailable ({msg[:160]})"}
+
+        try:
+            import httpx
+        except Exception as e:  # pragma: no cover - httpx ships with the bot
+            return failed(e, "option quote")
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
+            # 1) NBBO quotes feed, NEWEST tick only (order=desc). The docs
+            #    default (asc) would return the oldest tick ever recorded.
+            try:
+                qdata = await self._get(client, f"/v3/quotes/{occ}",
+                                        {"order": "desc", "sort": "timestamp", "limit": 1})
+                qv = option_quotes_to_quote(qdata, time.time())
+            except Exception as e:
+                qv = failed(e, "quotes feed")
+            if qv.get("live") is True:
+                self.last_ok_at = time.time()
+                return qv
+            # 2) Contract snapshot (carries Massive's own timeframe flag).
+            try:
+                sdata = await self._get(
+                    client, f"/v3/snapshot/options/{str(underlying).strip().upper()}/{occ}")
+                sv = option_snapshot_to_quote(sdata, time.time())
+            except Exception as e:
+                sv = failed(e, "option snapshot")
+        out = pick_option_quote(qv, sv)
+        if out.get("live") is True:
+            self.last_ok_at = time.time()
+        return out
 
     def status(self) -> Dict[str, Any]:
         return {
@@ -10792,7 +10876,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.80.0-safety-rails"
+BOT_VERSION = "5.83.0-massive-nbbo"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -10981,7 +11065,11 @@ _ENTRY_ABANDONED_EVENTS = frozenset({
 # about nothing. At the shared 10% day halt the day's budget absorbs exactly
 # five full-risk losses before the capital rule fires; the six-loss count
 # rule remains the tighter of the two for small accounts.
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "2.0"))
+# 5.82 (operator, 2026-10-29): 8% per trade. On the ~$4.2k account 2% was
+# $84 — below the stop distance of almost every liquid 0.60-delta contract, so
+# nothing dispatched. 8% (~$340) funds one real contract; the 10% ceilings
+# below sit just above it so an 8% plan plus a stop gap still fits.
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "8.0"))
 # The day-halt rule is FIXED at 10% of capital (mirrors services/dayHalt.ts in
 # the app — operator-set shared policy, 2026-09, was 20): a day down 10% of
 # capital halts, six losing trades halts, nothing else does. For scale, the
@@ -10991,7 +11079,11 @@ RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "2.0"))
 # `entry_risk_rejected` before the session's second setup ever priced. At 10%
 # that budget is $516 there, and the per-trade ceiling (0.5 × base = 5%) sits
 # comfortably ABOVE the 2% per-trade policy instead of below it.
-DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "10.0"))
+# 5.82: raised 10 → 20 with the 8% per-trade risk. The per-trade ceiling is
+# MAX_TRADE_RISK_FRACTION_OF_DAILY (0.5) × this, so a 10% day could never fund
+# an 8% trade, and one loss must not end the day: 20% absorbs two full-risk
+# losses before the halt. Mirrors MAX_DAY_LOSS_PCT in the app.
+DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "20.0"))
 # A daily TRADE COUNT is not a risk control and no longer gates entries. It let
 # 6 trades at 1% risk (6% of the account) through while refusing 20 at 0.25%
 # (5%) — exactly backwards — and it killed the 7th good setup on a day the first
@@ -11076,7 +11168,8 @@ TICKER_COOLDOWN_MINUTES = int(os.getenv("TICKER_COOLDOWN_MINUTES", "15"))
 # silently declines to honour is the exact bug this whole mechanism exists to
 # kill, so a rejected value never disappears quietly.
 POLICY_HARD_MIN_SCORE = float(os.getenv("POLICY_HARD_MIN_SCORE", "40"))
-POLICY_HARD_MAX_RISK_PCT = float(os.getenv("POLICY_HARD_MAX_RISK_PCT", "5.0"))
+# 5.82: 5 → 10 — the operator's stated 8-10% per-trade range, never higher.
+POLICY_HARD_MAX_RISK_PCT = float(os.getenv("POLICY_HARD_MAX_RISK_PCT", "10.0"))
 POLICY_HARD_MAX_DAILY_LOSS_PCT = float(os.getenv("POLICY_HARD_MAX_DAILY_LOSS_PCT", "25.0"))
 # Where the adopted policy is persisted. A restart that silently reverted to
 # env defaults would re-open the same invisible gap the sync just closed.
@@ -11362,6 +11455,24 @@ APP_EXIT_AUTHORITY = os.getenv("APP_EXIT_AUTHORITY", "false").lower() == "true"
 #
 # Scanner-origin entries keep every gate. APP_DECIDES=false restores 5.77.
 APP_DECIDES = os.getenv("APP_DECIDES", "true").strip().lower() not in {"false", "0", "no"}
+# 5.82.1 BOOK LIMITS FOR APP ENTRIES. "The app decides" covers WHICH trade and
+# HOW it is expressed -- it never covered how much of the BOOK may be at risk.
+# An app-origin entry now also meets: MAX_CONCURRENT_POSITIONS, a total open
+# risk ceiling (APP_MAX_OPEN_RISK_PCT of equity, open positions + this entry),
+# and refusal once the daily loss limit has tripped. APP_ENTRY_RISK_GATES=false
+# restores 5.82.0 behaviour.
+APP_ENTRY_RISK_GATES = os.getenv("APP_ENTRY_RISK_GATES", "true").strip().lower() not in {"false", "0", "no"}
+# Default 10 = HARD_RISK_CAP_PCT (5.82): one full 8% plan (+gap) fits, a second
+# full-size app entry does not until the first is closed or de-risked, and the
+# whole app book stays well inside the 20% daily loss limit. 0 disables it.
+# (PORTFOLIO_HEAT_PCT=6 is NOT reused: at 8%/trade it would refuse every app
+# entry before it started.) Railway-tunable.
+APP_MAX_OPEN_RISK_PCT = float(os.getenv("APP_MAX_OPEN_RISK_PCT", "10.0"))
+# 5.82.1 CLOSE BACKOFF FOR DISPATCH (APP-DRIVEN) CLOSES. The same exit-retry
+# backoff (plan_exit_retry) and stop-churn limit (assess_stop_churn) the
+# bot-owned exits use. APP_CLOSE_RETRY_GATES=false restores 5.82.0 behaviour.
+APP_CLOSE_RETRY_GATES = os.getenv("APP_CLOSE_RETRY_GATES", "true").strip().lower() not in {"false", "0", "no"}
+APP_CLOSE_REASON = "app_close"
 # Deliberately WIDER than OPTION_STOP_MAX_HAIRCUT_PCT: that clamp bounds a
 # tactical stop meant to pay 1.5:1, while this is the disaster floor and is not
 # supposed to be reachable by noise.
@@ -11787,6 +11898,59 @@ def app_decides_entry(origin: Any, is_close: bool, enabled: bool) -> bool:
     if not enabled or is_close:
         return False
     return str(origin or "").strip().lower() == DISPATCH_ORIGIN_APP
+
+
+def assess_open_risk_ceiling(open_risk_usd: Any, new_risk_usd: Any, equity_usd: Any,
+                             ceiling_pct: Any) -> Optional[str]:
+    """Refusal text when open risk + this entry's risk exceeds `ceiling_pct`
+    of equity, else None. An unmeasurable new risk counts as 0 here (the
+    post-pricing recheck measures the real contract); an unknown account
+    refuses -- the ceiling cannot be verified. Pure."""
+    def num(v: Any) -> float:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return 0.0
+        return f if math.isfinite(f) and f > 0 else 0.0
+
+    eq, cap_pct = num(equity_usd), num(ceiling_pct)
+    if cap_pct <= 0:
+        return None
+    if eq <= 0:
+        return "total open risk ceiling cannot be verified — account size unknown"
+    total = num(open_risk_usd) + num(new_risk_usd)
+    pct = total / eq * 100.0
+    if pct > cap_pct + 1e-9:
+        return (f"total open risk {pct:.2f}% > {cap_pct:g}% of equity "
+                f"(${total:,.0f} of ${eq * cap_pct / 100.0:,.0f} allowed)")
+    return None
+
+
+def assess_app_risk_gates(open_count: Any, realized_pnl_today_pct: Any, daily_loss_limit_pct: Any,
+                          open_risk_usd: Any, new_risk_usd: Any, equity_usd: Any,
+                          max_positions: Any, max_open_risk_pct: Any) -> List[str]:
+    """The three BOOK limits an app-origin entry meets in 5.82.1: max concurrent
+    positions, total open risk, and the tripped daily loss limit. Returns the
+    refusal reasons (empty = allowed). Same wording as the scanner gates.
+    Pure: no I/O, fully unit-testable."""
+    reasons: List[str] = []
+    try:
+        limit = abs(float(daily_loss_limit_pct))
+        pnl = float(realized_pnl_today_pct)
+        if math.isfinite(limit) and math.isfinite(pnl) and limit > 0 and pnl <= -limit:
+            reasons.append(f"daily loss limit ({pnl:.2f}% ≤ -{limit:g}%)")
+    except (TypeError, ValueError):
+        pass
+    try:
+        n, cap = int(open_count), int(max_positions)
+        if cap > 0 and n >= cap:
+            reasons.append(f"max positions ({cap}) open")
+    except (TypeError, ValueError):
+        pass
+    heat = assess_open_risk_ceiling(open_risk_usd, new_risk_usd, equity_usd, max_open_risk_pct)
+    if heat:
+        reasons.append(heat)
+    return reasons
 
 
 def assess_app_entry_gates(
@@ -12582,6 +12746,24 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
         ticker_m = str(p.get("ticker") or "").upper()
         if ticker_m and ticker_m in (await state.all_positions()):
             blocked.append(f"already in {ticker_m}")
+        if APP_ENTRY_RISK_GATES:
+            # 5.82.1 — book limits (see APP_ENTRY_RISK_GATES). Fails CLOSED: an
+            # unreadable book is not permission to add to it.
+            try:
+                daily_a = await state.get_daily()
+                positions_a = await state.all_positions()
+                blocked.extend(assess_app_risk_gates(
+                    len(positions_a),
+                    daily_a.get("realized_pnl_today_pct"),
+                    live_policy("daily_loss_limit_pct"),
+                    sum(position_risk_usd(x) for x in positions_a.values()),
+                    estimate_entry_risk_usd(p),
+                    await _risk_account_reference(),
+                    MAX_CONCURRENT_POSITIONS,
+                    APP_MAX_OPEN_RISK_PCT,
+                ))
+            except Exception as e:
+                blocked.append(f"app book limits unreadable ({str(e)[:80]}) — entry refused")
         if blocked:
             logger.warning(f"📱 APP DECIDES — {ticker_m or 'entry'} refused: {' · '.join(blocked)}")
         else:
@@ -15233,6 +15415,19 @@ async def _record_api_failure(source: str, error: str) -> None:
         )
 
 
+class LocalRefusal(Exception):
+    """The bot's OWN verdict (a gate, a sizing rule, a missing input) — raised
+    without any broker call. Typed so the circuit breaker can tell it apart
+    from a broker failure without guessing from the message.
+
+    5.81: the marker list below was a deny-list, so every gate whose wording
+    was not on it (the priced-risk recheck, learning-loop and portfolio-risk
+    refusals) counted as a BROKER failure. Five of those inside the window
+    tripped the breaker on a healthy broker and halted every entry for the
+    cooldown. Raising this type makes the classification structural."""
+    local_refusal = True
+
+
 # Failures that are the BOT'S OWN verdict, not the broker's. These must never
 # count toward the API circuit breaker: five benign rejections in a row (five
 # signals arriving after hours, five duplicate tickers, five fail-closed sizing
@@ -15258,9 +15453,13 @@ _LOCAL_REFUSAL_MARKERS = (
 )
 
 
-def _is_local_refusal(err: str) -> bool:
+def _is_local_refusal(err: Any) -> bool:
     """True when a failure came from this bot's own gating rather than from a
-    broker API call — it says nothing about broker health."""
+    broker API call — it says nothing about broker health. A LocalRefusal is
+    local by type; the message markers stay as a backstop for gates that
+    still raise a plain Exception."""
+    if getattr(err, 'local_refusal', False):
+        return True
     low = str(err).lower()
     return any(marker in low for marker in _LOCAL_REFUSAL_MARKERS)
 
@@ -17825,7 +18024,7 @@ async def _place_entry_with_funds_clamp(
             budget = max(0.0, available) * FUNDS_SAFETY_MARGIN
             affordable = int(budget // unit_cost)
             if affordable < 1:
-                raise Exception(
+                raise LocalRefusal(
                     f"insufficient funds: available ≈${available:.2f}, one {unit_name} of "
                     f"{common.get('symbol')} costs ≈${unit_cost:.2f} — trade refused before reaching broker"
                 )
@@ -18636,6 +18835,47 @@ def _quote_symbol(ticker: str, contract: Optional[dict] = None) -> str:
     return ticker
 
 
+def choose_option_mark(etrade_bid: Any, etrade_ask: Any, etrade_quality: Any,
+                       massive_quote: Any) -> Dict[str, Any]:
+    """Which (bid, ask) should an option exit price on? (5.83)
+
+    E*TRADE's own quote when it is TRUSTED (real-time, fresh) and two-sided —
+    it is the book the order rests in. Otherwise Massive's live NBBO when it
+    is live and two-sided. Otherwise E*TRADE's numbers unchanged with their
+    untrusted verdict, so every existing refusal still fires.
+
+    The ORCL 1011 stall was a limit priced off a 15-minute-old E*TRADE bid;
+    a live Massive bid prices the exit where the market actually is. Bid and
+    ask always come from ONE feed. Returns {bid, ask, quality, source}. Pure.
+    """
+    def num(v: Any) -> float:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return 0.0
+        return f if math.isfinite(f) and f > 0 else 0.0
+
+    eb, ea = num(etrade_bid), num(etrade_ask)
+    eq = dict(etrade_quality) if isinstance(etrade_quality, dict) else {
+        "trusted": False, "realtime": False, "age_seconds": None,
+        "reason": "no_quote_recorded", "detail": "E*TRADE returned no quote",
+    }
+    if eq.get("trusted") is True and eb > 0 and ea >= eb:
+        return {"bid": eb, "ask": ea, "quality": eq, "source": "etrade"}
+    mq = massive_quote if isinstance(massive_quote, dict) else {}
+    mb, ma = num(mq.get("bid")), num(mq.get("ask"))
+    if mq.get("live") is True and mb > 0 and ma >= mb:
+        age = mq.get("age_s")
+        return {"bid": mb, "ask": ma, "source": "massive", "quality": {
+            "trusted": True, "realtime": True,
+            "age_seconds": float(age) if isinstance(age, (int, float)) else None,
+            "reason": "massive_realtime",
+            "detail": (f"Massive live NBBO ({mq.get('endpoint') or 'quote'}) — E*TRADE quote "
+                       f"was {eq.get('reason') or 'unusable'}"),
+        }}
+    return {"bid": eb, "ask": ea, "quality": eq, "source": "etrade"}
+
+
 async def _current_bid_ask(ticker: str, contract: Optional[dict] = None) -> Tuple[float, float]:
     """Best-effort live (bid, ask) for an equity — or a specific option
     contract via E*TRADE's SYMBOL:YYYY:MM:DD:TYPE:STRIKE quote syntax.
@@ -18645,6 +18885,32 @@ async def _current_bid_ask(ticker: str, contract: Optional[dict] = None) -> Tupl
     `_LAST_MARK_QUALITY` so exits can ask whether the number they are about to
     sell on is actually real. The price contract is unchanged — callers that
     only need a number are untouched."""
+    eb, ea = await _etrade_bid_ask(ticker, contract)
+    if not contract:
+        return eb, ea
+    # OPTION CONTRACT (5.83): if E*TRADE's print is not trusted (delayed,
+    # stale, missing), price on Massive's live NBBO instead — never a blend.
+    sym = _quote_symbol(ticker, contract)
+    eq = _LAST_MARK_QUALITY.get(sym)
+    if eq and eq.get("trusted") is True and eb > 0:
+        return eb, ea
+    try:
+        exp = str(contract.get("expiration") or "")[:10]
+        right = "C" if str(contract.get("right") or "").upper().startswith("C") else "P"
+        mq = await massive_client.fetch_option_quote(ticker, exp, right, float(contract.get("strike")))
+    except Exception as e:
+        logger.warning(f"Massive option mark failed for {ticker}: {e}")
+        return eb, ea
+    pick = choose_option_mark(eb, ea, eq, mq)
+    _LAST_MARK_QUALITY[sym] = pick["quality"]
+    if pick["source"] == "massive":
+        logger.info(f"📡 {sym} priced on Massive live NBBO {pick['bid']:.2f}/{pick['ask']:.2f} "
+                    f"(E*TRADE {eb:.2f}/{ea:.2f} untrusted)")
+    return pick["bid"], pick["ask"]
+
+
+async def _etrade_bid_ask(ticker: str, contract: Optional[dict] = None) -> Tuple[float, float]:
+    """E*TRADE's own (bid, ask) + provenance stamp. (0.0, 0.0) when none."""
     tokens = load_tokens()
     if not tokens:
         return 0.0, 0.0
@@ -18654,6 +18920,8 @@ async def _current_bid_ask(ticker: str, contract: Optional[dict] = None) -> Tupl
             tokens["oauth_token"], tokens["oauth_token_secret"], dev=is_sandbox,
         )
         sym = _quote_symbol(ticker, contract)
+        # A failed fetch must not leave an older verdict describing no quote.
+        _LAST_MARK_QUALITY.pop(sym, None)
         resp = await _etrade_call(market.get_quote, [sym], resp_format="json", source="stop_reprice_quote")
         data = (((resp or {}).get("QuoteResponse") or {}).get("QuoteData")) or []
         if isinstance(data, dict):
@@ -19065,6 +19333,90 @@ async def _emergency_flatten(ticker: str, guard: dict, qty: int) -> Optional[str
     return flatten_id
 
 
+# 1011 FALLBACK (5.82.1). E*TRADE refuses a sell limit it judges "below the
+# current market price by a large percentage" (Code 1011). ORCL 2026-10-28:
+# every event-flatten close died on that rejection at the FIRST placement, so
+# the MARKET fallback below (which only runs after a limit has RESTED) was
+# never reached, and the stop was cancelled and re-sent for over an hour.
+# On a 1011 the exit now retries ONCE with a small cushion off a fresh bid,
+# and if that is refused too, closes at MARKET (SELL_CLOSE of a long only).
+EXIT_1011_RETRY_CUSHION_PCT = float(os.getenv("EXIT_1011_RETRY_CUSHION_PCT", "2.0"))
+EXIT_1011_MARKET_FALLBACK = os.getenv("EXIT_1011_MARKET_FALLBACK", "true").strip().lower() not in {"false", "0", "no"}
+
+# E*TRADE Code 1011 as pyetrade reports it ("Etrade API Error - Code: 1011,
+# Msg: ...") and as the raw JSON path reports it (message text only).
+_LIMIT_TOO_FAR_RE = re.compile(r"code\W{0,3}1011\b|by a large percentage", re.IGNORECASE)
+
+
+def is_limit_too_far_rejection(err: Any) -> bool:
+    """True when a placement error is E*TRADE's 1011 "limit price ... below
+    the current market price by a large percentage" refusal. Pure."""
+    return bool(_LIMIT_TOO_FAR_RE.search(str(err or "")))
+
+
+def plan_exit_1011_retry(bid: Any, first_limit: Any, cushion_pct: Any = None) -> Optional[float]:
+    """The ONE tighter crossing limit tried after a 1011, or None.
+
+    The higher (closer to the bid) of bid x (1 - EXIT_1011_RETRY_CUSHION_PCT%)
+    and one safe tick under the bid, rounded DOWN to the safe $0.05/$0.10 grid
+    (5.82: $0.10 at/above $3 -- the same `_safe_option_tick` /
+    `_round_to_option_tick` grid the entry and stop pricers use; never above
+    the bid, so it stays marketable). The order goes out through
+    `_place_order_smart`, so a 2040 on it still gets the one $0.10 re-price. None when there is no bid,
+    or when the result would not be strictly above the limit that was just
+    refused -- the same price earns the same 1011, so the caller goes straight
+    to MARKET instead. Pure.
+    """
+    try:
+        b = float(bid)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(b) or b <= 0:
+        return None
+    try:
+        c = float(EXIT_1011_RETRY_CUSHION_PCT if cushion_pct is None else cushion_pct)
+    except (TypeError, ValueError):
+        c = EXIT_1011_RETRY_CUSHION_PCT
+    c = min(10.0, max(0.0, c))
+    candidate = max(b * (1.0 - c / 100.0), b - _safe_option_tick(b))
+    price = _round_to_option_tick(candidate, "down")
+    if price > b + 1e-9:
+        # The grid floor is one tick; on a sub-tick bid that can sit above it.
+        return None
+    try:
+        first = float(first_limit) if first_limit is not None else None
+    except (TypeError, ValueError):
+        first = None
+    if first is not None and math.isfinite(first) and price <= first + 1e-9:
+        return None
+    return round(price, 2)
+
+
+def plan_exit_rejection_step(err: Any, attempt: int, order_action: Any,
+                             market_allowed: bool = True) -> str:
+    """What a crossing exit does after its limit was REFUSED at placement.
+
+      "raise"       -- not a 1011, not a SELL_CLOSE, or MARKET disabled: the
+                       error surfaces and every caller re-arms the stop;
+      "retry_tight" -- the first 1011: one tighter limit (plan_exit_1011_retry);
+      "market"      -- a second 1011 on a SELL_CLOSE: close at MARKET.
+
+    MARKET is only ever chosen for SELL_CLOSE, i.e. closing a long option the
+    account holds -- never an opening order, never a short. Pure.
+    """
+    if not is_limit_too_far_rejection(err):
+        return "raise"
+    if str(order_action or "").strip().upper() != "SELL_CLOSE":
+        return "raise"
+    try:
+        n = int(attempt)
+    except (TypeError, ValueError):
+        n = 1
+    if n <= 1:
+        return "retry_tight"
+    return "market" if market_allowed else "raise"
+
+
 async def _place_crossing_exit(common: dict, tokens: dict, bid: float) -> Any:
     """Place an option SELL_CLOSE as a CROSSING LIMIT, never a blind market.
 
@@ -19078,6 +19430,11 @@ async def _place_crossing_exit(common: dict, tokens: dict, bid: float) -> Any:
 
     Mutates `common` to the order actually sent first; returns the place
     response of whichever order is working.
+
+    5.82.1: a limit REFUSED at placement with E*TRADE 1011 no longer raises
+    straight out (which skipped the MARKET fallback entirely). It retries once
+    tighter, then MARKET -- see `_exit_after_limit_rejection`. Any other
+    rejection, or a failed MARKET, still raises and the caller re-arms the stop.
     """
     limit = plan_exit_limit(bid)
     if limit is None:
@@ -19093,7 +19450,12 @@ async def _place_crossing_exit(common: dict, tokens: dict, bid: float) -> Any:
         f"[CROSS EXIT] {common.get('symbol')} crossing limit {common['limitPrice']} "
         f"({EXIT_CROSS_CUSHION_PCT:.0f}% under bid {float(bid):.2f})"
     )
-    placed = await _place_order_smart("option", common, tokens)
+    try:
+        placed = await _place_order_smart("option", common, tokens)
+    except Exception as first_err:
+        placed, went_market = await _exit_after_limit_rejection(common, tokens, float(bid), first_err)
+        if went_market:
+            return placed
     order_id = _order_id_from_place(placed)
     if not order_id or EXIT_CROSS_WAIT_SECONDS <= 0:
         return placed
@@ -19124,6 +19486,84 @@ async def _place_crossing_exit(common: dict, tokens: dict, bid: float) -> Any:
     return placed
 
 
+async def _exit_after_limit_rejection(common: dict, tokens: dict, bid: float,
+                                      first_err: Exception) -> Tuple[Any, bool]:
+    """The 5.82.1 1011 ladder for a crossing exit whose first limit was refused.
+
+    Returns (place_response, went_market). Raises -- and every caller then
+    re-arms the protective stop -- when the error is not a 1011, when the
+    order is not a SELL_CLOSE, or when the MARKET close itself is refused.
+    `common` is updated to the order actually working.
+    """
+    symbol = str(common.get("symbol") or "")
+    # The bot's OWN refusal (LocalRefusal / marker text) is never a reason to
+    # go to MARKET -- it surfaces unchanged and stays off the breaker. A broker
+    # 1011 is a plain broker Exception: it is NOT a local refusal, so if the
+    # whole ladder fails it still counts toward the API circuit breaker.
+    if _is_local_refusal(first_err):
+        raise first_err
+    step = plan_exit_rejection_step(first_err, 1, common.get("orderAction"), EXIT_1011_MARKET_FALLBACK)
+    if step == "raise":
+        raise first_err
+    rejected_limit = common.get("limitPrice")
+    fresh_bid = float(bid or 0.0)
+    try:
+        b, _a = await _current_bid_ask(symbol, {
+            "right": common.get("callPut"), "strike": common.get("strikePrice"),
+            "expiration": common.get("expiryDate"),
+        })
+        if b and float(b) > 0:
+            fresh_bid = float(b)
+    except Exception as e:
+        logger.warning(f"[CROSS EXIT] {symbol} fresh bid unreadable after 1011 ({e}) — using {fresh_bid:.2f}")
+    tight = plan_exit_1011_retry(fresh_bid, rejected_limit)
+    if tight is not None:
+        retry = dict(common)
+        retry["priceType"] = "LIMIT"
+        retry["limitPrice"] = tight
+        retry["clientOrderId"] = str(uuid.uuid4().int)[:18]
+        logger.warning(
+            f"[CROSS EXIT] {symbol} limit {rejected_limit} refused with 1011 — retrying ONCE at {tight} "
+            f"(bid {fresh_bid:.2f}, {EXIT_1011_RETRY_CUSHION_PCT:g}% / one tick cushion)"
+        )
+        await trade_ledger.record("exit_1011_retry", {
+            "ticker": symbol, "rejected_limit": rejected_limit, "retry_limit": tight,
+            "bid": fresh_bid, "error": str(first_err)[:200],
+        })
+        try:
+            placed = await _place_order_smart("option", retry, tokens)
+            common.update(retry)
+            return placed, False
+        except Exception as second_err:
+            if plan_exit_rejection_step(second_err, 2, retry.get("orderAction"),
+                                        EXIT_1011_MARKET_FALLBACK) != "market":
+                raise
+            first_err = second_err
+    elif not EXIT_1011_MARKET_FALLBACK:
+        raise first_err
+    market = dict(common)
+    market["priceType"] = "MARKET"
+    market.pop("limitPrice", None)
+    market["clientOrderId"] = str(uuid.uuid4().int)[:18]
+    logger.error(
+        f"[CROSS EXIT] {symbol} crossing limit refused (1011) twice — closing the long option at MARKET"
+    )
+    await trade_ledger.record("exit_1011_market", {
+        "ticker": symbol, "rejected_limit": rejected_limit, "retry_limit": tight,
+        "bid": fresh_bid, "error": str(first_err)[:200],
+    })
+    await alerts.send(
+        "warning", "exit_1011_market",
+        f"{symbol}: E*TRADE refused the exit limit as too far from the market (1011) — "
+        f"closed at MARKET instead so the position is not left open.",
+        dedupe_key=f"exit_1011_market:{symbol}",
+    )
+    placed = await _place_order_smart("option", market, tokens)
+    common.update(market)
+    common.pop("limitPrice", None)
+    return placed, True
+
+
 async def _place_option_market_close(ticker: str, contract: dict, qty: int) -> Optional[str]:
     """SELL_CLOSE for `qty` contracts of an OCC contract we hold.
 
@@ -19132,9 +19572,9 @@ async def _place_option_market_close(ticker: str, contract: dict, qty: int) -> O
     """
     tokens = load_tokens()
     if not tokens:
-        raise Exception("E*TRADE tokens not set")
+        raise LocalRefusal("E*TRADE tokens not set")
     if not contract or not contract.get("right") or not contract.get("expiration"):
-        raise Exception(f"cannot close {ticker} — option contract details missing")
+        raise LocalRefusal(f"cannot close {ticker} — option contract details missing")
     acct_key = await _resolve_account_id_key(tokens)
     common = dict(
         resp_format="json",
@@ -19177,9 +19617,9 @@ async def _place_option_limit_entry(ticker: str, contract: dict, qty: int,
     """
     tokens = load_tokens()
     if not tokens:
-        raise Exception("E*TRADE tokens not set")
+        raise LocalRefusal("E*TRADE tokens not set")
     if not contract or not contract.get("right") or not contract.get("expiration"):
-        raise Exception(f"cannot reprice {ticker} — option contract details missing")
+        raise LocalRefusal(f"cannot reprice {ticker} — option contract details missing")
     acct_key = await _resolve_account_id_key(tokens)
     common = dict(
         resp_format="json",
@@ -22575,14 +23015,42 @@ def _best_expression_contract(market, symbol: str, spot: Any, vol_annual: Any,
 # resizes — a ticket that breaks it is refused outright, because a size this far
 # off the plan means some upstream number is wrong, and quietly shrinking it
 # would hide that. Declared from policy, never tuned on the ledger:
-#   * HARD_RISK_CAP_PCT: 2x the 2% per-trade policy, measured INCLUDING a stop
-#     gap. The plan plus a gap as bad as ORCL's must still fit; a 3x plan never.
+#   * HARD_RISK_CAP_PCT: 10% (5.82; was 4% = 2x the old 2% policy), measured
+#     INCLUDING a stop gap. The 8% plan plus a 10% gap (8.8%) must still fit;
+#     anything past the operator's 10% top end never.
 #   * STOP_GAP_ALLOWANCE_PCT: stops do not fill at their price on a gap. ORCL
 #     2026-10-28: stop 10.60, filled 9.72 = 8.3% of the stop. 10% rounds that up.
 #   * HARD_NOTIONAL_CAP_PCT: a long option can go to zero; no single ticket may
 #     spend more than a quarter of the account on premium.
 #   * HARD_MAX_CONTRACTS: an absolute count no plan on this account needs.
-HARD_RISK_CAP_PCT = 4.0
+# Optional (5.82.1): readable from Railway so the cap can move without a code
+# edit. Default is the operator's 10.0. A bad value (unparseable, <= 0, or
+# above POLICY_HARD_MAX_RISK_PCT) falls back to 10.0 and is logged at boot, so
+# a typo can never remove the cap or lift it past the policy ceiling.
+def _hard_risk_cap_from_env(raw: Any, default: float = 10.0) -> float:
+    """HARD_RISK_CAP_PCT from its env text; `default` when unusable. Pure."""
+    try:
+        v = float(str(raw).strip()) if raw is not None and str(raw).strip() else default
+    except (TypeError, ValueError):
+        return default
+    ceiling = max(default, float(POLICY_HARD_MAX_RISK_PCT))
+    if not math.isfinite(v) or v <= 0 or v > ceiling:
+        return default
+    return v
+
+
+HARD_RISK_CAP_PCT = _hard_risk_cap_from_env(os.getenv("HARD_RISK_CAP_PCT"))
+try:
+    _hrc_raw = os.getenv("HARD_RISK_CAP_PCT")
+    if _hrc_raw and str(_hrc_raw).strip():
+        try:
+            _hrc_ok = abs(float(_hrc_raw) - HARD_RISK_CAP_PCT) < 1e-9
+        except (TypeError, ValueError):
+            _hrc_ok = False
+        if not _hrc_ok:
+            logger.warning(f"HARD_RISK_CAP_PCT env {_hrc_raw!r} unusable — hard cap stays {HARD_RISK_CAP_PCT}%")
+except Exception:
+    pass
 STOP_GAP_ALLOWANCE_PCT = 10.0
 HARD_NOTIONAL_CAP_PCT = 25.0
 HARD_MAX_CONTRACTS = int(os.getenv("HARD_MAX_CONTRACTS", "20"))
@@ -22897,9 +23365,9 @@ async def execute_live_order(payload: dict):
 
     if not is_close:
         if await state.is_killed():
-            raise Exception("kill switch active — entry refused")
+            raise LocalRefusal("kill switch active — entry refused")
         if not _is_market_open() and not bool(payload.get("force_execute")):
-            raise Exception("market closed — entry refused (exchange-aware calendar)")
+            raise LocalRefusal("market closed — entry refused (exchange-aware calendar)")
 
     # LEARNING LOOP SIZING — entries only, never a probe. Re-judged here (a
     # queued job may run after a close moved a cell). A disabled cell refuses;
@@ -22912,7 +23380,7 @@ async def execute_live_order(payload: dict):
             logger.warning(f"learning sizing unavailable for {ticker} (full size): {e}")
         if learning_ctx is not None:
             if not learning_ctx["allowed"]:
-                raise Exception("; ".join(learning_ctx["reasons"]) or "learning loop: cell disabled")
+                raise LocalRefusal("; ".join(learning_ctx["reasons"]) or "learning loop: cell disabled")
             payload["_learning"] = learning_ctx
 
     # PORTFOLIO RISK — re-judged here for the same reason: the book a queued
@@ -22929,7 +23397,7 @@ async def execute_live_order(payload: dict):
                 logger.warning(f"portfolio risk unavailable for {ticker} (unweighted): {e}")
         if risk_ctx is not None:
             if not risk_ctx["allowed"]:
-                raise Exception("; ".join(risk_ctx["reasons"]) or "portfolio risk: entry refused")
+                raise LocalRefusal("; ".join(risk_ctx["reasons"]) or "portfolio risk: entry refused")
             payload["_risk"] = risk_ctx
         # The expected cost as filtered — stamped so the ledger can later set
         # the cost the model PREDICTED against the fill that happened. An
@@ -22942,7 +23410,7 @@ async def execute_live_order(payload: dict):
     tokens = load_tokens()
     if not tokens:
         logger.error("❌ No E*TRADE tokens available")
-        raise Exception("E*TRADE tokens not set")
+        raise LocalRefusal("E*TRADE tokens not set")
 
     # NEVER pass the raw env value straight through — E*TRADE needs the opaque
     # accountIdKey from /accounts/list (Error 102 otherwise).
@@ -22956,7 +23424,7 @@ async def execute_live_order(payload: dict):
     try:
         await order_lock.acquire()
     except LockNotAcquired:
-        raise Exception(f"order lock busy for {ticker} — another worker is placing/closing this ticker")
+        raise LocalRefusal(f"order lock busy for {ticker} — another worker is placing/closing this ticker")
 
     try:
         if instrument == "option":
@@ -23084,7 +23552,7 @@ async def execute_live_order(payload: dict):
                     strike, expiry = expression["strike"], expression["expiry"]
 
             if not strike or not expiry:
-                raise Exception(f"Missing strike or expiration for option order. Got strike={strike}, expiry={expiry}")
+                raise LocalRefusal(f"Missing strike or expiration for option order. Got strike={strike}, expiry={expiry}")
 
             # Snap to a contract that actually exists on E*TRADE's chain.
             # Without this, a 0DTE expiry on a market holiday (or an unlisted
@@ -23254,6 +23722,24 @@ async def execute_live_order(payload: dict):
                     common["quantity"] = quantity
                 opt_guard = await state.get_guard(sym_u) or {}
                 resting_stop_id = pos.get("stop_order_id") or opt_guard.get("stop_order_id")
+                if pos and APP_CLOSE_RETRY_GATES:
+                    # 5.82.1 — the same close-failure backoff and stop-churn limit
+                    # the bot-owned exits use. Refusals are RETURNED (no breaker
+                    # feed) and leave the protective stop resting untouched.
+                    if not await _exit_retry_gate(sym_u, pos, APP_CLOSE_REASON):
+                        retry_v = plan_exit_retry(pos.get("exit_retry"), APP_CLOSE_REASON, time.time())
+                        backoff_reason = (
+                            f"close backing off after {retry_v['fails']} failed attempt(s) — next try in "
+                            f"{retry_v['wait_s']:.0f}s; the protective stop is still resting"
+                        )
+                        logger.warning(f"[CLOSE] {sym_u} {backoff_reason}")
+                        return {"status": "refused", "reason": backoff_reason, "code": "close_backoff"}
+                    if resting_stop_id and not await _stop_churn_gate(sym_u, pos, APP_CLOSE_REASON):
+                        churn_reason = (
+                            f"the protective stop was cancelled {STOP_CHURN_MAX_CANCELS}+ times in "
+                            f"{STOP_CHURN_WINDOW_SECONDS / 60:.0f} min — leaving it resting instead of closing"
+                        )
+                        return {"status": "refused", "reason": churn_reason, "code": "stop_churn"}
                 stop_outcome = await _cancel_order_verified(resting_stop_id, expected_qty=cover_qty)
                 if stop_outcome == CANCEL_FILLED:
                     await _finish_guard(sym_u, "closed_by_stop")
@@ -23291,7 +23777,7 @@ async def execute_live_order(payload: dict):
                     common["quantity"] = remaining
                     pos = await state.get_position(sym_u) or {}
                 if stop_outcome == CANCEL_LIVE:
-                    raise Exception(
+                    raise LocalRefusal(
                         f"could not cancel resting option stop {resting_stop_id} — refusing to double-sell {sym_u}"
                     )
                 await _finish_guard(sym_u, "closed_by_app")
@@ -23422,7 +23908,7 @@ async def execute_live_order(payload: dict):
                         f"≈${reprice['intended_usd']:.0f} intended outlay). The sizing premise no longer exists.",
                         dedupe_key=f"reprice_reject:{symbol}",
                     )
-                    raise Exception(
+                    raise LocalRefusal(
                         f"entry price drifted {reprice['drift_pct']:.0f}% above the app's estimate "
                         f"(≈${reprice['actual_unit_usd']:.0f}/contract vs ≈${reprice['intended_usd']:.0f} intended) "
                         f"— refusing to multiply the planned risk"
@@ -23544,7 +24030,7 @@ async def execute_live_order(payload: dict):
                         f"{symbol}: entry REFUSED — {risk_check['reason']}.",
                         dedupe_key=f"priced_risk_reject:{symbol}",
                     )
-                    raise Exception(f"priced-risk recheck refused the entry — {risk_check['reason']}")
+                    raise LocalRefusal(f"priced-risk recheck refused the entry — {risk_check['reason']}")
                 if risk_check["action"] == "shrink":
                     logger.warning(
                         f"⚖️ {symbol} priced-risk recheck resize: qty {quantity} → {risk_check['qty']} "
@@ -23621,6 +24107,35 @@ async def execute_live_order(payload: dict):
                     return {"status": "refused", "reason": cap["reason"],
                             "code": "hard_size_cap", "paper": True}
                 logger.info(f"✅ {symbol} {cap['reason']}")
+                if app_decides and APP_ENTRY_RISK_GATES:
+                    # 5.82.1 — the open-risk ceiling on the PRICED contract (the
+                    # pre-dispatch filter only saw the app's estimate).
+                    try:
+                        positions_now = await state.all_positions()
+                        open_risk_now = sum(position_risk_usd(x) for x in positions_now.values())
+                        per_contract = (cap_premium - cap_stop) if (cap_stop and 0 < cap_stop < cap_premium) else cap_premium
+                        heat_reason = assess_open_risk_ceiling(
+                            open_risk_now, per_contract * 100.0 * int(quantity),
+                            await _risk_account_reference(), APP_MAX_OPEN_RISK_PCT,
+                        )
+                    except Exception as e:
+                        heat_reason = f"app open-risk recheck unreadable ({str(e)[:80]}) — entry refused"
+                    if heat_reason:
+                        logger.warning(f"⛔ {symbol} app entry: {heat_reason}")
+                        await trade_ledger.record("entry_app_open_risk_refused", {
+                            "ticker": sym_u, "premium": cap_premium or None, "stop_premium": cap_stop,
+                            "qty": quantity, "reason": heat_reason,
+                        })
+                        await alerts.send(
+                            "warning", "entry_app_open_risk_refused",
+                            f"{symbol}: app entry REFUSED — {heat_reason}.",
+                            dedupe_key=f"app_open_risk:{symbol}",
+                        )
+                        # Typed LocalRefusal (same as the priced-risk recheck
+                        # above): the dispatch handler logs it, books
+                        # order_failed with counted_toward_breaker=False, and
+                        # never feeds _record_api_failure.
+                        raise LocalRefusal(f"app open-risk ceiling refused the entry — {heat_reason}")
 
             logger.info(f"📤 Placing OPTION: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
             if is_exit:
@@ -23634,6 +24149,13 @@ async def execute_live_order(payload: dict):
                     # The resting protective stop was cancelled above. A failed
                     # close must NOT leave the position naked until the next
                     # reconcile pass (up to 15 min off-hours) — re-arm now.
+                    if pos and APP_CLOSE_RETRY_GATES:
+                        # Stamped BEFORE the re-arm, which persists this record.
+                        pos["exit_retry"] = record_exit_failure(pos.get("exit_retry"), APP_CLOSE_REASON, time.time())
+                        try:
+                            await state.set_position(sym_u, pos)
+                        except Exception as stamp_err:
+                            logger.warning(f"[CLOSE] {sym_u} close-failure stamp not persisted: {stamp_err}")
                     if pos:
                         try:
                             await _reconcile_rearm_guard(sym_u, dict(pos))
@@ -23868,7 +24390,7 @@ async def execute_live_order(payload: dict):
                 )
                 already_closed_by_stop = stop_outcome == CANCEL_FILLED
                 if stop_outcome == CANCEL_LIVE:
-                    raise Exception(
+                    raise LocalRefusal(
                         f"could not cancel resting stop {stop_order_id} — refusing to double-sell {symbol}"
                     )
                 if stop_outcome == CANCEL_PARTIAL:
@@ -23908,7 +24430,7 @@ async def execute_live_order(payload: dict):
 
                 qty = int(pos.get("filled_qty") or pos.get("qty") or payload.get("position_size_shares") or 0)
                 if qty < 1:
-                    raise Exception(
+                    raise LocalRefusal(
                         f"close refused — unknown quantity for {symbol} (no tracked position and no position_size_shares)"
                     )
                 entry_action = str(pos.get("action") or ("BUY" if action != "BUY" else "SELL")).upper()
@@ -23964,7 +24486,7 @@ async def execute_live_order(payload: dict):
                     quantity = int((equity_val * (live_policy("risk_per_trade_pct") / 100.0)) // dist)
                     logger.info(f"sized {symbol} from live equity {equity_val:.2f}: qty={quantity}")
                 if quantity < 1:
-                    raise Exception(
+                    raise LocalRefusal(
                         "fail-closed sizing: position_size_shares missing/invalid and cannot size "
                         "from live equity — refusing to default to 1 share"
                     )
@@ -23986,7 +24508,7 @@ async def execute_live_order(payload: dict):
                 # A bare SELL with no tracked position would OPEN a naked short
                 # (and E*TRADE expects SELL_SHORT for that anyway). Bearish
                 # exposure routes through long PUTs on the option path.
-                raise Exception(
+                raise LocalRefusal(
                     "short equity entries are not supported — bearish signals route "
                     "through PUT options (instrument=option, option_right=PUT)"
                 )
@@ -24075,13 +24597,18 @@ async def execute_live_order(payload: dict):
     except Exception as e:
         # Only genuine broker/API failures feed the circuit breaker — our own
         # gate refusals are working-as-intended, not signs of a sick broker.
-        if _is_local_refusal(str(e)):
+        local = _is_local_refusal(e)
+        if local:
             logger.info(f"↩︎ {ticker} refused locally (breaker untouched): {e}")
         else:
-            await _record_api_failure("order_placement", str(e))
+            await _record_api_failure("order_placement", f"{type(e).__name__}: {e}")
         await trade_ledger.record("order_failed", {
             "ticker": ticker, "action": action, "instrument": instrument,
             "error": str(e)[:300],
+            # Which failures fed the breaker — so a trip can be audited
+            # against the exact errors that caused it.
+            "error_type": type(e).__name__,
+            "counted_toward_breaker": not local,
         })
         await alerts.send(
             "error", "order_failed",
