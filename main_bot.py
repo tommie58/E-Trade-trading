@@ -2356,6 +2356,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -2570,8 +2571,22 @@ def parse_broker_positions(portfolio_resp: Dict[str, Any]) -> Dict[str, dict]:
             record = out.setdefault(symbol, {
                 "qty": 0, "eq_qty": 0, "optn_qty": 0,
                 "security_type": sec_type, "occ": None, "optn_legs": [],
+                "eq_mv": 0.0, "optn_mv": 0.0,
             })
             record["qty"] += qty
+            # MARKET VALUE per leg, so the app can price a position nothing in
+            # this system opened (no entry, no stop). Unknown is never zero: one
+            # unreadable lot makes the whole leg's value None.
+            mv_key = "optn_mv" if sec_type == "OPTN" else "eq_mv"
+            try:
+                mv = float(pos.get("marketValue"))
+                if not math.isfinite(mv):
+                    raise ValueError
+            except (TypeError, ValueError):
+                record[mv_key] = None
+            else:
+                if record.get(mv_key) is not None:
+                    record[mv_key] = record[mv_key] + mv
             if sec_type == "OPTN":
                 record["optn_qty"] += qty
                 record["security_type"] = "OPTN"
@@ -2748,6 +2763,12 @@ def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
                     exec_price = float(inst.get("averageExecutionPrice") or 0)
                 except (TypeError, ValueError):
                     exec_price = 0.0
+                # The trigger the broker actually held. Unknown stays None —
+                # a 0 here would read as "stop at zero" and fake a huge gap.
+                try:
+                    stop_px = float(detail.get("stopPrice") or 0)
+                except (TypeError, ValueError):
+                    stop_px = 0.0
                 out.append({
                     "order_id": order_id,
                     "symbol": str(product.get("symbol") or "").upper(),
@@ -2759,6 +2780,7 @@ def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
                     "ordered": ordered,
                     "exec_price": exec_price,
                     "executed_ts": executed_ts,
+                    "stop_price": stop_px if stop_px > 0 else None,
                 })
     return out
 
@@ -2900,6 +2922,7 @@ def build_account_snapshot(
                 "stop_orders": len(stops),
                 "stop_covered_qty": covered,
                 "entry": (pos or {}).get("entry") if is_tracked else None,
+                "market_value": record.get("optn_mv" if is_option else "eq_mv"),
                 "stop": (protective_level(pos) or None) if is_tracked else None,
                 "target": (pos or {}).get("target") if is_tracked else None,
                 "opened_ts": (pos or {}).get("ts") if is_tracked else None,
@@ -3189,6 +3212,8 @@ def plan_ghost_resolution(
             "order_id": str(order.get("order_id") or ""),
             "exit_price": price,
             "basis": basis,
+            # Only a STOP-type order has a trigger to slip from.
+            "stop_price": order.get("stop_price") if is_stop_price_type(order.get("price_type")) else None,
         }
 
     if tracked_ids:
@@ -3720,6 +3745,112 @@ async def reconciliation_loop(
                 except Exception:
                     logger.debug("reconcile loop alert failed", exc_info=True)
         await asyncio.sleep(delay)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STOP SLIPPAGE (5.83.5) — how far below its trigger a protective stop sold.
+#
+# A broker STOP becomes a MARKET order when it triggers, so on a wide option
+# chain it sells at whatever the next bid is. Nov 4 2026, five stops in one
+# session: PLTR 9.51→9.25, ORCL 7.30→7.00, AAPL 8.00→7.65, UBER 2.85→2.66 —
+# about 3–7% of the trigger each. A stop-LIMIT would end the slippage but can
+# fail to sell at all in a fast drop, which is worse. This is RECORD-ONLY: it
+# measures the cost so the choice is made on data, never on four trades.
+# ─────────────────────────────────────────────────────────────────────────────
+
+STOP_PRICE_TYPES = frozenset({"STOP", "STOP_LIMIT", "TRAILING_STOP_CNST", "TRAILING_STOP_PRCT"})
+# Close reasons that ARE a resting stop executing. `trail_stop_level` is NOT in
+# here: it books the trigger itself because the fill was unreadable, so its
+# slippage is unmeasured, not zero.
+STOP_FILL_REASONS = frozenset({
+    "stop_fill", "trail_stop_fill", "flatten_stop_fill", "fill_capture:tracked_stop",
+})
+# Same bar as every other record-only spec: fewer than 10 live stop fills is
+# not a sample, so the summary gives numbers but no verdict.
+STOP_SLIPPAGE_MIN_SAMPLES = 10
+
+
+def is_stop_price_type(price_type: Any) -> bool:
+    return str(price_type or "").upper() in STOP_PRICE_TYPES
+
+
+def assess_stop_slippage(stop_price: Any, fill: Any, entry_direction: Any = 1,
+                         qty: Any = None, is_option: bool = True) -> Optional[Dict[str, Any]]:
+    """Gap between a stop's trigger and its actual fill. Pure.
+
+    `slippage` is per share/contract-premium and POSITIVE when the fill was
+    WORSE than the trigger (a long's stop sold lower; a short's bought higher);
+    negative is price improvement and is kept, never clipped. None when either
+    price is missing — unmeasured is never zero."""
+    try:
+        stop = float(stop_price)
+        px = float(fill)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(stop) and math.isfinite(px)) or stop <= 0 or px <= 0:
+        return None
+    try:
+        direction = -1.0 if float(entry_direction) < 0 else 1.0
+    except (TypeError, ValueError):
+        direction = 1.0
+    slip = (stop - px) if direction > 0 else (px - stop)
+    try:
+        q = int(qty) if qty is not None else 0
+    except (TypeError, ValueError):
+        q = 0
+    mult = 100.0 if is_option else 1.0
+    return {
+        "stop_price": round(stop, 4),
+        "fill": round(px, 4),
+        "slippage": round(slip, 4),
+        "slippage_pct": round(slip / stop * 100.0, 3),
+        "slippage_usd": round(slip * mult * q, 2) if q > 0 else None,
+        "qty": q if q > 0 else None,
+    }
+
+
+def summarize_stop_slippage(records: Any, min_samples: int = STOP_SLIPPAGE_MIN_SAMPLES) -> Dict[str, Any]:
+    """Roll up `stop_slippage` ledger events. Paper rows never count."""
+    rows: List[Dict[str, Any]] = []
+    for rec in records or []:
+        if not isinstance(rec, dict) or str(rec.get("event") or "") != "stop_slippage":
+            continue
+        d = rec.get("data") or {}
+        if not isinstance(d, dict) or d.get("paper"):
+            continue
+        try:
+            pct = float(d.get("slippage_pct"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(pct):
+            continue
+        rows.append({**d, "_pct": pct, "ts": rec.get("ts")})
+    n = len(rows)
+    if n == 0:
+        return {"samples": 0, "min_samples": min_samples, "enough_data": False,
+                "median_pct": None, "mean_pct": None, "worst_pct": None,
+                "total_usd": None, "usd_samples": 0, "recent": []}
+    pcts = sorted(r["_pct"] for r in rows)
+    mid = n // 2
+    median = pcts[mid] if n % 2 else (pcts[mid - 1] + pcts[mid]) / 2.0
+    usd = [float(r["slippage_usd"]) for r in rows if isinstance(r.get("slippage_usd"), (int, float))]
+    recent = [
+        {k: r.get(k) for k in ("ticker", "stop_price", "fill", "slippage", "slippage_pct",
+                               "slippage_usd", "reason", "stop_source", "ts")}
+        for r in rows[-20:]
+    ]
+    recent.reverse()
+    return {
+        "samples": n,
+        "min_samples": min_samples,
+        "enough_data": n >= min_samples,
+        "median_pct": round(median, 3),
+        "mean_pct": round(sum(pcts) / n, 3),
+        "worst_pct": round(pcts[-1], 3),
+        "total_usd": round(sum(usd), 2) if usd else None,
+        "usd_samples": len(usd),
+        "recent": recent,
+    }
 
 ''')
 
@@ -10063,7 +10194,8 @@ reads both files and fails if either side drifts, because a calendar that
 disagrees with the app flattens (or fails to flatten) on a different day than
 the one the operator was shown.
 
-Dates are the official published 2026 schedules (federalreserve.gov, bls.gov).
+Dates are the official published 2026 and 2027 schedules (federalreserve.gov,
+bls.gov, bea.gov — PCE is BEA's "Personal Income and Outlays", 8:30 ET).
 Past the last covered year the calendar reports itself OUTDATED instead of
 silently answering "no event today" — an unknown day is not a quiet day.
 
@@ -10103,18 +10235,57 @@ JOBS_DAYS_2026 = (
     "2026-07-02", "2026-08-07", "2026-09-04", "2026-10-02", "2026-11-06", "2026-12-04",
 )
 
-CALENDAR_COVERAGE_LAST_YEAR = 2026
+# PCE (BEA Personal Income and Outlays) release days 2026 (8:30 ET), from
+# 2026-11 on — the release was not tracked before this calendar version.
+PCE_DAYS_2026 = (
+    "2026-11-25", "2026-12-23",
+)
+
+# FOMC decision days 2027 (federalreserve.gov, tentative until confirmed).
+FOMC_DECISION_DAYS_2027 = (
+    "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09",
+    "2027-07-28", "2027-09-15", "2027-10-27", "2027-12-08",
+)
+
+# CPI release days 2027 (8:30 ET) — official BLS schedule.
+CPI_DAYS_2027 = (
+    "2027-01-13", "2027-02-11", "2027-03-10", "2027-04-13", "2027-05-12", "2027-06-10",
+    "2027-07-14", "2027-08-11", "2027-09-14", "2027-10-14", "2027-11-10", "2027-12-10",
+)
+
+# PPI release days 2027 (8:30 ET) — official BLS schedule.
+PPI_DAYS_2027 = (
+    "2027-01-14", "2027-02-12", "2027-03-12", "2027-04-14", "2027-05-13", "2027-06-11",
+    "2027-07-15", "2027-08-10", "2027-09-10", "2027-10-15", "2027-11-12", "2027-12-15",
+)
+
+# Jobs report (NFP) release days 2027 (8:30 ET) — official BLS schedule.
+JOBS_DAYS_2027 = (
+    "2027-01-08", "2027-02-05", "2027-03-05", "2027-04-02", "2027-05-07", "2027-06-04",
+    "2027-07-02", "2027-08-06", "2027-09-03", "2027-10-08", "2027-11-05", "2027-12-03",
+)
+
+# PCE release days 2027 (8:30 ET) — official BEA schedule.
+PCE_DAYS_2027 = (
+    "2027-01-28", "2027-02-25", "2027-03-31", "2027-04-29", "2027-05-27", "2027-06-25",
+    "2027-07-29", "2027-08-25", "2027-09-30", "2027-10-28", "2027-11-24", "2027-12-22",
+)
+
+CALENDAR_COVERAGE_LAST_YEAR = 2027
 
 # Minutes before a window OPENS at which the event already counts as active.
 IMMINENT_LEAD_MINUTES = 30
 
 # (kind, name, days, release, block_start, block_end) — windows in ET minutes.
 _EVENT_SPECS = (
-    ("fomc", "FOMC Rate Decision + Powell Press Conference", FOMC_DECISION_DAYS_2026,
-     _m(14, 0), _m(13, 30), _m(15, 45)),
-    ("cpi", "CPI Inflation Report", CPI_DAYS_2026, _m(8, 30), _m(8, 0), _m(10, 0)),
-    ("ppi", "PPI Inflation Report", PPI_DAYS_2026, _m(8, 30), _m(8, 0), _m(9, 50)),
-    ("jobs", "Jobs Report (Nonfarm Payrolls)", JOBS_DAYS_2026, _m(8, 30), _m(8, 0), _m(10, 0)),
+    ("fomc", "FOMC Rate Decision + Powell Press Conference",
+     FOMC_DECISION_DAYS_2026 + FOMC_DECISION_DAYS_2027, _m(14, 0), _m(13, 30), _m(15, 45)),
+    ("cpi", "CPI Inflation Report", CPI_DAYS_2026 + CPI_DAYS_2027, _m(8, 30), _m(8, 0), _m(10, 0)),
+    ("ppi", "PPI Inflation Report", PPI_DAYS_2026 + PPI_DAYS_2027, _m(8, 30), _m(8, 0), _m(9, 50)),
+    ("jobs", "Jobs Report (Nonfarm Payrolls)", JOBS_DAYS_2026 + JOBS_DAYS_2027,
+     _m(8, 30), _m(8, 0), _m(10, 0)),
+    ("pce", "PCE Inflation (Personal Income and Outlays)", PCE_DAYS_2026 + PCE_DAYS_2027,
+     _m(8, 30), _m(8, 0), _m(10, 0)),
 )
 
 
@@ -10178,6 +10349,24 @@ def next_event_after(day_key: str) -> Optional[str]:
     """First scheduled event day strictly after `day_key` (for status)."""
     days = sorted({d for spec in _EVENT_SPECS for d in spec[2] if d > str(day_key)})
     return days[0] if days else None
+
+
+def entry_block_reason(day_key: Any, et_minute: Any, year: Any = None,
+                       windows: bool = True) -> Optional[str]:
+    """Why a NEW entry must not open now, or None.
+
+    Unlike `assess_event_window` (which destroys positions, so it fails OPEN),
+    this only refuses to ADD risk, so it fails CLOSED: a year the calendar
+    does not cover blocks entries — an unknown day is not a quiet day.
+    `windows=False` keeps only the coverage check.
+    """
+    verdict = assess_event_window(day_key, et_minute, year)
+    if verdict["calendar_outdated"]:
+        return (f"macro calendar does not cover this year (last covered "
+                f"{CALENDAR_COVERAGE_LAST_YEAR}) — entries blocked until econ_calendar.py is updated")
+    if windows and verdict["active"]:
+        return f"event window — {verdict['reason']}"
+    return None
 
 ''')
 
@@ -10876,7 +11065,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.83.0-massive-nbbo"
+BOT_VERSION = "5.83.5-stop-slippage"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -11639,6 +11828,23 @@ _MAX_PENDING_REQUEST_TOKENS = 5
 # ==================== MARKET CALENDAR ====================
 _ET_ZONE = ZoneInfo("America/New_York")
 
+
+def _macro_entry_block(windows: bool = True) -> Optional[str]:
+    """Macro reason a NEW entry must not open right now, or None (5.83.3).
+
+    Event window (when `windows`) or an outdated calendar — the latter fails
+    CLOSED. An unreadable clock is not a reason to refuse: returns None.
+    """
+    try:
+        now_et = _utcnow().astimezone(_ET_ZONE)
+        return econ_calendar.entry_block_reason(
+            now_et.date().isoformat(), now_et.hour * 60 + now_et.minute, now_et.year,
+            windows=windows,
+        )
+    except Exception as e:
+        logger.warning(f"macro entry check unavailable: {e}")
+        return None
+
 # NYSE/Nasdaq full-closure holidays (observed dates).
 _MARKET_HOLIDAYS = {
     # 2025
@@ -11663,6 +11869,40 @@ _MARKET_HALF_DAYS = {
 def _session_close_minute(now_et: datetime) -> int:
     """Minute-of-day (ET) of today's regular close: 13:00 on half days."""
     return 13 * 60 if now_et.date().isoformat() in _MARKET_HALF_DAYS else 16 * 60
+
+
+# OPENING HOLD (5.83.4) — no NEW entries in the first minutes of the regular
+# session. 9:30–9:45 ET carries the day's widest option spreads and the most
+# reversal-prone bars; on 2026-11-04 the whole morning loss came from entries
+# in this window. The user's declared rule, mirrored from the app's
+# services/openingHold.ts. Exits are never held.
+OPENING_HOLD_MINUTES = 15
+
+
+def opening_hold_reason(day_iso: str, weekday: int, minute_of_day: int) -> Optional[str]:
+    """Pure: block reason for a new entry at this ET minute, or None.
+    Weekends/holidays → None (other gates own those)."""
+    if weekday >= 5 or day_iso in _MARKET_HOLIDAYS:
+        return None
+    since_open = minute_of_day - (9 * 60 + 30)
+    if 0 <= since_open < OPENING_HOLD_MINUTES:
+        return (
+            f"opening hold — no new entries until 9:{30 + OPENING_HOLD_MINUTES} ET "
+            f"({OPENING_HOLD_MINUTES - since_open} min left)"
+        )
+    return None
+
+
+def _opening_hold_block() -> Optional[str]:
+    """Live read of `opening_hold_reason`. An unreadable clock refuses nothing."""
+    try:
+        now_et = _utcnow().astimezone(_ET_ZONE)
+        return opening_hold_reason(
+            now_et.date().isoformat(), now_et.weekday(), now_et.hour * 60 + now_et.minute,
+        )
+    except Exception as e:
+        logger.warning(f"opening hold check unavailable: {e}")
+        return None
 
 
 def _is_market_open() -> bool:
@@ -12746,6 +12986,16 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
         ticker_m = str(p.get("ticker") or "").upper()
         if ticker_m and ticker_m in (await state.all_positions()):
             blocked.append(f"already in {ticker_m}")
+        if not is_probe:
+            # 5.83.3 — macro window / outdated calendar backstop. The app blocks
+            # the same windows itself; this catches a skipped app check.
+            macro_block = _macro_entry_block(True)
+            if macro_block:
+                blocked.append(macro_block)
+            # 5.83.4 — opening hold backstop (the app holds the same window).
+            hold_block = _opening_hold_block()
+            if hold_block:
+                blocked.append(hold_block)
         if APP_ENTRY_RISK_GATES:
             # 5.82.1 — book limits (see APP_ENTRY_RISK_GATES). Fails CLOSED: an
             # unreadable book is not permission to add to it.
@@ -12889,13 +13139,13 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
         # EVENT WINDOW — the same window the risk desk flattens the book in.
         # Opening a position the desk is about to close pays two spreads for
         # nothing and rides the release in between.
-        if EVENT_FLATTEN_ENABLED:
-            now_et = _utcnow().astimezone(_ET_ZONE)
-            event = econ_calendar.assess_event_window(
-                now_et.date().isoformat(), now_et.hour * 60 + now_et.minute, now_et.year,
-            )
-            if event["active"]:
-                blocked.append(f"event window — {event['reason']}")
+        # An outdated calendar blocks regardless of the flatten switch (5.83.3).
+        macro_block = _macro_entry_block(EVENT_FLATTEN_ENABLED)
+        if macro_block:
+            blocked.append(macro_block)
+        hold_block = _opening_hold_block()
+        if hold_block:
+            blocked.append(hold_block)
     else:
         logger.info("🧪 Connectivity test payload — quality gates skipped, risk gates still enforced")
 
@@ -13066,6 +13316,24 @@ async def _risk_account_reference() -> float:
             return float(tracked)
     except Exception as e:
         logger.warning(f"risk account reference: tracked balance unavailable ({e})")
+
+    # LAST KNOWN EQUITY (5.83.1) — an expired E*TRADE token (every midnight ET)
+    # used to drop straight to ACCOUNT_SIZE $50,000 on a ~$4.2k account, so 8%
+    # read as $4,000 of risk. The last equity the broker actually reported
+    # (kept 36h) is a real number about THIS account; the env default never
+    # was. A smaller env figure still wins (fail toward the smaller account).
+    try:
+        last = await state.last_equity()
+        last_v = float((last or {}).get("value") or 0)
+        if math.isfinite(last_v) and last_v > 0:
+            ref = min(last_v, env_ref)
+            logger.warning(
+                f"risk account reference: broker equity unreadable — sizing risk gates off the "
+                f"last known equity ${ref:,.0f}"
+            )
+            return ref
+    except Exception as e:
+        logger.warning(f"risk account reference: last known equity unavailable ({e})")
 
     logger.warning(
         f"risk account reference: no broker or tracked balance — falling back to ACCOUNT_SIZE "
@@ -21497,7 +21765,8 @@ def _peak_value(value: Any) -> Optional[float]:
 async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
                         exit_premium: Optional[float] = None,
                         close_reason: Optional[str] = None,
-                        expired: bool = False) -> None:
+                        expired: bool = False,
+                        stop_price: Optional[float] = None) -> None:
     """Pop the position and feed realized pnl (signed by the ENTRY direction)
     into the daily loss-limit accounting — plus credit equity proceeds back
     into the tracked balance so wins/losses immediately update the funds
@@ -21635,8 +21904,30 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
     _hold = _hold_seconds((pos or {}).get("ts"), _closed_at)
     _edge_ctx = (pos or {}).get("edge") if isinstance((pos or {}).get("edge"), dict) else {}
     _entry_session_minutes = edge._num(_edge_ctx.get("session_minutes"))
+    # STOP SLIPPAGE (5.83.5, record-only). The trigger comes from the broker's
+    # own executed order when the reconciler read it; otherwise from the stop
+    # the bot was tracking — only for closes that ARE a stop executing.
+    _stop_slip: Optional[Dict[str, Any]] = None
+    try:
+        _stop_src: Optional[str] = None
+        _stop_level: Optional[float] = None
+        if stop_price is not None and float(stop_price) > 0:
+            _stop_level, _stop_src = float(stop_price), "broker"
+        elif str(close_reason or "") in reconciliation.STOP_FILL_REASONS:
+            _tracked = (pos or {}).get("stop_premium") if is_option else (pos or {}).get("trail")
+            if _tracked is not None and float(_tracked) > 0:
+                _stop_level, _stop_src = float(_tracked), "tracked"
+        if _stop_level is not None and not expired_booked and exit_px > 0:
+            _stop_slip = reconciliation.assess_stop_slippage(
+                _stop_level, exit_px, direction, qty, is_option=is_option)
+            if _stop_slip is not None:
+                _stop_slip["stop_source"] = _stop_src
+    except (TypeError, ValueError) as e:
+        logger.debug(f"[STOP SLIP] {ticker} slippage not measurable: {e}")
+        _stop_slip = None
     await trade_ledger.record("position_closed", {
         "ticker": ticker,
+        "stop_slippage": _stop_slip,
         # On the premium basis, entry/exit are BOTH premiums so a replay
         # re-derives the same percent the daily counter was fed.
         "entry": (entry_premium if basis == "premium" else entry) or None,
@@ -21702,6 +21993,16 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         # against an underlying R (the −564.85R class of bug).
         "peak_basis": "premium" if is_option else "underlying",
     })
+    if _stop_slip is not None:
+        await trade_ledger.record("stop_slippage", {
+            "ticker": ticker, "reason": close_reason,
+            "basis": "premium" if is_option else "underlying",
+            **_stop_slip,
+        })
+        logger.info(
+            f"[STOP SLIP] {ticker} stop {_stop_slip['stop_price']:.2f} filled {_stop_slip['fill']:.2f} "
+            f"({_stop_slip['slippage_pct']:+.2f}% worse, source={_stop_slip['stop_source']})"
+        )
     await _announce_learning_transitions(ticker)
     # SELL ALERT — every close path in the bot funnels through `_record_close`
     # (protective stop fill, signalled close, trailing exit, emergency flatten,
@@ -23963,6 +24264,29 @@ async def execute_live_order(payload: dict):
                     )
                     return {"status": "refused", "reason": pq["reason"],
                             "code": "no_live_quote", "paper": True}
+                # SPREAD CEILING ON THE TRUSTED QUOTE (5.83.3). The chain-quote
+                # gate above exempts app-decided entries, and the app could only
+                # check a spread it had a quote for — so an unquoted app entry
+                # crossed any book with nobody measuring. The app's ceiling is
+                # the same 10%, so enforcing it here on the live NBBO is the
+                # app's own rule on a fresher quote, not the bot overruling it.
+                live_spread = plan_spread_gate(pq["bid"], pq["ask"], payload.get("max_spread_pct"))
+                if live_spread["ok"] is not True:
+                    reason = live_spread["reason"] if live_spread["ok"] is False else (
+                        "live quote has no measurable spread — refusing an unmeasured book")
+                    logger.warning(f"⛔ {symbol} {reason} [{pq['source']}]")
+                    await trade_ledger.record("entry_spread_refused", {
+                        "ticker": sym_u, "real_bid": pq["bid"], "real_ask": pq["ask"],
+                        "spread_pct": live_spread["spread_pct"], "ceiling_pct": live_spread["ceiling"],
+                        "quote_source": pq["source"], "app_decides": bool(app_decides),
+                    })
+                    await alerts.send(
+                        "warning", "entry_spread_refused",
+                        f"{symbol}: no live ticket — {reason}.",
+                        dedupe_key=f"spread_refused:{symbol}",
+                    )
+                    return {"status": "refused", "reason": reason,
+                            "code": "spread_too_wide", "paper": True}
                 # FILLED-SHAPE GATE — the trade must still pay 1.5R at the REAL
                 # ask, not at the app's limit. After the reprice, before any
                 # dollars are budgeted. Returns (never raises): a dead shape is
@@ -24785,10 +25109,12 @@ async def _reconcile_record_close(ticker: str, pos: dict, resolution: dict) -> N
         )
         return
     reason = f"fill_capture:{resolution.get('source') or 'unknown'}"
+    broker_stop = resolution.get("stop_price")
     if str(resolution.get("basis") or "") == "premium":
-        await _record_close(ticker, None, payload, exit_premium=exit_price, close_reason=reason)
+        await _record_close(ticker, None, payload, exit_premium=exit_price, close_reason=reason,
+                            stop_price=broker_stop)
     else:
-        await _record_close(ticker, exit_price, payload, close_reason=reason)
+        await _record_close(ticker, exit_price, payload, close_reason=reason, stop_price=broker_stop)
 
 
 async def _reconcile_rearm_guard(ticker: str, pos: dict) -> None:
@@ -27282,6 +27608,14 @@ async def pnl_sign_migration(
                                  "retry with ?force=true once it finishes")
     _last_pnl_migration = await _run_pnl_sign_migration(force=force)
     return _last_pnl_migration
+
+
+@app.get("/stats/stop-slippage")
+async def stop_slippage_stats(count: int = Query(2000, ge=1, le=5000)):
+    """How far below their trigger protective stops have been selling.
+    Record-only: no stop behaviour reads this. `enough_data` stays false until
+    reconciliation.STOP_SLIPPAGE_MIN_SAMPLES live stop fills exist."""
+    return reconciliation.summarize_stop_slippage(trade_ledger.recent(count))
 
 
 @app.get("/ledger/corrections")
