@@ -1072,6 +1072,26 @@ class StateStore:
             await self._persist_hash(key)
         return result
 
+    # ET-day counters (5.84.1). The daily key above is UTC-dated; caps that
+    # follow the TRADING day (one 0DTE entry per ET session) key on the ET
+    # date the caller passes, so 8 PM ET never rolls the count early.
+    async def get_day_counter(self, name: str, day_et: str) -> int:
+        key = f"daily_et:{day_et}"
+        fields = (await self.redis.hgetall(key)) if self.redis is not None \
+            else await self._memory.hgetall(key)
+        return int(float(fields.get(name, "0") or 0))
+
+    async def incr_day_counter(self, name: str, day_et: str) -> int:
+        key = f"daily_et:{day_et}"
+        if self.redis is not None:
+            val = await self.redis.hincrby(key, name, 1)
+            await self.redis.expire(key, DAILY_TTL_SECONDS)
+            return int(val)
+        result = int(await self._memory.hincrbyfloat(key, name, 1, DAILY_TTL_SECONDS))
+        if self._persistence is not None:
+            await self._persist_hash(key)
+        return result
+
     async def add_realized_pnl(self, pct: float) -> float:
         key = self._daily_key()
         if self.redis is not None:
@@ -10872,6 +10892,329 @@ class MassiveClient:
 
 ''')
 
+_bundle_load('exit_guards', r'''
+"""
+exit_guards.py — 5.84.1 exit guards. Pure decisions, no I/O.
+
+WHY THIS EXISTS. 2026-11-09: an NVDA Nov 13 $175 call (4 days to expiry)
+was bought at 2:13 PM CT for $6.55, held overnight into Tuesday's 8:30 ET
+CPI print, and sold Tuesday at $2.78 — −$377 on one contract. Nothing in the
+bot asked "should a short-dated long option sit through tonight's news?".
+
+The rules (operator's choices, declared — never tuned on the ledger):
+
+  HOLD GUARD     At 3:45 PM ET (2:45 PM CT) every long option that expires
+                 within HOLD_GUARD_MAX_TRADING_DAYS sessions, OR faces CPI /
+                 PPI / jobs / PCE / FOMC / earnings before the next open, is
+                 sold. Runs even while the app owns discretionary exits.
+  OPENING EXIT   No bot-initiated exit in the first N minutes of the session
+  GUARD          (broker-resting stops still trigger — they live at E*TRADE).
+  MARKET-HOURS   Max hold counts regular-session seconds only, so an overnight
+  MAX HOLD       gap no longer spends the clock.
+  PRE-OPEN       8:45 AM ET (7:45 CT): alert when the broker login is dead
+  TOKEN ALERT    while positions are open — before the open, not after it.
+  0DTE CAP       At most one same-day-expiry entry per ET day, at half size;
+                 a single contract only when its whole cost fits inside the
+                 normal per-trade risk budget.
+
+Unknown inputs: an unreadable expiry counts as short-dated (fails toward
+closing); unknown earnings never fires the guard but is named in the detail;
+unknown 0DTE count or budget refuses the 0DTE entry (fails closed).
+"""
+from __future__ import annotations
+
+import math
+from datetime import date, datetime, time as dtime, timedelta
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
+SESSION_OPEN_MINUTE = 9 * 60 + 30
+
+# 3:45 PM ET = 2:45 PM CT (operator's choice). 15 minutes before the bell:
+# late enough that the day's thesis had its whole session, early enough for
+# a limit ladder plus a minute-by-minute retry before 4:00. On a half day the
+# guard moves with the close (12:45 ET).
+HOLD_GUARD_MINUTE_ET = 15 * 60 + 45
+HOLD_GUARD_LEAD_MINUTES = 15
+# "Expires within 2 days" (operator's choice) counted in TRADING sessions after
+# today: a Friday holding a Monday expiry is 1 session away (and two weekend
+# days of news), which calendar days would understate.
+HOLD_GUARD_MAX_TRADING_DAYS = 2
+# Scheduled releases that gap an option through any stop overnight.
+HOLD_GUARD_NEWS_KINDS = frozenset({"cpi", "ppi", "jobs", "pce", "fomc"})
+
+# Pre-open broker-login check: 8:45 AM ET = 7:45 AM CT. 45 minutes is time
+# to relink before 9:30; earlier and the overnight token state is noise.
+PREOPEN_TOKEN_ALERT_MINUTE_ET = 8 * 60 + 45
+
+# 0DTE: one entry per ET day, half size (operator's choice).
+ZERO_DTE_MAX_ENTRIES_PER_DAY = 1
+ZERO_DTE_SIZE_FRACTION = 0.5
+
+# Limit-only exit ladder: the first crossing limit sits at the normal cushion
+# under the bid (marketable — it executes AT the bid); each unfilled step
+# re-reads the bid and steps down by this much more. Bounded so a vanished
+# bid can never sell at a penny.
+LIMIT_EXIT_STEPS = 3
+LIMIT_EXIT_STEP_PCT = 5.0
+LIMIT_EXIT_MAX_CUSHION_PCT = 25.0
+
+
+def _num(v: Any) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _day(v: Any) -> Optional[date]:
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    try:
+        return datetime.strptime(str(v)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Trading calendar
+# ---------------------------------------------------------------------------
+def is_trading_day(d: date, holidays: Iterable[str]) -> bool:
+    return d.weekday() < 5 and d.isoformat() not in set(holidays or ())
+
+
+def next_trading_day(d: date, holidays: Iterable[str]) -> date:
+    hol = set(holidays or ())
+    nxt = d + timedelta(days=1)
+    for _ in range(15):
+        if is_trading_day(nxt, hol):
+            return nxt
+        nxt += timedelta(days=1)
+    return nxt
+
+
+def trading_days_to_expiry(today: date, expiry: date, holidays: Iterable[str]) -> int:
+    """Sessions AFTER today up to and including expiry. Today → 0, the next
+    session → 1. A past expiry → negative calendar days (still ≤ the limit)."""
+    if expiry <= today:
+        return (expiry - today).days
+    hol = set(holidays or ())
+    n, d = 0, today
+    while d < expiry and n < 400:
+        d += timedelta(days=1)
+        if is_trading_day(d, hol):
+            n += 1
+    return n
+
+
+# ---------------------------------------------------------------------------
+# Hold guard
+# ---------------------------------------------------------------------------
+def hold_guard_window_open(minute_et: Any, close_minute: Any) -> bool:
+    m, c = _num(minute_et), _num(close_minute)
+    if m is None or c is None:
+        return False
+    start = min(HOLD_GUARD_MINUTE_ET, c - HOLD_GUARD_LEAD_MINUTES)
+    return start <= m < c
+
+
+def parse_opt_out(raw: Any) -> Set[str]:
+    return {t.strip().upper() for t in str(raw or "").split(",") if t.strip()}
+
+
+def news_before_next_open(today: date, holidays: Iterable[str],
+                          events_for_day: Callable[[str], List[Dict[str, Any]]]) -> List[str]:
+    """Names of scheduled releases between tonight and the next session's
+    open (an FOMC decision on the next session counts: the overnight hold is
+    a bet into it)."""
+    nxt = next_trading_day(today, holidays)
+    out: List[str] = []
+    d = today + timedelta(days=1)
+    while d <= nxt:
+        try:
+            evs = events_for_day(d.isoformat()) or []
+        except Exception:
+            evs = []
+        for ev in evs:
+            kind = str(ev.get("kind") or "")
+            if kind not in HOLD_GUARD_NEWS_KINDS:
+                continue
+            rel = _num(ev.get("release_minute"))
+            if kind == "fomc" or d < nxt or (rel is not None and rel < SESSION_OPEN_MINUTE):
+                out.append(f"{ev.get('name') or kind.upper()} {d.isoformat()}")
+        d += timedelta(days=1)
+    return out
+
+
+def plan_hold_guard(*, enabled: bool, minute_et: Any, close_minute: Any, today: Any,
+                    expiry: Any, ticker: Any, holidays: Iterable[str],
+                    events_for_day: Callable[[str], List[Dict[str, Any]]],
+                    earnings_date: Any = None, swing_hold: Any = False,
+                    opt_out: Iterable[str] = ()) -> Dict[str, Any]:
+    """Should this long option be sold now rather than held overnight?
+    {fire, reason, detail, dte_sessions, news, earnings}."""
+    base = {"fire": False, "reason": "hold_guard", "detail": "", "dte_sessions": None,
+            "news": [], "earnings": None}
+    if not enabled:
+        return {**base, "detail": "hold guard disabled"}
+    if not hold_guard_window_open(minute_et, close_minute):
+        return base
+    t = _day(today)
+    if t is None:
+        return base
+    sym = str(ticker or "").upper()
+    if sym and sym in set(opt_out or ()):
+        return {**base, "detail": f"{sym} opted out (HOLD_GUARD_OPT_OUT_TICKERS)"}
+    if swing_hold is True:
+        return {**base, "detail": f"{sym} flagged swing_hold"}
+    reasons: List[str] = []
+    exp = _day(expiry)
+    dte: Optional[int] = None
+    if exp is None:
+        reasons.append("expiry unreadable — treated as short-dated")
+    else:
+        dte = trading_days_to_expiry(t, exp, holidays)
+        if dte <= HOLD_GUARD_MAX_TRADING_DAYS:
+            reasons.append(f"expires {exp.isoformat()} ({dte} session{'s' if dte != 1 else ''} away)")
+    news = news_before_next_open(t, holidays, events_for_day)
+    if news:
+        reasons.append("news before the next open: " + ", ".join(news))
+    earn = _day(earnings_date)
+    earnings_note: Optional[str] = None
+    if earn is None:
+        earnings_note = "earnings unknown"
+    elif earn == t or earn == next_trading_day(t, holidays):
+        reasons.append(f"earnings {earn.isoformat()} before the next open")
+        earnings_note = earn.isoformat()
+    else:
+        earnings_note = earn.isoformat()
+    detail = " · ".join(reasons)
+    if earnings_note == "earnings unknown" and reasons:
+        detail += " · earnings unknown"
+    return {**base, "fire": bool(reasons), "detail": detail, "dte_sessions": dte,
+            "news": news, "earnings": earnings_note}
+
+
+# ---------------------------------------------------------------------------
+# Opening exit guard
+# ---------------------------------------------------------------------------
+def opening_exit_hold(day_iso: Any, weekday: Any, minute_et: Any, minutes: Any,
+                      holidays: Iterable[str]) -> Optional[str]:
+    """Reason to hold bot-initiated exits now, or None."""
+    n, m = _num(minutes), _num(minute_et)
+    if n is None or n <= 0 or m is None:
+        return None
+    try:
+        wd = int(weekday)
+    except (TypeError, ValueError):
+        return None
+    if wd >= 5 or str(day_iso) in set(holidays or ()):
+        return None
+    since = m - SESSION_OPEN_MINUTE
+    if 0 <= since < n:
+        return f"opening exit guard — bot exits wait {int(n - since)} more min while the open settles"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Market-hours max hold
+# ---------------------------------------------------------------------------
+def market_seconds_between(start: datetime, end: datetime, holidays: Iterable[str],
+                           half_days: Iterable[str]) -> Optional[float]:
+    """Regular-session seconds between two aware datetimes. None if unusable."""
+    if not isinstance(start, datetime) or not isinstance(end, datetime):
+        return None
+    if start.tzinfo is None or end.tzinfo is None:
+        return None
+    if end <= start:
+        return 0.0
+    s, e = start.astimezone(ET), end.astimezone(ET)
+    hol, half = set(holidays or ()), set(half_days or ())
+    total = 0.0
+    d = s.date()
+    for _ in range(400):
+        if d > e.date():
+            break
+        if is_trading_day(d, hol):
+            close = dtime(13, 0) if d.isoformat() in half else dtime(16, 0)
+            o = datetime.combine(d, dtime(9, 30), tzinfo=ET)
+            c = datetime.combine(d, close, tzinfo=ET)
+            lo, hi = max(o, s), min(c, e)
+            if hi > lo:
+                total += (hi - lo).total_seconds()
+        d += timedelta(days=1)
+    return total
+
+
+# ---------------------------------------------------------------------------
+# Pre-open token alert
+# ---------------------------------------------------------------------------
+def preopen_token_check_due(day_iso: Any, weekday: Any, minute_et: Any,
+                            holidays: Iterable[str]) -> bool:
+    m = _num(minute_et)
+    try:
+        wd = int(weekday)
+    except (TypeError, ValueError):
+        return False
+    if m is None or wd >= 5 or str(day_iso) in set(holidays or ()):
+        return False
+    return PREOPEN_TOKEN_ALERT_MINUTE_ET <= m < SESSION_OPEN_MINUTE
+
+
+def preopen_token_alert(token_ok: Optional[bool], open_positions: Any) -> bool:
+    """Alert when positions are open and the login is not PROVEN alive."""
+    n = _num(open_positions)
+    return bool(n and n > 0) and token_ok is not True
+
+
+# ---------------------------------------------------------------------------
+# 0DTE cap
+# ---------------------------------------------------------------------------
+def plan_zero_dte_entry(qty: Any, premium: Any, base_budget_usd: Any,
+                        entries_today: Any) -> Dict[str, Any]:
+    """{allowed, qty, reason} for a same-day-expiry entry."""
+    try:
+        q = int(qty)
+    except (TypeError, ValueError):
+        q = 0
+    if q < 1:
+        return {"allowed": False, "qty": 0, "reason": "0DTE: no contracts requested"}
+    n = _num(entries_today)
+    if n is None:
+        return {"allowed": False, "qty": 0, "reason": "0DTE: today's 0DTE count unreadable (unknown)"}
+    if n >= ZERO_DTE_MAX_ENTRIES_PER_DAY:
+        return {"allowed": False, "qty": 0,
+                "reason": f"0DTE: already {int(n)} same-day entry today (max {ZERO_DTE_MAX_ENTRIES_PER_DAY})"}
+    if q >= 2:
+        half = max(1, int(math.floor(q * ZERO_DTE_SIZE_FRACTION)))
+        return {"allowed": True, "qty": half, "reason": f"0DTE half size: {q} → {half} contract(s)"}
+    px, budget = _num(premium), _num(base_budget_usd)
+    if px is None or px <= 0:
+        return {"allowed": False, "qty": 0, "reason": "0DTE: 1-contract cost unknown (no live premium)"}
+    if budget is None or budget <= 0:
+        return {"allowed": False, "qty": 0, "reason": "0DTE: per-trade risk budget unavailable (unknown)"}
+    cost = px * 100.0
+    if cost > budget + 1e-9:
+        return {"allowed": False, "qty": 0,
+                "reason": f"0DTE: 1 contract costs ${cost:,.0f} > per-trade risk ${budget:,.0f} (can't halve one)"}
+    return {"allowed": True, "qty": 1,
+            "reason": f"0DTE: 1 contract ${cost:,.0f} fits per-trade risk ${budget:,.0f}"}
+
+
+# ---------------------------------------------------------------------------
+# Limit-only exit ladder
+# ---------------------------------------------------------------------------
+def limit_exit_cushion(base_cushion_pct: Any, step: int) -> float:
+    b = _num(base_cushion_pct)
+    b = 10.0 if b is None else max(0.0, b)
+    return min(LIMIT_EXIT_MAX_CUSHION_PCT, b + LIMIT_EXIT_STEP_PCT * max(0, int(step)))
+
+''')
+
 # =========================================================================
 # main_bot.py source follows (its `from x import y` calls resolve to the
 # embedded modules registered in sys.modules above).
@@ -11025,6 +11368,7 @@ try:  # package-style import (python -m bot.main_bot) or flat (uvicorn main_bot:
     from . import cost_model
     from . import core_book
     from . import massive
+    from . import exit_guards
 except ImportError:
     from state_store import (
         StateStore, LockNotAcquired, sanitize_conn_url, unreplaced_placeholders,
@@ -11045,6 +11389,7 @@ except ImportError:
     import cost_model
     import core_book
     import massive
+    import exit_guards
 
 load_dotenv()
 
@@ -11111,7 +11456,7 @@ is_sandbox = ENV == "sandbox"
 #     healed filled_qty to the blend (booking inflated P&L), condemned a
 #     correctly-sized stop as under-covered, and reported the manual lot as
 #     nothing at all.
-BOT_VERSION = "5.84.0-0dte"
+BOT_VERSION = "5.84.1-exit-guards"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -11441,6 +11786,30 @@ TAKE_PROFIT_ENABLED = os.getenv("TAKE_PROFIT_ENABLED", "true").lower() == "true"
 # bot already carries an `expired_worthless` close reason.
 SCHEDULED_EXIT_ENABLED = os.getenv("SCHEDULED_EXIT_ENABLED", "true").lower() == "true"
 MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "8"))
+# 5.84.1 EXIT GUARDS (see exit_guards.py for the why and the thresholds).
+def _env_on(name: str, default: str = "true") -> bool:
+    return os.getenv(name, default).strip().lower() not in {"false", "0", "no", "off"}
+# Sell short-dated / news-exposed long options at 3:45 PM ET instead of
+# holding them overnight. Runs even while the app owns discretionary exits.
+HOLD_GUARD_ENABLED = _env_on("HOLD_GUARD_ENABLED")
+HOLD_GUARD_OPT_OUT_TICKERS = exit_guards.parse_opt_out(os.getenv("HOLD_GUARD_OPT_OUT_TICKERS", ""))
+# Bot DECISION exits (take-profit, scale-out, max-hold, event, hold guard)
+# sell with limits only — a stepped crossing-limit ladder, never MARKET. The
+# 3:40 same-day-expiry flatten, /flatten, kill and app-sent closes still keep
+# the MARKET last resort: an expiring or user-ordered close must not stay open.
+BOT_EXIT_LIMIT_ONLY = _env_on("BOT_EXIT_LIMIT_ONLY")
+# No bot-initiated exit in the first N minutes after 9:30 ET (opening quotes
+# are the widest of the day). Broker-resting stops are not affected.
+try:
+    OPENING_EXIT_GUARD_MINUTES = max(0, int(os.getenv("OPENING_EXIT_GUARD_MINUTES", "5")))
+except ValueError:
+    OPENING_EXIT_GUARD_MINUTES = 5
+# Max hold counts regular-session time ("market") or clock time ("wall").
+MAX_HOLD_BASIS = "wall" if os.getenv("MAX_HOLD_BASIS", "market").strip().lower() == "wall" else "market"
+# 8:45 AM ET alert when the broker login is dead with positions open.
+PREOPEN_TOKEN_ALERT_ENABLED = _env_on("PREOPEN_TOKEN_ALERT_ENABLED")
+# One same-day-expiry (0DTE) entry per ET day, at half size.
+ZERO_DTE_CAP_ENABLED = _env_on("ZERO_DTE_CAP_ENABLED")
 # DAILY-LOSS FLATTEN. The daily loss limit used to refuse the NEXT entry and
 # nothing else: the positions already on kept running into a day that had
 # already breached. When realized loss crosses the limit the bot now engages
@@ -19731,7 +20100,7 @@ def plan_exit_rejection_step(err: Any, attempt: int, order_action: Any,
     return "market" if market_allowed else "raise"
 
 
-async def _place_crossing_exit(common: dict, tokens: dict, bid: float) -> Any:
+async def _place_crossing_exit(common: dict, tokens: dict, bid: float, market_ok: bool = True) -> Any:
     """Place an option SELL_CLOSE as a CROSSING LIMIT, never a blind market.
 
     The limit sits EXIT_CROSS_CUSHION_PCT below the live bid: marketable, so it
@@ -19749,7 +20118,15 @@ async def _place_crossing_exit(common: dict, tokens: dict, bid: float) -> Any:
     straight out (which skipped the MARKET fallback entirely). It retries once
     tighter, then MARKET -- see `_exit_after_limit_rejection`. Any other
     rejection, or a failed MARKET, still raises and the caller re-arms the stop.
+
+    5.84.1: `market_ok=False` (bot decision exits while BOT_EXIT_LIMIT_ONLY)
+    never sends MARKET. No bid refuses; an unfilled crossing limit is cancelled
+    (verified), the bid re-read, and the limit stepped LIMIT_EXIT_STEP_PCT lower
+    up to LIMIT_EXIT_STEPS times (cushion capped at LIMIT_EXIT_MAX_CUSHION_PCT).
+    Still unfilled -> LocalRefusal: the caller re-arms the stop and alerts.
     """
+    if not market_ok and BOT_EXIT_LIMIT_ONLY:
+        return await _place_limit_only_exit(common, tokens, float(bid or 0.0))
     limit = plan_exit_limit(bid)
     if limit is None:
         logger.warning(
@@ -19767,7 +20144,7 @@ async def _place_crossing_exit(common: dict, tokens: dict, bid: float) -> Any:
     try:
         placed = await _place_order_smart("option", common, tokens)
     except Exception as first_err:
-        placed, went_market = await _exit_after_limit_rejection(common, tokens, float(bid), first_err)
+        placed, went_market = await _exit_after_limit_rejection(common, tokens, float(bid), first_err, market_ok)
         if went_market:
             return placed
     order_id = _order_id_from_place(placed)
@@ -19800,8 +20177,60 @@ async def _place_crossing_exit(common: dict, tokens: dict, bid: float) -> Any:
     return placed
 
 
+async def _place_limit_only_exit(common: dict, tokens: dict, bid: float) -> Any:
+    """Limit-only exit ladder (5.84.1). Never MARKET. See `_place_crossing_exit`."""
+    symbol = str(common.get("symbol") or "")
+    qty = int(common.get("quantity") or 0)
+    contract = {"right": common.get("callPut"), "strike": common.get("strikePrice"),
+                "expiration": common.get("expiryDate")}
+    cur_bid = float(bid or 0.0)
+    for step in range(exit_guards.LIMIT_EXIT_STEPS + 1):
+        if step > 0:
+            try:
+                b, _a = await _current_bid_ask(symbol, contract)
+                cur_bid = float(b or 0.0)
+            except Exception as e:
+                logger.warning(f"[LIMIT EXIT] {symbol} bid unreadable on step {step} ({e})")
+                cur_bid = 0.0
+        if cur_bid <= 0:
+            raise LocalRefusal(f"{symbol}: no live bid — limit-only exit will not sell at MARKET")
+        cushion = exit_guards.limit_exit_cushion(EXIT_CROSS_CUSHION_PCT, step)
+        limit = _round_to_option_tick(cur_bid * (1.0 - cushion / 100.0), "down")
+        if not limit or limit <= 0:
+            raise LocalRefusal(f"{symbol}: bid {cur_bid:.2f} too thin for a limit exit")
+        order = dict(common)
+        order["priceType"] = "LIMIT"
+        order["limitPrice"] = limit
+        order["clientOrderId"] = str(uuid.uuid4().int)[:18]
+        logger.info(f"[LIMIT EXIT] {symbol} step {step}: limit {limit} ({cushion:.0f}% under bid {cur_bid:.2f})")
+        placed = await _place_order_smart("option", order, tokens)
+        common.update(order)
+        order_id = _order_id_from_place(placed)
+        if not order_id or EXIT_CROSS_WAIT_SECONDS <= 0:
+            return placed
+        if await _resolve_exit_fill(order_id, timeout_s=EXIT_CROSS_WAIT_SECONDS):
+            return placed
+        outcome = await _cancel_order_verified(order_id, expected_qty=qty)
+        if outcome == CANCEL_FILLED:
+            return placed
+        if outcome != CANCEL_CONFIRMED:
+            await alerts.send(
+                "critical", "crossing_exit_unresolved",
+                f"{symbol}: limit exit {order_id} did not fill and the cancel returned {outcome} — check the position",
+                dedupe_key=f"cross_exit:{symbol}",
+            )
+            return placed
+        await trade_ledger.record("exit_limit_step", {
+            "ticker": symbol, "step": step, "limit": limit, "bid": cur_bid, "order_id": order_id,
+        })
+    raise LocalRefusal(
+        f"{symbol}: limit exit unfilled after {exit_guards.LIMIT_EXIT_STEPS + 1} limits "
+        f"(down to {exit_guards.LIMIT_EXIT_MAX_CUSHION_PCT:.0f}% under the bid) — not sent at MARKET"
+    )
+
+
 async def _exit_after_limit_rejection(common: dict, tokens: dict, bid: float,
-                                      first_err: Exception) -> Tuple[Any, bool]:
+                                      first_err: Exception, market_ok: bool = True) -> Tuple[Any, bool]:
     """The 5.82.1 1011 ladder for a crossing exit whose first limit was refused.
 
     Returns (place_response, went_market). Raises -- and every caller then
@@ -19816,7 +20245,8 @@ async def _exit_after_limit_rejection(common: dict, tokens: dict, bid: float,
     # whole ladder fails it still counts toward the API circuit breaker.
     if _is_local_refusal(first_err):
         raise first_err
-    step = plan_exit_rejection_step(first_err, 1, common.get("orderAction"), EXIT_1011_MARKET_FALLBACK)
+    market_allowed = EXIT_1011_MARKET_FALLBACK and (market_ok or not BOT_EXIT_LIMIT_ONLY)
+    step = plan_exit_rejection_step(first_err, 1, common.get("orderAction"), market_allowed)
     if step == "raise":
         raise first_err
     rejected_limit = common.get("limitPrice")
@@ -19850,10 +20280,10 @@ async def _exit_after_limit_rejection(common: dict, tokens: dict, bid: float,
             return placed, False
         except Exception as second_err:
             if plan_exit_rejection_step(second_err, 2, retry.get("orderAction"),
-                                        EXIT_1011_MARKET_FALLBACK) != "market":
+                                        market_allowed) != "market":
                 raise
             first_err = second_err
-    elif not EXIT_1011_MARKET_FALLBACK:
+    elif not market_allowed:
         raise first_err
     market = dict(common)
     market["priceType"] = "MARKET"
@@ -19878,7 +20308,8 @@ async def _exit_after_limit_rejection(common: dict, tokens: dict, bid: float,
     return placed, True
 
 
-async def _place_option_market_close(ticker: str, contract: dict, qty: int) -> Optional[str]:
+async def _place_option_market_close(ticker: str, contract: dict, qty: int,
+                                     market_ok: bool = False) -> Optional[str]:
     """SELL_CLOSE for `qty` contracts of an OCC contract we hold.
 
     Name kept for its callers; the order is a CROSSING LIMIT off the live bid
@@ -19909,7 +20340,7 @@ async def _place_option_market_close(ticker: str, contract: dict, qty: int) -> O
         bid, _ask = await _current_bid_ask(ticker, contract)
     except Exception:
         bid = 0.0
-    placed = await _place_crossing_exit(common, tokens, float(bid or 0.0))
+    placed = await _place_crossing_exit(common, tokens, float(bid or 0.0), market_ok=market_ok)
     return _order_id_from_place(placed)
 
 
@@ -20056,6 +20487,7 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
         outcome = await _cancel_order_verified(stop_order_id, expected_qty=qty)
         if outcome == CANCEL_FILLED:
             logger.warning(f"[SCALE-OUT] {ticker} protective stop filled first — nothing to scale")
+            await _book_stop_beat_exit(ticker, pos, stop_order_id, "SCALE-OUT")
             return False
         if outcome == CANCEL_PARTIAL:
             # The stop beat us to PART of the position. The split we computed
@@ -20283,6 +20715,7 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
         outcome = await _cancel_order_verified(resting_id, expected_qty=qty)
         if outcome == CANCEL_FILLED:
             logger.warning(f"[TAKE PROFIT] {ticker} protective order filled first — nothing left to bank")
+            await _book_stop_beat_exit(ticker, pos, resting_id, "TAKE PROFIT")
             return False
         if outcome == CANCEL_PARTIAL:
             remaining = await _handle_partial_stop_fill(
@@ -20390,7 +20823,8 @@ def plan_exit_retry(record: Any, reason: str, now_s: float) -> Dict[str, Any]:
         return {"allowed": True, "exhausted": False, "fails": 0, "wait_s": 0.0}
     if fails <= 0:
         return {"allowed": True, "exhausted": False, "fails": 0, "wait_s": 0.0}
-    is_eod = reason == "eod_flatten"
+    # The 3:45 hold guard has the same hard deadline as the 3:40 flatten.
+    is_eod = reason in ("eod_flatten", "hold_guard")
     if not is_eod and fails >= EXIT_RETRY_MAX_FAILS:
         # Exhausted is not abandoned (5.80): one slow try per window.
         remaining = last + EXIT_RETRY_SLOW_SECONDS - float(now_s)
@@ -20504,7 +20938,7 @@ async def _stop_churn_gate(ticker: str, pos: dict, who: str) -> bool:
         )
         await alerts.send(
             "critical", "stop_churn_blocked",
-            f"{ticker}: the protective stop was cancelled and re-sent {verdict['recent']} times in "
+            f"{ticker}: the protective stop was cancelled {verdict['recent']} times in "
             f"{STOP_CHURN_WINDOW_SECONDS / 60:.0f} minutes — the bot stopped touching it so the position "
             f"stays protected. Last attempt: {who}. Check the position and close it yourself if you want out.",
             dedupe_key=f"stop_churn:{ticker}",
@@ -20548,6 +20982,30 @@ async def _exit_retry_gate(ticker: str, pos: dict, reason: str) -> bool:
         # The stop just moved — never cancel it again in the same pass.
         return False
     return bool(retry["allowed"])
+
+
+async def _book_stop_beat_exit(ticker: str, pos: dict, stop_id: Any, who: str) -> None:
+    """The resting stop FILLED while an exit was cancelling it (5.84.1).
+
+    These paths used to just `return False`, leaving the flat position tracked
+    so every pass cancelled the same filled stop again. Book it ONCE: only
+    while the position is still tracked (another path may already have).
+    """
+    try:
+        still = await state.get_position(ticker)
+    except Exception as e:
+        logger.warning(f"[{who}] {ticker} stop filled — position read failed ({e}); reconciler will book it")
+        return
+    if not still:
+        logger.info(f"[{who}] {ticker} stop filled and the close is already booked — nothing to do")
+        return
+    await _finish_guard(ticker, "closed_by_stop")
+    fill = await _resolve_exit_fill(stop_id)
+    if fill:
+        await _record_close(ticker, None, {"ticker": ticker, "action": pos.get("action") or "BUY"},
+                            exit_premium=fill, close_reason="stop_fill")
+    else:
+        await _defer_close_to_reconciler(ticker, stop_id, "option stop executed — fill price unavailable")
 
 
 async def _tighten_stop_after_giveup(ticker: str, pos: dict, reason: str) -> Optional[float]:
@@ -20667,7 +21125,18 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
     try:
         opened = pos.get("ts")
         if opened:
-            held = (_utcnow() - datetime.fromisoformat(str(opened))).total_seconds()
+            opened_dt = datetime.fromisoformat(str(opened))
+            if opened_dt.tzinfo is None:
+                opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+            held = (_utcnow() - opened_dt).total_seconds()
+            if MAX_HOLD_BASIS == "market":
+                # 5.84.1: max hold counts SESSION time — a night closed does
+                # not spend the clock. Unusable → keep the wall-clock figure.
+                mkt = exit_guards.market_seconds_between(
+                    opened_dt, _utcnow(), _MARKET_HOLIDAYS, _MARKET_HALF_DAYS,
+                )
+                if mkt is not None:
+                    held = mkt
     except (TypeError, ValueError):
         held = None
 
@@ -20683,6 +21152,22 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
         expiry=contract.get("expiration"),
         today=now_et.date().isoformat(),
     )
+    if not verdict["fire"] and HOLD_GUARD_ENABLED:
+        # 5.84.1 HOLD GUARD: 3:45 PM ET (2:45 CT). A short-dated or
+        # news-exposed long option is sold instead of held overnight. The EOD
+        # verdict above outranks it; it outranks the event flatten below.
+        sig = pos.get("entry_signal") if isinstance(pos.get("entry_signal"), dict) else {}
+        hg = exit_guards.plan_hold_guard(
+            enabled=True, minute_et=now_et.hour * 60 + now_et.minute,
+            close_minute=_session_close_minute(now_et), today=now_et.date().isoformat(),
+            expiry=contract.get("expiration"), ticker=ticker, holidays=_MARKET_HOLIDAYS,
+            events_for_day=econ_calendar.events_for_day,
+            earnings_date=sig.get("earnings_date"), swing_hold=sig.get("swing_hold") is True,
+            opt_out=HOLD_GUARD_OPT_OUT_TICKERS,
+        )
+        if hg["fire"]:
+            verdict = {"fire": True, "reason": "hold_guard",
+                       "detail": f"hold guard — {hg['detail']}"}
     if not verdict["fire"] and EVENT_FLATTEN_ENABLED:
         # EVENT FLATTEN rides the same close path: it is a decision about the
         # calendar, not about price, and the EOD flatten above still outranks
@@ -20698,14 +21183,17 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
     # The expiry-day flatten always runs (a phone asleep at 3:40 must not let a
     # contract expire). Max hold and the event flatten are decisions — the app
     # makes those for a position it is guarding.
-    if str(verdict.get("reason")) != "eod_flatten" and await _app_owns_exit(ticker, pos):
+    # 5.84.1: the hold guard also runs while the app owns the exit — an
+    # overnight hold into news is exactly what a sleeping phone cannot stop.
+    if str(verdict.get("reason")) not in ("eod_flatten", "hold_guard") and await _app_owns_exit(ticker, pos):
         return False
 
     reason = str(verdict["reason"])
+    deadline = reason in ("eod_flatten", "hold_guard")
     if not await _exit_retry_gate(ticker, pos, reason):
         return False
     resting_id = pos.get("stop_order_id") or pos.get("native_trail_order_id")
-    if resting_id and reason != "eod_flatten" and not await _stop_churn_gate(ticker, pos, reason):
+    if resting_id and not deadline and not await _stop_churn_gate(ticker, pos, reason):
         return False
     if resting_id:
         # Same cancel-before-close discipline as every other exit: the resting
@@ -20713,6 +21201,7 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
         outcome = await _cancel_order_verified(resting_id, expected_qty=qty)
         if outcome == CANCEL_FILLED:
             logger.warning(f"[{reason.upper()}] {ticker} protective order filled first — nothing left to close")
+            await _book_stop_beat_exit(ticker, pos, resting_id, reason.upper())
             return False
         if outcome == CANCEL_PARTIAL:
             remaining = await _handle_partial_stop_fill(
@@ -20758,7 +21247,10 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
             mark = 0.0
 
     try:
-        close_id = await _place_option_market_close(ticker, contract, qty)
+        # MARKET last resort only for the same-day-expiry flatten; every other
+        # clock decision is limit-only (BOT_EXIT_LIMIT_ONLY).
+        close_id = await _place_option_market_close(ticker, contract, qty,
+                                                     market_ok=(reason == "eod_flatten"))
     except Exception as e:
         logger.error(f"[{reason.upper()}] {ticker} close FAILED: {e} — re-arming protection")
         pos["exit_retry"] = record_exit_failure(pos.get("exit_retry"), reason, time.time())
@@ -20774,7 +21266,10 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
             "critical", f"{reason}_failed",
             f"{ticker}: the {reason.replace('_', ' ')} close FAILED ({e}) — "
             + ("this position may expire worthless; close it manually."
-               if reason == "eod_flatten" else "position still open."),
+               if reason == "eod_flatten" else
+               "the bot keeps retrying each minute, but sell it manually before the close "
+               "if you don't want to hold it overnight."
+               if reason == "hold_guard" else "position still open."),
             dedupe_key=f"{reason}:failed:{ticker}",
         )
         return False
@@ -21351,6 +21846,10 @@ _CLOSE_REASON_LABELS = {
     "eod_flatten": "3:40 PM ET hard flatten",
     "time_exit": "max hold reached",
     "event_flatten": "event flatten ahead of a macro release",
+    # The bot books max-hold closes as "max_hold" — "time_exit" is the app's
+    # name for the same exit. Both get the label (5.84.1).
+    "max_hold": "max hold reached",
+    "hold_guard": "3:45 PM ET hold guard (short-dated or news before the open)",
 }
 
 
@@ -21593,6 +22092,13 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         "entry_signal": entry_signal or None,
     })
     await state.incr_trades_today()
+    # 5.84.1 0DTE cap memory: count a same-day-expiry open on its ET day.
+    try:
+        today_et = _utcnow().astimezone(_ET_ZONE).date().isoformat()
+        if contract and str(contract.get("expiration") or "")[:10] == today_et:
+            await state.incr_day_counter("zero_dte_entries", today_et)
+    except Exception as e:
+        logger.warning(f"[0DTE CAP] {ticker} same-day entry count not recorded: {e}")
     await trade_ledger.record("position_opened", {
         "ticker": ticker, "qty": int(qty), "action": str(action or "BUY").upper(),
         "entry": float(entry) if entry else None,
@@ -21633,6 +22139,9 @@ def _entry_signal(payload: dict) -> Dict[str, Any]:
         rvol = edge._num(p["edge_features"].get("rvol"))
     mtf_raw = p.get("mtf_alignment")
     aligned, total = _mtf_parts(mtf_raw)
+    ectx = p.get("earnings_context")
+    etext = str((ectx.get("earningsDate") if isinstance(ectx, dict) else None) or "").strip()[:10]
+    earnings_date = etext if re.fullmatch(r"\d{4}-\d{2}-\d{2}", etext) else None
     return {
         "score": round(score, 2) if score is not None else None,
         "rvol": round(rvol, 3) if rvol is not None else None,
@@ -21640,6 +22149,10 @@ def _entry_signal(payload: dict) -> Dict[str, Any]:
         "mtf_aligned": aligned,
         "mtf_total": total,
         "source": (str(p.get("source") or "").strip() or None),
+        # 5.84.1 hold guard inputs. Earnings only when the sender gave a real
+        # YYYY-MM-DD (unknown stays null — never "no earnings").
+        "earnings_date": earnings_date,
+        "swing_hold": p.get("swing_hold") is True,
     }
 
 
@@ -24007,6 +24520,42 @@ async def execute_live_order(payload: dict):
                     f"({payload['_expression']['delta_basis']}) — {planned_qty} → {quantity} contract(s)"
                 )
 
+            # 5.84.1 0DTE CAP: one same-day-expiry entry per ET day, half
+            # size; a lone contract only when it fits the per-trade risk
+            # budget. App-sent trades too. Fails CLOSED on any error.
+            today_iso_0dte = _utcnow().astimezone(_ET_ZONE).date().isoformat()
+            if (ZERO_DTE_CAP_ENABLED and not is_exit and not _is_connectivity_test(payload)
+                    and str(expiry)[:10] == today_iso_0dte):
+                try:
+                    zd_count: Optional[int] = await state.get_day_counter("zero_dte_entries", today_iso_0dte)
+                except Exception as e:
+                    logger.warning(f"[0DTE CAP] {symbol} count unreadable: {e}")
+                    zd_count = None
+                try:
+                    zd_budget = (await _day_risk_budget()).get("base_budget_usd")
+                except Exception as e:
+                    logger.warning(f"[0DTE CAP] {symbol} risk budget unreadable: {e}")
+                    zd_budget = None
+                zd_premium = real_ask if real_ask and real_ask > 0 else payload.get("option_limit_price")
+                zd = exit_guards.plan_zero_dte_entry(quantity, zd_premium, zd_budget, zd_count)
+                await trade_ledger.record("zero_dte_cap", {
+                    "ticker": sym_u, "expiry": str(expiry)[:10], "requested_qty": quantity,
+                    "allowed": zd["allowed"], "qty": zd["qty"], "reason": zd["reason"],
+                    "entries_today": zd_count, "premium": zd_premium, "base_budget_usd": zd_budget,
+                })
+                if not zd["allowed"]:
+                    logger.warning(f"⛔ {symbol} {zd['reason']}")
+                    await alerts.send(
+                        "warning", "zero_dte_cap",
+                        f"{symbol}: no live ticket — {zd['reason']}.",
+                        dedupe_key=f"zero_dte_cap:{symbol}:{today_iso_0dte}",
+                    )
+                    return {"status": "refused", "reason": zd["reason"],
+                            "code": "zero_dte_cap", "paper": True}
+                if zd["qty"] != quantity:
+                    logger.info(f"🎯 {symbol} {zd['reason']}")
+                    quantity = int(zd["qty"])
+
             # EXPECTED COST on the REAL contract. The entry filter priced the
             # spread from the app's chain snapshot (or a prior, for scanner
             # puts); this is the quote the order will actually cross. A policy
@@ -25010,6 +25559,70 @@ async def execute_live_order(payload: dict):
 TOKEN_KEEPALIVE_SECONDS = 50 * 60
 
 
+async def _preopen_token_probe() -> Optional[bool]:
+    """Is the broker login PROVEN alive right now? True / False / None (unknown)."""
+    tokens = load_tokens()
+    if not tokens:
+        return False
+    if _token_session["valid"] is False:
+        return False
+    try:
+        auth_manager = pyetrade.ETradeAccessManager(
+            CONSUMER_KEY, CONSUMER_SECRET,
+            tokens["oauth_token"], tokens["oauth_token_secret"],
+        )
+        await _etrade_call(auth_manager.renew_access_token, source="preopen_token_check")
+        _mark_token_session(True, "pre-open renew ok")
+        return True
+    except Exception as e:
+        if _looks_like_auth_failure(e):
+            _mark_token_session(False, "pre-open renew rejected — relink required")
+            return False
+        logger.warning(f"[PRE-OPEN TOKEN] renew probe inconclusive: {e}")
+        return None
+
+
+_preopen_token_checked_day: Optional[str] = None
+
+
+async def preopen_token_worker():
+    """5.84.1: once per trading day at 8:45 AM ET (7:45 CT), alert when the
+    broker login is not proven alive while positions are open — 45 minutes
+    to relink BEFORE the open, instead of finding out at 9:30."""
+    global _preopen_token_checked_day
+    while not _worker_stop:
+        await asyncio.sleep(60)
+        if not PREOPEN_TOKEN_ALERT_ENABLED:
+            continue
+        try:
+            now_et = _utcnow().astimezone(_ET_ZONE)
+            day = now_et.date().isoformat()
+            if _preopen_token_checked_day == day:
+                continue
+            if not exit_guards.preopen_token_check_due(
+                day, now_et.weekday(), now_et.hour * 60 + now_et.minute, _MARKET_HOLIDAYS,
+            ):
+                continue
+            _preopen_token_checked_day = day
+            positions = await state.all_positions()
+            n_open = len(positions or {})
+            ok = await _preopen_token_probe()
+            await trade_ledger.record("preopen_token_check", {
+                "day": day, "token_ok": ok, "open_positions": n_open,
+            })
+            if exit_guards.preopen_token_alert(ok, n_open):
+                state_txt = "DEAD" if ok is False else "could not be confirmed"
+                await alerts.send(
+                    "critical", "preopen_token_dead",
+                    f"Pre-open check: the E*TRADE login is {state_txt} and {n_open} position(s) are open. "
+                    f"Open the app and tap Link Account before 9:30 AM ET (8:30 CT) so the bot can "
+                    f"manage them at the open.",
+                    dedupe_key=f"preopen_token:{day}",
+                )
+        except Exception as e:
+            logger.warning(f"[PRE-OPEN TOKEN] check failed: {e}")
+
+
 async def token_keepalive_worker():
     while not _worker_stop:
         await asyncio.sleep(TOKEN_KEEPALIVE_SECONDS)
@@ -25297,6 +25910,16 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     # broker-native trail used to stand the whole pass down, so a 0DTE contract
     # in either state rode into the bell with nothing asking the clock. The
     # clock also outranks the target, the scale-out and the ratchet below.
+    # 5.84.1 OPENING EXIT GUARD: no bot-initiated exit in the first minutes
+    # after 9:30 ET. The broker-resting stop is untouched and still triggers.
+    _now_open = _utcnow().astimezone(_ET_ZONE)
+    _open_hold = exit_guards.opening_exit_hold(
+        _now_open.date().isoformat(), _now_open.weekday(),
+        _now_open.hour * 60 + _now_open.minute, OPENING_EXIT_GUARD_MINUTES, _MARKET_HOLIDAYS,
+    )
+    if _open_hold:
+        logger.debug(f"[TRAIL] {ticker} {_open_hold}")
+        return
     if await _maybe_scheduled_exit(ticker, pos, mark if mark > 0 else 0.0):
         return
     if mark <= 0:
@@ -26189,6 +26812,7 @@ async def start_worker():
     global _worker_task
     _worker_task = asyncio.create_task(placement_worker())
     asyncio.create_task(token_keepalive_worker())
+    asyncio.create_task(preopen_token_worker())
     asyncio.create_task(trailing_worker())
     asyncio.create_task(risk_desk_worker())
     asyncio.create_task(app_eyes_worker())
