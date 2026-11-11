@@ -66,6 +66,51 @@ def test_signal_id_is_stable_and_ignores_timestamp():
     assert main_bot.client_order_id_for("sig-1").isdigit()
 
 
+def test_scanner_signal_id_is_one_idea_per_session():
+    import scanner
+
+    morning = scanner.scanner_signal_id("nvda", "long", "vwap reclaim", "2026-11-11T14:33:38+00:00")
+    rescan = scanner.scanner_signal_id("NVDA", "LONG", "vwap   reclaim", "2026-11-11T14:51:33Z")
+    assert morning == rescan
+    assert morning == "scanner:2026-11-11:NVDA:long:vwap reclaim"
+    assert len(morning) <= 80
+    # 04:30 UTC is still the previous ET date (EST, UTC-5).
+    late = scanner.scanner_signal_id("NVDA", "long", "vwap reclaim", "2026-11-12T04:30:00+00:00")
+    assert late == morning
+    other_setup = scanner.scanner_signal_id("NVDA", "long", "breakout", "2026-11-11T14:33:38+00:00")
+    other_side = scanner.scanner_signal_id("NVDA", "short", "vwap reclaim", "2026-11-11T14:33:38+00:00")
+    next_day = scanner.scanner_signal_id("NVDA", "long", "vwap reclaim", "2026-11-12T15:00:00+00:00")
+    assert len({morning, other_setup, other_side, next_day}) == 4
+    long_setup = scanner.scanner_signal_id("NVDA", "long", "x" * 200, "2026-11-11T14:33:38+00:00")
+    assert len(long_setup) <= 80
+    assert long_setup == scanner.scanner_signal_id("NVDA", "long", "x" * 200, "2026-11-11T18:00:00+00:00")
+
+
+def test_build_signal_stamps_a_stable_signal_id(monkeypatch):
+    import scanner
+
+    monkeypatch.setattr(scanner, "ITM_EXPRESSION", False)
+    candidate = {
+        "ticker": "MU",
+        "side": "long",
+        "entry": 783.86,
+        "stop": 773.04,
+        "target": 800.0,
+        "score": 93,
+        "rvol": 3.04,
+        "setup": "vwap reclaim",
+        "ts": "2026-11-11T14:51:33+00:00",
+    }
+    first = scanner.build_signal({"bid": 1.0, "ask": 1.2}, candidate, "live")
+    candidate["entry"] = 790.0
+    candidate["ts"] = "2026-11-11T15:10:00+00:00"
+    second = scanner.build_signal({}, candidate, "live")
+    assert first["signal_id"] == second["signal_id"]
+    assert first["signal_id"] == "scanner:2026-11-11:MU:long:vwap reclaim"
+    assert main_bot.signal_identity(first) == first["signal_id"]
+    assert main_bot.client_order_id_for(first["signal_id"]) == main_bot.client_order_id_for(second["signal_id"])
+
+
 def test_fallback_key_keeps_intent_when_signal_id_is_missing():
     entry = {"ticker": "NVDA", "action": "BUY", "timestamp": "1", "intent": "open"}
     close = {"ticker": "NVDA", "action": "BUY", "timestamp": "1", "intent": "close"}
