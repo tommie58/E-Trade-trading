@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment and local broker state
+.env
+.etrade_tokens.json
+.etrade_state.json
+etrade_cache.db
+trade_ledger.jsonl
+
+# IDE
+.vscode/
+.idea/
