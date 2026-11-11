@@ -7,6 +7,16 @@ from fastapi import HTTPException
 import main_bot
 
 
+def test_broker_env_ignores_an_inline_note():
+    assert main_bot.broker_env("sandbox            # sandbox | production") == "sandbox"
+    assert main_bot.broker_env("  SANDBOX  ") == "sandbox"
+    assert main_bot.broker_env("production") == "production"
+    assert main_bot.broker_env("sandbox # comment") == "sandbox"
+    assert main_bot.broker_env("") == "production"
+    assert main_bot.broker_env(None) == "production"
+    assert main_bot.broker_env("live") == "live"
+
+
 def test_secrets_match_is_exact():
     assert main_bot._secrets_match("same-secret", "same-secret")
     assert not main_bot._secrets_match("same-secret", "same-secret ")

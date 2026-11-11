@@ -11488,10 +11488,22 @@ except ImportError:
 
 load_dotenv()
 
+def broker_env(raw: Optional[str], default: str = "production") -> str:
+    """First word of ETRADE_ENV, after an inline note is removed.
+
+    The bot treats every value other than exactly ``sandbox`` as production.
+    A host that keeps ``sandbox # sandbox | production`` — Railway's raw
+    editor and Docker's env-file do — must not turn that into a live session.
+    """
+    text = (raw if raw is not None else default).split("#", 1)[0].strip().lower()
+    token = text.split()[0] if text else ""
+    return token or default
+
+
 # ==================== CONFIG ====================
 # Defaults match the deployed production bot: this bot exists to trade live.
 # Set ETRADE_ENV=sandbox / LIVE_TRADING=false explicitly for testing.
-ENV = os.getenv("ETRADE_ENV", "production").lower()
+ENV = broker_env(os.getenv("ETRADE_ENV"))
 LIVE_TRADING = os.getenv("LIVE_TRADING", "true").lower() == "true"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 # A client `force_execute` flag skips the exchange calendar only when the
@@ -11560,7 +11572,9 @@ is_sandbox = ENV == "sandbox"
 # is also the broker clientOrderId. Parked 401s live in the state store and
 # replay through process_signal. A placement that crashes before the broker
 # call is requeued; one that already reached the broker is not sent again.
-BOT_VERSION = "5.85.0-fail-closed"
+# 5.85.1: ETRADE_ENV keeps only the first word, so a pasted inline note
+# ("sandbox # ...") stays sandbox instead of being read as production.
+BOT_VERSION = "5.85.1-env-token"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
