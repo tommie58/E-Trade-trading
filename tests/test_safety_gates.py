@@ -170,3 +170,59 @@ def test_public_health_has_no_account_fields():
     webhook = client.post("/webhook", json={"ticker": "NVDA", "action": "BUY", "mode": "live"})
     assert status.status_code == 401
     assert webhook.status_code == 401
+
+
+def test_native_handoff_arms_when_the_trigger_clears_the_stop():
+    plan = main_bot.trailing_engine.plan_native_handoff(
+        3.40, 0.10, 0.80, 2.40, tick=0.05,
+    )
+    assert plan["arm"] is True
+    assert plan["reason"] == "arm"
+    assert plan["offset"] == 0.20
+    assert plan["trigger"] == 3.20
+
+
+def test_native_handoff_keeps_a_tighter_fixed_stop():
+    plan = main_bot.trailing_engine.plan_native_handoff(
+        2.50, 0.10, 0.80, 2.40, tick=0.05,
+    )
+    assert plan["arm"] is False
+    assert plan["reason"] == "would_loosen"
+    assert plan["trigger"] is None
+
+
+def test_native_handoff_refuses_a_wide_or_unmeasured_book():
+    wide = main_bot.trailing_engine.plan_native_handoff(
+        3.40, 0.50, 0.80, 2.40, tick=0.05,
+    )
+    blind = main_bot.trailing_engine.plan_native_handoff(
+        3.40, None, 0.80, 2.40, tick=0.05,
+    )
+    assert wide["arm"] is False and wide["reason"] == "offset"
+    assert blind["arm"] is False and blind["reason"] == "offset"
+
+
+def test_native_handoff_needs_a_long_with_a_resting_stop():
+    no_order = main_bot.trailing_engine.plan_native_handoff(
+        3.40, 0.10, 0.80, 2.40, has_stop_order=False,
+    )
+    short = main_bot.trailing_engine.plan_native_handoff(
+        3.40, 0.10, 0.80, 2.40, long_side=False,
+    )
+    covered = main_bot.trailing_engine.plan_native_handoff(
+        3.40, 0.10, 0.80, 2.40, already_native=True,
+    )
+    assert no_order["reason"] == "no_stop_order"
+    assert short["reason"] == "short"
+    assert covered["reason"] == "already_native"
+    assert not any(p["arm"] for p in (no_order, short, covered))
+
+
+def test_native_trail_retry_waits_until_the_stamp():
+    from datetime import datetime, timedelta, timezone
+    future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    assert main_bot._native_trail_retry_waiting({"native_trail_retry_after": future})
+    assert not main_bot._native_trail_retry_waiting({"native_trail_retry_after": past})
+    assert not main_bot._native_trail_retry_waiting({})
+    assert not main_bot._native_trail_retry_waiting({"native_trail_retry_after": "not-a-time"})
