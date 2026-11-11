@@ -8209,12 +8209,14 @@ main_bot (no circular imports) and its helpers stay unit-testable.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import re
 from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 try:  # package-style import (python -m bot...) or flat (uvicorn main_bot:app)
     from .state_store import StateStore
@@ -9073,6 +9075,54 @@ def next_friday_expiry(now_et: datetime) -> str:
     return (now_et.date() + timedelta(days=days_ahead)).isoformat()
 
 
+_SESSION_ZONE = ZoneInfo("America/New_York")
+
+
+def _session_day(ts: Any) -> str:
+    """ET calendar date of a scanner timestamp. Naive values are UTC.
+
+    The trading session is an ET date. A rescan at 14:33 UTC and another at
+    14:51 UTC are the same morning, and a print just before midnight ET stays
+    on the day that session belongs to.
+    """
+    when: Optional[datetime] = None
+    if isinstance(ts, datetime):
+        when = ts
+    elif ts is not None and str(ts).strip():
+        text = str(ts).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            when = datetime.fromisoformat(text)
+        except ValueError:
+            when = None
+    if when is None:
+        when = _utcnow()
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(_SESSION_ZONE).date().isoformat()
+
+
+def scanner_signal_id(ticker: Any, side: Any, setup: Any, ts: Any) -> str:
+    """One id per name, side, setup, and ET session.
+
+    Live dispatch requires this. The broker clientOrderId is a hash of it, so
+    a 60-second rescan of the same idea must reuse it or the next pass can
+    open a second position. Entry, stop, and the exact timestamp move on every
+    pass and are not part of the id. A different setup, side, or session is a
+    new idea. Capped at 80 characters, which is all the order path keeps.
+    """
+    day = _session_day(ts)
+    name = str(ticker or "").upper().strip() or "UNKNOWN"
+    way = str(side or "long").lower().strip() or "long"
+    idea = " ".join(str(setup or "unknown").lower().split()) or "unknown"
+    text = f"scanner:{day}:{name}:{way}:{idea}"
+    if len(text) <= 80:
+        return text
+    digest = hashlib.sha256(text.encode()).hexdigest()[:24]
+    return f"scanner:{day}:{name}:{digest}"[:80]
+
+
 def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) -> Dict[str, Any]:
     """Webhook-shaped payload for a qualifying candidate.
 
@@ -9088,6 +9138,9 @@ def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) ->
     the REAL bid/ask."""
     side = str(candidate.get("side") or "long")
     payload: Dict[str, Any] = {
+        "signal_id": scanner_signal_id(
+            candidate.get("ticker"), side, candidate.get("setup"), candidate.get("ts"),
+        ),
         "ticker": candidate["ticker"],
         "action": "BUY" if side == "long" else "SELL",
         "mode": mode,
@@ -11574,7 +11627,10 @@ is_sandbox = ENV == "sandbox"
 # call is requeued; one that already reached the broker is not sent again.
 # 5.85.1: ETRADE_ENV keeps only the first word, so a pasted inline note
 # ("sandbox # ...") stays sandbox instead of being read as production.
-BOT_VERSION = "5.85.1-env-token"
+# 5.85.2: the scanner stamps a session-stable signal_id. 5.85.0 rejects every
+# live entry that lacks one, so a live scan found candidates and refused all
+# of them before a risk gate ran.
+BOT_VERSION = "5.85.2-scanner-signal"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
