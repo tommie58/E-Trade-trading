@@ -4537,27 +4537,23 @@ def plan_scheduled_exit(
     close_minute: Any = None,
     expiry: Any = None,
     today: Any = None,
+    flatten_all: bool = True,
 ) -> Dict[str, Any]:
     """Do the CLOCK-driven exits fire? Returns
     ``{"fire": bool, "reason": str|None, "detail": str}``.
 
     Two exits the app's card promises and the bot could not perform:
 
-      EOD HARD FLATTEN — from 3:40 PM ET to the bell, every position closes.
-        This is the guarantee that a same-day (0DTE) option can never be held
-        into the close and expire worthless. The app enforced it only while the
-        phone was awake; a locked phone at 3:40 meant the promise silently did
-        not apply, and an expiring contract went to zero.
+      EOD HARD FLATTEN — from 3:40 PM ET to the bell, positions close.
+        Day-trade mode (`flatten_all=True`, the default): EVERY open option
+        is sold — no overnight hold. Overnight mode (`flatten_all=False`):
+        only a contract whose expiry is today or earlier is force-closed, so
+        a same-day (0DTE) option can never ride into the bell and expire
+        worthless. An UNKNOWN expiry or date is treated as expiring today
+        and closed either way.
 
       MAX HOLD — a position that has reached neither target nor stop in
         `max_hold_hours` is not working. Holding it longer only pays theta.
-
-    EXPIRING-ONLY: the flatten exists to stop a contract expiring worthless,
-    so it fires only for a contract whose `expiry` (YYYY-MM-DD) is `today`
-    (ET date) or earlier. A longer-dated contract (the 14-30 DTE expression)
-    is left to its stop / trail / targets and is held overnight. An UNKNOWN
-    expiry or date is treated as expiring today and closed — not knowing the
-    expiry must never be the reason a 0DTE contract rides into the bell.
 
     The EOD flatten OUTRANKS the max-hold timer: inside the window everything
     goes regardless of age, so an aging position never escapes the window by
@@ -4579,14 +4575,19 @@ def plan_scheduled_exit(
         close = float(MARKET_CLOSE_MINUTE)
     window_open = close - (MARKET_CLOSE_MINUTE - EOD_FLATTEN_MINUTE)
 
-    if eod_enabled and minutes is not None and not is_weekend and contract_expires_by(expiry, today):
+    due_for_eod = bool(flatten_all) or contract_expires_by(expiry, today)
+    if eod_enabled and minutes is not None and not is_weekend and due_for_eod:
         if window_open <= minutes < close:
             hh, mm = divmod(int(minutes), 60)
+            why = (
+                "day-trade flatten — no overnight holds"
+                if flatten_all else
+                "a same-day option must never be held into the close"
+            )
             return {
                 "fire": True, "reason": "eod_flatten",
                 "detail": (
-                    f"{hh:02d}:{mm:02d} ET is inside the hard-flatten window — "
-                    f"a same-day option must never be held into the close"
+                    f"{hh:02d}:{mm:02d} ET is inside the hard-flatten window — {why}"
                 ),
             }
 
@@ -7554,9 +7555,9 @@ removal, as policy:
    reading).
 
 4. EXPRESSION. Option entries are re-expressed as an in-the-money contract
-   (|Δ| ≈ 0.60) with 1–30 days to expiry (best expiry chosen). The payoff tracks the underlying
-   almost linearly, theta per day is a fraction of a weekly's, and a premium
-   stop derived from the underlying stop means what it says. What it is NOT is
+   (|Δ| ≈ 0.60) with 0–7 days to expiry (best expiry chosen — day-trade book).
+   The payoff tracks the underlying almost linearly; short-dated θ is charged
+   honestly by the best-expiry score for a same-session hold. What it is NOT is
    free: an ITM contract quotes a wider absolute spread per unit of delta than
    an ATM weekly, and the cost model charges it on the contract's REAL quote at
    the order. Share entries stay shares — already the most linear expression.
@@ -7609,33 +7610,35 @@ SHADOW_FLATTEN_MIN = 15 * 60 + 55
 # budget. Less intrinsic value means a little more of the premium is time
 # value — the best-expiry θ score already charges for that.
 EXPRESSION_DELTA = 0.60
-# 0–30 DTE window (5.84.0, operator's choice): same-day (0DTE) and every
-# date of the current week are now allowed, out to a month. Inside the window
-# the expiry is CHOSEN, not fixed: see pick_best_expiry — its θ term already
-# charges 0DTE its (large) one-day decay, so it wins only when it is cheapest
-# to hold. A 0DTE position is still force-closed by the 3:40 PM ET expiry
-# flatten; see ZERO_DTE_ENTRY_CUTOFF_ET_MIN for the entry side of that.
+# 0–7 DTE window (day-trade book): same-day (0DTE) through the current week's
+# Friday. Inside the window the expiry is CHOSEN, not fixed: see
+# pick_best_expiry — its θ term charges short dates for same-session decay,
+# so 0DTE wins only when it is cheapest to hold. Every open option is still
+# force-closed by the 3:40 PM ET day-trade flatten; see
+# ZERO_DTE_ENTRY_CUTOFF_ET_MIN for the 0DTE entry side of that.
 MIN_DTE = 0
-MAX_DTE = 30
+MAX_DTE = 7
 # No NEW 0DTE entry at/after 14:30 ET (minutes after midnight ET). Declared,
-# not tuned: the 3:40 PM expiry flatten force-closes same-day contracts, so a
+# not tuned: the 3:40 PM day-trade flatten force-closes the book, so a
 # 14:30 entry keeps ≥70 min of runway — one opening-hold-length (15 min) of
 # settling plus most of an hour for the thesis — and stays out of the final
 # hour where 0DTE θ and spreads blow out. An UNKNOWN clock fails closed for
 # 0DTE only (later expiries are unaffected).
 ZERO_DTE_ENTRY_CUTOFF_ET_MIN = 14 * 60 + 30
 # The fallback when no candidate could be MEASURED (no two-sided quote, no
-# published delta/theta): the old fixed target. Unmeasured is never "best".
-TARGET_DTE = 21
+# published delta/theta): nearest listed near TARGET_DTE. Unmeasured is never
+# "best". Prefer same-day when the chain can be scored; the unmeasured
+# fallback still avoids 0DTE (see pick_expiry).
+TARGET_DTE = 0
 
 # BEST-EXPIRY SCORE — the cost of HOLDING the contract for the trade, as a
 # fraction of its premium:  spread/mid  +  HOLD_DAYS × |θ|/mid.
 #   • spread is paid once (in and out ≈ one full spread),
-#   • θ is paid per day held. The core theses resolve inside the session, so
-#     one day of decay is the honest carry for a trade the bot may hold to
-#     the next open. Short dates win on spread when they are liquid; longer
-#     dates win when short-dated θ would eat more than the spread saves.
-HOLD_DAYS = 1.0
+#   • θ is paid per day held. Day-trade theses resolve inside the session and
+#     the 3:40 flatten ends every open, so a fraction of one day is the honest
+#     carry. Short dates win on spread when they are liquid; longer dates win
+#     when short-dated θ would eat more than the spread saves.
+HOLD_DAYS = 0.25
 # A contract whose spread is more than 10% of its mid is not a market a
 # day-trade can cross and recover from — it is refused as a candidate.
 MAX_EXPIRY_SPREAD_PCT = 0.10
@@ -7643,8 +7646,8 @@ MAX_EXPIRY_SPREAD_PCT = 0.10
 # an exit at size. Unmeasured OI does not block (the two-sided quote is the
 # proof a market exists), but it never counts as depth either.
 MIN_EXPIRY_OI = 100.0
-# At most this many weekly expiries are priced per entry — each one is a chain
-# call made while the order waits. A 1–30 DTE window holds 4–5 weeklies.
+# At most this many expiries are priced per entry — each one is a chain call
+# made while the order waits. A 0–7 DTE window is today + ~1 weekly.
 MAX_EXPIRY_CANDIDATES = 6
 # The delta band the snapped contract must land in. Wider than the target so a
 # listed strike grid ($1/$2.50/$5) can be honoured, narrow enough that an
@@ -7965,10 +7968,10 @@ def reinstated_keys(events: Iterable[Dict[str, Any]]) -> Set[str]:
 
 
 # ---------------------------------------------------------------------------
-# 4. Expression: in-the-money, best expiry in 1–30 DTE
+# 4. Expression: in-the-money, best expiry in 0–7 DTE (day-trade book)
 # ---------------------------------------------------------------------------
 def bs_delta(spot: float, strike: float, vol_annual: float, dte: float, right: str) -> Optional[float]:
-    """Black–Scholes delta, r = q = 0 (a three-week horizon makes carry noise)."""
+    """Black–Scholes delta, r = q = 0 (a short horizon makes carry noise)."""
     s, k, v = _num(spot), _num(strike), _num(vol_annual)
     if s is None or k is None or v is None or s <= 0 or k <= 0 or v <= 0:
         return None
@@ -8004,17 +8007,22 @@ def strike_for_delta(spot: float, vol_annual: float, dte: float, right: str,
 
 
 def target_expiry(today: date) -> date:
-    """The requested expiry (the chain snap picks the nearest LISTED date)."""
-    return today + timedelta(days=TARGET_DTE)
+    """The unmeasured requested expiry (the chain snap picks the nearest LISTED
+    date). Never asks for 0DTE — only a MEASURED pick_best_expiry may."""
+    return today + timedelta(days=max(TARGET_DTE, 1))
 
 
 def pick_expiry(listed: Iterable[date], today: date) -> Optional[date]:
     """Nearest listed expiry to TARGET_DTE inside [MIN_DTE, MAX_DTE], else None.
-    The TARGET_DTE fallback never lands on 0DTE (only a MEASURED pick may)."""
+    The unmeasured TARGET_DTE fallback never lands on 0DTE (only a MEASURED
+    pick_best_expiry may) — buying an unscored same-day contract is refused."""
+    # Prefer the listed date nearest TARGET_DTE; when TARGET_DTE is 0 the
+    # fallback still starts at 1 DTE so an unmeasured chain never buys 0DTE.
+    prefer = max(TARGET_DTE, 1)
     inside = [d for d in (listed or []) if max(MIN_DTE, 1) <= (d - today).days <= MAX_DTE]
     if not inside:
         return None
-    return min(inside, key=lambda d: (abs((d - today).days - TARGET_DTE), d))
+    return min(inside, key=lambda d: (abs((d - today).days - prefer), d))
 
 
 def same_day_entry_open(now_minutes_et: Any) -> bool:
@@ -11779,7 +11787,8 @@ EDGE_REINSTATED_KEY = "edge:reinstated"
 # → size weight / disablement → probation re-test. Weights only ever SHRINK
 # size; a disabled cell refuses entries until its cooldown re-test. false =
 # report only (the cells are still computed and shown, nothing is enforced).
-LEARNING_ENABLED = os.getenv("LEARNING_ENABLED", os.getenv("SETUP_GATES_ENABLED", "false")).strip().lower() not in {"false", "0", "no"}
+# Day-trade default ON: every live close feeds the next size/disable decision.
+LEARNING_ENABLED = os.getenv("LEARNING_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
 # PORTFOLIO RISK (portfolio_risk.py) — correlation-weighted exposure across
 # underlyings, regime/gap-scaled sizing with a crisis pause, order-book
 # capacity, and the evidence class ("proven +EV in this regime" vs "merely
@@ -11801,9 +11810,14 @@ COST_MODEL_ENABLED = os.getenv("COST_MODEL_ENABLED", "true").strip().lower() not
 # shadow-tracked on paper; a family returns only when its shadow record, net
 # of cost, earns it back (≥ 30 closes, t ≥ 2). false = report only.
 CORE_BOOK_ENABLED = os.getenv("CORE_BOOK_ENABLED", os.getenv("SETUP_GATES_ENABLED", "false")).strip().lower() not in {"false", "0", "no"}
-# Option entries are re-expressed as an ITM contract (|Δ| ≈ 0.60, best expiry in 0–30 DTE)
+# Option entries are re-expressed as an ITM contract (|Δ| ≈ 0.60, best expiry in 0–7 DTE)
 # before the chain snap. false = trade the contract the sender asked for.
 ITM_EXPRESSION_ENABLED = os.getenv("ITM_EXPRESSION_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+# DAY-TRADE MODE — aggressive same-session book. When true (default):
+#   • 3:40 PM ET hard flatten closes EVERY open option (no overnight holds)
+#   • expression already prefers 0–7 DTE / same-day when cheapest to hold
+# Set false to restore overnight holds (EOD flatten only for expiring contracts).
+DAY_TRADE_MODE = os.getenv("DAY_TRADE_MODE", "true").strip().lower() not in {"false", "0", "no"}
 # OPTIONS ONLY — the account trades option contracts, never shares. Every
 # ENTRY whose instrument is not "option" is refused at the last gate before
 # the broker (closes still pass: a share position that already exists must
@@ -12031,7 +12045,7 @@ NATIVE_TRAIL_AUTO = os.getenv("NATIVE_TRAIL_AUTO", "true").lower() == "true"
 # every poll would open that naked window on a loop.
 NATIVE_TRAIL_RETRY_SECONDS = 600
 # The clock-driven exits the same card promises: the 3:40 PM ET hard flatten
-# ("same-day options can never be held into the close and expire worthless")
+# (day-trade mode: every open option; overnight mode: same-day expiry only)
 # and the 8-hour max hold. Both were app-foreground-only too, so a locked
 # phone at 3:40 meant an expiring contract rode to zero — which is why the
 # bot already carries an `expired_worthless` close reason.
@@ -13611,7 +13625,8 @@ def _assess_expected_cost(p: dict, option_quote: Optional[Dict[str, Any]] = None
         option_premium=None if (q or pending_itm) else p.get("option_limit_price"),
         delta=(core_book.EXPRESSION_DELTA if pending_itm
                else (q.get("delta") if q.get("delta") is not None else p.get("option_delta"))),
-        days_to_expiry=float(core_book.TARGET_DTE) if pending_itm else _payload_days_to_expiry(p),
+        days_to_expiry=(float(max(core_book.TARGET_DTE, 1)) if pending_itm
+                        else _payload_days_to_expiry(p)),
         sigma_sec=sigma, sigma_basis=basis,
         signal_age_sec=_signal_age_sec(p),
     )
@@ -21549,13 +21564,11 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
     bot could perform two of them. `_maybe_take_profit` added the third. These
     are the last two, and they are the ones that fail most quietly:
 
-      3:40 PM ET HARD FLATTEN — advertised as "every open position is
-        force-closed at 3:40 PM ET — same-day (0DTE) options can never be held
-        into the close and expire worthless". The app enforced it only while
-        the phone was awake and in the foreground. A locked phone at 3:40 meant
-        the guarantee silently did not apply and an expiring contract rode to
-        zero — the `expired_worthless` close reason the bot already has a label
-        for, which is the receipt of this exact failure.
+      3:40 PM ET HARD FLATTEN — day-trade mode force-closes EVERY open option
+        so nothing rides overnight; overnight mode keeps the original promise
+        that same-day (0DTE) options never expire worthless. The app enforced
+        it only while the phone was awake; a locked phone at 3:40 meant an
+        expiring contract rode to zero — the `expired_worthless` close reason.
 
       8h MAX HOLD — advertised as "close stale positions that never reached
         target or stop". Nothing server-side ever did.
@@ -21601,10 +21614,11 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
         # A half day closes at 13:00 — the flatten must land at 12:40, not
         # hours after the bell when the contract is already stuck.
         close_minute=_session_close_minute(now_et),
-        # 3:40 flatten applies only to a contract expiring TODAY; a longer-
-        # dated contract is held and left to its stop/trail/targets.
+        # Day-trade mode: 3:40 closes every open option. Overnight mode:
+        # only a contract expiring TODAY (longer-dated left to stop/trail).
         expiry=contract.get("expiration"),
         today=now_et.date().isoformat(),
+        flatten_all=DAY_TRADE_MODE,
     )
     if not verdict["fire"] and HOLD_GUARD_ENABLED:
         # 5.84.1 HOLD GUARD: 3:45 PM ET (2:45 CT). A short-dated or
@@ -22297,7 +22311,7 @@ _CLOSE_REASON_LABELS = {
     "trailing_stop": "trailing stop executed",
     "scale_out": "scale-out at the first target",
     "take_profit": "premium take-profit target tagged",
-    "eod_flatten": "3:40 PM ET hard flatten",
+    "eod_flatten": "3:40 PM ET day-trade flatten",
     "time_exit": "max hold reached",
     "event_flatten": "event flatten ahead of a macro release",
     # The bot books max-hold closes as "max_hold" — "time_exit" is the app's
@@ -24251,7 +24265,7 @@ def _et_minutes_now() -> Optional[int]:
 def _best_expression_contract(market, symbol: str, spot: Any, vol_annual: Any,
                               right: str, today: date) -> Optional[Dict[str, Any]]:
     """BEST EXPIRY (core_book.pick_best_expiry) — price the |Δ|≈0.60 contract
-    on every weekly (plus today’s 0DTE) in the 0–30 DTE window from E*TRADE's own chain and return
+    on every weekly (plus today’s 0DTE) in the 0–7 DTE window from E*TRADE's own chain and return
     the cheapest to hold: {expiry, strike, bid, ask, theta, delta, cost, dte,
     considered, scored}. None when nothing could be measured — the caller then
     keeps the TARGET_DTE plan. Best effort and read-only: a chain failure on
@@ -24801,7 +24815,7 @@ async def execute_live_order(payload: dict):
             contract_liquidity: Dict[str, Any] = {}
 
             # EXPRESSION (core_book) — an option ENTRY is re-planned as the ITM
-            # contract (|Δ| ≈ 0.60, best expiry in 0–30 DTE) before the chain snap. The
+            # contract (|Δ| ≈ 0.60, best expiry in 0–7 DTE) before the chain snap. The
             # sender's strike/expiry only said "options, this direction".
             # HELD-CONTRACT TRUTH — a close sells what the account HOLDS. The
             # sender's strike/expiry is the contract it PLANNED; once the bot
@@ -24827,7 +24841,7 @@ async def execute_live_order(payload: dict):
             expression: Optional[Dict[str, Any]] = None
             expression_vol: Optional[float] = None
             # APP ↔ BOT CONTRACT ALIGNMENT — when the sender's own contract is
-            # already inside the expression (measured |Δ| in band, 0–30 DTE),
+            # already inside the expression (measured |Δ| in band, 0–7 DTE),
             # the bot trades THAT contract with the sender's limit and stop,
             # instead of re-planning from a model σ and filling a different
             # strike than the one the app showed.
@@ -24862,7 +24876,7 @@ async def execute_live_order(payload: dict):
                         f"(Δ {payload.get('option_delta')} already inside the expression)"
                     )
                 elif expression is not None:
-                    # BEST EXPIRY in 0–30 DTE from the broker's own chain; the
+                    # BEST EXPIRY in 0–7 DTE from the broker's own chain; the
                     # TARGET_DTE plan stands only when nothing was measurable.
                     try:
                         pick_market = pyetrade.ETradeMarket(
@@ -28492,9 +28506,10 @@ async def status():
             "portfolio_risk_enabled": PORTFOLIO_RISK_ENABLED,
             "cost_model_enabled": COST_MODEL_ENABLED,
             # Core book (core_book.py): retired families refused + shadow-tracked;
-            # option entries re-expressed ITM, best expiry in 0–30 DTE.
+            # option entries re-expressed ITM, best expiry in 0–7 DTE.
             "core_book_enabled": CORE_BOOK_ENABLED,
             "itm_expression_enabled": ITM_EXPRESSION_ENABLED,
+            "day_trade_mode": DAY_TRADE_MODE,
             "require_proven_ev": REQUIRE_PROVEN_EV,
             "risk_per_trade_pct": live_policy("risk_per_trade_pct"),
             "daily_loss_limit_pct": live_policy("daily_loss_limit_pct"),
