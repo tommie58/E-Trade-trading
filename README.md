@@ -28,6 +28,9 @@ A value set on the host overrides these.
 | `MIN_RVOL` | `0.9` |
 | `MIN_MTF` | `1` |
 | `COMMISSION_PER_CONTRACT` | `0.52` |
+| `DAY_TRADE_MODE` | `true` (3:40 ET flattens every open option; 0–7 DTE expression) |
+| `LEARNING_ENABLED` | `true` (live closes resize / disable setup×regime cells) |
+| `SCHEDULED_EXIT_ENABLED` | `true` |
 
 `DAILY_LOSS_LIMIT_DOLLARS` is not read. `PAPER_MODE` is not read. Paper versus live is the payload `mode` plus `LIVE_TRADING` and `ETRADE_ENV`.
 
