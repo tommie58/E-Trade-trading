@@ -1675,10 +1675,11 @@ class ETradeAsyncClient:
              `stopPrice` carries the CURRENT trigger price.
           2. There is a long-standing SERVER-side bug where `stopPrice` and
              the trailing parameter are read swapped, which rests a trail of
-             "64.49 points below bid" from a $0.66 request. E*TRADE support's
-             own guidance is that the current trailing stop price belongs in
-             `stopPrice` — so both fields are always sent together and never
-             guessed.
+             "64.49 points below bid" from a $0.66 request (seen again live
+             2026-11-13 on GOOGL/SMCI option T-Stops). Callers MUST read the
+             resting Stop Val back after place and, on a swap, re-place with
+             the fields intentionally inverted (stopPrice=offset,
+             offsetValue=trigger) so the broker's swap lands the real trail.
           3. `offsetType` must echo the priceType, or the offset is ignored
              and the order rests as a plain stop at `stopPrice`.
 
@@ -2844,13 +2845,32 @@ def plan_untracked_exposure(
     return out
 
 
+def trail_offset_from_order_detail(detail: Any) -> Optional[float]:
+    """Trail DISTANCE E*TRADE is using on a trailing stop detail, if present.
+
+    Prefers ``offsetValue``, then the legacy ``trailPrice`` key. Used to detect
+    the stopPrice/offsetValue swap after a native trail is placed.
+    """
+    if not isinstance(detail, dict):
+        return None
+    for key in ("offsetValue", "trailPrice"):
+        try:
+            value = float(detail.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+    return None
+
+
 def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
     """Flatten an OrdersResponse into order records (live AND terminal):
     {order_id, symbol, status, price_type, order_action, filled, ordered,
-     exec_price, executed_ts}. `exec_price` is the average execution price of
-    a filled instrument (0 when not filled); `executed_ts` is the epoch-seconds
-    execution time (0 when unknown) — both are what fill capture books a
-    broker-side close from."""
+     exec_price, executed_ts, stop_price, offset_value}. `exec_price` is the
+    average execution price of a filled instrument (0 when not filled);
+    `executed_ts` is the epoch-seconds execution time (0 when unknown) — both
+    are what fill capture books a broker-side close from. `offset_value` is
+    the resting trail distance on TRAILING_STOP_* orders (None otherwise)."""
     out: List[dict] = []
     root = (orders_resp or {}).get("OrdersResponse", {}) or {}
     for order in _as_list(root.get("Order")):
@@ -2862,6 +2882,7 @@ def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
                 executed_ts = float(detail.get("executedTime") or 0) / 1000.0
             except (TypeError, ValueError):
                 executed_ts = 0.0
+            offset_value = trail_offset_from_order_detail(detail)
             for inst in _as_list(detail.get("Instrument")):
                 product = inst.get("Product") or {}
                 try:
@@ -2894,6 +2915,7 @@ def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
                     "exec_price": exec_price,
                     "executed_ts": executed_ts,
                     "stop_price": stop_px if stop_px > 0 else None,
+                    "offset_value": offset_value,
                 })
     return out
 
@@ -4346,6 +4368,92 @@ def plan_native_handoff(
         "reason": "arm",
         "detail": str(plan["detail"]),
     }
+
+
+def native_trail_order_prices(
+    offset: Any,
+    trigger: Any,
+    *,
+    counter_swap: bool = False,
+) -> Dict[str, float]:
+    """Map (trail distance, initial trigger) onto the stopPrice/offsetValue pair.
+
+    ``counter_swap=True`` inverts the fields so that AFTER E*TRADE's server-side
+    swap, the resting Stop Val equals ``offset`` and the initial Price equals
+    ``trigger``.
+    """
+    off = round(float(offset), 2)
+    trig = round(float(trigger), 2)
+    if off <= 0 or trig <= 0:
+        raise ValueError("native trail offset and trigger must both be positive")
+    if counter_swap:
+        return {"stop_price": off, "offset_value": trig}
+    return {"stop_price": trig, "offset_value": off}
+
+
+def classify_resting_trail_offset(
+    intended_offset: Any,
+    intended_trigger: Any,
+    resting_offset: Any,
+    *,
+    tol: float = 0.05,
+) -> Dict[str, Any]:
+    """Did the broker rest the trail DISTANCE we asked for?
+
+    Returns ``{"status": "ok"|"swapped"|"wrong"|"unknown", "detail": str}``.
+
+    ``swapped`` means the resting Stop Val matches the trigger we put in
+    ``stopPrice`` — the documented payload was inverted by E*TRADE — so the
+    placer must cancel and re-send with ``native_trail_order_prices(...,
+    counter_swap=True)``.
+    """
+    want_off = _finite(intended_offset)
+    want_trig = _finite(intended_trigger)
+    got = _finite(resting_offset)
+    if got is None or got <= 0:
+        return {"status": "unknown", "detail": "broker did not report a trail offset"}
+    if want_off is None or want_off <= 0:
+        return {"status": "unknown", "detail": "no intended offset to compare"}
+    if abs(got - want_off) <= tol:
+        return {
+            "status": "ok",
+            "detail": f"resting offset {got:.2f} matches intended {want_off:.2f}",
+        }
+    if want_trig is not None and want_trig > 0 and abs(got - want_trig) <= tol:
+        return {
+            "status": "swapped",
+            "detail": (
+                f"resting offset {got:.2f} matches the trigger {want_trig:.2f} "
+                f"not the intended trail {want_off:.2f} — stopPrice/offsetValue swapped"
+            ),
+        }
+    return {
+        "status": "wrong",
+        "detail": (
+            f"resting offset {got:.2f} matches neither intended trail "
+            f"{want_off:.2f} nor trigger "
+            f"{'?' if want_trig is None else f'{want_trig:.2f}'}"
+        ),
+    }
+
+
+def native_trail_offset_looks_inflated(
+    resting_offset: Any,
+    intended_offset: Any,
+    *,
+    min_factor: float = 2.0,
+    min_extra: float = 0.25,
+) -> bool:
+    """True when a resting trail distance is far looser than the spread floor.
+
+    Heals already-adopted native trails armed through the swapped field path
+    (Stop Val became the initial trigger, e.g. 7.6 instead of ~0.80).
+    """
+    got = _finite(resting_offset)
+    want = _finite(intended_offset)
+    if got is None or want is None or got <= 0 or want <= 0:
+        return False
+    return got + 1e-9 >= max(want * min_factor, want + min_extra)
 
 
 # A premium target more than this multiple of the entry premium is not a
@@ -11707,7 +11815,7 @@ is_sandbox = ENV == "sandbox"
 # 5.85.2: the scanner stamps a session-stable signal_id. 5.85.0 rejects every
 # live entry that lacks one, so a live scan found candidates and refused all
 # of them before a risk gate ran.
-BOT_VERSION = "5.86.0-native-trail"
+BOT_VERSION = "5.86.1-native-trail-swapfix"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -20205,6 +20313,111 @@ class NativeTrailRefused(Exception):
     """Handoff declined before the resting stop was touched."""
 
 
+NATIVE_TRAIL_VERIFY_ATTEMPTS = 5
+NATIVE_TRAIL_VERIFY_SLEEP_SECONDS = 0.45
+
+
+async def _read_resting_trail_offset(order_id: Optional[str]) -> Optional[float]:
+    """Poll the open-order list for the trail DISTANCE on ``order_id``.
+
+    Returns None when the order is missing, terminal, or carries no offset —
+    never invents a zero. Brief retries absorb E*TRADE's post-place lag.
+    """
+    if not order_id:
+        return None
+    for attempt in range(NATIVE_TRAIL_VERIFY_ATTEMPTS):
+        try:
+            resp = await _reconcile_fetch_orders()
+            for order in reconciliation.parse_open_orders(resp):
+                if str(order.get("order_id") or "") != str(order_id):
+                    continue
+                status = str(order.get("status") or "").upper()
+                if status in _TERMINAL_ORDER_STATUSES:
+                    return None
+                offset = order.get("offset_value")
+                if offset is not None and float(offset) > 0:
+                    return float(offset)
+        except Exception as e:
+            logger.warning(
+                f"[NATIVE TRAIL] offset readback for {order_id} failed "
+                f"(attempt {attempt + 1}/{NATIVE_TRAIL_VERIFY_ATTEMPTS}): {e}"
+            )
+        await asyncio.sleep(NATIVE_TRAIL_VERIFY_SLEEP_SECONDS * (attempt + 1))
+    return None
+
+
+async def _place_verified_native_trail(
+    kind: str,
+    common: dict,
+    tokens: Dict[str, str],
+    *,
+    intended_offset: float,
+    intended_trigger: float,
+) -> Tuple[Any, Optional[str], str]:
+    """Place a trailing stop and refuse to keep one whose Stop Val is wrong.
+
+    Tries the documented field layout first (stopPrice=trigger,
+    offsetValue=offset). If the resting offset matches the trigger instead —
+    E*TRADE's stopPrice/offsetValue swap — cancels and re-places with the
+    fields intentionally inverted so the broker's swap lands the real trail.
+    Raises when the resting offset still does not match ``intended_offset``.
+    """
+    placed = await _place_order_smart(kind, common, tokens)
+    order_id = _order_id_from_place(placed)
+    resting = await _read_resting_trail_offset(order_id)
+    verdict = trailing_engine.classify_resting_trail_offset(
+        intended_offset, intended_trigger, resting,
+    )
+    if verdict["status"] == "ok":
+        return placed, order_id, "documented"
+    if verdict["status"] == "unknown":
+        # Order list lagged or omitted offsetValue. Keep the resting order and
+        # let `_maybe_repair_inflated_native_trail` heal it once the Stop Val
+        # is readable — cancelling here would reopen the naked window for a
+        # missing field, not a proven bad trail.
+        logger.warning(
+            f"[NATIVE TRAIL] {common.get('symbol')}: {verdict['detail']} — "
+            f"keeping order {order_id} for later offset repair"
+        )
+        return placed, order_id, "unverified"
+
+    qty = int(common.get("quantity") or 0)
+    if verdict["status"] != "swapped":
+        if order_id:
+            await _cancel_order_verified(order_id, expected_qty=qty)
+        raise Exception(f"native trail offset verify failed: {verdict['detail']}")
+
+    logger.warning(
+        f"[NATIVE TRAIL] {common.get('symbol')}: {verdict['detail']} — "
+        f"cancelling and re-placing with counter-swapped fields"
+    )
+    outcome = await _cancel_order_verified(order_id, expected_qty=qty)
+    if outcome not in (CANCEL_CONFIRMED, CANCEL_NONE):
+        raise Exception(
+            f"could not cancel swapped trail {order_id} ({outcome}) before counter-swap retry"
+        )
+
+    prices = trailing_engine.native_trail_order_prices(
+        intended_offset, intended_trigger, counter_swap=True,
+    )
+    common["clientOrderId"] = str(uuid.uuid4().int)[:18]
+    common["stopPrice"] = prices["stop_price"]
+    common["offsetValue"] = prices["offset_value"]
+    placed = await _place_order_smart(kind, common, tokens)
+    order_id = _order_id_from_place(placed)
+    resting = await _read_resting_trail_offset(order_id)
+    verdict = trailing_engine.classify_resting_trail_offset(
+        intended_offset, intended_trigger, resting,
+    )
+    if verdict["status"] != "ok":
+        if order_id:
+            await _cancel_order_verified(order_id, expected_qty=qty)
+        raise Exception(
+            f"counter-swapped native trail still wrong: {verdict['detail']}"
+        )
+    return placed, order_id, "counter_swap"
+
+
 async def _arm_native_trail(
     ticker: str,
     offset: Optional[float] = None,
@@ -20320,6 +20533,7 @@ async def _arm_native_trail(
             f"{remaining} left; re-protected by the reconciler, no trail armed"
         )
 
+    prices = trailing_engine.native_trail_order_prices(offset_value, trigger)
     client_id = str(uuid.uuid4().int)[:18]
     common = dict(
         resp_format="json",
@@ -20328,8 +20542,8 @@ async def _arm_native_trail(
         orderAction="SELL_CLOSE" if is_option else "SELL",
         clientOrderId=client_id,
         priceType=TRAILING_STOP_CNST,
-        stopPrice=trigger,
-        offsetValue=offset_value,
+        stopPrice=prices["stop_price"],
+        offsetValue=prices["offset_value"],
         quantity=qty,
         orderTerm="GOOD_FOR_DAY",
         marketSession="REGULAR",
@@ -20341,12 +20555,21 @@ async def _arm_native_trail(
             strikePrice=float(contract["strike"]),
             expiryDate=str(contract["expiration"])[:10],
         )
+    field_mode = "documented"
     try:
-        placed = await _place_order_smart("option" if is_option else "equity", common, tokens)
+        _placed, order_id, field_mode = await _place_verified_native_trail(
+            "option" if is_option else "equity",
+            common,
+            tokens,
+            intended_offset=offset_value,
+            intended_trigger=trigger,
+        )
+        client_id = str(common.get("clientOrderId") or client_id)
     except Exception as e:
         # THE NAKED WINDOW. The old stop is provably gone and the trail did not
-        # go on. Restore protection before surfacing the failure — returning an
-        # error with the position unprotected is the worst possible outcome.
+        # go on (or was cancelled after a bad Stop Val). Restore protection
+        # before surfacing the failure — returning an error with the position
+        # unprotected is the worst possible outcome.
         logger.error(f"[NATIVE TRAIL] {ticker} placement FAILED ({e}) — restoring the protective stop")
         try:
             fresh = await state.get_position(ticker)
@@ -20362,31 +20585,35 @@ async def _arm_native_trail(
             raise Exception(f"{ticker}: trail failed and re-arm FAILED ({e}) — POSITION UNPROTECTED")
         raise Exception(f"{ticker}: trail placement failed ({e}) — protective stop restored")
 
-    order_id = _order_id_from_place(placed)
     pos = await state.get_position(ticker) or pos
     pos["stop_order_id"] = None
     pos["native_trail_order_id"] = str(order_id) if order_id else None
     pos["native_trail_price_type"] = TRAILING_STOP_CNST
     pos["native_trail_source"] = source
+    pos["native_trail_field_mode"] = field_mode
+    pos["native_trail_offset"] = offset_value
     pos["native_trail_skip"] = None
     pos["native_trail_retry_after"] = None
     await state.set_position(ticker, pos)
     logger.info(
         f"[NATIVE TRAIL] {ticker} broker-native trailing stop RESTING: qty={qty} "
         f"offset={offset_value:.2f} ({rationale}) trigger={trigger:.2f} bid={bid:.2f} "
-        f"spread={spread if spread is None else round(spread, 2)} (order={order_id}) — engine trail stands down"
+        f"spread={spread if spread is None else round(spread, 2)} "
+        f"fields={field_mode} (order={order_id}) — engine trail stands down"
     )
     await trade_ledger.record("native_trail_armed", {
         "ticker": ticker, "qty": qty, "offset": offset_value, "trigger": trigger,
         "bid": round(bid, 4), "spread": None if spread is None else round(spread, 4),
         "rationale": rationale, "order_id": order_id,
         "replaced_stop_order_id": stop_order_id, "source": source,
+        "field_mode": field_mode,
     })
     return {
         "ticker": ticker, "order_id": order_id, "offset": offset_value,
         "trigger": trigger, "qty": qty, "bid": round(bid, 4),
         "spread": None if spread is None else round(spread, 4),
         "rationale": rationale, "replaced_stop_order_id": stop_order_id,
+        "field_mode": field_mode,
     }
 
 
@@ -26410,6 +26637,128 @@ async def _remember_native_skip(ticker: str, pos: dict, reason: str, detail: str
     logger.info(f"[NATIVE TRAIL] {ticker} keeping the fixed stop — {detail}")
 
 
+async def _maybe_repair_inflated_native_trail(
+    ticker: str,
+    pos: dict,
+    bid: float,
+    spread: Optional[float],
+    native_trail_id: str,
+) -> bool:
+    """Re-arm a broker trail whose Stop Val is clearly the swapped trigger.
+
+    Live 2026-11-13 GOOGL/SMCI rested T-Stop distances of 7.6 / 1.85 while
+    2×spread wanted ~0.80 / ~0.30. Those legs stay "protected" in name only
+    until the inflated offset is cancelled and a verified trail is placed.
+    Returns True when this pass owns the stop (repair attempted or declined
+    with a sticky skip) so the engine ratchet does not also touch it.
+    """
+    if _native_trail_retry_waiting(pos):
+        return True
+    if pos.get("native_trail_skip") == "inflated_offset_ok":
+        return True
+
+    contract = pos.get("contract") or {}
+    is_option = bool(contract.get("right")) or pos.get("entry_premium") is not None
+    entry = float(pos.get("entry_premium") if is_option else (pos.get("entry") or 0) or 0)
+    base_stop = float(pos.get("stop_premium" if is_option else "stop") or 0)
+    risk = (entry - base_stop) if (entry > 0 and base_stop > 0) else None
+    if is_option:
+        ask = (bid + spread) if (spread is not None and spread > 0 and bid > 0) else 0.0
+        tick = _option_tick_from_quote(bid or entry, bid, ask) or _safe_option_tick(bid or entry)
+    else:
+        tick = 0.01
+    floor = trailing_engine.native_trail_offset(spread, risk=risk, tick=tick)
+    if not floor["ok"]:
+        return True
+
+    resting_offset = await _read_resting_trail_offset(str(native_trail_id))
+    if resting_offset is None:
+        return True
+    if not trailing_engine.native_trail_offset_looks_inflated(
+        resting_offset, floor["offset"],
+    ):
+        if pos.get("native_trail_skip") != "inflated_offset_ok":
+            pos["native_trail_skip"] = "inflated_offset_ok"
+            pos["native_trail_offset"] = resting_offset
+            await state.set_position(ticker, pos)
+        return True
+
+    qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
+    logger.warning(
+        f"[NATIVE TRAIL] {ticker} resting offset {resting_offset:.2f} is inflated vs "
+        f"intended {float(floor['offset']):.2f} ({floor['detail']}) — cancelling "
+        f"{native_trail_id} and re-arming with verified fields"
+    )
+    outcome = await _cancel_order_verified(str(native_trail_id), expected_qty=qty)
+    if outcome == CANCEL_FILLED:
+        logger.warning(f"[NATIVE TRAIL] {ticker} inflated trail filled while repairing")
+        return True
+    if outcome not in (CANCEL_CONFIRMED, CANCEL_NONE):
+        await _remember_native_skip(
+            ticker, pos, "inflated_cancel_live",
+            f"could not cancel inflated trail {native_trail_id} ({outcome})",
+        )
+        return True
+
+    fresh = await state.get_position(ticker) or pos
+    fresh["native_trail_order_id"] = None
+    fresh["native_trail_price_type"] = None
+    fresh["native_trail_field_mode"] = None
+    fresh["stop_order_id"] = None
+    fresh["native_trail_skip"] = None
+    await state.set_position(ticker, fresh)
+
+    # Floor the new trigger at the old (too-loose) stopPrice if we can read it,
+    # otherwise at the journaled stop — never loosen what little protection
+    # the swapped trail still had.
+    min_trigger = base_stop if base_stop > 0 else None
+    try:
+        resp = await _reconcile_fetch_orders()
+        for order in reconciliation.parse_open_orders(resp):
+            if str(order.get("order_id") or "") != str(native_trail_id):
+                continue
+            old_stop = order.get("stop_price")
+            if old_stop is not None and float(old_stop) > 0:
+                min_trigger = max(float(min_trigger or 0), float(old_stop)) or float(old_stop)
+            break
+    except Exception:
+        pass
+
+    try:
+        await _arm_native_trail(ticker, min_trigger=min_trigger, source="repair")
+    except NativeTrailRefused as e:
+        await _remember_native_skip(ticker, fresh, "repair_refused", str(e))
+        try:
+            await _reconcile_rearm_guard(ticker, dict(await state.get_position(ticker) or fresh))
+        except Exception as re_arm_error:
+            await alerts.send(
+                "critical", "native_trail_repair_unprotected",
+                f"{ticker}: inflated trail cancelled, repair refused, and fixed stop "
+                f"re-arm failed — verify at your broker ({e}; re-arm: {re_arm_error})",
+                dedupe_key=f"native_trail_repair:{ticker}",
+            )
+        return True
+    except Exception as e:
+        logger.error(f"[NATIVE TRAIL] {ticker} inflated-trail repair failed: {e}")
+        fresh = await state.get_position(ticker) or fresh
+        fresh["native_trail_retry_after"] = (
+            _utcnow() + timedelta(seconds=NATIVE_TRAIL_RETRY_SECONDS)
+        ).isoformat()
+        fresh["native_trail_skip"] = str(e)[:240]
+        await state.set_position(ticker, fresh)
+        try:
+            await _reconcile_rearm_guard(ticker, dict(fresh))
+        except Exception as re_arm_error:
+            await alerts.send(
+                "critical", "native_trail_repair_unprotected",
+                f"{ticker}: inflated trail cancelled and repair failed — verify at your "
+                f"broker now ({e}; re-arm: {re_arm_error})",
+                dedupe_key=f"native_trail_repair:{ticker}",
+            )
+        return True
+    return True
+
+
 async def _maybe_hand_off_native_trail(
     ticker: str, pos: dict, bid: float, spread: Optional[float],
 ) -> bool:
@@ -26558,6 +26907,10 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     #     exit, and a naked short if it triggers).
     native_trail_id = pos.get("native_trail_order_id")
     if native_trail_id:
+        # May cancel/re-arm when the resting Stop Val is the swapped trigger.
+        await _maybe_repair_inflated_native_trail(
+            ticker, pos, bid, spread, str(native_trail_id),
+        )
         logger.info(
             f"[TRAIL] {ticker} broker-native trail {native_trail_id} owns the stop — "
             f"engine trail standing down (watermark still tracked)"

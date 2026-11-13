@@ -226,3 +226,76 @@ def test_native_trail_retry_waits_until_the_stamp():
     assert not main_bot._native_trail_retry_waiting({"native_trail_retry_after": past})
     assert not main_bot._native_trail_retry_waiting({})
     assert not main_bot._native_trail_retry_waiting({"native_trail_retry_after": "not-a-time"})
+
+
+def test_native_trail_order_prices_support_counter_swap():
+    documented = main_bot.trailing_engine.native_trail_order_prices(0.80, 7.60)
+    swapped = main_bot.trailing_engine.native_trail_order_prices(
+        0.80, 7.60, counter_swap=True,
+    )
+    assert documented == {"stop_price": 7.60, "offset_value": 0.80}
+    assert swapped == {"stop_price": 0.80, "offset_value": 7.60}
+
+
+def test_classify_resting_trail_offset_detects_the_etrade_swap():
+    # Live 2026-11-13 GOOGL shape: intended trail ~0.80, initial trigger ~7.60,
+    # broker Stop Val came back as 7.6 (the trigger).
+    ok = main_bot.trailing_engine.classify_resting_trail_offset(0.80, 7.60, 0.80)
+    swapped = main_bot.trailing_engine.classify_resting_trail_offset(0.80, 7.60, 7.60)
+    wrong = main_bot.trailing_engine.classify_resting_trail_offset(0.80, 7.60, 1.85)
+    unknown = main_bot.trailing_engine.classify_resting_trail_offset(0.80, 7.60, None)
+    assert ok["status"] == "ok"
+    assert swapped["status"] == "swapped"
+    assert wrong["status"] == "wrong"
+    assert unknown["status"] == "unknown"
+
+
+def test_native_trail_offset_looks_inflated_on_live_googl_smci_distances():
+    assert main_bot.trailing_engine.native_trail_offset_looks_inflated(7.6, 0.80)
+    assert main_bot.trailing_engine.native_trail_offset_looks_inflated(1.85, 0.30)
+    assert not main_bot.trailing_engine.native_trail_offset_looks_inflated(0.80, 0.80)
+    assert not main_bot.trailing_engine.native_trail_offset_looks_inflated(0.30, 0.30)
+
+
+def test_parse_open_orders_captures_trail_offset_value():
+    resp = {
+        "OrdersResponse": {
+            "Order": {
+                "orderId": 1598,
+                "OrderDetail": {
+                    "status": "OPEN",
+                    "priceType": "TRAILING_STOP_CNST",
+                    "stopPrice": 3.35,
+                    "offsetValue": 7.6,
+                    "Instrument": {
+                        "orderAction": "SELL_CLOSE",
+                        "orderedQuantity": 1,
+                        "filledQuantity": 0,
+                        "Product": {"symbol": "GOOGL", "securityType": "OPTN"},
+                    },
+                },
+            }
+        }
+    }
+    orders = main_bot.reconciliation.parse_open_orders(resp)
+    assert len(orders) == 1
+    assert orders[0]["order_id"] == "1598"
+    assert orders[0]["stop_price"] == 3.35
+    assert orders[0]["offset_value"] == 7.6
+    assert main_bot.reconciliation.trail_offset_from_order_detail(
+        {"trailPrice": 1.85}
+    ) == 1.85
+
+
+def test_order_detail_sends_offset_and_stop_together():
+    detail = main_bot.ETradeAsyncClient.order_detail(
+        [{"orderAction": "SELL_CLOSE", "quantity": 1}],
+        "TRAILING_STOP_CNST",
+        stop_price=7.60,
+        offset_value=0.80,
+    )
+    assert detail["priceType"] == "TRAILING_STOP_CNST"
+    assert detail["stopPrice"] == 7.60
+    assert detail["offsetValue"] == 0.80
+    assert detail["trailPrice"] == 0.80
+    assert detail["offsetType"] == "TRAILING_STOP_CNST"
