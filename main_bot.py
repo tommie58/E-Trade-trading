@@ -11835,8 +11835,21 @@ FORCE_EXECUTE_ALLOWED = os.getenv("FORCE_EXECUTE_ALLOWED", "false").strip().lowe
 }
 
 
+def normalize_account_id(raw: Optional[str]) -> Optional[str]:
+    """Collapse UI account forms to the alnum id E*TRADE stores.
+
+    The app and statements show ``888103-8595`` / ``146 261816``; the API
+    accountId is the same digits without separators. Opaque accountIdKey
+    values stay unchanged when they already have no separators.
+    """
+    if raw is None:
+        return None
+    cleaned = "".join(ch for ch in str(raw) if ch.isalnum())
+    return cleaned or None
+
+
 def sanitize_account_id(raw: Optional[str]) -> Tuple[Optional[str], bool]:
-    """Strip stray whitespace out of an account number.
+    """Strip stray whitespace and punctuation out of an account number.
 
     A real deployment carried ``ETRADE_ACCOUNT_ID="146 261816"`` — the digits
     were right, an invisible space was not. E*TRADE matches the account number
@@ -11845,23 +11858,53 @@ def sanitize_account_id(raw: Optional[str]) -> Tuple[Optional[str], bool]:
     harmless; on a login with several it aims real orders at whichever account
     E*TRADE happens to list first. The only warning was a log line nobody reads.
 
-    Internal whitespace is removed, not just trimmed: a copy-paste from a
-    statement ("146 261816") is the exact shape of the bug. Returns the cleaned
-    value and whether anything was actually repaired, so the caller can say so.
+    Internal whitespace and display hyphens are removed, not just trimmed: a
+    copy-paste from the E*TRADE UI ("888103-8595") is the exact shape of the
+    crypto-account bug. Returns the cleaned value and whether anything was
+    actually repaired, so the caller can say so.
     """
     if raw is None:
         return None, False
-    cleaned = "".join(raw.split())
-    return (cleaned or None), (cleaned != raw.strip() or raw != raw.strip())
+    stripped = str(raw).strip()
+    cleaned = normalize_account_id(raw)
+    repaired = cleaned is not None and cleaned != stripped
+    return cleaned, repaired
+
+
+def account_ids_equivalent(left: Optional[str], right: Optional[str]) -> bool:
+    """True when two account id strings name the same account (dash-tolerant)."""
+    if left is None or right is None:
+        return False
+    a, b = str(left).strip(), str(right).strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return normalize_account_id(a) == normalize_account_id(b)
+
+
+def account_matches_id(acct: Optional[dict], requested: Optional[str]) -> bool:
+    """Match a requested id against an /accounts/list row's accountId or key."""
+    if not isinstance(acct, dict) or not requested:
+        return False
+    req = str(requested).strip()
+    if not req:
+        return False
+    return any(
+        account_ids_equivalent(acct.get(key), req)
+        for key in ("accountId", "accountIdKey")
+    )
 
 
 TARGET_ACCOUNT_ID, _ACCOUNT_ID_REPAIRED = sanitize_account_id(os.getenv("ETRADE_ACCOUNT_ID"))
-# Separate zerohash crypto account (desc like "Individual Crypto -8595").
+# Separate zerohash crypto account — Individual Crypto 888103-8595.
 # When unset the bot auto-picks the linked account whose description/type
 # contains "crypto". Brokerage buying power sweeps in; orders still must
-# route to this accountIdKey, not the equity/options one.
+# route to this accountIdKey, not the equity/options one. Default pins the
+# known Individual Crypto account so crypto never silently falls through to
+# brokerage when the env var is missing on a redeploy.
 TARGET_CRYPTO_ACCOUNT_ID, _CRYPTO_ACCOUNT_ID_REPAIRED = sanitize_account_id(
-    os.getenv("ETRADE_CRYPTO_ACCOUNT_ID")
+    os.getenv("ETRADE_CRYPTO_ACCOUNT_ID", "8881038595")
 )
 REDIS_URL = os.getenv("REDIS_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -11917,7 +11960,9 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # 5.87.0: crypto trading (BTC/ETH/SOL) on the linked zerohash account —
 # instrument=crypto entries alongside options-only mode, dollar or coin sizing,
 # MARKET/LIMIT Good-for-Day, 24/7 session (no equity calendar gate).
-BOT_VERSION = "5.87.0-crypto"
+# 5.87.1: pin Individual Crypto 888103-8595 as the crypto-only routing target
+# (dash-tolerant id match, Redis crypto pin, refuse crypto as options pin).
+BOT_VERSION = "5.87.1-crypto"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -12863,6 +12908,10 @@ _account_binding: Optional[Dict[str, Any]] = None
 # relink (the pin is the user's intent, not session state).
 ACCOUNT_PIN_KEY = "etrade:pinned_account"
 _pinned_account_id: Optional[str] = None
+# Crypto-only pin (POST /etrade/crypto/account/select). Separate from the
+# brokerage pin — zerohash crypto must never receive option/equity orders.
+CRYPTO_ACCOUNT_PIN_KEY = "etrade:pinned_crypto_account"
+_pinned_crypto_account_id: Optional[str] = None
 
 # ACCESS TOKENS IN THE STATE STORE.
 # Tokens used to persist to Postgres ONLY. With no working DATABASE_URL that is
@@ -15297,6 +15346,10 @@ async def get_etrade_account():
                 "accountDesc": a.get("accountDesc"),
                 "accountName": a.get("accountName"),
                 "institutionType": a.get("institutionType"),
+                # Zerohash Individual Crypto rows are crypto-only — the app must
+                # not offer them as the options/equity trading pin.
+                "is_crypto": is_crypto_account(a),
+                "crypto_only": is_crypto_account(a),
             })
         # A successful authenticated call proves the session is alive.
         _mark_token_session(True, "account enumeration ok")
@@ -15338,20 +15391,52 @@ async def get_etrade_account():
         }
 
     pinned = await _load_pinned_account()
+    crypto_pinned = await _load_pinned_crypto_account()
+    crypto_routed: Dict[str, Any] = {}
+    if raw and CRYPTO_ENABLED:
+        try:
+            crypto_key = _resolved_crypto_account_id_key
+            if not crypto_key:
+                crypto_key = await _resolve_crypto_account_id_key(tokens)
+            crypto_chosen = next(
+                (a for a in raw if str(a.get("accountIdKey") or "") == str(crypto_key)),
+                None,
+            )
+            if crypto_chosen:
+                c_id = str(crypto_chosen.get("accountId") or "").strip()
+                crypto_routed = {
+                    "crypto_account_id": c_id or None,
+                    "crypto_account_id_key": str(crypto_chosen.get("accountIdKey") or "").strip() or None,
+                    "crypto_account_desc": (
+                        crypto_chosen.get("accountDesc") or crypto_chosen.get("accountName") or None
+                    ),
+                    "crypto_account_last4": c_id[-4:] if c_id else None,
+                }
+        except Exception as e:
+            logger.warning(f"Crypto account resolution failed during /etrade/account: {e}")
     return {
         "status": "linked",
         "linked": True,
         "accounts": accounts_out,
         **routed,
+        **crypto_routed,
         # Which account the USER pinned from the app (null = auto-select).
         "pinned_account_id": pinned,
+        "pinned_crypto_account_id": crypto_pinned,
         "account_pin_source": (
             "pinned" if pinned else ("env" if (TARGET_ACCOUNT_ID or "").strip() else "auto")
         ),
+        "crypto_account_pin_source": (
+            "pinned" if crypto_pinned
+            else ("env" if (TARGET_CRYPTO_ACCOUNT_ID or "").strip() else "auto")
+        ),
         "env_account_id": (TARGET_ACCOUNT_ID or "").strip() or None,
+        "env_crypto_account_id": (TARGET_CRYPTO_ACCOUNT_ID or "").strip() or None,
         # Provenance for the pick above — lets the app say "pinned" vs
         # "fell back to this one" without a second /status round-trip.
         "account_binding": _account_binding,
+        "crypto_account_binding": _crypto_account_binding,
+        "crypto_enabled": CRYPTO_ENABLED,
         "equity": balances.get("total"),
         "cash_buying_power": balances.get("available"),
         # Session health — `linked` means "tokens on file", these fields say
@@ -15424,7 +15509,7 @@ async def select_etrade_account(
         if isinstance(account_list, dict):
             account_list = [account_list]
         for acct in account_list:
-            if requested in {str(acct.get("accountId", "")), str(acct.get("accountIdKey", ""))}:
+            if account_matches_id(acct, requested):
                 matched = acct
                 break
         if not matched:
@@ -15435,10 +15520,20 @@ async def select_etrade_account(
             )
         if str(matched.get("accountStatus", "")).upper() == "CLOSED":
             raise HTTPException(400, f"Account {requested} is CLOSED at E*TRADE and cannot be traded.")
+        if is_crypto_account(matched):
+            raise HTTPException(
+                400,
+                f"Account {requested} is Individual Crypto (zerohash) and is crypto-only. "
+                f"Pin it via POST /etrade/crypto/account/select — option/equity orders "
+                f"stay on the brokerage account.",
+            )
 
     # Persist the pin by ACCOUNT ID (stable and human-recognisable); the opaque
     # accountIdKey is re-resolved from it on the next order.
-    pin_value = str(matched.get("accountId") or requested).strip() if matched else None
+    pin_value = (
+        normalize_account_id(str(matched.get("accountId") or requested))
+        or str(matched.get("accountId") or requested).strip()
+    ) if matched else None
     await _save_pinned_account(pin_value)
 
     resolved_key: Optional[str] = None
@@ -15474,6 +15569,110 @@ async def select_etrade_account(
         "resolved_account_id_key": resolved_key,
         "account_binding": _account_binding,
         "forced_with_open_positions": bool(open_positions and force),
+    }
+
+
+@app.post("/etrade/crypto/account/select")
+async def select_etrade_crypto_account(
+    data: dict = Body(default={}),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Pin the Individual Crypto (zerohash) account for instrument=crypto only.
+
+    Body: {"account_id": "8881038595"} | {"account_id": "888103-8595"} |
+          {"clear": true}
+    """
+    await _require_control_auth(x_rork_secret, "/etrade/crypto/account/select")
+    if not CRYPTO_ENABLED:
+        raise HTTPException(400, "CRYPTO_ENABLED=false — crypto account pin is disabled")
+    tokens = load_tokens()
+    if not tokens:
+        raise HTTPException(401, "E*TRADE account not linked")
+
+    requested = str(data.get("account_id") or data.get("account_id_key") or "").strip()
+    clearing = bool(data.get("clear")) or not requested
+    current_pin = await _load_pinned_crypto_account()
+    if clearing and not current_pin:
+        return {
+            "status": "success", "changed": False, "pinned_crypto_account_id": None,
+            "message": "No crypto account was pinned; the bot uses ETRADE_CRYPTO_ACCOUNT_ID / auto-detect.",
+        }
+
+    matched: Optional[Dict[str, Any]] = None
+    if not clearing:
+        try:
+            accounts_api = pyetrade.ETradeAccounts(
+                CONSUMER_KEY, CONSUMER_SECRET,
+                tokens["oauth_token"], tokens["oauth_token_secret"],
+                dev=is_sandbox,
+            )
+            resp = await _etrade_call(
+                accounts_api.list_accounts, resp_format="json", source="select_crypto_account",
+            )
+        except Exception as e:
+            logger.error(f"Crypto account select failed to enumerate accounts: {e}")
+            raise HTTPException(502, f"Could not read your E*TRADE accounts: {e}")
+        account_list = (((resp or {}).get("AccountListResponse") or {}).get("Accounts") or {}).get("Account") or []
+        if isinstance(account_list, dict):
+            account_list = [account_list]
+        for acct in account_list:
+            if account_matches_id(acct, requested):
+                matched = acct
+                break
+        if not matched:
+            raise HTTPException(
+                404,
+                f"Account {requested} is not one of the {len(account_list)} account(s) "
+                f"linked to this E*TRADE session.",
+            )
+        if not is_crypto_account(matched):
+            raise HTTPException(
+                400,
+                f"Account {requested} is not an Individual Crypto (zerohash) account — "
+                f"crypto orders are crypto-only. Use POST /etrade/account/select for brokerage.",
+            )
+        if str(matched.get("accountStatus", "")).upper() == "CLOSED":
+            raise HTTPException(400, f"Account {requested} is CLOSED at E*TRADE and cannot be traded.")
+
+    pin_value = (
+        normalize_account_id(str(matched.get("accountId") or requested))
+        or str(matched.get("accountId") or requested).strip()
+    ) if matched else None
+    await _save_pinned_crypto_account(pin_value)
+
+    resolved_key: Optional[str] = None
+    try:
+        if pin_value:
+            resolved_key = await _resolve_crypto_account_id_key(tokens)
+    except Exception as e:
+        logger.warning(f"Crypto account select: re-resolution failed (will retry on next use): {e}")
+
+    acct_id = str((matched or {}).get("accountId") or "").strip()
+    logger.info(
+        f"📌 CRYPTO account {'pinned to ****' + acct_id[-4:] if acct_id else 'pin cleared (env/auto)'}"
+    )
+    await alerts.send(
+        "info", "crypto_account_pin_changed",
+        (f"CRYPTO account pinned to ****{acct_id[-4:]} "
+         f"({(matched or {}).get('accountDesc', 'n/a')}) — crypto-only."
+         if pin_value else
+         "CRYPTO account pin cleared — env/auto-detect will choose again."),
+        dedupe_key=f"cryptopin:set:{pin_value or 'cleared'}",
+    )
+
+    return {
+        "status": "success",
+        "changed": pin_value != current_pin,
+        "pinned_crypto_account_id": pin_value,
+        "account_id": acct_id or None,
+        "account_id_key": str((matched or {}).get("accountIdKey") or "").strip() or None,
+        "account_desc": (matched or {}).get("accountDesc") or (matched or {}).get("accountName") or None,
+        "account_type": (matched or {}).get("accountType") or None,
+        "account_status": (matched or {}).get("accountStatus") or None,
+        "account_last4": acct_id[-4:] if acct_id else None,
+        "resolved_account_id_key": resolved_key,
+        "crypto_account_binding": _crypto_account_binding,
+        "crypto_only": True,
     }
 
 
@@ -16727,7 +16926,7 @@ async def _load_pinned_account() -> Optional[str]:
 async def _save_pinned_account(account_id: Optional[str]) -> None:
     """Persist (or clear) the pinned account and drop the cached key."""
     global _pinned_account_id, _resolved_account_id_key, _account_binding
-    value = (account_id or "").strip() or None
+    value = normalize_account_id(account_id) or ((account_id or "").strip() or None)
     if value:
         await state.set(ACCOUNT_PIN_KEY, value)
     else:
@@ -16736,6 +16935,40 @@ async def _save_pinned_account(account_id: Optional[str]) -> None:
     # Force re-resolution so the very next order routes to the new account.
     _resolved_account_id_key = None
     _account_binding = None
+
+
+async def _load_pinned_crypto_account() -> Optional[str]:
+    """Read the crypto-only pin from the state store into memory."""
+    global _pinned_crypto_account_id, _resolved_crypto_account_id_key
+    try:
+        raw = await state.get(CRYPTO_ACCOUNT_PIN_KEY)
+    except Exception as e:
+        logger.warning(f"could not read pinned crypto account: {e}")
+        return _pinned_crypto_account_id
+    pinned = normalize_account_id(raw) or ((raw or "").strip() or None)
+    if pinned != _pinned_crypto_account_id:
+        logger.info(f"Pinned CRYPTO account is now {pinned or 'unset (env/auto)'}")
+        _resolved_crypto_account_id_key = None
+    _pinned_crypto_account_id = pinned
+    return _pinned_crypto_account_id
+
+
+async def _save_pinned_crypto_account(account_id: Optional[str]) -> None:
+    """Persist (or clear) the crypto-only pin and drop the cached crypto key."""
+    global _pinned_crypto_account_id, _resolved_crypto_account_id_key, _crypto_account_binding
+    value = normalize_account_id(account_id) or ((account_id or "").strip() or None)
+    if value:
+        await state.set(CRYPTO_ACCOUNT_PIN_KEY, value)
+    else:
+        await state.delete(CRYPTO_ACCOUNT_PIN_KEY)
+    _pinned_crypto_account_id = value
+    _resolved_crypto_account_id_key = None
+    _crypto_account_binding = None
+
+
+def _brokerage_accounts(account_list: List[dict]) -> List[dict]:
+    """Accounts that may receive option/equity orders (exclude zerohash crypto)."""
+    return [a for a in account_list if not is_crypto_account(a)]
 
 
 async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
@@ -16748,8 +16981,8 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
     match) fall back to the first ACTIVE account. Cached per linked session.
 
     Precedence: user pin (POST /etrade/account/select) → ETRADE_ACCOUNT_ID →
-    first ACTIVE → first. The pin wins because it is a deliberate in-app choice
-    the user can see and change; the env var needs a redeploy.
+    first ACTIVE brokerage → first brokerage. Crypto (zerohash) accounts are
+    never chosen here — they are crypto-only via `_resolve_crypto_account_id_key`.
     """
     global _resolved_account_id_key
     # Refresh the pin FIRST — a pin set on another worker must invalidate this
@@ -16770,26 +17003,27 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
     if not account_list:
         raise Exception("E*TRADE returned no accounts for the linked session")
 
+    brokerage = _brokerage_accounts(account_list) or account_list
     target = (TARGET_ACCOUNT_ID or "").strip()
     chosen = None
     matched = False
     source = "fallback"
     if pinned:
-        for acct in account_list:
-            if pinned in {str(acct.get("accountId", "")), str(acct.get("accountIdKey", ""))}:
+        for acct in brokerage:
+            if account_matches_id(acct, pinned):
                 chosen = acct
                 matched = True
                 source = "pinned"
                 break
         if not chosen:
             logger.warning(
-                f"⚠️ Pinned account {pinned} matches none of the {len(account_list)} "
-                f"linked account(s) — the pin is stale (account closed or a different "
-                f"E*TRADE login is linked). Falling back."
+                f"⚠️ Pinned account {pinned} matches none of the {len(brokerage)} "
+                f"brokerage account(s) — the pin is stale (account closed, crypto-only, "
+                f"or a different E*TRADE login is linked). Falling back."
             )
     if not chosen and target:
-        for acct in account_list:
-            if target in {str(acct.get("accountId", "")), str(acct.get("accountIdKey", ""))}:
+        for acct in brokerage:
+            if account_matches_id(acct, target):
                 chosen = acct
                 matched = True
                 source = "env"
@@ -16797,12 +17031,12 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
         if not chosen:
             logger.warning(
                 f"⚠️ ETRADE_ACCOUNT_ID does not match any accountId/accountIdKey "
-                f"among {len(account_list)} account(s) — falling back to first ACTIVE account"
+                f"among {len(brokerage)} brokerage account(s) — falling back to first ACTIVE account"
             )
     if not chosen:
         chosen = next(
-            (a for a in account_list if str(a.get("accountStatus", "")).upper() == "ACTIVE"),
-            account_list[0],
+            (a for a in brokerage if str(a.get("accountStatus", "")).upper() == "ACTIVE"),
+            brokerage[0],
         )
 
     key = chosen.get("accountIdKey")
@@ -16867,10 +17101,13 @@ async def _resolve_crypto_account_id_key(tokens: Dict[str, str]) -> str:
     """Return the accountIdKey for the linked zerohash crypto account.
 
     Crypto orders MUST NOT route to the brokerage pin — E*TRADE keeps a
-    separate Individual Crypto account. Precedence: ETRADE_CRYPTO_ACCOUNT_ID
-    → first ACTIVE account whose desc/type mentions crypto/zerohash.
+    separate Individual Crypto account (e.g. Individual Crypto 888103-8595).
+    Precedence: crypto pin (POST /etrade/crypto/account/select) →
+    ETRADE_CRYPTO_ACCOUNT_ID → first ACTIVE account whose desc/type mentions
+    crypto/zerohash.
     """
     global _resolved_crypto_account_id_key, _crypto_account_binding
+    pinned = await _load_pinned_crypto_account()
     if _resolved_crypto_account_id_key:
         return _resolved_crypto_account_id_key
 
@@ -16889,21 +17126,45 @@ async def _resolve_crypto_account_id_key(tokens: Dict[str, str]) -> str:
     target = (TARGET_CRYPTO_ACCOUNT_ID or "").strip()
     chosen = None
     source = "fallback"
-    if target:
+    if pinned:
         for acct in account_list:
-            if target in {str(acct.get("accountId", "")), str(acct.get("accountIdKey", ""))}:
+            if account_matches_id(acct, pinned) and is_crypto_account(acct):
+                chosen = acct
+                source = "pinned"
+                break
+        if not chosen:
+            logger.warning(
+                f"⚠️ Pinned CRYPTO account {pinned} matches no linked crypto "
+                f"account — falling through to env/auto"
+            )
+    if not chosen and target:
+        for acct in account_list:
+            if account_matches_id(acct, target):
+                if not is_crypto_account(acct):
+                    raise LocalRefusal(
+                        f"ETRADE_CRYPTO_ACCOUNT_ID ({target}) matched a non-crypto "
+                        f"account ({acct.get('accountDesc') or acct.get('accountName') or 'n/a'}) "
+                        f"— crypto orders are crypto-only"
+                    )
                 chosen = acct
                 source = "env"
                 break
         if not chosen:
-            raise LocalRefusal(
-                f"ETRADE_CRYPTO_ACCOUNT_ID ({target}) matches none of the "
-                f"{len(account_list)} linked account(s)"
+            # Env default may be set before the account is linked — fall back to
+            # auto-detect rather than hard-failing every crypto path.
+            logger.warning(
+                f"⚠️ ETRADE_CRYPTO_ACCOUNT_ID ({target}) matches none of the "
+                f"{len(account_list)} linked account(s) — falling back to auto-detect"
             )
     if not chosen:
         crypto_accts = [a for a in account_list if is_crypto_account(a)]
         active = [a for a in crypto_accts if str(a.get("accountStatus", "")).upper() == "ACTIVE"]
-        chosen = (active or crypto_accts or [None])[0]
+        # Prefer the known Individual Crypto ****8595 when several crypto rows exist.
+        preferred = [
+            a for a in (active or crypto_accts)
+            if account_matches_id(a, "8881038595") or str(a.get("accountId") or "").endswith("8595")
+        ]
+        chosen = (preferred or active or crypto_accts or [None])[0]
         source = "auto"
     if not chosen:
         raise LocalRefusal(
@@ -16918,12 +17179,14 @@ async def _resolve_crypto_account_id_key(tokens: Dict[str, str]) -> str:
     acct_id = str(chosen.get("accountId", ""))
     _crypto_account_binding = {
         "configured": target or None,
+        "pinned": pinned,
         "source": source,
         "resolved_account_id": acct_id or None,
         "resolved_account_id_key": _resolved_crypto_account_id_key,
         "resolved_last4": acct_id[-4:] if acct_id else None,
         "resolved_description": chosen.get("accountDesc") or chosen.get("accountName") or None,
         "account_count": len(account_list),
+        "crypto_only": True,
     }
     logger.info(
         f"✅ Resolved CRYPTO accountIdKey for ****{acct_id[-4:] if acct_id else '????'} "
@@ -28378,6 +28641,7 @@ async def on_startup():
     await _announce_ledger_memory()
     # Which account the user pinned from the app (survives restarts/redeploys).
     await _load_pinned_account()
+    await _load_pinned_crypto_account()
     # SHARED POLICY — re-adopt the gate/risk numbers the app last pushed. Env
     # only seeds the very first boot; without this, every redeploy silently
     # reverts to defaults while the settings screen keeps showing the
@@ -29382,6 +29646,9 @@ async def status():
         },
         "alert_webhook_configured": alerts.webhook_configured(),
         "account_binding": _account_binding,
+        "crypto_account_binding": _crypto_account_binding,
+        "crypto_enabled": CRYPTO_ENABLED,
+        "env_crypto_account_id": (TARGET_CRYPTO_ACCOUNT_ID or "").strip() or None,
         "recent_dispatches": await _recent_dispatch_verdicts(20),
         "broker_linked": load_tokens() is not None,
         **_token_session_fields(),

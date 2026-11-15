@@ -51,7 +51,7 @@ E*TRADE crypto (zerohash) is supported alongside options-only mode for **BTC**, 
 - `amount_usd` (or `dollar_amount`) — USD notional, matching the app ticket Amount field ($10 min / $500k max), or
 - `coin_quantity` / `quantity_type: "QUANTITY"` — fractional coin amount (up to 8 decimals)
 
-Market or limit (`limit_price`), Good for Day. Crypto is **24/7** (no equity calendar gate). Orders route to the linked Individual Crypto account (`ETRADE_CRYPTO_ACCOUNT_ID`, or auto-detected from account description). Broker stop orders are not available for crypto — exits are MARKET/LIMIT only.
+Market or limit (`limit_price`), Good for Day. Crypto is **24/7** (no equity calendar gate). Orders route to the linked Individual Crypto account only (`ETRADE_CRYPTO_ACCOUNT_ID=8881038595` by default, Redis pin via `POST /etrade/crypto/account/select`, or auto-detected from account description). That account is **crypto-only** — it cannot be pinned as the options/equity trading account. Broker stop orders are not available for crypto — exits are MARKET/LIMIT only.
 
 `GET /health` and `GET /healthz` return status, version, and whether a secret is configured. Positions, stops, the guardian, and the cost model are on `GET /status`, which requires the secret.
 
