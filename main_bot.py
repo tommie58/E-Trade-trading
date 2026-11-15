@@ -1639,6 +1639,44 @@ class ETradeAsyncClient:
         }
 
     @staticmethod
+    def normalize_crypto_symbol(symbol: str) -> str:
+        """BTC/USD, BTC-USD, BTCUSD → BTC. E*TRADE crypto pairs settle in USD."""
+        raw = str(symbol or "").strip().upper().replace(" ", "")
+        for sep in ("/", "-", "_"):
+            if sep in raw:
+                raw = raw.split(sep, 1)[0]
+                break
+        if raw.endswith("USD") and len(raw) > 3:
+            raw = raw[:-3]
+        return raw
+
+    @staticmethod
+    def crypto_instrument(symbol: str, order_action: str, quantity: float,
+                          quantity_type: str = "DOLLAR",
+                          currency: str = "USD") -> Dict[str, Any]:
+        """Zerohash crypto leg. Quantity may be USD notional (DOLLAR) or coin
+        amount (QUANTITY, up to 8 decimals). ALL_I_OWN is for full closes."""
+        qtype = str(quantity_type or "DOLLAR").upper()
+        if qtype not in {"DOLLAR", "QUANTITY", "ALL_I_OWN"}:
+            raise ValueError(f"unsupported crypto quantityType: {quantity_type}")
+        inst: Dict[str, Any] = {
+            "Product": {
+                "securityType": "CRYPTO",
+                "symbol": ETradeAsyncClient.normalize_crypto_symbol(symbol),
+            },
+            "orderAction": str(order_action).upper(),
+            "quantityType": qtype,
+            "currency": str(currency or "USD").upper(),
+        }
+        if qtype != "ALL_I_OWN":
+            q = float(quantity)
+            if q <= 0:
+                raise ValueError("crypto quantity must be positive")
+            # Dollar notionals keep cents; coin amounts keep up to 8 decimals.
+            inst["quantity"] = round(q, 2) if qtype == "DOLLAR" else round(q, 8)
+        return inst
+
+    @staticmethod
     def option_instrument(symbol: str, call_put: str, strike: float,
                           expiry_iso: str, order_action: str, quantity: int) -> Dict[str, Any]:
         y, m, d = str(expiry_iso)[:10].split("-")
@@ -1823,6 +1861,29 @@ class ETradeAsyncClient:
             offset_value=offset_value,
         )
         return await self.preview_and_place(account_id_key, "OPTN", client_order_id, [detail])
+
+    async def place_crypto(self, account_id_key: str, client_order_id: str, symbol: str,
+                           order_action: str, quantity: float, price_type: str,
+                           quantity_type: str = "DOLLAR",
+                           limit_price: Optional[float] = None,
+                           currency: str = "USD",
+                           order_term: str = "GOOD_FOR_DAY") -> Dict[str, Any]:
+        """Place a crypto order on the linked zerohash account.
+
+        E*TRADE crypto (BTC/ETH/SOL) supports MARKET and LIMIT only — no stop
+        orders. Quantity is USD notional (DOLLAR) or coin amount (QUANTITY).
+        orderType stays EQ: the public enum has no CRYPTO value; the product
+        securityType carries CRYPTO.
+        """
+        price_type = str(price_type or "MARKET").upper()
+        if price_type not in {"MARKET", "LIMIT"}:
+            raise ValueError(f"crypto supports MARKET/LIMIT only, not {price_type}")
+        detail = self.order_detail(
+            [self.crypto_instrument(symbol, order_action, quantity,
+                                    quantity_type=quantity_type, currency=currency)],
+            price_type, limit_price=limit_price, order_term=order_term,
+        )
+        return await self.preview_and_place(account_id_key, "EQ", client_order_id, [detail])
 
     async def place_otoco_best_effort(self, account_id_key: str, client_order_id: str,
                                       order_type: str, entry_detail: Dict[str, Any],
@@ -2675,23 +2736,43 @@ def parse_broker_positions(portfolio_resp: Dict[str, Any]) -> Dict[str, dict]:
         for pos in _as_list(acct.get("Position")):
             product = pos.get("Product") or {}
             sec_type = str(product.get("securityType") or "EQ").upper()
+            # ProductId.typeCode may say CRYPTO when securityType is absent/EQ.
+            type_code = str((product.get("productId") or {}).get("typeCode")
+                            or product.get("typeCode") or "").upper()
+            if type_code == "CRYPTO":
+                sec_type = "CRYPTO"
             symbol = str(product.get("symbol") or "").upper()
             if not symbol:
                 continue
+            if sec_type == "CRYPTO":
+                # Normalize BTC/USD → BTC (same rules as etrade_async).
+                for sep in ("/", "-", "_"):
+                    if sep in symbol:
+                        symbol = symbol.split(sep, 1)[0]
+                        break
+                if symbol.endswith("USD") and len(symbol) > 3:
+                    symbol = symbol[:-3]
             try:
-                qty = int(float(pos.get("quantity") or 0))
+                # Crypto supports fractional coin quantities (up to 8 decimals).
+                raw_qty = float(pos.get("quantity") or 0)
+                qty = raw_qty if sec_type == "CRYPTO" else int(raw_qty)
             except (TypeError, ValueError):
                 qty = 0
             record = out.setdefault(symbol, {
-                "qty": 0, "eq_qty": 0, "optn_qty": 0,
+                "qty": 0, "eq_qty": 0, "optn_qty": 0, "crypto_qty": 0.0,
                 "security_type": sec_type, "occ": None, "optn_legs": [],
-                "eq_mv": 0.0, "optn_mv": 0.0,
+                "eq_mv": 0.0, "optn_mv": 0.0, "crypto_mv": 0.0,
             })
             record["qty"] += qty
             # MARKET VALUE per leg, so the app can price a position nothing in
             # this system opened (no entry, no stop). Unknown is never zero: one
             # unreadable lot makes the whole leg's value None.
-            mv_key = "optn_mv" if sec_type == "OPTN" else "eq_mv"
+            if sec_type == "OPTN":
+                mv_key = "optn_mv"
+            elif sec_type == "CRYPTO":
+                mv_key = "crypto_mv"
+            else:
+                mv_key = "eq_mv"
             try:
                 mv = float(pos.get("marketValue"))
                 if not math.isfinite(mv):
@@ -2722,6 +2803,9 @@ def parse_broker_positions(portfolio_resp: Dict[str, Any]) -> Dict[str, dict]:
                     "key": contract_key(product.get("callPut"),
                                         product.get("strikePrice"), expiry),
                 })
+            elif sec_type == "CRYPTO":
+                record["crypto_qty"] = float(record.get("crypto_qty") or 0) + float(qty)
+                record["security_type"] = "CRYPTO"
             else:
                 record["eq_qty"] += qty
     return out
@@ -11772,12 +11856,27 @@ def sanitize_account_id(raw: Optional[str]) -> Tuple[Optional[str], bool]:
 
 
 TARGET_ACCOUNT_ID, _ACCOUNT_ID_REPAIRED = sanitize_account_id(os.getenv("ETRADE_ACCOUNT_ID"))
+# Separate zerohash crypto account (desc like "Individual Crypto -8595").
+# When unset the bot auto-picks the linked account whose description/type
+# contains "crypto". Brokerage buying power sweeps in; orders still must
+# route to this accountIdKey, not the equity/options one.
+TARGET_CRYPTO_ACCOUNT_ID, _CRYPTO_ACCOUNT_ID_REPAIRED = sanitize_account_id(
+    os.getenv("ETRADE_CRYPTO_ACCOUNT_ID")
+)
 REDIS_URL = os.getenv("REDIS_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 CONSUMER_KEY = os.getenv("ETRADE_CONSUMER_KEY")
 CONSUMER_SECRET = os.getenv("ETRADE_CONSUMER_SECRET")
 
 is_sandbox = ENV == "sandbox"
+
+# Crypto (zerohash via E*TRADE): BTC, ETH, SOL. Min $10 / max $500k notional.
+# 0.50% commission on notional. 24/7. MARKET + LIMIT only (no broker stops).
+CRYPTO_ENABLED = os.getenv("CRYPTO_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+CRYPTO_SYMBOLS = frozenset({"BTC", "ETH", "SOL"})
+CRYPTO_MIN_USD = float(os.getenv("CRYPTO_MIN_USD", "10"))
+CRYPTO_MAX_USD = float(os.getenv("CRYPTO_MAX_USD", "500000"))
+CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 
 # Bump on every deploy-relevant change. Reported by /health and /etrade/auth/start
 # so the app/user can verify the running container matches the repo code.
@@ -11815,7 +11914,10 @@ is_sandbox = ENV == "sandbox"
 # 5.85.2: the scanner stamps a session-stable signal_id. 5.85.0 rejects every
 # live entry that lacks one, so a live scan found candidates and refused all
 # of them before a risk gate ran.
-BOT_VERSION = "5.86.1-native-trail-swapfix"
+# 5.87.0: crypto trading (BTC/ETH/SOL) on the linked zerohash account —
+# instrument=crypto entries alongside options-only mode, dollar or coin sizing,
+# MARKET/LIMIT Good-for-Day, 24/7 session (no equity calendar gate).
+BOT_VERSION = "5.87.0-crypto"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -11927,24 +12029,158 @@ ITM_EXPRESSION_ENABLED = os.getenv("ITM_EXPRESSION_ENABLED", "true").strip().low
 # Set false to restore overnight holds (EOD flatten only for expiring contracts).
 DAY_TRADE_MODE = os.getenv("DAY_TRADE_MODE", "true").strip().lower() not in {"false", "0", "no"}
 # OPTIONS ONLY — the account trades option contracts, never shares. Every
-# ENTRY whose instrument is not "option" is refused at the last gate before
-# the broker (closes still pass: a share position that already exists must
-# stay sellable). Default ON; OPTIONS_ONLY=false is the only way to re-open
-# the share path.
+# ENTRY whose instrument is not "option" (or "crypto" when CRYPTO_ENABLED) is
+# refused at the last gate before the broker (closes still pass: a share
+# position that already exists must stay sellable). Default ON;
+# OPTIONS_ONLY=false is the only way to re-open the share path.
 OPTIONS_ONLY = os.getenv("OPTIONS_ONLY", "true").strip().lower() not in {"false", "0", "no"}
 
 
-def entry_instrument_permitted(instrument: Any, is_close: bool, options_only: bool) -> Tuple[bool, str]:
+def entry_instrument_permitted(instrument: Any, is_close: bool, options_only: bool,
+                               crypto_enabled: bool = True) -> Tuple[bool, str]:
     """(allowed, reason) for an order's instrument. Pure. Closes always pass;
-    with options_only, an entry must be explicitly "option" — a missing or
-    unreadable instrument fails closed (it would otherwise default to shares)."""
+    with options_only, an entry must be explicitly "option" — or "crypto" when
+    crypto trading is enabled. A missing or unreadable instrument fails closed
+    (it would otherwise default to shares)."""
     if is_close or not options_only:
         return True, ""
-    if str(instrument or "").strip().lower() == "option":
-        return True, ""
     shown = str(instrument or "").strip().lower() or "unspecified"
+    if shown == "option":
+        return True, ""
+    if shown == "crypto":
+        if crypto_enabled:
+            return True, ""
+        return False, "crypto entries are disabled (CRYPTO_ENABLED=false)"
     return False, (f"options-only: share entries are disabled (instrument={shown}) — "
-                   "this account trades option contracts only")
+                   "this account trades option contracts"
+                   + (" and crypto" if crypto_enabled else " only"))
+
+
+def normalize_crypto_symbol(symbol: Any) -> str:
+    """BTC/USD, btc-usd, BTCUSD → BTC."""
+    return ETradeAsyncClient.normalize_crypto_symbol(str(symbol or ""))
+
+
+def is_crypto_account(acct: Optional[dict]) -> bool:
+    """True when an /accounts/list row looks like the zerohash crypto account."""
+    if not isinstance(acct, dict):
+        return False
+    blob = " ".join(
+        str(acct.get(k) or "") for k in (
+            "accountDesc", "accountName", "accountType", "institutionType",
+        )
+    ).lower()
+    return "crypto" in blob or "zerohash" in blob
+
+
+def plan_crypto_order(payload: dict, available_usd: Optional[float] = None,
+                      risk_pct: float = 8.0) -> Dict[str, Any]:
+    """Pure sizing/routing for a crypto entry or close.
+
+    Prefers an explicit USD notional (`amount_usd` / `dollar_amount`), then a
+    coin quantity, then risk_pct of available buying power. Enforces the
+    E*TRADE $10–$500k band on dollar notionals and the BTC/ETH/SOL allow-list.
+    """
+    symbol = normalize_crypto_symbol(payload.get("ticker") or payload.get("symbol"))
+    if symbol not in CRYPTO_SYMBOLS:
+        return {
+            "ok": False, "reason": (
+                f"unsupported crypto symbol {symbol or '(blank)'} — "
+                f"E*TRADE crypto is BTC, ETH, or SOL only"
+            ),
+        }
+    is_close = _is_close_payload(payload) or str(payload.get("action") or "").upper() in {
+        "EXIT", "CLOSE", "SELL",
+    }
+    action = "SELL" if is_close else "BUY"
+    if not is_close and str(payload.get("action") or "BUY").upper() not in {"BUY", "LONG"}:
+        return {"ok": False, "reason": "crypto entries are buy-only (no short crypto)"}
+
+    # Explicit coin quantity (fractional OK).
+    coin_raw = payload.get("coin_quantity")
+    if coin_raw is None and str(payload.get("quantity_type") or "").upper() == "QUANTITY":
+        coin_raw = payload.get("quantity") or payload.get("position_size_shares")
+    try:
+        coin_qty = float(coin_raw) if coin_raw is not None else 0.0
+    except (TypeError, ValueError):
+        coin_qty = 0.0
+
+    # Explicit dollar notional — matches the app ticket's Amount field.
+    usd_raw = (
+        payload.get("amount_usd")
+        or payload.get("dollar_amount")
+        or payload.get("amount")
+    )
+    if usd_raw is None and str(payload.get("quantity_type") or "").upper() == "DOLLAR":
+        usd_raw = payload.get("quantity")
+    try:
+        amount_usd = float(usd_raw) if usd_raw is not None else 0.0
+    except (TypeError, ValueError):
+        amount_usd = 0.0
+
+    limit_raw = payload.get("limit_price") or payload.get("entry")
+    try:
+        limit_price = float(limit_raw) if limit_raw is not None else None
+    except (TypeError, ValueError):
+        limit_price = None
+    if limit_price is not None and (not math.isfinite(limit_price) or limit_price <= 0):
+        limit_price = None
+    price_type = "LIMIT" if limit_price else "MARKET"
+
+    if is_close:
+        if coin_qty > 0:
+            return {
+                "ok": True, "symbol": symbol, "action": action, "is_close": True,
+                "quantity_type": "QUANTITY", "quantity": round(coin_qty, 8),
+                "amount_usd": None, "price_type": price_type, "limit_price": limit_price,
+                "reason": f"close {coin_qty} {symbol}",
+            }
+        return {
+            "ok": True, "symbol": symbol, "action": action, "is_close": True,
+            "quantity_type": "ALL_I_OWN", "quantity": 0.0,
+            "amount_usd": None, "price_type": price_type, "limit_price": limit_price,
+            "reason": f"close all {symbol}",
+        }
+
+    if coin_qty > 0 and amount_usd <= 0:
+        return {
+            "ok": True, "symbol": symbol, "action": action, "is_close": False,
+            "quantity_type": "QUANTITY", "quantity": round(coin_qty, 8),
+            "amount_usd": None, "price_type": price_type, "limit_price": limit_price,
+            "reason": f"buy {coin_qty} {symbol}",
+        }
+
+    if amount_usd <= 0:
+        # Size from risk % of buying power when the app omits an amount.
+        if available_usd is None or not math.isfinite(available_usd) or available_usd <= 0:
+            return {
+                "ok": False,
+                "reason": "crypto entry needs amount_usd (or coin_quantity), and buying power is unreadable",
+            }
+        pct = risk_pct if math.isfinite(risk_pct) and risk_pct > 0 else 8.0
+        amount_usd = available_usd * (pct / 100.0)
+        sized_from_risk = True
+    else:
+        sized_from_risk = False
+
+    if amount_usd + 1e-9 < CRYPTO_MIN_USD:
+        return {
+            "ok": False,
+            "reason": f"crypto notional ${amount_usd:.2f} is below the ${CRYPTO_MIN_USD:.0f} minimum",
+        }
+    if amount_usd > CRYPTO_MAX_USD:
+        amount_usd = CRYPTO_MAX_USD
+    amount_usd = round(amount_usd, 2)
+    return {
+        "ok": True, "symbol": symbol, "action": action, "is_close": False,
+        "quantity_type": "DOLLAR", "quantity": amount_usd,
+        "amount_usd": amount_usd, "price_type": price_type, "limit_price": limit_price,
+        "sized_from_risk": sized_from_risk,
+        "reason": (
+            f"buy ${amount_usd:.2f} of {symbol}"
+            + (f" ({risk_pct:g}% of buying power)" if sized_from_risk else "")
+        ),
+    }
 # How much ledger the shadow replay reads. Shadows accumulate slowly (one per
 # ticker×family at a time), so this is generous.
 CORE_LOOKBACK = int(os.getenv("CORE_LOOKBACK", "6000"))
@@ -12608,6 +12844,9 @@ _placement_sig: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 # "Code: 102, Please enter valid Account Key". We resolve the real key once
 # per session and cache it here (cleared on relink/disconnect).
 _resolved_account_id_key: Optional[str] = None
+# Cached zerohash crypto accountIdKey (separate from the brokerage pin).
+_resolved_crypto_account_id_key: Optional[str] = None
+_crypto_account_binding: Optional[Dict[str, Any]] = None
 
 # Account-binding provenance for the resolved key: which account real orders
 # actually route to, whether it matched the configured ETRADE_ACCOUNT_ID, and
@@ -12976,7 +13215,8 @@ async def _replay_parked_signals() -> None:
                     "ticker": ticker, "age_seconds": int(age), "reason": "stale",
                 })
                 continue
-            if not _is_market_open() and not _force_execute(pd):
+            is_crypto = str(pd.get("instrument") or "").lower() == "crypto"
+            if not is_crypto and not _is_market_open() and not _force_execute(pd):
                 logger.info(f"Dropping parked entry {ticker} — market closed")
                 await trade_ledger.record("parked_signal_dropped", {
                     "ticker": ticker, "age_seconds": int(age), "reason": "market_closed",
@@ -13242,6 +13482,10 @@ def describe_dispatch_route(pd: dict) -> Tuple[str, str]:
             pd.get("option_right") or pd.get("call_put") or "CALL",
         )
         return intent, routed
+    if instrument == "crypto":
+        if is_close or action in {"EXIT", "CLOSE", "SELL"}:
+            return "close", "SELL"
+        return intent, "BUY"
     if is_close or action in {"EXIT", "CLOSE"}:
         return "close", "SELL"
     return intent, action
@@ -13880,6 +14124,51 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
         blocked.append("kill switch active")
 
     is_probe = _is_connectivity_test(p)
+    is_crypto = str(p.get("instrument") or "").lower() == "crypto"
+
+    # CRYPTO — equity quality gates (rvol / mtf / score / opening hold) do not
+    # apply to zerohash pairs. Keep the book limits: kill switch (above),
+    # runaway breaker, one position per coin, daily loss, max positions.
+    if is_crypto:
+        if not CRYPTO_ENABLED:
+            blocked.append("crypto entries are disabled (CRYPTO_ENABLED=false)")
+        symbol = normalize_crypto_symbol(p.get("ticker"))
+        if symbol not in CRYPTO_SYMBOLS:
+            blocked.append(
+                f"unsupported crypto symbol {symbol or '(blank)'} — BTC, ETH, or SOL only"
+            )
+        try:
+            daily_c = await state.get_daily()
+            if daily_c["trades_today"] >= RUNAWAY_TRADE_CIRCUIT_BREAKER:
+                blocked.append(
+                    f"runaway circuit breaker: {daily_c['trades_today']} entries today — this is a "
+                    f"dispatch loop, not a trading day"
+                )
+        except Exception as e:
+            logger.warning(f"daily counter unreadable (crypto runaway breaker skipped): {e}")
+        ticker_c = symbol or str(p.get("ticker") or "").upper()
+        if ticker_c and ticker_c in (await state.all_positions()):
+            blocked.append(f"already in {ticker_c}")
+        try:
+            daily_a = await state.get_daily()
+            positions_a = await state.all_positions()
+            blocked.extend(assess_app_risk_gates(
+                len(positions_a),
+                daily_a.get("realized_pnl_today_pct"),
+                live_policy("daily_loss_limit_pct"),
+                sum(position_risk_usd(x) for x in positions_a.values()),
+                estimate_entry_risk_usd(p),
+                await _risk_account_reference(),
+                MAX_CONCURRENT_POSITIONS,
+                APP_MAX_OPEN_RISK_PCT,
+            ))
+        except Exception as e:
+            blocked.append(f"crypto book limits unreadable ({str(e)[:80]}) — entry refused")
+        if blocked:
+            logger.warning(f"CRYPTO — {ticker_c or 'entry'} refused: {' · '.join(blocked)}")
+        else:
+            logger.info(f"CRYPTO — {ticker_c or 'entry'} passed book risk gates")
+        return len(blocked) == 0, blocked
 
     # APP DECIDES (see APP_DECIDES): an app-origin entry meets the kill
     # switch, volume verification, setup verification, and the server score
@@ -14442,10 +14731,16 @@ class WebhookPayload(BaseModel):
     call_put: Optional[str] = None
     contracts: Optional[int] = None
     option_contracts: Optional[int] = None
-    quantity: Optional[int] = None
+    quantity: Optional[float] = None
     limit_price: Optional[float] = None
     option_limit_price: Optional[float] = None
     position_size_shares: Optional[int] = None
+    # Crypto (instrument=crypto): USD notional matches the app ticket Amount
+    # field. quantity_type is DOLLAR (default) or QUANTITY (coin amount).
+    amount_usd: Optional[float] = None
+    dollar_amount: Optional[float] = None
+    coin_quantity: Optional[float] = None
+    quantity_type: Optional[str] = None
     # Stop / trailing-stop telemetry from the app. Informational on entries —
     # the Auto-Exit engine handles exits app-side by dispatching SELL_CLOSE.
     # Used broker-side ONLY on a SELL_CLOSE with broker_stop=true.
@@ -14612,6 +14907,7 @@ def _token_session_fields() -> Dict[str, Any]:
 
 def save_tokens(token: str, token_secret: str):
     global _current_tokens, _resolved_account_id_key, _account_binding, _token_source
+    global _resolved_crypto_account_id_key, _crypto_account_binding
     logger.info("=== NEW TOKENS RECEIVED ===")
     # Fresh tokens are validated by the auth flow before they get here — the
     # session starts ACTIVE.
@@ -14620,6 +14916,8 @@ def save_tokens(token: str, token_secret: str):
     _token_source = "relink"
     _resolved_account_id_key = None  # re-resolve accountIdKey for the new session
     _account_binding = None
+    _resolved_crypto_account_id_key = None
+    _crypto_account_binding = None
     # A fresh link is an explicit user action — clear any tripped breaker so
     # the relinked session starts clean instead of rejecting with 503.
     try:
@@ -15262,10 +15560,13 @@ async def etrade_disconnect(
     """
     await _require_control_auth(x_rork_secret, "/etrade/disconnect")
     global _current_tokens, _resolved_account_id_key, _account_binding, _token_source
+    global _resolved_crypto_account_id_key, _crypto_account_binding
     _current_tokens = None
     _token_source = None
     _resolved_account_id_key = None
     _account_binding = None
+    _resolved_crypto_account_id_key = None
+    _crypto_account_binding = None
     _mark_token_session(False, "account disconnected by user")
     try:
         await state.delete(PARKED_KEY)
@@ -16560,6 +16861,75 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
             dedupe_key=f"acctbind:unset:{acct_id}",
         )
     return _resolved_account_id_key
+
+
+async def _resolve_crypto_account_id_key(tokens: Dict[str, str]) -> str:
+    """Return the accountIdKey for the linked zerohash crypto account.
+
+    Crypto orders MUST NOT route to the brokerage pin — E*TRADE keeps a
+    separate Individual Crypto account. Precedence: ETRADE_CRYPTO_ACCOUNT_ID
+    → first ACTIVE account whose desc/type mentions crypto/zerohash.
+    """
+    global _resolved_crypto_account_id_key, _crypto_account_binding
+    if _resolved_crypto_account_id_key:
+        return _resolved_crypto_account_id_key
+
+    accounts_api = pyetrade.ETradeAccounts(
+        CONSUMER_KEY, CONSUMER_SECRET,
+        tokens["oauth_token"], tokens["oauth_token_secret"],
+        dev=is_sandbox,
+    )
+    resp = await _etrade_call(accounts_api.list_accounts, resp_format="json", source="resolve_crypto_account")
+    account_list = (((resp or {}).get("AccountListResponse") or {}).get("Accounts") or {}).get("Account") or []
+    if isinstance(account_list, dict):
+        account_list = [account_list]
+    if not account_list:
+        raise LocalRefusal("E*TRADE returned no accounts — cannot place crypto")
+
+    target = (TARGET_CRYPTO_ACCOUNT_ID or "").strip()
+    chosen = None
+    source = "fallback"
+    if target:
+        for acct in account_list:
+            if target in {str(acct.get("accountId", "")), str(acct.get("accountIdKey", ""))}:
+                chosen = acct
+                source = "env"
+                break
+        if not chosen:
+            raise LocalRefusal(
+                f"ETRADE_CRYPTO_ACCOUNT_ID ({target}) matches none of the "
+                f"{len(account_list)} linked account(s)"
+            )
+    if not chosen:
+        crypto_accts = [a for a in account_list if is_crypto_account(a)]
+        active = [a for a in crypto_accts if str(a.get("accountStatus", "")).upper() == "ACTIVE"]
+        chosen = (active or crypto_accts or [None])[0]
+        source = "auto"
+    if not chosen:
+        raise LocalRefusal(
+            "no crypto account linked — open an Individual Crypto (zerohash) "
+            "account at E*TRADE, or set ETRADE_CRYPTO_ACCOUNT_ID"
+        )
+
+    key = chosen.get("accountIdKey")
+    if not key:
+        raise LocalRefusal("Matched crypto account has no accountIdKey")
+    _resolved_crypto_account_id_key = str(key)
+    acct_id = str(chosen.get("accountId", ""))
+    _crypto_account_binding = {
+        "configured": target or None,
+        "source": source,
+        "resolved_account_id": acct_id or None,
+        "resolved_account_id_key": _resolved_crypto_account_id_key,
+        "resolved_last4": acct_id[-4:] if acct_id else None,
+        "resolved_description": chosen.get("accountDesc") or chosen.get("accountName") or None,
+        "account_count": len(account_list),
+    }
+    logger.info(
+        f"✅ Resolved CRYPTO accountIdKey for ****{acct_id[-4:] if acct_id else '????'} "
+        f"(desc={chosen.get('accountDesc', 'n/a')}, source={source})"
+    )
+    return _resolved_crypto_account_id_key
 
 
 # ==================== SAFETY (distributed circuit breaker) ====================
@@ -19157,6 +19527,17 @@ async def _place_order_once(kind: str, common: dict, tokens: Dict[str, str]) -> 
                     price_type, limit_price=limit_price, stop_price=stop_price,
                     offset_value=offset_value,
                 )
+            if kind == "crypto":
+                # Crypto is raw-API only — pyetrade has no crypto order builder.
+                return await client.place_crypto(
+                    acct, cid, str(common["symbol"]), str(common["orderAction"]),
+                    float(common.get("quantity") or 0),
+                    price_type,
+                    quantity_type=str(common.get("quantityType") or "DOLLAR"),
+                    limit_price=limit_price,
+                    currency=str(common.get("currency") or "USD"),
+                    order_term=str(common.get("orderTerm") or "GOOD_FOR_DAY"),
+                )
             return await client.place_equity(
                 acct, cid, str(common["symbol"]), str(common["orderAction"]),
                 int(common["quantity"]), price_type,
@@ -19164,6 +19545,9 @@ async def _place_order_once(kind: str, common: dict, tokens: Dict[str, str]) -> 
                 offset_value=offset_value,
             )
         except ETradeAPIError as e:
+            if kind == "crypto":
+                # No pyetrade fallback for crypto — surface the broker error.
+                raise
             if _raw_place_fallback_safe(e.status_code, False):
                 logger.warning(f"RAW order path rejected ({e}) — falling back to pyetrade")
             else:
@@ -19171,7 +19555,11 @@ async def _place_order_once(kind: str, common: dict, tokens: Dict[str, str]) -> 
                 # pyetrade risks a double fill. Surface the ambiguity instead.
                 raise
         except httpx.ConnectError as e:
+            if kind == "crypto":
+                raise
             logger.warning(f"RAW order path unreachable before send ({e}) — falling back to pyetrade")
+    if kind == "crypto":
+        raise LocalRefusal("crypto orders require USE_RAW_ORDER_API (pyetrade has no crypto path)")
     orders = _orders_client(tokens)
     fn = orders.place_option_order if kind == "option" else orders.place_equity_order
     # NON-IDEMPOTENT — executed exactly once (no blind retry of a place).
@@ -24869,6 +25257,10 @@ async def execute_live_order(payload: dict):
     instrument = payload.get("instrument", "stock").lower()
     ticker = payload.get("ticker", "UNKNOWN")
     action = payload.get("action", "UNKNOWN").upper()
+    # Crypto pairs (BTC/USD) share one position key with the base symbol.
+    if instrument == "crypto":
+        ticker = normalize_crypto_symbol(ticker) or str(ticker).upper()
+        payload = {**payload, "ticker": ticker}
 
     logger.info(f"📥 Received signal → mode={mode}, instrument={instrument}, ticker={ticker}, action={action}")
 
@@ -24916,9 +25308,12 @@ async def execute_live_order(payload: dict):
         )
         return {"status": "refused", "reason": origin_reason}
 
-    # INSTRUMENT GATE — options only. Checked on the RAW payload field so a
-    # payload with no instrument (which used to default to shares) refuses.
-    inst_ok, inst_reason = entry_instrument_permitted(payload.get("instrument"), is_close, OPTIONS_ONLY)
+    # INSTRUMENT GATE — options only (crypto allowed when CRYPTO_ENABLED).
+    # Checked on the RAW payload field so a payload with no instrument
+    # (which used to default to shares) refuses.
+    inst_ok, inst_reason = entry_instrument_permitted(
+        payload.get("instrument"), is_close, OPTIONS_ONLY, CRYPTO_ENABLED,
+    )
     if not inst_ok:
         logger.error(f"🚫 {ticker} {action} — {inst_reason}")
         await trade_ledger.record("entry_refused_instrument", {
@@ -24938,7 +25333,8 @@ async def execute_live_order(payload: dict):
     if not is_close:
         if await state.is_killed():
             raise LocalRefusal("kill switch active — entry refused")
-        if not _is_market_open() and not _force_execute(payload):
+        # E*TRADE crypto (zerohash) is 24/7 — skip the equity calendar gate.
+        if instrument != "crypto" and not _is_market_open() and not _force_execute(payload):
             raise LocalRefusal("market closed — entry refused (exchange-aware calendar)")
 
     # LEARNING LOOP SIZING — entries only, never a probe. Re-judged here (a
@@ -24985,8 +25381,15 @@ async def execute_live_order(payload: dict):
         raise LocalRefusal("E*TRADE tokens not set")
 
     # NEVER pass the raw env value straight through — E*TRADE needs the opaque
-    # accountIdKey from /accounts/list (Error 102 otherwise).
-    account_id_key = await _resolve_account_id_key(tokens)
+    # accountIdKey from /accounts/list (Error 102 otherwise). Crypto orders
+    # route to the separate zerohash account, not the brokerage pin.
+    if instrument == "crypto":
+        if not CRYPTO_ENABLED:
+            return {"status": "refused", "reason": "crypto entries are disabled (CRYPTO_ENABLED=false)",
+                    "code": "crypto_disabled"}
+        account_id_key = await _resolve_crypto_account_id_key(tokens)
+    else:
+        account_id_key = await _resolve_account_id_key(tokens)
 
     sid = signal_identity(payload)
     if not is_close and mode == "live" and LIVE_TRADING and not is_sandbox and not sid:
@@ -26009,6 +26412,154 @@ async def execute_live_order(payload: dict):
                 else:
                     logger.warning(f"⚠️ {symbol} option entry has no derivable stop premium — no broker-side stop armed")
             return {"status": "success", "response": final}
+
+        elif instrument == "crypto":
+            # CRYPTO ORDER (zerohash via E*TRADE) — BTC / ETH / SOL only.
+            # MARKET or LIMIT, Good for Day. Dollar notional or coin quantity.
+            # No broker-side STOP (E*TRADE crypto does not support stop orders).
+            available = None
+            if not is_close:
+                try:
+                    available = await _available_funds()
+                except Exception as e:
+                    logger.warning(f"crypto buying power unreadable for {ticker}: {e}")
+            try:
+                risk_pct = float(live_policy("risk_per_trade_pct"))
+            except Exception:
+                risk_pct = float(os.getenv("RISK_PER_TRADE_PCT", "8") or 8)
+            plan = plan_crypto_order(payload, available_usd=available, risk_pct=risk_pct)
+            if not plan.get("ok"):
+                raise LocalRefusal(plan.get("reason") or "crypto order refused")
+            symbol = plan["symbol"]
+            common = dict(
+                resp_format="json",
+                accountIdKey=account_id_key,
+                symbol=symbol,
+                orderAction=plan["action"],
+                clientOrderId=client_order_id,
+                quantity=plan["quantity"],
+                quantityType=plan["quantity_type"],
+                currency="USD",
+                orderTerm="GOOD_FOR_DAY",
+                marketSession="REGULAR",
+                allOrNone=False,
+                priceType=plan["price_type"],
+            )
+            if plan.get("limit_price") is not None:
+                common["limitPrice"] = round(float(plan["limit_price"]), 2)
+
+            if plan["is_close"]:
+                tracked = await state.get_position(symbol) or {}
+                if plan["quantity_type"] == "ALL_I_OWN":
+                    # Prefer a known coin qty so the ledger can book the close;
+                    # fall back to ALL_I_OWN when qty was a USD placeholder.
+                    coin = 0.0
+                    if not tracked.get("qty_is_usd"):
+                        try:
+                            coin = float(tracked.get("filled_qty") or tracked.get("qty") or 0)
+                        except (TypeError, ValueError):
+                            coin = 0.0
+                    if coin > 0:
+                        common["quantityType"] = "QUANTITY"
+                        common["quantity"] = round(coin, 8)
+                logger.info(
+                    f"📤 Placing CRYPTO CLOSE: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}"
+                )
+                final = await _place_order_smart("crypto", common, tokens)
+                close_order_id = _order_id_from_place(final)
+                exit_fill = await _resolve_exit_fill(close_order_id)
+                if exit_fill:
+                    await _record_close(symbol, exit_fill, payload, close_reason="close_fill")
+                else:
+                    # Dollar/ALL_I_OWN closes may not yield a share price immediately.
+                    try:
+                        await state.delete_position(symbol)
+                    except Exception:
+                        pass
+                    await _defer_close_to_reconciler(symbol, close_order_id,
+                                                     "crypto close placed — fill sync deferred")
+                logger.info(f"✅ LIVE CRYPTO CLOSE SUCCESS: SELL {symbol}")
+                await _record_api_success()
+                await trade_ledger.record("crypto_order", {
+                    "ticker": symbol, "side": "SELL", "plan": plan,
+                    "order_id": close_order_id, "client_order_id": client_order_id,
+                })
+                return {"status": "success", "response": final, "crypto": True, "plan": plan}
+
+            # ENTRY — shrink dollar notionals by learning / portfolio weights.
+            qty = float(plan["quantity"])
+            for ctx in (learning_ctx, risk_ctx):
+                if not ctx:
+                    continue
+                try:
+                    w = float(ctx.get("weight"))
+                except (TypeError, ValueError):
+                    continue
+                if 0 < w < 1:
+                    qty = round(qty * w, 8 if plan["quantity_type"] == "QUANTITY" else 2)
+            if plan["quantity_type"] == "DOLLAR" and qty + 1e-9 < CRYPTO_MIN_USD:
+                raise LocalRefusal(
+                    f"crypto notional ${qty:.2f} after sizing is below the ${CRYPTO_MIN_USD:.0f} minimum"
+                )
+            if qty <= 0:
+                raise LocalRefusal("crypto quantity after sizing is zero")
+            common["quantity"] = qty
+            if plan["quantity_type"] == "DOLLAR":
+                plan = {**plan, "quantity": qty, "amount_usd": qty}
+
+            logger.info(
+                f"📤 Placing CRYPTO: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})} "
+                f"— {plan.get('reason')}"
+            )
+            # Place directly — the share funds-clamp path int()-casts quantity
+            # and would truncate fractional coin amounts.
+            final = await _place_order_smart("crypto", common, tokens)
+
+            entry_px = float(payload.get("entry") or common.get("limitPrice") or 0) or None
+            stop_px = float(payload.get("stop") or payload.get("stop_price") or 0) or None
+            # Coin entries record the coin qty. Dollar entries store the
+            # notional with qty_is_usd until reconcile heals the coin fill.
+            is_coin = plan["quantity_type"] == "QUANTITY"
+            record_qty = int(max(1, math.ceil(qty))) if not is_coin else max(1, int(math.ceil(qty)))
+            await _record_open(
+                symbol, record_qty, entry_px, stop_px, payload.get("target"), None, action,
+                payload.get("setup"), edge_ctx=_payload_edge(payload),
+                entry_signal=_entry_signal(payload),
+            )
+            try:
+                pos = await state.get_position(symbol) or {}
+                pos["instrument"] = "crypto"
+                pos["quantity_type"] = plan["quantity_type"]
+                if plan.get("amount_usd"):
+                    pos["amount_usd"] = float(plan["amount_usd"])
+                if is_coin:
+                    pos["qty"] = float(qty)
+                    pos["filled_qty"] = float(qty)
+                    pos["qty_is_usd"] = False
+                else:
+                    pos["qty"] = float(qty)
+                    pos["filled_qty"] = None
+                    pos["qty_is_usd"] = True
+                await state.set_position(symbol, pos)
+            except Exception as e:
+                logger.warning(f"crypto position stamp failed for {symbol}: {e}")
+
+            if stop_px:
+                logger.info(
+                    f"[CRYPTO] {symbol} stop={stop_px} noted app-side only — "
+                    f"E*TRADE crypto has no broker STOP orders"
+                )
+            logger.info(
+                f"✅ LIVE CRYPTO TRADE SUCCESS: {plan['action']} {common['quantity']} {symbol} "
+                f"({plan['quantity_type']})"
+            )
+            await _record_api_success()
+            await trade_ledger.record("crypto_order", {
+                "ticker": symbol, "side": plan["action"], "plan": plan,
+                "order_id": _order_id_from_place(final), "client_order_id": client_order_id,
+                "commission_pct": CRYPTO_COMMISSION_PCT,
+            })
+            return {"status": "success", "response": final, "crypto": True, "plan": plan}
 
         else:
             # EQUITY ORDER
@@ -28541,9 +29092,10 @@ async def process_signal(pd: dict, replay: bool = False) -> dict:
         return {"status": "duplicate", "existing_status": claimed, "signal_id": sig_key}
 
     # Server-side gates for LIVE ENTRIES. Closes always pass — a protective
-    # exit must never be blocked by entry gating.
+    # exit must never be blocked by entry gating. Crypto is 24/7 (zerohash).
     if live_intent and not is_close:
-        if not _is_market_open() and not _force_execute(pd):
+        is_crypto = str(pd.get("instrument") or "").lower() == "crypto"
+        if not is_crypto and not _is_market_open() and not _force_execute(pd):
             await state.set(sig_key, "rejected", ex=86400)
             await _record_dispatch_verdict(pd, "rejected", "market_closed")
             return {"status": "rejected", "reason": "market_closed", "signal_id": sig_key}
