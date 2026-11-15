@@ -85,9 +85,46 @@ def test_plan_crypto_order_close_all_i_own():
 
 def test_is_crypto_account_detects_zerohash_desc():
     assert main_bot.is_crypto_account({"accountDesc": "Individual Crypto -8595"})
+    assert main_bot.is_crypto_account({"accountDesc": "Individual Crypto 888103-8595"})
     assert main_bot.is_crypto_account({"accountType": "CRYPTO", "accountDesc": "x"})
     assert not main_bot.is_crypto_account({"accountDesc": "Individual Brokerage"})
     assert not main_bot.is_crypto_account(None)
+
+
+def test_sanitize_account_id_strips_ui_dashes_and_spaces():
+    cleaned, repaired = main_bot.sanitize_account_id("888103-8595")
+    assert cleaned == "8881038595" and repaired
+    cleaned, repaired = main_bot.sanitize_account_id("146 261816")
+    assert cleaned == "146261816" and repaired
+    cleaned, repaired = main_bot.sanitize_account_id("8881038595")
+    assert cleaned == "8881038595" and not repaired
+
+
+def test_account_matches_id_accepts_dashed_ui_form():
+    acct = {
+        "accountId": "8881038595",
+        "accountIdKey": "opaqueCryptoKey",
+        "accountDesc": "Individual Crypto 888103-8595",
+    }
+    assert main_bot.account_matches_id(acct, "888103-8595")
+    assert main_bot.account_matches_id(acct, "8881038595")
+    assert main_bot.account_matches_id(acct, "opaqueCryptoKey")
+    assert not main_bot.account_matches_id(acct, "9999999999")
+
+
+def test_crypto_account_default_targets_individual_crypto_8595():
+    assert main_bot.TARGET_CRYPTO_ACCOUNT_ID == "8881038595"
+    assert main_bot.CRYPTO_ENABLED is True
+
+
+def test_brokerage_accounts_excludes_crypto():
+    rows = [
+        {"accountId": "111", "accountDesc": "Individual Brokerage"},
+        {"accountId": "8881038595", "accountDesc": "Individual Crypto 888103-8595"},
+    ]
+    brokerage = main_bot._brokerage_accounts(rows)
+    assert len(brokerage) == 1
+    assert brokerage[0]["accountId"] == "111"
 
 
 def test_crypto_instrument_payload_shape():
