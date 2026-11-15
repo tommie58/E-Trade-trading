@@ -44,6 +44,15 @@ Live entries must include `signal_id`. The bot dedupes on that id and derives th
 
 `force_execute` in a payload does nothing unless `FORCE_EXECUTE_ALLOWED=true` on the host.
 
+### Crypto (`instrument=crypto`)
+
+E*TRADE crypto (zerohash) is supported alongside options-only mode for **BTC**, **ETH**, and **SOL**. Send `instrument: "crypto"` with either:
+
+- `amount_usd` (or `dollar_amount`) — USD notional, matching the app ticket Amount field ($10 min / $500k max), or
+- `coin_quantity` / `quantity_type: "QUANTITY"` — fractional coin amount (up to 8 decimals)
+
+Market or limit (`limit_price`), Good for Day. Crypto is **24/7** (no equity calendar gate). Orders route to the linked Individual Crypto account (`ETRADE_CRYPTO_ACCOUNT_ID`, or auto-detected from account description). Broker stop orders are not available for crypto — exits are MARKET/LIMIT only.
+
 `GET /health` and `GET /healthz` return status, version, and whether a secret is configured. Positions, stops, the guardian, and the cost model are on `GET /status`, which requires the secret.
 
 The link-complete response does not include OAuth tokens. The server stores them.
