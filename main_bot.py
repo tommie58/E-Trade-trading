@@ -4258,7 +4258,8 @@ PROFIT_LOCK_LADDER = (
     (PROFIT_LOCK_TRIGGER_PCT, 0.25),
 )
 
-# Multiple of the round-trip spread a BROKER-NATIVE trailing stop must clear.
+# Multiple of the round-trip spread a BROKER-NATIVE trailing stop must clear
+# on EQUITIES (and as a secondary floor under the option percent gap).
 #
 # WHY THIS IS WIDER THAN SPREAD_FLOOR_MULT (1.5). That floor governs a LEVEL
 # this engine recomputes each poll from the high-water mark: a one-tick bid
@@ -4276,6 +4277,18 @@ PROFIT_LOCK_LADDER = (
 # was tighter still. At 2.0x the same chain asks for 0.30, which is the number
 # that actually sits outside the observed movement.
 NATIVE_TRAIL_SPREAD_MULT = 2.0
+# OPTION native-trail DISTANCE as a fraction of the live premium (mark).
+#
+# THE DEFECT (2026-11-19): auto-handoff sized the E*TRADE trail at
+# NATIVE_TRAIL_SPREAD_MULT × bid/ask. On a $3–$5 call with a $0.05–$0.15
+# book that is a $0.10–$0.30 gap — 2–6% of premium — while the resting
+# hard stop is ~20%. The trail armed on the first bounce that cleared the
+# hard stop, then got picked off by ordinary option noise. The operator's
+# rule is: keep the fixed ~20% stop until the trade locks breakeven; once
+# it trails, leave a 10–15% of-premium gap. 12.5% is the middle of that
+# band. Equities still use the spread multiple above (12% of a stock price
+# is not a day-trade trail).
+NATIVE_TRAIL_OPTION_PCT = 0.125
 
 # Profit-tier ladder: (minimum MFE in R, trail distance as fraction of R, tier).
 TIER_LADDER = (
@@ -4327,43 +4340,80 @@ def native_trail_offset(
     spread: Any,
     risk: Any = None,
     tick: float = 0.05,
+    mark: Any = None,
+    *,
+    option: bool = False,
 ) -> Dict[str, Any]:
-    """Trail DISTANCE for a broker-native trailing stop, from the live spread.
+    """Trail DISTANCE for a broker-native trailing stop.
+
+    Options size the gap as ``NATIVE_TRAIL_OPTION_PCT`` of the live premium
+    (at least the spread noise floor). Equities keep the legacy
+    ``NATIVE_TRAIL_SPREAD_MULT × spread`` distance.
 
     Returns ``{"ok": True, "offset": float, "detail": str}`` or
     ``{"ok": False, "offset": None, "detail": <why>}``. Never returns a
     number it cannot justify from a measured quote.
 
-    REFUSES ON AN UNMEASURED SPREAD. A missing or one-sided book is not a
-    zero spread — treating it as one yields the tightest possible trail on
-    precisely the contract whose liquidity is unknown, which is the worst
-    place to guess. The caller must fall back and say so.
+    REFUSES ON AN UNMEASURED BASIS. Options need a positive mark; equities
+    need a two-sided spread. A missing book is not a zero spread.
 
-    REFUSES A CHAIN TOO WIDE TO TRAIL. When the noise floor exceeds the
-    position's own risk, a native trail would rest further away than the
-    protective stop it is meant to replace — that is not protection, it is a
-    wider stop wearing its name. Better to keep the engine trail, which can
-    at least re-evaluate against the mid each poll.
+    REFUSES A GAP WIDER THAN THE POSITION'S OWN RISK. A native trail that
+    rests further away than the stop it replaces is not protection.
     """
     spread_f = _finite(spread)
-    if spread_f is None or spread_f <= 0:
-        return {
-            "ok": False,
-            "offset": None,
-            "detail": (
-                "no two-sided quote — the spread is unmeasured, and an unmeasured "
-                "spread is not a zero spread"
-            ),
-        }
+    mark_f = _finite(mark)
+    tick_f = _finite(tick) or 0.05
+    if tick_f <= 0:
+        tick_f = 0.05
 
-    raw = NATIVE_TRAIL_SPREAD_MULT * spread_f
+    if option:
+        if mark_f is None or mark_f <= 0:
+            return {
+                "ok": False,
+                "offset": None,
+                "detail": (
+                    "no live option mark — a percent-of-premium trail needs the "
+                    "premium it is measured against"
+                ),
+            }
+        pct_gap = NATIVE_TRAIL_OPTION_PCT * mark_f
+        spread_floor = (
+            NATIVE_TRAIL_SPREAD_MULT * spread_f
+            if spread_f is not None and spread_f > 0
+            else 0.0
+        )
+        # Percent-of-premium is the rule; the spread multiple only raises the
+        # floor when the book itself is wider than 12.5% of premium.
+        raw = max(pct_gap, spread_floor)
+        if spread_floor > pct_gap + 1e-9:
+            detail_basis = (
+                f"{NATIVE_TRAIL_SPREAD_MULT:g}x the {spread_f:.2f} spread "
+                f"(above {NATIVE_TRAIL_OPTION_PCT * 100:g}% of {mark_f:.2f})"
+            )
+        else:
+            detail_basis = (
+                f"{NATIVE_TRAIL_OPTION_PCT * 100:g}% of the {mark_f:.2f} premium"
+            )
+    else:
+        if spread_f is None or spread_f <= 0:
+            return {
+                "ok": False,
+                "offset": None,
+                "detail": (
+                    "no two-sided quote — the spread is unmeasured, and an unmeasured "
+                    "spread is not a zero spread"
+                ),
+            }
+        raw = NATIVE_TRAIL_SPREAD_MULT * spread_f
+        detail_basis = f"{NATIVE_TRAIL_SPREAD_MULT:g}x the {spread_f:.2f} spread"
+
     risk_f = _finite(risk)
     if risk_f is not None and risk_f > 0 and raw > risk_f:
         return {
             "ok": False,
             "offset": None,
             "detail": (
-                f"spread {spread_f:.2f} needs a {raw:.2f} trail, wider than the "
+                f"{detail_basis} needs a {raw:.2f} trail, wider than the "
                 f"position's own risk {risk_f:.2f} — a native trail here would rest "
                 f"further away than the stop it replaces"
             ),
@@ -4371,17 +4421,11 @@ def native_trail_offset(
 
     # Round UP to a tradable increment: rounding down could land back inside
     # the noise band this floor exists to clear.
-    tick_f = _finite(tick) or 0.05
-    if tick_f <= 0:
-        tick_f = 0.05
     offset = _round2(math.ceil(raw / tick_f - 1e-9) * tick_f)
     return {
         "ok": True,
         "offset": offset,
-        "detail": (
-            f"{NATIVE_TRAIL_SPREAD_MULT:g}x the {spread_f:.2f} spread, "
-            f"rounded up to the {tick_f:.2f} tick"
-        ),
+        "detail": f"{detail_basis}, rounded up to the {tick_f:.2f} tick",
     }
 
 
@@ -4395,6 +4439,9 @@ def plan_native_handoff(
     long_side: bool = True,
     has_stop_order: bool = True,
     already_native: bool = False,
+    breakeven_locked: bool = False,
+    mark: Any = None,
+    option: bool = False,
 ) -> Dict[str, Any]:
     """Whether to replace a fixed stop with an E*TRADE trailing stop.
 
@@ -4403,11 +4450,13 @@ def plan_native_handoff(
     caller can log a decline once; ``detail`` carries the numbers.
 
     Arms only for a long position that already has exactly one fixed stop
-    resting, and only when the spread-based distance is a real measurement
-    that is not wider than the position's own risk. The trigger compared here
-    is the bid minus that distance, floored to the cent. The placer rounds
-    the order toward the market (tighter) and refuses, before cancelling
-    anything, if the order it would send sits below ``resting_stop``.
+    resting, that has locked breakeven (or better), and only when the trail
+    distance is a real measurement that is not wider than the position's own
+    risk. Until breakeven the fixed ~20% stop stays — a 2×spread trail on the
+    first bounce is how winners were stopped out as noise. The trigger
+    compared here is the bid minus that distance, floored to the cent. The
+    placer rounds the order toward the market (tighter) and refuses, before
+    cancelling anything, if the order it would send sits below ``resting_stop``.
     """
     def decline(reason: str, why: str) -> Dict[str, Any]:
         return {"arm": False, "offset": None, "trigger": None, "reason": reason, "detail": why}
@@ -4418,8 +4467,15 @@ def plan_native_handoff(
         return decline("short", "native trail is long-side only")
     if not has_stop_order:
         return decline("no_stop_order", "no fixed stop is resting — nothing to replace")
+    if not breakeven_locked:
+        return decline(
+            "pre_breakeven",
+            "fixed stop stays until the trade locks breakeven — native trail waits",
+        )
 
-    plan = native_trail_offset(spread, risk=risk, tick=tick)
+    plan = native_trail_offset(
+        spread, risk=risk, tick=tick, mark=mark if mark is not None else bid, option=option,
+    )
     if not plan["ok"]:
         return decline("offset", str(plan["detail"]))
 
@@ -4983,6 +5039,23 @@ def compute_trail_level(
     mfe = (water_mark - entry) if is_buy else (entry - water_mark)
     r_multiple = mfe / risk
     mfe_percent = mfe / entry
+
+    # HARD STOP ONLY UNTIL BREAKEVEN. A 1R trail off a rising watermark used
+    # to inch the resting stop up on every small bounce — and the native
+    # handoff, sized at 2×spread, then replaced the ~20% hard stop with a
+    # noise-width trail. Until MFE clears the breakeven trigger (R or %),
+    # the resting level is the original stop and nothing else.
+    if r_multiple < BREAKEVEN_TRIGGER_R and mfe_percent < BREAKEVEN_TRIGGER_PCT:
+        return {
+            "trail_price": _round2(stop),
+            "trail_distance": _round2(risk),
+            "tier": "initial",
+            "r_multiple": round(r_multiple * 100) / 100.0,
+            "breakeven_locked": False,
+            "mfe_percent": math.floor(mfe_percent * 10000 + 0.5) / 10000.0,
+            "giveback_active": False,
+            "giveback_withheld": False,
+        }
 
     rung = trail_tier_for(r_multiple)
     tier = rung["tier"]
@@ -8841,6 +8914,10 @@ def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
         # entry/stop derived from it were quoted against a market that had
         # moved on. Carried here so scan_once can refuse to DISPATCH on them.
         status = str(entry.get("quoteStatus") or "").upper().strip()
+        # E*TRADE's All quote sometimes carries a session VWAP; Massive may
+        # too. Absent → None so the call-index gate can fall through to the
+        # scanner's sampled VWAP rather than inventing one.
+        vwap = num(all_q, "vwap") or num(all_q, "VWAP") or num(all_q, "averagePrice")
         out.append({
             "symbol": symbol,
             "last": last,
@@ -8854,6 +8931,7 @@ def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
             "previous_close": num(all_q, "previousClose"),
             "total_volume": num(all_q, "totalVolume"),
             "avg_daily_volume": num(all_q, "volume10Day"),
+            "vwap": vwap,
             # Top-of-book size — the order-book imbalance feature (edge.py).
             "bid_size": num(all_q, "bidSize"),
             "ask_size": num(all_q, "askSize"),
@@ -12426,9 +12504,18 @@ SCALE_OUT_FIRST_TARGET_PCT = float(os.getenv("SCALE_OUT_FIRST_TARGET_PCT", "14.0
 # default: a promised exit that only sometimes exists is worse than none.
 TAKE_PROFIT_ENABLED = os.getenv("TAKE_PROFIT_ENABLED", "true").lower() == "true"
 # Replace a resting fixed stop with an E*TRADE TRAILING_STOP_CNST once the
-# live spread supports a trail that is at least as tight. Off keeps the
-# engine cancel/replace ratchet. A trail placed by hand is still adopted.
+# trade has locked breakeven and the trail gap (12.5% of option premium, or
+# 2×spread on equities) does not loosen the fixed stop. Off keeps the engine
+# cancel/replace ratchet. A trail placed by hand is still adopted.
 NATIVE_TRAIL_AUTO = os.getenv("NATIVE_TRAIL_AUTO", "true").lower() == "true"
+# CALL entries only when SPY or QQQ is at/above that day's VWAP. Blocks buying
+# calls into a falling tape (the 2026-11-19 pattern). Off = no index check.
+CALL_INDEX_VWAP_GATE = os.getenv("CALL_INDEX_VWAP_GATE", "true").lower() == "true"
+CALL_INDEX_VWAP_SYMBOLS = tuple(
+    s.strip().upper()
+    for s in os.getenv("CALL_INDEX_VWAP_SYMBOLS", "SPY,QQQ").split(",")
+    if s.strip()
+) or ("SPY", "QQQ")
 # After a handoff that cancelled the stop and failed to rest the trail, wait
 # before trying again. The failure path re-arms the fixed stop; retrying
 # every poll would open that naked window on a loop.
@@ -13026,6 +13113,66 @@ def _opening_hold_block() -> Optional[str]:
         return None
 
 
+def _payload_option_right(p: dict) -> str:
+    """CALL / PUT / '' for an entry payload. SELL equity → long PUT exposure."""
+    right = str(p.get("option_right") or p.get("call_put") or "").upper().strip()
+    if right in {"CALL", "C", "PUT", "P"}:
+        return "PUT" if right.startswith("P") else "CALL"
+    if str(p.get("instrument") or "").lower() == "option":
+        return "PUT" if str(p.get("action") or "").upper() == "SELL" else "CALL"
+    return ""
+
+
+async def _index_vwap_quotes(symbols: Tuple[str, ...] = CALL_INDEX_VWAP_SYMBOLS) -> List[Dict[str, Any]]:
+    """SPY/QQQ last + day VWAP for the call gate. Prefers the broker VWAP
+    field; falls back to the scanner's sampled session VWAP when the quote
+    omits it. Empty list on a total fetch failure (assess fails open)."""
+    syms = [s for s in symbols if s]
+    if not syms:
+        return []
+    quotes: List[Dict[str, Any]] = []
+    try:
+        raw = await _scanner_fetch_quotes(syms)
+        quotes = scanner_mod.parse_quotes(raw)
+    except Exception as e:
+        logger.warning(f"call-index VWAP quote fetch failed ({e})")
+        quotes = []
+    by_sym = {str(q.get("symbol") or "").upper(): q for q in quotes if isinstance(q, dict)}
+    out: List[Dict[str, Any]] = []
+    for sym in syms:
+        row = dict(by_sym.get(sym) or {"symbol": sym})
+        row["symbol"] = sym
+        vwap = row.get("vwap")
+        if (vwap is None or float(vwap or 0) <= 0) and scanner is not None:
+            try:
+                series = await scanner._series(sym)
+                sampled = scanner_mod.sampled_vwap(series)
+                if sampled is not None and sampled > 0:
+                    row["vwap"] = sampled
+                    row["vwap_source"] = "scanner_sampled"
+            except Exception as e:
+                logger.debug(f"call-index sampled VWAP for {sym} unavailable: {e}")
+        elif vwap is not None and float(vwap or 0) > 0:
+            row["vwap_source"] = "quote"
+        out.append(row)
+    return out
+
+
+async def _call_index_vwap_block(p: dict) -> Optional[str]:
+    """Live CALL-vs-index-VWAP check. Fail-open on fetch errors."""
+    if not CALL_INDEX_VWAP_GATE:
+        return None
+    right = _payload_option_right(p)
+    if right != "CALL":
+        return None
+    try:
+        quotes = await _index_vwap_quotes()
+        return assess_call_index_vwap_gate(right, quotes, enabled=True)
+    except Exception as e:
+        logger.warning(f"call-index VWAP gate unavailable (entry not blocked): {e}")
+        return None
+
+
 def _is_market_open() -> bool:
     """Exchange-aware regular-session check: 9:30–16:00 US/Eastern (13:00 close
     on half days), weekdays only, NYSE holidays excluded. DST-safe via zoneinfo."""
@@ -13397,6 +13544,54 @@ def assess_app_risk_gates(open_count: Any, realized_pnl_today_pct: Any, daily_lo
     if heat:
         reasons.append(heat)
     return reasons
+
+
+def assess_call_index_vwap_gate(
+    option_right: Any,
+    index_quotes: Any,
+    *,
+    enabled: bool = True,
+) -> Optional[str]:
+    """Refuse CALL entries when every measured index is below its day VWAP.
+
+    ``index_quotes`` is an iterable of ``{symbol, last, vwap}`` (SPY / QQQ).
+    Allows when ANY measured index prints at or above VWAP. Unmeasured indexes
+    are ignored — a feed gap is not evidence the market is falling (fail open
+    when nothing is measurable). Puts and non-option entries are untouched.
+    Pure: no I/O, fully unit-testable.
+    """
+    if not enabled:
+        return None
+    right = str(option_right or "").upper().strip()
+    if right not in {"CALL", "C"}:
+        return None
+    above: List[str] = []
+    below: List[str] = []
+    rows = index_quotes.values() if isinstance(index_quotes, dict) else (index_quotes or [])
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sym = str(row.get("symbol") or "").upper().strip()
+        try:
+            last = float(row.get("last") or 0)
+            vwap = float(row.get("vwap") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not sym or last <= 0 or vwap <= 0 or not math.isfinite(last) or not math.isfinite(vwap):
+            continue
+        if last + 1e-9 >= vwap:
+            above.append(f"{sym} {last:.2f}≥VWAP {vwap:.2f}")
+        else:
+            below.append(f"{sym} {last:.2f}<VWAP {vwap:.2f}")
+    if above:
+        return None
+    if below:
+        return (
+            "CALL blocked while the index is below day VWAP ("
+            + "; ".join(below)
+            + ") — waiting for SPY or QQQ to reclaim"
+        )
+    return None
 
 
 def assess_app_entry_gates(
@@ -14174,6 +14369,16 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
 
     is_probe = _is_connectivity_test(p)
     is_crypto = str(p.get("instrument") or "").lower() == "crypto"
+
+    # CALL INDEX VWAP — bullish premium only when SPY or QQQ holds above the
+    # session VWAP. Applies to app-decided and bot-decided entries alike: a
+    # falling tape is not a quality opinion, it is a regime the book already
+    # lost money on. Probes skip it so connectivity tests still prove the path.
+    if not is_probe and not is_crypto:
+        vwap_block = await _call_index_vwap_block(p)
+        if vwap_block:
+            blocked.append(vwap_block)
+            logger.warning(f"📉 INDEX VWAP — {vwap_block}")
 
     # CRYPTO — equity quality gates (rvol / mtf / score / opening hold) do not
     # apply to zerohash pairs. Keep the book limits: kill switch (above),
@@ -21119,7 +21324,10 @@ async def _arm_native_trail(
     if offset is None:
         tick = (_option_tick_from_quote(bid or entry, bid, ask)
                 or _safe_option_tick(bid or entry)) if is_option else 0.01
-        plan = trailing_engine.native_trail_offset(spread, risk=risk, tick=tick)
+        plan = trailing_engine.native_trail_offset(
+            spread, risk=risk, tick=tick,
+            mark=bid if bid > 0 else entry, option=is_option,
+        )
         if not plan["ok"]:
             refuse(plan["detail"])
         offset_value = float(plan["offset"])
@@ -21127,11 +21335,13 @@ async def _arm_native_trail(
     else:
         # An explicit operator offset is honoured, but never silently below the
         # measured noise floor — that is the exact mistake this helper exists
-        # to prevent (a 0.20 trail on a 0.15-wide chain).
+        # to prevent (a 2×spread trail on an option that needs 10–15% of premium).
         offset_value = round(float(offset), 2)
         if offset_value <= 0:
             refuse("trail offset must be positive")
-        floor_plan = trailing_engine.native_trail_offset(spread, risk=risk)
+        floor_plan = trailing_engine.native_trail_offset(
+            spread, risk=risk, mark=bid if bid > 0 else entry, option=is_option,
+        )
         if floor_plan["ok"] and offset_value < float(floor_plan["offset"]):
             refuse(
                 f"requested trail {offset_value:.2f} is inside the noise band — "
@@ -27481,7 +27691,10 @@ async def _maybe_repair_inflated_native_trail(
         tick = _option_tick_from_quote(bid or entry, bid, ask) or _safe_option_tick(bid or entry)
     else:
         tick = 0.01
-    floor = trailing_engine.native_trail_offset(spread, risk=risk, tick=tick)
+    floor = trailing_engine.native_trail_offset(
+        spread, risk=risk, tick=tick,
+        mark=bid if bid > 0 else entry, option=is_option,
+    )
     if not floor["ok"]:
         return True
 
@@ -27573,6 +27786,38 @@ async def _maybe_repair_inflated_native_trail(
     return True
 
 
+def _position_breakeven_locked(pos: dict, is_option: bool, mark: float) -> bool:
+    """Has this position reached breakeven (or better) on the trail basis?
+
+    Prefers the ratchet's own ``breakeven_locked`` flag and peak MFE, then
+    re-measures from the live mark against entry so a fresh bounce that has
+    not yet been persisted still counts.
+    """
+    if pos.get("breakeven_locked"):
+        return True
+    mfe_pct = float(pos.get("trail_mfe_pct") or 0) or 0.0
+    r_mult = float(pos.get("trail_r") or 0) or 0.0
+    if mfe_pct >= trailing_engine.BREAKEVEN_TRIGGER_PCT:
+        return True
+    if r_mult >= trailing_engine.BREAKEVEN_TRIGGER_R:
+        return True
+    entry = float(pos.get("entry_premium") if is_option else (pos.get("entry") or 0) or 0)
+    initial = float(
+        pos.get("initial_stop")
+        or (pos.get("stop_premium") if is_option else pos.get("stop"))
+        or 0
+    )
+    if entry <= 0 or mark <= 0:
+        return False
+    mfe = mark - entry  # long-only for options; equities use the same for longs
+    if mfe < 0:
+        return False
+    if (mfe / entry) >= trailing_engine.BREAKEVEN_TRIGGER_PCT:
+        return True
+    risk = abs(entry - initial) if initial > 0 else 0.0
+    return bool(risk > 0 and (mfe / risk) >= trailing_engine.BREAKEVEN_TRIGGER_R)
+
+
 async def _maybe_hand_off_native_trail(
     ticker: str, pos: dict, bid: float, spread: Optional[float],
 ) -> bool:
@@ -27594,12 +27839,16 @@ async def _maybe_hand_off_native_trail(
         tick = _option_tick_from_quote(bid or entry, bid, ask) or _safe_option_tick(bid or entry)
     else:
         tick = 0.01
+    be_locked = _position_breakeven_locked(pos, is_option, bid)
     plan = trailing_engine.plan_native_handoff(
         bid, spread, risk, base_stop,
         tick=tick,
         long_side=long_side,
         has_stop_order=bool(pos.get("stop_order_id")),
         already_native=False,
+        breakeven_locked=be_locked,
+        mark=bid if bid > 0 else entry,
+        option=is_option,
     )
     if not plan["arm"]:
         await _remember_native_skip(ticker, pos, str(plan["reason"]), str(plan["detail"]))
@@ -30281,19 +30530,20 @@ async def arm_native_trail(
 
     Body: { "ticker": "AAPL", "offset": 0.30 (optional), "dry_run": false }
 
-    With no `offset` the distance is derived from the contract's live spread
-    (NATIVE_TRAIL_SPREAD_MULT x spread, rounded up to a tradable tick). An
-    explicit offset is honoured only if it clears that same floor — the point
-    of this endpoint is that a trail tighter than the noise band is not a
-    tighter stop, it is a guaranteed exit on the next quote wobble.
+    With no `offset` the distance is derived from the instrument: options use
+    NATIVE_TRAIL_OPTION_PCT of the live premium (at least 2×spread); equities
+    keep NATIVE_TRAIL_SPREAD_MULT × spread. An explicit offset is honoured
+    only if it clears that same floor — a trail tighter than the noise band
+    is not a tighter stop, it is a guaranteed exit on the next quote wobble.
 
     `dry_run` prices the trail and returns the number WITHOUT touching the
     resting stop, so the offset can be inspected before anything moves.
 
     The trail worker also places this order on its own when NATIVE_TRAIL_AUTO
-    is on and the spread-based trigger is at least as tight as the fixed stop.
-    A trail already resting at E*TRADE — placed here, by the worker, or by
-    hand — is adopted, and the engine trail stands down.
+    is on, the trade has locked breakeven, and the trail trigger is at least
+    as tight as the fixed stop. A trail already resting at E*TRADE — placed
+    here, by the worker, or by hand — is adopted, and the engine trail
+    stands down.
     """
     await _require_control_auth(x_rork_secret, "/trail/native")
     ticker = str((body or {}).get("ticker") or "").upper().strip()
@@ -30315,7 +30565,10 @@ async def arm_native_trail(
         spread = (ask - bid) if (bid > 0 and ask > 0 and ask >= bid) else None
         tick = (_option_tick_from_quote(bid or entry, bid, ask)
                 or _safe_option_tick(bid or entry)) if is_option else 0.01
-        plan = trailing_engine.native_trail_offset(spread, risk=risk, tick=tick)
+        plan = trailing_engine.native_trail_offset(
+            spread, risk=risk, tick=tick,
+            mark=bid if bid > 0 else entry, option=is_option,
+        )
         return {
             "dry_run": True, "ticker": ticker,
             "bid": round(bid, 4) if bid > 0 else None,

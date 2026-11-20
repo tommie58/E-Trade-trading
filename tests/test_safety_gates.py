@@ -172,19 +172,48 @@ def test_public_health_has_no_account_fields():
     assert webhook.status_code == 401
 
 
+def test_native_handoff_waits_for_breakeven():
+    # The 2026-11-19 defect: a small bounce armed a 2×spread trail and replaced
+    # the ~20% hard stop. Until breakeven locks, the fixed stop stays.
+    early = main_bot.trailing_engine.plan_native_handoff(
+        3.10, 0.10, 0.60, 2.40, tick=0.05,
+        breakeven_locked=False, option=True, mark=3.10,
+    )
+    assert early["arm"] is False
+    assert early["reason"] == "pre_breakeven"
+
+
 def test_native_handoff_arms_when_the_trigger_clears_the_stop():
+    # After breakeven, options trail at 12.5% of premium — not 2×spread.
+    # Bid 3.80, 12.5% → 0.475 → 0.50 tick; trigger 3.30 clears a BE stop at 3.00.
     plan = main_bot.trailing_engine.plan_native_handoff(
-        3.40, 0.10, 0.80, 2.40, tick=0.05,
+        3.80, 0.10, 0.60, 3.00, tick=0.05,
+        breakeven_locked=True, option=True, mark=3.80,
     )
     assert plan["arm"] is True
     assert plan["reason"] == "arm"
-    assert plan["offset"] == 0.20
-    assert plan["trigger"] == 3.20
+    assert plan["offset"] == 0.50
+    assert plan["trigger"] == 3.30
+
+
+def test_native_option_trail_offset_is_percent_of_premium():
+    plan = main_bot.trailing_engine.native_trail_offset(
+        0.10, risk=0.80, tick=0.05, mark=4.00, option=True,
+    )
+    assert plan["ok"] is True
+    assert plan["offset"] == 0.50  # 12.5% of 4.00
+    assert "12.5%" in plan["detail"]
+    # Equities keep the spread multiple.
+    eq = main_bot.trailing_engine.native_trail_offset(0.10, risk=5.0, tick=0.01)
+    assert eq["ok"] is True and eq["offset"] == 0.20
 
 
 def test_native_handoff_keeps_a_tighter_fixed_stop():
+    # At breakeven the resting stop is entry; a 12.5% trail from a small run
+    # would sit below it — keep the fixed stop.
     plan = main_bot.trailing_engine.plan_native_handoff(
-        2.50, 0.10, 0.80, 2.40, tick=0.05,
+        3.24, 0.10, 0.60, 3.00, tick=0.05,
+        breakeven_locked=True, option=True, mark=3.24,
     )
     assert plan["arm"] is False
     assert plan["reason"] == "would_loosen"
@@ -192,30 +221,80 @@ def test_native_handoff_keeps_a_tighter_fixed_stop():
 
 
 def test_native_handoff_refuses_a_wide_or_unmeasured_book():
+    # Percent gap wider than the position's own risk → refuse.
     wide = main_bot.trailing_engine.plan_native_handoff(
-        3.40, 0.50, 0.80, 2.40, tick=0.05,
+        10.00, 0.10, 0.80, 8.00, tick=0.05,
+        breakeven_locked=True, option=True, mark=10.00,
     )
     blind = main_bot.trailing_engine.plan_native_handoff(
         3.40, None, 0.80, 2.40, tick=0.05,
+        breakeven_locked=True, option=True, mark=0,
+    )
+    # Equity path still needs a measured spread.
+    eq_blind = main_bot.trailing_engine.plan_native_handoff(
+        100.0, None, 2.0, 98.0, tick=0.01,
+        breakeven_locked=True, option=False,
     )
     assert wide["arm"] is False and wide["reason"] == "offset"
     assert blind["arm"] is False and blind["reason"] == "offset"
+    assert eq_blind["arm"] is False and eq_blind["reason"] == "offset"
 
 
 def test_native_handoff_needs_a_long_with_a_resting_stop():
     no_order = main_bot.trailing_engine.plan_native_handoff(
-        3.40, 0.10, 0.80, 2.40, has_stop_order=False,
+        3.80, 0.10, 0.60, 3.00, has_stop_order=False,
+        breakeven_locked=True, option=True, mark=3.80,
     )
     short = main_bot.trailing_engine.plan_native_handoff(
-        3.40, 0.10, 0.80, 2.40, long_side=False,
+        3.80, 0.10, 0.60, 3.00, long_side=False,
+        breakeven_locked=True, option=True, mark=3.80,
     )
     covered = main_bot.trailing_engine.plan_native_handoff(
-        3.40, 0.10, 0.80, 2.40, already_native=True,
+        3.80, 0.10, 0.60, 3.00, already_native=True,
+        breakeven_locked=True, option=True, mark=3.80,
     )
     assert no_order["reason"] == "no_stop_order"
     assert short["reason"] == "short"
     assert covered["reason"] == "already_native"
     assert not any(p["arm"] for p in (no_order, short, covered))
+
+
+def test_engine_trail_stays_at_hard_stop_until_breakeven():
+    te = main_bot.trailing_engine
+    early = te.compute_trail_level("BUY", 3.0, 2.4, 3.1, 2.9)
+    assert early["trail_price"] == 2.4
+    assert early["breakeven_locked"] is False
+    assert early["tier"] == "initial"
+    locked = te.compute_trail_level("BUY", 3.0, 2.4, 3.25, 2.9)
+    assert locked["breakeven_locked"] is True
+    assert locked["trail_price"] >= 3.0
+
+
+def test_call_index_vwap_gate_blocks_calls_below_vwap():
+    below = main_bot.assess_call_index_vwap_gate(
+        "CALL",
+        [
+            {"symbol": "SPY", "last": 500.0, "vwap": 505.0},
+            {"symbol": "QQQ", "last": 400.0, "vwap": 410.0},
+        ],
+    )
+    assert below is not None and "below day VWAP" in below
+    above = main_bot.assess_call_index_vwap_gate(
+        "CALL",
+        [
+            {"symbol": "SPY", "last": 510.0, "vwap": 505.0},
+            {"symbol": "QQQ", "last": 400.0, "vwap": 410.0},
+        ],
+    )
+    assert above is None
+    assert main_bot.assess_call_index_vwap_gate("PUT", [
+        {"symbol": "SPY", "last": 500.0, "vwap": 505.0},
+    ]) is None
+    assert main_bot.assess_call_index_vwap_gate("CALL", [], enabled=False) is None
+    # Unmeasured → fail open.
+    assert main_bot.assess_call_index_vwap_gate("CALL", [
+        {"symbol": "SPY", "last": 500.0, "vwap": None},
+    ]) is None
 
 
 def test_native_trail_retry_waits_until_the_stamp():
