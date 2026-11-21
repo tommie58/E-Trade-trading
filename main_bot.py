@@ -12040,7 +12040,10 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # MARKET/LIMIT Good-for-Day, 24/7 session (no equity calendar gate).
 # 5.87.1: pin Individual Crypto 888103-8595 as the crypto-only routing target
 # (dash-tolerant id match, Redis crypto pin, refuse crypto as options pin).
-BOT_VERSION = "5.87.1-crypto"
+# 5.88.2-trade-eyes: observational trade-eyes capture (MFE/MAE, entry context,
+# post-exit +15/+30 marks) written to the ledger. No order/stop/gate changes.
+# MAE adverse % floored at 0; entry-capture race fix writes only eyes_* keys.
+BOT_VERSION = "5.88.2-trade-eyes"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -21455,6 +21458,10 @@ async def _arm_native_trail(
     pos["native_trail_offset"] = offset_value
     pos["native_trail_skip"] = None
     pos["native_trail_retry_after"] = None
+    try:
+        _trade_eyes_note_trail_armed(pos, offset_value, order_id)
+    except Exception as e:
+        logger.debug(f"[TRADE EYES] {ticker} trail-arm note failed: {e}")
     await state.set_position(ticker, pos)
     logger.info(
         f"[NATIVE TRAIL] {ticker} broker-native trailing stop RESTING: qty={qty} "
@@ -23665,6 +23672,12 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         "edge": edge_ctx or None,
         "entry_signal": entry_signal or None,
     })
+    try:
+        _trade_eyes_tasks.add(asyncio.create_task(
+            _trade_eyes_capture_entry(ticker), name=f"trade_eyes_entry:{ticker}"))
+        _trade_eyes_tasks.difference_update({t for t in _trade_eyes_tasks if t.done()})
+    except Exception as e:
+        logger.debug(f"[TRADE EYES] {ticker} entry capture not scheduled: {e}")
 
 
 def _mtf_parts(raw: Any) -> Tuple[Optional[int], Optional[int]]:
@@ -23875,6 +23888,398 @@ def _peak_value(value: Any) -> Optional[float]:
     if f != f or f in (float("inf"), float("-inf")):
         return None
     return f
+
+
+# ---- TRADE EYES (5.88.2) — observational only, never affects orders --------
+# Records per-trade MFE/MAE, entry context, and post-exit +15/+30 marks on
+# the existing hash-chained ledger. Every public function swallows its own
+# errors so a capture failure cannot change placement, stops, gates, or
+# flatten behaviour. Named `_trade_eyes_*` so it cannot collide with the
+# existing `_app_eyes_pass` exit-authority path.
+TRADE_EYES_EVENT = "trade_eyes"
+TRADE_EYES_POST_EVENT = "trade_eyes_post"
+TRADE_EYES_POST_MINUTES = (15, 30)
+_trade_eyes_tasks: set = set()
+
+
+def _trade_eyes_num(value: Any) -> Optional[float]:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    return n if math.isfinite(n) else None
+
+
+def _trade_eyes_pct(entry: float, mark: float) -> Optional[float]:
+    if entry <= 0:
+        return None
+    return round((mark - entry) / entry, 4)
+
+
+def _trade_eyes_is_buy(pos: dict) -> bool:
+    contract = pos.get("contract") or {}
+    if contract.get("right"):
+        return True  # long options; exits are SELL_CLOSE
+    return str(pos.get("action") or "BUY").upper() != "SELL"
+
+
+def _trade_eyes_entry(pos: dict) -> Optional[float]:
+    contract = pos.get("contract") or {}
+    is_option = bool(contract.get("right") or pos.get("entry_premium") is not None)
+    raw = pos.get("entry_premium") if is_option else pos.get("entry")
+    n = _trade_eyes_num(raw)
+    return n if n is not None and n > 0 else None
+
+
+def _trade_eyes_right(pos: dict) -> Optional[str]:
+    right = str(((pos.get("contract") or {}).get("right") or "")).upper()
+    if right.startswith("C"):
+        return "CALL"
+    if right.startswith("P"):
+        return "PUT"
+    return None
+
+
+def _trade_eyes_note_trail_armed(pos: dict, offset: Any, order_id: Any) -> None:
+    """Stamp the first native-trail arm on the in-memory position."""
+    if pos.get("eyes_trail_armed_ts"):
+        return
+    pos["eyes_trail_armed_ts"] = _utcnow().isoformat()
+    off = _trade_eyes_num(offset)
+    if off is not None:
+        pos["eyes_trail_offset"] = round(off, 4)
+    if order_id:
+        pos["eyes_trail_order_id"] = str(order_id)
+
+
+def _trade_eyes_note_mark(pos: dict, mark: Any, bid: Any = None, ask: Any = None) -> None:
+    """Advance MFE/MAE (and their first-reach timestamps) from a live mark.
+
+    Mutates only `eyes_*` keys. Favourable / adverse sides follow the
+    position's direction. A missing peak stays missing — never defaulted to 0.
+    """
+    mark_f = _trade_eyes_num(mark)
+    if mark_f is None or mark_f <= 0:
+        return
+    now = _utcnow().isoformat()
+    is_buy = _trade_eyes_is_buy(pos)
+    entry = _trade_eyes_entry(pos)
+    # MFE = most favourable mark; MAE = most adverse mark.
+    mfe_mark = _trade_eyes_num(pos.get("eyes_mfe_mark"))
+    mae_mark = _trade_eyes_num(pos.get("eyes_mae_mark"))
+    mfe_better = (mfe_mark is None) or (mark_f > mfe_mark if is_buy else mark_f < mfe_mark)
+    mae_worse = (mae_mark is None) or (mark_f < mae_mark if is_buy else mark_f > mae_mark)
+    if mfe_better:
+        pos["eyes_mfe_mark"] = round(mark_f, 4)
+        pos["eyes_mfe_ts"] = now
+        if entry:
+            pos["eyes_mfe_pct"] = _trade_eyes_pct(entry, mark_f)
+    if mae_worse:
+        pos["eyes_mae_mark"] = round(mark_f, 4)
+        pos["eyes_mae_ts"] = now
+    if entry:
+        # Adverse percent is the WORST signed excursion observed, floored at
+        # 0 from the trader's view: a trade that has never gone red shows a
+        # 0 drawdown, not a positive one. 5.88.2 fix over the draft patch,
+        # which echoed the latest mark's pct and read positive on green trades.
+        signed = _trade_eyes_pct(entry, mark_f)
+        if signed is not None:
+            adverse = min(0.0, signed) if is_buy else min(0.0, -signed)
+            prev = _trade_eyes_num(pos.get("eyes_mae_pct"))
+            pos["eyes_mae_pct"] = round(min(prev if prev is not None else 0.0, adverse), 4)
+    # First-poll spread snapshot when the background entry capture missed it.
+    bid_f, ask_f = _trade_eyes_num(bid), _trade_eyes_num(ask)
+    if bid_f and ask_f and ask_f >= bid_f and not pos.get("eyes_entry_bid"):
+        pos["eyes_entry_bid"] = round(bid_f, 4)
+        pos["eyes_entry_ask"] = round(ask_f, 4)
+        pos["eyes_entry_spread"] = round(ask_f - bid_f, 4)
+
+
+def _trade_eyes_exit_kind(close_reason: Optional[str], pos: Optional[dict], expired: bool) -> str:
+    if expired or close_reason == "expired_worthless":
+        return "expired"
+    reason = str(close_reason or "")
+    if reason == "eod_flatten":
+        return "eod_flatten"
+    if reason == "hold_guard":
+        return "hold_guard"
+    if reason in ("trail_stop_fill", "trail_stop_level"):
+        return "trail"
+    if reason == "take_profit":
+        return "take_profit"
+    if reason in ("emergency_flatten_fill", "flatten_stop_fill"):
+        return "flatten"
+    if reason == "stop_fill" or reason.startswith("fill_capture:"):
+        # A still-resting native trail at close is the most reliable signal
+        # that this fill was the trail, not the original fixed stop.
+        if (pos or {}).get("native_trail_order_id"):
+            return "trail"
+        return "fixed_stop"
+    if reason == "close_fill":
+        return "signal_close"
+    return "other" if reason else "other"
+
+
+def _trade_eyes_index_row(row: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(row, dict):
+        return None
+    sym = str(row.get("symbol") or "").upper().strip()
+    last, vwap = _trade_eyes_num(row.get("last")), _trade_eyes_num(row.get("vwap"))
+    if not sym or last is None or last <= 0 or vwap is None or vwap <= 0:
+        return None
+    return {
+        "symbol": sym,
+        "last": round(last, 4),
+        "vwap": round(vwap, 4),
+        "vs_vwap_pct": round((last - vwap) / vwap, 4),
+        "above_vwap": last + 1e-9 >= vwap,
+        "source": row.get("vwap_source"),
+    }
+
+
+async def _trade_eyes_capture_entry(ticker: str) -> None:
+    """Best-effort entry snapshot after the open is already booked.
+
+    Uses existing quote helpers (scanner / index VWAP gate). Failures leave
+    fields missing and never raise to the caller.
+    """
+    try:
+        pos = await state.get_position(ticker)
+        if not pos:
+            return
+        if not pos.get("eyes_id"):
+            pos["eyes_id"] = uuid.uuid4().hex
+        sig = pos.get("entry_signal") if isinstance(pos.get("entry_signal"), dict) else {}
+        pos.setdefault("eyes_score", sig.get("score"))
+        pos.setdefault("eyes_rvol", sig.get("rvol"))
+        pos.setdefault("eyes_right", _trade_eyes_right(pos))
+        pos.setdefault("eyes_opened_at", pos.get("ts"))
+        try:
+            now_et = _utcnow().astimezone(_ET_ZONE)
+            pos.setdefault("eyes_session_minutes", round(edge.session_minutes(now_et), 2))
+            pos.setdefault("eyes_time_et", now_et.strftime("%H:%M"))
+        except Exception:
+            pass
+        # Option bid/ask: skip if the first trail poll already stamped them.
+        if not pos.get("eyes_entry_bid"):
+            try:
+                contract = pos.get("contract") or None
+                bid, ask = await _current_bid_ask(ticker, dict(contract) if contract else None)
+                if bid > 0 and ask > 0 and ask >= bid:
+                    pos["eyes_entry_bid"] = round(bid, 4)
+                    pos["eyes_entry_ask"] = round(ask, 4)
+                    pos["eyes_entry_spread"] = round(ask - bid, 4)
+            except Exception as e:
+                logger.debug(f"[TRADE EYES] {ticker} entry option quote skipped: {e}")
+        if not pos.get("eyes_index"):
+            try:
+                rows = await _index_vwap_quotes()
+                index = [r for r in (_trade_eyes_index_row(q) for q in (rows or [])) if r]
+                if index:
+                    pos["eyes_index"] = index
+            except Exception as e:
+                logger.debug(f"[TRADE EYES] {ticker} index VWAP snapshot skipped: {e}")
+        if not pos.get("eyes_underlying"):
+            try:
+                raw = await _scanner_fetch_quotes([ticker])
+                quotes = scanner_mod.parse_quotes(raw) if raw else []
+                by_sym = {str(q.get("symbol") or "").upper(): q for q in quotes if isinstance(q, dict)}
+                row = _trade_eyes_index_row(by_sym.get(str(ticker).upper()) or {"symbol": ticker})
+                if row:
+                    pos["eyes_underlying"] = row
+                else:
+                    q = by_sym.get(str(ticker).upper()) or {}
+                    last, vwap = _trade_eyes_num(q.get("last")), _trade_eyes_num(q.get("vwap"))
+                    if last and vwap and vwap > 0:
+                        pos["eyes_underlying"] = {
+                            "symbol": str(ticker).upper(),
+                            "last": round(last, 4),
+                            "vwap": round(vwap, 4),
+                            "vs_vwap_pct": round((last - vwap) / vwap, 4),
+                            "above_vwap": last + 1e-9 >= vwap,
+                        }
+            except Exception as e:
+                logger.debug(f"[TRADE EYES] {ticker} underlying VWAP snapshot skipped: {e}")
+        # 5.88.2 RACE FIX. The quote fetches above can take seconds; the trail
+        # worker may persist a stop/trail id in that window. Re-read the stored
+        # position and write ONLY the eyes_* keys, so those ids survive.
+        try:
+            fresh = await state.get_position(ticker)
+            if isinstance(fresh, dict):
+                for k, v in pos.items():
+                    if str(k).startswith("eyes_"):
+                        fresh[k] = v
+                pos = fresh
+        except Exception as e:
+            logger.debug(f"[TRADE EYES] {ticker} eyes save re-read failed: {e}")
+        await state.set_position(ticker, pos)
+    except Exception as e:
+        logger.debug(f"[TRADE EYES] {ticker} entry capture failed: {e}")
+
+
+def _trade_eyes_from_pos(pos: Optional[dict]) -> Dict[str, Any]:
+    """Build the close-time eyes payload from the tracked position."""
+    pos = pos or {}
+    entry = _trade_eyes_entry(pos)
+    # If a close arrives before any poll, derive marks from the trail
+    # watermarks (no timestamps — those were never observed).
+    mfe_mark = _trade_eyes_num(pos.get("eyes_mfe_mark"))
+    mae_mark = _trade_eyes_num(pos.get("eyes_mae_mark"))
+    if mfe_mark is None:
+        mfe_mark = _trade_eyes_num(pos.get("trail_high"))
+    if mae_mark is None:
+        mae_mark = _trade_eyes_num(pos.get("trail_low"))
+    mfe_pct = _trade_eyes_num(pos.get("eyes_mfe_pct"))
+    mae_pct = _trade_eyes_num(pos.get("eyes_mae_pct"))
+    if entry and mfe_mark is not None and mfe_pct is None:
+        mfe_pct = _trade_eyes_pct(entry, mfe_mark)
+    if entry and mae_mark is not None and mae_pct is None:
+        mae_pct = _trade_eyes_pct(entry, mae_mark)
+    sig = pos.get("entry_signal") if isinstance(pos.get("entry_signal"), dict) else {}
+    return {
+        "eyes_id": pos.get("eyes_id") or uuid.uuid4().hex,
+        "mfe_mark": mfe_mark,
+        "mfe_pct": mfe_pct,
+        "mfe_ts": pos.get("eyes_mfe_ts"),
+        "mae_mark": mae_mark,
+        "mae_pct": mae_pct,
+        "mae_ts": pos.get("eyes_mae_ts"),
+        "trail_armed": bool(pos.get("eyes_trail_armed_ts") or pos.get("native_trail_order_id")),
+        "trail_armed_ts": pos.get("eyes_trail_armed_ts"),
+        "trail_offset": _trade_eyes_num(pos.get("eyes_trail_offset") or pos.get("native_trail_offset")),
+        "trail_order_id": pos.get("eyes_trail_order_id") or pos.get("native_trail_order_id"),
+        "entry_bid": _trade_eyes_num(pos.get("eyes_entry_bid")),
+        "entry_ask": _trade_eyes_num(pos.get("eyes_entry_ask")),
+        "entry_spread": _trade_eyes_num(pos.get("eyes_entry_spread")),
+        "underlying": pos.get("eyes_underlying") if isinstance(pos.get("eyes_underlying"), dict) else None,
+        "index": pos.get("eyes_index") if isinstance(pos.get("eyes_index"), list) else None,
+        "score": pos.get("eyes_score", sig.get("score")),
+        "rvol": pos.get("eyes_rvol", sig.get("rvol")),
+        "right": pos.get("eyes_right") or _trade_eyes_right(pos),
+        "session_minutes": _trade_eyes_num(pos.get("eyes_session_minutes")),
+        "time_et": pos.get("eyes_time_et"),
+        "opened_at": pos.get("eyes_opened_at") or pos.get("ts"),
+    }
+
+
+async def _trade_eyes_on_close(
+    ticker: str,
+    pos: Optional[dict],
+    exit_px: float,
+    close_reason: Optional[str],
+    expired: bool,
+    entry: Optional[float],
+    qty: int,
+    is_option: bool,
+) -> None:
+    """Append one trade_eyes ledger record and schedule post-exit marks."""
+    snap = _trade_eyes_from_pos(pos)
+    kind = _trade_eyes_exit_kind(close_reason, pos, expired)
+    record = {
+        "ticker": str(ticker).upper(),
+        "eyes_id": snap["eyes_id"],
+        "bot_version": BOT_VERSION,
+        "qty": qty or None,
+        "is_option": bool(is_option),
+        "right": snap["right"],
+        "entry": entry if entry else snap.get("entry"),
+        "exit": None if expired else (exit_px or None),
+        "exit_kind": kind,
+        "close_reason": close_reason,
+        "expired": True if expired else None,
+        "mfe_mark": snap["mfe_mark"],
+        "mfe_pct": snap["mfe_pct"],
+        "mfe_ts": snap["mfe_ts"],
+        "mae_mark": snap["mae_mark"],
+        "mae_pct": snap["mae_pct"],
+        "mae_ts": snap["mae_ts"],
+        "trail_armed": snap["trail_armed"],
+        "trail_armed_ts": snap["trail_armed_ts"],
+        "trail_offset": snap["trail_offset"],
+        "trail_order_id": snap["trail_order_id"],
+        "entry_bid": snap["entry_bid"],
+        "entry_ask": snap["entry_ask"],
+        "entry_spread": snap["entry_spread"],
+        "underlying": snap["underlying"],
+        "index": snap["index"],
+        "score": snap["score"],
+        "rvol": snap["rvol"],
+        "session_minutes": snap["session_minutes"],
+        "time_et": snap["time_et"],
+        "opened_at": snap["opened_at"],
+        "closed_at": _utcnow().isoformat(),
+    }
+    await trade_ledger.record(TRADE_EYES_EVENT, record)
+    logger.info(
+        f"[TRADE EYES] {ticker} {kind} MFE={record['mfe_pct']} MAE={record['mae_pct']} "
+        f"trail={'yes' if record['trail_armed'] else 'no'}"
+    )
+    if expired:
+        return
+    contract = (pos or {}).get("contract") if pos else None
+    try:
+        task = asyncio.create_task(
+            _trade_eyes_post_worker(
+                snap["eyes_id"], str(ticker).upper(),
+                dict(contract) if contract else None,
+                bool(is_option), entry or record.get("entry"),
+            ),
+            name=f"trade_eyes_post:{ticker}:{snap['eyes_id'][:8]}",
+        )
+        _trade_eyes_tasks.add(task)
+        _trade_eyes_tasks.difference_update({t for t in _trade_eyes_tasks if t.done()})
+    except Exception as e:
+        logger.debug(f"[TRADE EYES] {ticker} post-exit marks not scheduled: {e}")
+
+
+async def _trade_eyes_post_worker(
+    eyes_id: str,
+    ticker: str,
+    contract: Optional[dict],
+    is_option: bool,
+    entry: Optional[float],
+) -> None:
+    """Quote the contract 15 and 30 minutes after the close. Never places,
+    cancels, or modifies an order. Skips a stamp when no quote is available.
+    Follow-ups are in-memory only — a process restart drops pending marks.
+    """
+    elapsed = 0
+    for minutes in TRADE_EYES_POST_MINUTES:
+        wait = minutes * 60 - elapsed
+        if wait > 0:
+            try:
+                await asyncio.sleep(wait)
+            except asyncio.CancelledError:
+                return
+            elapsed = minutes * 60
+        if _worker_stop:
+            return
+        try:
+            bid, ask = await _current_bid_ask(ticker, contract if is_option else None)
+        except Exception as e:
+            logger.debug(f"[TRADE EYES] {ticker} +{minutes}m quote skipped: {e}")
+            continue
+        if not bid or bid <= 0:
+            logger.debug(f"[TRADE EYES] {ticker} +{minutes}m quote unavailable — skipped")
+            continue
+        mid = round((bid + ask) / 2.0, 4) if ask and ask >= bid else None
+        mark = round(bid, 4)  # same conservative basis the trail uses for longs
+        spread = round(ask - bid, 4) if ask and ask >= bid else None
+        vs_entry = _trade_eyes_pct(entry, mark) if entry else None
+        try:
+            await trade_ledger.record(TRADE_EYES_POST_EVENT, {
+                "eyes_id": eyes_id,
+                "ticker": ticker,
+                "minutes_after_exit": minutes,
+                "bid": mark,
+                "ask": round(ask, 4) if ask else None,
+                "mid": mid,
+                "spread": spread,
+                "vs_entry_pct": vs_entry,
+                "ts": _utcnow().isoformat(),
+            })
+        except Exception as e:
+            logger.debug(f"[TRADE EYES] {ticker} +{minutes}m ledger write failed: {e}")
 
 
 async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
@@ -24108,6 +24513,14 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         # against an underlying R (the −564.85R class of bug).
         "peak_basis": "premium" if is_option else "underlying",
     })
+    try:
+        await _trade_eyes_on_close(
+            ticker, pos, exit_px, close_reason, expired_booked,
+            (entry_premium if basis == "premium" else entry) or None,
+            qty, is_option,
+        )
+    except Exception as e:
+        logger.warning(f"[TRADE EYES] {ticker} close record failed: {e}")
     if _stop_slip is not None:
         await trade_ledger.record("stop_slippage", {
             "ticker": ticker, "reason": close_reason,
@@ -27924,6 +28337,10 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         pos["trail_checked_at"] = _utcnow().isoformat()
         # Persisted BEFORE the branches below so the observation survives a
         # scale-out return, a None plan, or a close booked by another path.
+        try:
+            _trade_eyes_note_mark(pos, mark, bid, ask)
+        except Exception as e:
+            logger.debug(f"[TRADE EYES] {ticker} mark note failed: {e}")
         await state.set_position(ticker, pos)
 
     # THE CLOCK RUNS BEFORE THE DEAD-QUOTE BAIL AND THE NATIVE-TRAIL
@@ -30240,10 +30657,18 @@ async def scanner_scan_now(
 
 
 @app.get("/ledger")
-async def ledger_tail(count: int = Query(100, ge=1, le=500), verify: bool = Query(False)):
+async def ledger_tail(count: int = Query(100, ge=1, le=500), verify: bool = Query(False),
+                      event: Optional[str] = Query(None)):
     """Tail of the immutable trade ledger (newest first). Pass ?verify=true to
-    walk the FULL hash chain and prove no record was altered or removed."""
-    out: Dict[str, Any] = {"records": trade_ledger.tail(count)}
+    walk the FULL hash chain and prove no record was altered or removed.
+    Optional `?event=trade_eyes` (comma-separated) filters the tail."""
+    records = trade_ledger.tail(count)
+    if event:
+        wanted = {part.strip() for part in str(event).split(",") if part.strip()}
+        # Scan a wider window so a filtered request still returns `count` hits.
+        pool = trade_ledger.recent(min(2000, max(count * 20, 200)))
+        records = [r for r in reversed(pool) if str(r.get("event") or "") in wanted][:count]
+    out: Dict[str, Any] = {"records": records}
     if _ledger_memory is not None:
         out["memory"] = _ledger_memory
     if verify:
@@ -30273,7 +30698,23 @@ async def study_endpoint(
     out = await study.summary(min_samples=min_samples, recent=recent)
     if _study_views is not None:
         out["views"] = _study_views
+    try:
+        eyes = [r for r in trade_ledger.recent(500)
+                if str(r.get("event") or "") in (TRADE_EYES_EVENT, TRADE_EYES_POST_EVENT)]
+        out["eyes"] = list(reversed(eyes[-recent:])) if eyes else []
+    except Exception as e:
+        logger.debug(f"[TRADE EYES] /study eyes tail failed: {e}")
     return out
+
+
+@app.get("/ledger/eyes")
+async def ledger_eyes(count: int = Query(50, ge=1, le=500)):
+    """Read-only trade-eyes records (close snapshots + post-exit marks).
+    Same auth as GET /ledger. Newest first."""
+    pool = trade_ledger.recent(min(2000, max(count * 20, 200)))
+    wanted = {TRADE_EYES_EVENT, TRADE_EYES_POST_EVENT}
+    records = [r for r in reversed(pool) if str(r.get("event") or "") in wanted][:count]
+    return {"records": records, "bot_version": BOT_VERSION}
 
 
 @app.post("/daily-pnl/repair")
