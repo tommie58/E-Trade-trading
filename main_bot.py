@@ -4146,7 +4146,7 @@ Pure functions only — the caller owns quotes, order placement, and state.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # REGIME FILTER trail modes (mirrors expo/services/regimeFilter.ts).
 #   full            — the tiered ratchet below, unchanged
@@ -4992,6 +4992,124 @@ def giveback_keep_for(mfe_percent: float) -> Optional[float]:
         if pct >= min_pct:
             return keep
     return None
+
+
+# Minimum scanner samples before a series range may speak as ATR. Matches the
+# scanner's own MIN_SAMPLES: no judging a tape the eyes just met.
+EYES_MIN_SAMPLES = 4
+
+
+def estimate_atr_from_eyes(
+    *,
+    series: Any = None,
+    session_high: Any = None,
+    session_low: Any = None,
+    mark: Any = None,
+    is_option: bool = False,
+    delta: Any = None,
+    prior_atr: Any = None,
+) -> Dict[str, Any]:
+    """ATR-like noise measure from the bot's own eyes (scanner / quotes).
+
+    Returns ``{"atr": float|None, "source": str|None, "underlying": float|None}``.
+    Units match the trail basis: equity dollars, or option *premium* dollars
+    when ``is_option`` (underlying range × |delta|, defaulting to
+    ASSUMED_ATM_DELTA when delta is unmeasured).
+
+    Candidates are compared on the *trail* basis (largest wins — the widest
+    floor is the most protective):
+      1. scanner series max(last)−min(last) when enough samples exist
+      2. session high−low from the quote the scanner last stored
+      3. a previously measured atr already on the position (already in
+         trail units — never re-scaled by delta)
+    """
+    underlying_candidates: List[Tuple[str, float]] = []
+
+    prices: List[float] = []
+    if isinstance(series, list):
+        for sample in series:
+            if not isinstance(sample, dict):
+                continue
+            last = _finite(sample.get("last"))
+            if last is not None and last > 0:
+                prices.append(last)
+    if len(prices) >= EYES_MIN_SAMPLES:
+        span = max(prices) - min(prices)
+        if span > 0:
+            underlying_candidates.append(("series", span))
+
+    hi = _finite(session_high)
+    lo = _finite(session_low)
+    if hi is not None and lo is not None and hi > lo > 0:
+        underlying_candidates.append(("session", hi - lo))
+
+    scale = 1.0
+    if is_option:
+        d = _finite(delta)
+        if d is None or abs(d) <= 0:
+            d = ASSUMED_ATM_DELTA
+        else:
+            d = min(1.0, max(0.05, abs(d)))
+        scale = d
+
+    candidates: List[Tuple[str, float, float]] = []
+    for src, und in underlying_candidates:
+        trail_units = und * scale
+        src_label = f"{src}*delta" if is_option else src
+        candidates.append((src_label, trail_units, und))
+
+    prior = _finite(prior_atr)
+    if prior is not None and prior > 0:
+        # Prior is already on the trail basis (premium for options).
+        und_guess = (prior / scale) if (is_option and scale > 0) else prior
+        candidates.append(("prior", prior, und_guess))
+
+    if not candidates:
+        return {"atr": None, "source": None, "underlying": None}
+
+    source, atr, underlying = max(candidates, key=lambda item: item[1])
+
+    mark_f = _finite(mark)
+    if mark_f is not None and mark_f > 0:
+        # Cap: never invent a noise band larger than the whole mark — that
+        # would freeze the trail at the hard stop forever.
+        atr = min(atr, mark_f)
+
+    if atr is None or atr <= 0:
+        return {"atr": None, "source": None, "underlying": None}
+    return {
+        "atr": _round2(atr),
+        "source": source,
+        "underlying": _round2(underlying),
+    }
+
+
+def apply_eyes_to_trail_position(
+    position: Dict[str, Any],
+    *,
+    atr: Any = None,
+    atr_source: Any = None,
+    vol_regime: Any = None,
+) -> Dict[str, Any]:
+    """Stamp eyes-derived fields onto a position record (shallow copy).
+
+    A positive ATR overwrites so the next ``plan_ratchet`` call can honour the
+    ATR noise floor. A *stressed* vol regime freezes the ratchet to
+    ``breakeven_only``; calmer regimes never unlock a mode stamped at entry —
+    eyes may only tighten protection mid-trade.
+    """
+    out = dict(position or {})
+    atr_f = _finite(atr)
+    if atr_f is not None and atr_f > 0:
+        out["atr"] = _round2(atr_f)
+        if atr_source:
+            out["atr_source"] = str(atr_source)[:64]
+    regime = str(vol_regime or "").strip().lower()
+    if regime == "stressed":
+        # Preserve an already-frozen mode; otherwise freeze the extension ratchet.
+        out["trail_mode"] = "breakeven_only"
+        out["trail_mode_source"] = "eyes_stressed"
+    return out
 
 
 def compute_trail_level(
@@ -9840,10 +9958,20 @@ class Scanner:
         return out
 
     async def _append_sample(self, quote: Dict[str, Any]) -> None:
+        # Eyes payload for the trail worker: last + volume for RVOL/VWAP, plus
+        # session high/low/prev-close and top-of-book so open positions can
+        # size their ATR noise floor and vol-regime freeze without a second
+        # quote round-trip.
         sample = {
             "ts": _utcnow().isoformat(),
             "last": quote.get("last"),
             "total_volume": quote.get("total_volume"),
+            "bid": quote.get("bid"),
+            "ask": quote.get("ask"),
+            "high": quote.get("high"),
+            "low": quote.get("low"),
+            "previous_close": quote.get("previous_close"),
+            "open": quote.get("open"),
         }
         try:
             await self.state.list_push_capped(
@@ -12040,7 +12168,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # MARKET/LIMIT Good-for-Day, 24/7 session (no equity calendar gate).
 # 5.87.1: pin Individual Crypto 888103-8595 as the crypto-only routing target
 # (dash-tolerant id match, Redis crypto pin, refuse crypto as options pin).
-BOT_VERSION = "5.87.1-crypto"
+BOT_VERSION = "5.88.0-eyes-trail"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -12651,6 +12779,11 @@ STARTUP_RECONCILE_TIMEOUT_SECONDS = int(os.getenv("STARTUP_RECONCILE_TIMEOUT_SEC
 TRAIL_ENGINE_ENABLED = os.getenv("TRAIL_ENGINE_ENABLED", "true").lower() == "true"
 TRAIL_INTERVAL_SECONDS = int(os.getenv("TRAIL_INTERVAL_SECONDS", "30"))
 TRAIL_MIN_STEP_FRAC = float(os.getenv("TRAIL_MIN_STEP_FRAC", "0.10"))
+# Feed the scanner's rolling series (and Massive/E*TRADE session high−low) into
+# the trailing engine's ATR noise floor, and freeze the ratchet to
+# breakeven_only when SPY's measured session is stressed. Off = trail math
+# unchanged from 5.87 (atr stays unset unless the app stamped it).
+TRAIL_EYES_ENABLED = os.getenv("TRAIL_EYES_ENABLED", "true").lower() == "true"
 # ---- V5.10 server-side scanner ----
 # The bot's own eyes: samples E*TRADE quotes for a universe on a fixed cadence,
 # measures RVOL from broker volume, detects setups and dispatches qualifying
@@ -27879,6 +28012,102 @@ async def _maybe_hand_off_native_trail(
     return True
 
 
+async def _scanner_series_for(ticker: str) -> List[Dict[str, Any]]:
+    """Chronological scanner eye samples for a symbol (newest last). Empty
+    when the scanner has not watched the name yet — never invents prints."""
+    out: List[Dict[str, Any]] = []
+    key = scanner_mod.SERIES_KEY_FMT.format(str(ticker or "").upper())
+    try:
+        raw_items = await state.list_range(key, scanner_mod.MAX_SAMPLES)
+    except Exception as e:
+        logger.debug(f"[TRAIL EYES] series read failed for {ticker}: {e}")
+        return out
+    for raw in raw_items:
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, dict):
+            out.append(parsed)
+    out.reverse()
+    return out
+
+
+def _session_levels_from_series(series: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    """Latest session high / low / previous_close the eyes stored."""
+    hi = lo = prev = None
+    for sample in reversed(series or []):
+        if hi is None and sample.get("high") is not None:
+            try:
+                hi = float(sample["high"])
+            except (TypeError, ValueError):
+                hi = None
+        if lo is None and sample.get("low") is not None:
+            try:
+                lo = float(sample["low"])
+            except (TypeError, ValueError):
+                lo = None
+        if prev is None and sample.get("previous_close") is not None:
+            try:
+                prev = float(sample["previous_close"])
+            except (TypeError, ValueError):
+                prev = None
+        if hi is not None and lo is not None and prev is not None:
+            break
+    return {"high": hi, "low": lo, "previous_close": prev}
+
+
+async def _refresh_trail_eyes(ticker: str, pos: dict) -> dict:
+    """Stamp live scanner/Massive measurements onto a position before the
+    trail ratchet runs. Pure math lives in trailing_engine; this only reads
+    the eyes' series and the edge regime classifier."""
+    if not TRAIL_EYES_ENABLED:
+        return pos
+    series = await _scanner_series_for(ticker)
+    levels = _session_levels_from_series(series)
+    contract = pos.get("contract") or {}
+    is_option = bool(contract.get("right")) or pos.get("entry_premium") is not None
+    delta = contract.get("delta")
+    if delta is None:
+        delta = pos.get("option_delta")
+    mark = pos.get("entry_premium") if is_option else pos.get("entry")
+    estimate = trailing_engine.estimate_atr_from_eyes(
+        series=series,
+        session_high=levels.get("high"),
+        session_low=levels.get("low"),
+        mark=mark,
+        is_option=is_option,
+        delta=delta,
+        prior_atr=pos.get("atr"),
+    )
+    vol_regime = None
+    try:
+        spy_series = await _scanner_series_for(edge.BENCHMARK)
+        spy_levels = _session_levels_from_series(spy_series)
+        spy_range = edge.spy_range_pct({
+            "high": spy_levels.get("high"),
+            "low": spy_levels.get("low"),
+            "previous_close": spy_levels.get("previous_close"),
+        })
+        vol_regime, _src = edge.classify_vol_regime(None, spy_range)
+    except Exception as e:
+        logger.debug(f"[TRAIL EYES] regime read failed: {e}")
+    updated = trailing_engine.apply_eyes_to_trail_position(
+        pos,
+        atr=estimate.get("atr"),
+        atr_source=estimate.get("source"),
+        vol_regime=vol_regime,
+    )
+    if updated.get("atr") != pos.get("atr") or updated.get("trail_mode") != pos.get("trail_mode"):
+        logger.info(
+            f"[TRAIL EYES] {ticker} atr={updated.get('atr')} "
+            f"({updated.get('atr_source') or 'n/a'}) "
+            f"trail_mode={updated.get('trail_mode') or 'full'} "
+            f"regime={vol_regime or 'unmeasured'}"
+        )
+    return updated
+
+
 async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     """Mark one position, hand it to an E*TRADE trailing stop when the book
     supports one, and otherwise cancel/replace the resting stop when the
@@ -27889,6 +28118,10 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     stop_order_id = pos.get("stop_order_id")
     if qty < 1:
         return
+
+    # Eyes first: ATR noise floor + stressed-regime freeze need the scanner's
+    # rolling series before plan_ratchet runs.
+    pos = await _refresh_trail_eyes(ticker, pos)
 
     bid, ask = await _current_bid_ask(ticker, dict(contract) if is_option else None)
     # Long options are ALWAYS held long here (exits are SELL_CLOSE), which is

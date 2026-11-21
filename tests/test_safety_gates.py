@@ -270,6 +270,65 @@ def test_engine_trail_stays_at_hard_stop_until_breakeven():
     assert locked["trail_price"] >= 3.0
 
 
+def test_estimate_atr_from_eyes_uses_series_and_session():
+    te = main_bot.trailing_engine
+    series = [{"last": 100.0}, {"last": 101.0}, {"last": 102.5}, {"last": 101.5}]
+    out = te.estimate_atr_from_eyes(series=series, session_high=105.0, session_low=99.0)
+    # Session range 6 > series span 2.5 → session wins.
+    assert out["atr"] == 6.0
+    assert out["source"] == "session"
+    series_only = te.estimate_atr_from_eyes(series=series)
+    assert series_only["atr"] == 2.5
+    assert series_only["source"] == "series"
+    # Too few samples and no session → nothing invented.
+    thin = te.estimate_atr_from_eyes(series=[{"last": 100.0}, {"last": 101.0}])
+    assert thin["atr"] is None
+
+
+def test_estimate_atr_from_eyes_scales_options_by_delta():
+    te = main_bot.trailing_engine
+    out = te.estimate_atr_from_eyes(
+        session_high=210.0, session_low=200.0, is_option=True, delta=0.5, mark=5.0,
+    )
+    # Underlying range 10 × 0.5 delta = 5.0 premium ATR (capped at mark).
+    assert out["atr"] == 5.0
+    assert out["source"] == "session*delta"
+    # Prior already on premium basis is not re-scaled.
+    prior = te.estimate_atr_from_eyes(
+        session_high=210.0, session_low=200.0, is_option=True, delta=0.5,
+        prior_atr=8.0, mark=12.0,
+    )
+    assert prior["atr"] == 8.0
+    assert prior["source"] == "prior"
+
+
+def test_eyes_atr_widens_trail_noise_floor():
+    te = main_bot.trailing_engine
+    # +1R open profit → "protect" tier trails 0.75R (= 0.45) without ATR.
+    bare = te.compute_trail_level("BUY", 3.0, 2.4, 3.6, 2.9)
+    assert bare["tier"] == "protect"
+    with_atr = te.compute_trail_level("BUY", 3.0, 2.4, 3.6, 2.9, atr=2.0)
+    # 0.45 × ATR=2.0 = 0.90 > 0.75R=0.45 → wider floor, lower trail price.
+    assert with_atr["trail_distance"] >= bare["trail_distance"]
+    assert with_atr["trail_price"] <= bare["trail_price"]
+
+
+def test_apply_eyes_freezes_trail_in_stressed_regime():
+    te = main_bot.trailing_engine
+    pos = te.apply_eyes_to_trail_position(
+        {"entry_premium": 3.0, "trail_mode": "full"},
+        atr=1.2, atr_source="series*delta", vol_regime="stressed",
+    )
+    assert pos["atr"] == 1.2
+    assert pos["atr_source"] == "series*delta"
+    assert pos["trail_mode"] == "breakeven_only"
+    # Calm must not unlock a frozen entry mode.
+    kept = te.apply_eyes_to_trail_position(
+        {"trail_mode": "breakeven_only"}, vol_regime="calm",
+    )
+    assert kept["trail_mode"] == "breakeven_only"
+
+
 def test_call_index_vwap_gate_blocks_calls_below_vwap():
     below = main_bot.assess_call_index_vwap_gate(
         "CALL",
