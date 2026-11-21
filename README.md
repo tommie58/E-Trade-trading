@@ -55,6 +55,17 @@ Market or limit (`limit_price`), Good for Day. Crypto is **24/7** (no equity cal
 
 `GET /health` and `GET /healthz` return status, version, and whether a secret is configured. Positions, stops, the guardian, and the cost model are on `GET /status`, which requires the secret.
 
+### Per-trade review & learning
+
+Every close writes a full review snapshot to the immutable ledger (`position_closed`) and a capped Redis list. That includes setup, origin (app/scanner), signal id, contract, stops, trail/eyes ATR, peak R/MFE, and realized P&L. The learning loop still sizes/disables setup×regime cells from those closes when `LEARNING_ENABLED=true`.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /trades` | Newest closes with the full review payload (secret required) |
+| `GET /study` | SQL study layer: coverage, expectancy, recent closes |
+| `GET /learning/report` | Live setup×regime cell weights / disablements |
+| `GET /ledger` | Raw hash-chained event tail |
+
 ### Bot eyes (scanner + smarter trails)
 
 The server-side scanner samples Massive (when `MASSIVE_API_KEY` is set) or E*TRADE quotes on a cadence, scores setups, and keeps a rolling series per symbol. With `TRAIL_EYES_ENABLED=true` (default), that series feeds the trailing-stop ATR noise floor and can freeze the ratchet to breakeven-only when SPY's session looks stressed. Configure via `POST /scanner/config` and inspect with `GET /scanner/status`. Autonomous entries stay off unless `SCANNER_ALLOW_AUTONOMOUS_ENTRY=true` and mode is `live`.

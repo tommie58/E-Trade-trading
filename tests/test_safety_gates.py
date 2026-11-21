@@ -329,6 +329,46 @@ def test_apply_eyes_freezes_trail_in_stressed_regime():
     assert kept["trail_mode"] == "breakeven_only"
 
 
+def test_build_trade_review_fields_keeps_decision_context():
+    pos = {
+        "origin": "app",
+        "signal_id": "sig-42",
+        "entry_premium": 3.5,
+        "stop_premium": 2.8,
+        "tactical_stop_premium": 2.8,
+        "trail": 3.1,
+        "atr": 0.45,
+        "atr_source": "series*delta",
+        "trail_mode": "breakeven_only",
+        "trail_tier": "protect",
+        "trail_mode_source": "eyes_stressed",
+        "breakeven_locked": True,
+        "native_trail_order_id": "99",
+        "native_trail_offset": 0.4,
+        "option_delta": 0.55,
+        "contract": {
+            "right": "CALL", "strike": 200.0, "expiration": "2026-11-21",
+            "occ_symbol": "AAPL261121C00200000",
+        },
+        "edge": {"vol_regime": "stressed"},
+        "app_decides": True,
+    }
+    review = main_bot.build_trade_review_fields(pos)
+    assert review["origin"] == "app"
+    assert review["signal_id"] == "sig-42"
+    assert review["instrument"] == "option"
+    assert review["final_stop"] == 3.1
+    assert review["atr"] == 0.45
+    assert review["native_trail"] is True
+    assert review["contract"]["strike"] == 200.0
+    assert review["vol_regime"] == "stressed"
+    # Empty position invents nothing.
+    empty = main_bot.build_trade_review_fields({})
+    assert empty["atr"] is None
+    assert empty["signal_id"] is None
+    assert empty["instrument"] == "equity"
+
+
 def test_call_index_vwap_gate_blocks_calls_below_vwap():
     below = main_bot.assess_call_index_vwap_gate(
         "CALL",

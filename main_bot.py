@@ -10438,7 +10438,26 @@ select
   bot_private.bot_ts(e.data->>'entry_time')              as entry_time,
   bot_private.bot_num(e.data->>'entry_session_minutes')  as entry_session_minutes,
   bot_private.bot_num(e.data->>'hold_seconds')           as hold_seconds,
-  bot_private.bot_num(e.data->>'hold_minutes')           as hold_minutes
+  bot_private.bot_num(e.data->>'hold_minutes')           as hold_minutes,
+  -- 5.89.0 review snapshot — origin, trail/eyes, contract. Appended LAST so
+  -- CREATE OR REPLACE upgrades an existing database in place.
+  nullif(e.data->>'origin', '')                     as origin,
+  nullif(e.data->>'signal_id', '')                  as signal_id,
+  nullif(e.data->>'instrument', '')                 as instrument,
+  nullif(e.data->>'trail_mode', '')                 as trail_mode,
+  nullif(e.data->>'trail_tier', '')                 as trail_tier,
+  nullif(e.data->>'atr_source', '')                 as atr_source,
+  bot_private.bot_num(e.data->>'atr')                    as atr,
+  bot_private.bot_num(e.data->>'option_delta')           as option_delta,
+  bot_private.bot_num(e.data->>'final_stop')             as final_stop,
+  bot_private.bot_num(e.data->>'entry_premium')          as entry_premium,
+  bot_private.bot_num(e.data->>'stop_premium')           as stop_premium,
+  nullif(e.data->>'vol_regime', '')                 as vol_regime,
+  nullif(e.data->'contract'->>'right', '')          as option_right,
+  bot_private.bot_num(e.data->'contract'->>'strike')     as option_strike,
+  nullif(e.data->'contract'->>'expiration', '')     as option_expiration,
+  bot_private.bot_bool(e.data->>'native_trail')          as native_trail,
+  bot_private.bot_bool(e.data->>'breakeven_locked')      as breakeven_locked
 from bot_private.bot_ledger_events e
 left join lateral (
   select t.value as fix
@@ -10801,7 +10820,11 @@ async def recent_closes(limit: int = 25) -> List[Dict[str, Any]]:
     return await _rows(
         "select closed_at, ticker, setup, exit_reason, pnl_basis, "
         "realized_pnl_pct, realized_pnl_usd, peak_r, peak_mfe_pct, peak_basis, "
-        "underlying_entry, underlying_stop "
+        "underlying_entry, underlying_stop, "
+        "origin, signal_id, instrument, trail_mode, trail_tier, atr, atr_source, "
+        "option_delta, final_stop, entry_premium, stop_premium, vol_regime, "
+        "option_right, option_strike, option_expiration, native_trail, breakeven_locked, "
+        "hold_minutes, entry_score, entry_rvol "
         "from bot_private.bot_trade_closes "
         f"order by seq desc limit {int(limit)}"
     )
@@ -12168,7 +12191,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # MARKET/LIMIT Good-for-Day, 24/7 session (no equity calendar gate).
 # 5.87.1: pin Individual Crypto 888103-8595 as the crypto-only routing target
 # (dash-tolerant id match, Redis crypto pin, refuse crypto as options pin).
-BOT_VERSION = "5.88.0-eyes-trail"
+BOT_VERSION = "5.89.0-trade-review"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -12824,6 +12847,10 @@ ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", "300"))
 # Immutable trade ledger — append-only, hash-chained JSONL (GET /ledger).
 TRADE_LEDGER_FILE = Path(os.getenv("TRADE_LEDGER_FILE", "trade_ledger.jsonl"))
+# Fast per-trade review list (Redis/memory) mirroring each position_closed
+# snapshot so GET /trades works even when Postgres study views are offline.
+TRADES_HISTORY_KEY = "trades:history"
+TRADES_HISTORY_MAX = int(os.getenv("TRADES_HISTORY_MAX", "500"))
 # Option stop protection: when the app doesn't send an explicit option stop
 # premium, protect at this percent below the entry premium (0 disables).
 # 5.54.0: was 30. A 30% blind stop next to winners the journal books at +18.9%
@@ -23754,16 +23781,104 @@ async def _alert_entry_fill(ticker: str, guard: dict, filled: int) -> None:
 
 
 # ==================== POSITION LEDGER (Redis-backed) ====================
+def _finite_or_none(value: Any) -> Optional[float]:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
+
+
+def build_trade_review_fields(pos: Optional[dict]) -> Dict[str, Any]:
+    """Per-trade fields that must survive a close for review and learning.
+
+    The position record holds stops, trail state, eyes ATR, origin and the
+    contract — but `_record_close` used to keep only a thin slice. Anything
+    not copied here is deleted with the Redis position and can never teach
+    the next decision. Missing stays missing (never invent zeros).
+    """
+    p = pos or {}
+    contract = p.get("contract") if isinstance(p.get("contract"), dict) else None
+    contract_slim: Optional[Dict[str, Any]] = None
+    if contract:
+        contract_slim = {
+            k: contract.get(k)
+            for k in ("occ_symbol", "right", "strike", "expiration", "delta")
+            if contract.get(k) is not None
+        } or None
+    origin = str(p.get("origin") or p.get(DISPATCH_ORIGIN_FIELD) or "").strip().lower() or None
+    signal_id = str(p.get("signal_id") or "").strip() or None
+    delta = _finite_or_none(p.get("option_delta"))
+    if delta is None and contract is not None:
+        delta = _finite_or_none(contract.get("delta"))
+    return {
+        "origin": origin,
+        "signal_id": signal_id,
+        "contract": contract_slim,
+        "option_delta": delta,
+        "instrument": (
+            "option" if (contract_slim or p.get("entry_premium") is not None)
+            else ("crypto" if str(p.get("instrument") or "").lower() == "crypto" else "equity")
+        ),
+        "entry_premium": _finite_or_none(p.get("entry_premium")),
+        "stop_premium": _finite_or_none(p.get("stop_premium")),
+        "tactical_stop_premium": _finite_or_none(p.get("tactical_stop_premium")),
+        "initial_stop": _finite_or_none(p.get("initial_stop")),
+        "final_stop": _finite_or_none(
+            p.get("trail") if p.get("trail") is not None
+            else (p.get("stop_premium") if p.get("entry_premium") is not None else p.get("stop"))
+        ),
+        "target_premium": _finite_or_none(p.get("target_premium")),
+        "stop_tier": (str(p.get("stop_tier") or "").strip() or None),
+        "trail_tier": (str(p.get("trail_tier") or "").strip() or None),
+        "trail_mode": trailing_engine.normalize_trail_mode(p.get("trail_mode")),
+        "trail_mode_source": (str(p.get("trail_mode_source") or "").strip() or None),
+        "atr": _finite_or_none(p.get("atr")),
+        "atr_source": (str(p.get("atr_source") or "").strip() or None),
+        "breakeven_locked": bool(p.get("breakeven_locked")) if p.get("breakeven_locked") is not None else None,
+        "trail_giveback": bool(p.get("trail_giveback")) if p.get("trail_giveback") is not None else None,
+        "native_trail": bool(p.get("native_trail_order_id")),
+        "native_trail_offset": _finite_or_none(p.get("native_trail_offset")),
+        "native_trail_source": (str(p.get("native_trail_source") or "").strip() or None),
+        "app_decides": bool(p.get("app_decides")) if p.get("app_decides") is not None else None,
+        "vol_regime": (
+            str((p.get("edge") or {}).get("vol_regime") or "").strip().lower() or None
+            if isinstance(p.get("edge"), dict) else None
+        ),
+    }
+
+
+async def _remember_trade_review(snapshot: Dict[str, Any]) -> None:
+    """Cap a Redis/memory list of full close snapshots for GET /trades when
+    Postgres study views are offline. Best-effort — never blocks a close."""
+    try:
+        await state.list_push_capped(
+            TRADES_HISTORY_KEY, json.dumps(snapshot, default=str), max_len=TRADES_HISTORY_MAX,
+        )
+    except Exception as e:
+        logger.debug(f"trade review list not updated: {e}")
+
+
 async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Optional[float],
                        target: Optional[float], contract: Optional[dict],
                        action: str = "BUY", setup: Optional[str] = None,
                        edge_ctx: Optional[dict] = None,
-                       entry_signal: Optional[dict] = None) -> None:
+                       entry_signal: Optional[dict] = None,
+                       origin: Optional[str] = None,
+                       signal_id: Optional[str] = None,
+                       option_delta: Any = None,
+                       instrument: Optional[str] = None) -> None:
     # The setup label rides on the position and into the ledger so the trade
     # can be attributed when it settles. Without it the bot writes a history it
     # can never learn from: every close lands in an anonymous pile and the
     # question "does this setup make money?" stays permanently unanswerable.
     setup_label = str(setup or "").strip() or None
+    origin_label = str(origin or "").strip().lower() or None
+    signal_label = str(signal_id or "").strip() or None
+    delta = _finite_or_none(option_delta)
+    instrument_label = str(instrument or "").strip().lower() or None
     await state.set_position(ticker, {
         "qty": int(qty),
         "action": str(action or "BUY").upper(),
@@ -23779,6 +23894,12 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         # The signal's own readings at entry (score, rvol, mtf) — stamped on
         # every close so entry quality can be measured against outcome.
         "entry_signal": entry_signal or None,
+        # Who asked for the trade and which signal — without these a close
+        # cannot tell app vs scanner or de-dupe against the same idea.
+        "origin": origin_label,
+        "signal_id": signal_label,
+        "option_delta": delta,
+        "instrument": instrument_label,
     })
     await state.incr_trades_today()
     # 5.84.1 0DTE cap memory: count a same-day-expiry open on its ET day.
@@ -23797,6 +23918,10 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         "setup": setup_label,
         "edge": edge_ctx or None,
         "entry_signal": entry_signal or None,
+        "origin": origin_label,
+        "signal_id": signal_label,
+        "option_delta": delta,
+        "instrument": instrument_label,
     })
 
 
@@ -24173,7 +24298,8 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
     except (TypeError, ValueError) as e:
         logger.debug(f"[STOP SLIP] {ticker} slippage not measurable: {e}")
         _stop_slip = None
-    await trade_ledger.record("position_closed", {
+    _review = build_trade_review_fields(pos)
+    close_data: Dict[str, Any] = {
         "ticker": ticker,
         "stop_slippage": _stop_slip,
         # On the premium basis, entry/exit are BOTH premiums so a replay
@@ -24240,7 +24366,14 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         # peak when the two disagree instead of comparing a premium excursion
         # against an underlying R (the −564.85R class of bug).
         "peak_basis": "premium" if is_option else "underlying",
-    })
+        # FULL REVIEW SNAPSHOT (5.89) — stops, trail/eyes state, origin,
+        # contract and signal id. Learning already used setup×regime; review
+        # needs the rest of the decision so a bad trail or scanner entry is
+        # visible without reconstructing Redis after the fact.
+        **_review,
+    }
+    await trade_ledger.record("position_closed", close_data)
+    await _remember_trade_review(close_data)
     if _stop_slip is not None:
         await trade_ledger.record("stop_slippage", {
             "ticker": ticker, "reason": close_reason,
@@ -26853,6 +26986,10 @@ async def execute_live_order(payload: dict):
                     payload.get("target"), contract, "BUY", payload.get("setup"),
                     edge_ctx=_payload_edge(payload),
                     entry_signal=_entry_signal(payload),
+                    origin=payload.get(DISPATCH_ORIGIN_FIELD),
+                    signal_id=signal_identity(payload),
+                    option_delta=payload.get("option_delta"),
+                    instrument="option",
                 )
                 if app_decides:
                     # Marks the position as the APP's to exit while it guards
@@ -27131,6 +27268,9 @@ async def execute_live_order(payload: dict):
                 symbol, record_qty, entry_px, stop_px, payload.get("target"), None, action,
                 payload.get("setup"), edge_ctx=_payload_edge(payload),
                 entry_signal=_entry_signal(payload),
+                origin=payload.get(DISPATCH_ORIGIN_FIELD),
+                signal_id=signal_identity(payload),
+                instrument="crypto",
             )
             try:
                 pos = await state.get_position(symbol) or {}
@@ -27354,7 +27494,10 @@ async def execute_live_order(payload: dict):
                     await _record_open(symbol, quantity, entry_px or None, stop_px or None,
                                        payload.get("target"), None, action, payload.get("setup"),
                                        edge_ctx=_payload_edge(payload),
-                                       entry_signal=_entry_signal(payload))
+                                       entry_signal=_entry_signal(payload),
+                                       origin=payload.get(DISPATCH_ORIGIN_FIELD),
+                                       signal_id=signal_identity(payload),
+                                       instrument="equity")
                     return {"status": "success", "response": final, "otoco": True}
                 except OTOCOUnsupported as e:
                     logger.warning(
@@ -27378,7 +27521,10 @@ async def execute_live_order(payload: dict):
 
             await _record_open(symbol, quantity, entry_px or None, stop_px or None, payload.get("target"), None, action,
                                payload.get("setup"), edge_ctx=_payload_edge(payload),
-                               entry_signal=_entry_signal(payload))
+                               entry_signal=_entry_signal(payload),
+                               origin=payload.get(DISPATCH_ORIGIN_FIELD),
+                               signal_id=signal_identity(payload),
+                               instrument="equity")
             entry_order_id = _order_id_from_place(final)
             if stop_px > 0:
                 # Arm the stop guard: poll the entry fill, then rest a real STOP
@@ -30485,6 +30631,53 @@ async def ledger_tail(count: int = Query(100, ge=1, le=500), verify: bool = Quer
         out["chain_records_checked"] = checked
         out["chain_error"] = err
     return out
+
+
+@app.get("/trades")
+async def trades_review(
+    count: int = Query(50, ge=1, le=500),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Per-trade review snapshots (newest first) for learning and forensics.
+
+    Prefers the Redis/memory review list stamped on every close; falls back to
+    `position_closed` rows in the immutable ledger when that list is empty
+    (e.g. after a cold boot before the first close of the process). Requires
+    the webhook secret — these rows carry fills, stops and P&L.
+    """
+    await _require_control_auth(x_rork_secret, "/trades")
+    trades: List[Dict[str, Any]] = []
+    source = "history"
+    try:
+        raw_items = await state.list_range(TRADES_HISTORY_KEY, count)
+        for raw in raw_items:
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(parsed, dict):
+                trades.append(parsed)
+    except Exception as e:
+        logger.warning(f"/trades history list unreadable: {e}")
+    if not trades:
+        source = "ledger"
+        for rec in trade_ledger.tail(min(count * 3, 1500)):
+            if not isinstance(rec, dict) or str(rec.get("event") or "") != "position_closed":
+                continue
+            data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+            row = dict(data)
+            row["ledger_seq"] = rec.get("seq")
+            row["ledger_ts"] = rec.get("ts")
+            trades.append(row)
+            if len(trades) >= count:
+                break
+    return {
+        "trades": trades[:count],
+        "count": len(trades[:count]),
+        "source": source,
+        "learning_enabled": LEARNING_ENABLED,
+        "version": BOT_VERSION,
+    }
 
 
 @app.get("/study")
