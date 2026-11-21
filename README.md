@@ -57,7 +57,7 @@ Market or limit (`limit_price`), Good for Day. Crypto is **24/7** (no equity cal
 
 ### Per-trade review & learning
 
-Every close writes a full review snapshot to the immutable ledger (`position_closed`) and a capped Redis list. That includes setup, origin (app/scanner), signal id, contract, stops, trail/eyes ATR, peak R/MFE, and realized P&L. The learning loop still sizes/disables setup×regime cells from those closes when `LEARNING_ENABLED=true`.
+Every close writes a full review snapshot to the immutable ledger (`position_closed`) and a capped Redis list. That includes setup, origin (app/scanner), signal id, contract, stops, trail/eyes ATR, peak R/MFE, worst drop (MAE), entry spread, SPY/QQQ vs day VWAP, and realized P&L. `native_trail` stays true when a broker trail was armed even if the 3:40 flatten cancelled it before booking — read it with `reason` and `final_stop`. The bot also re-quotes 15 and 30 minutes after exit (`exit_followup`) to flag stops that may have been too tight. The learning loop still sizes/disables setup×regime cells from those closes when `LEARNING_ENABLED=true`.
 
 | Endpoint | Purpose |
 | --- | --- |

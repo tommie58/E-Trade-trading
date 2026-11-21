@@ -352,6 +352,11 @@ def test_build_trade_review_fields_keeps_decision_context():
         },
         "edge": {"vol_regime": "stressed"},
         "app_decides": True,
+        "entry_spread": 0.10,
+        "entry_spread_pct": 2.85,
+        "entry_index_vwap": [
+            {"symbol": "SPY", "last": 510.0, "vwap": 505.0, "vs_vwap_pct": 0.9901, "above_vwap": True},
+        ],
     }
     review = main_bot.build_trade_review_fields(pos)
     assert review["origin"] == "app"
@@ -362,11 +367,110 @@ def test_build_trade_review_fields_keeps_decision_context():
     assert review["native_trail"] is True
     assert review["contract"]["strike"] == 200.0
     assert review["vol_regime"] == "stressed"
+    assert review["entry_spread"] == 0.10
+    assert review["entry_index_vwap"][0]["symbol"] == "SPY"
     # Empty position invents nothing.
     empty = main_bot.build_trade_review_fields({})
     assert empty["atr"] is None
     assert empty["signal_id"] is None
     assert empty["instrument"] == "equity"
+    assert empty["entry_spread"] is None
+
+
+def test_native_trail_survives_eod_cancel_before_close():
+    """3:40 flatten clears native_trail_order_id before booking — must not
+    mislabel the trade as having had no native trail."""
+    after_cancel = {
+        "entry_premium": 4.0,
+        "stop_premium": 3.2,
+        "trail": 3.5,
+        "native_trail_order_id": None,  # wiped by cancel-before-close
+        "had_native_trail": True,
+        "native_trail_offset": 0.50,
+        "native_trail_source": "auto",
+    }
+    review = main_bot.build_trade_review_fields(after_cancel)
+    assert review["native_trail"] is True
+    assert review["native_trail_offset"] == 0.50
+    assert review["final_stop"] == 3.5
+    # Offset alone (legacy positions without the sticky flag) still counts.
+    legacy = {
+        "entry_premium": 4.0,
+        "native_trail_order_id": None,
+        "native_trail_offset": 0.40,
+        "native_trail_source": "auto",
+    }
+    assert main_bot.position_had_native_trail(legacy) is True
+    assert main_bot.build_trade_review_fields(legacy)["native_trail"] is True
+    assert main_bot.position_had_native_trail({}) is False
+
+
+def test_observe_water_mark_tracks_worst_drop_mae():
+    pos = {
+        "entry_premium": 4.00,
+        "stop_premium": 3.20,
+        "initial_stop": 3.20,
+        "contract": {"right": "CALL"},
+    }
+    # Favourable first.
+    up = main_bot.trailing_engine.observe_water_mark(pos, 4.80)
+    assert up is not None
+    assert up["mfe_percent"] == pytest.approx(0.2, abs=1e-4)
+    assert up["mae_percent"] == 0.0
+    pos["trail_high"] = up["high_since"]
+    pos["trail_low"] = up["low_since"]
+    pos["trail_r"] = up["r_multiple"]
+    pos["trail_mfe_pct"] = up["mfe_percent"]
+    pos["trail_mae_r"] = up["mae_r"]
+    pos["trail_mae_pct"] = up["mae_percent"]
+    # Then a drawdown under entry — MAE must rise and stay monotonic.
+    down = main_bot.trailing_engine.observe_water_mark(pos, 3.60)
+    assert down is not None
+    assert down["mae_percent"] == pytest.approx(0.1, abs=1e-4)
+    assert down["mae_r"] == pytest.approx(0.5, abs=1e-2)
+    assert down["mfe_percent"] == pytest.approx(0.2, abs=1e-4)  # peak kept
+    pos["trail_high"] = down["high_since"]
+    pos["trail_low"] = down["low_since"]
+    pos["trail_mae_pct"] = down["mae_percent"]
+    pos["trail_mae_r"] = down["mae_r"]
+    # A bounce must not erase the trough.
+    bounce = main_bot.trailing_engine.observe_water_mark(pos, 4.10)
+    assert bounce["mae_percent"] == pytest.approx(0.1, abs=1e-4)
+
+
+def test_snapshot_index_vs_vwap_and_entry_spread():
+    rows = main_bot.snapshot_index_vs_vwap([
+        {"symbol": "SPY", "last": 510.0, "vwap": 500.0, "vwap_source": "quote"},
+        {"symbol": "QQQ", "last": 400.0, "vwap": 410.0},
+        {"symbol": "BAD", "last": 0, "vwap": 10},
+    ])
+    assert len(rows) == 2
+    spy = rows[0]
+    assert spy["symbol"] == "SPY"
+    assert spy["above_vwap"] is True
+    assert spy["vs_vwap_pct"] == pytest.approx(2.0, abs=1e-4)
+    assert rows[1]["above_vwap"] is False
+    spread = main_bot.snapshot_entry_spread(2.00, 2.10)
+    assert spread["spread"] == pytest.approx(0.10)
+    assert spread["spread_pct"] == pytest.approx(4.878, abs=1e-2)
+    assert main_bot.snapshot_entry_spread(None, 2.10)["spread"] is None
+
+
+def test_exit_followup_plan_and_recovery_move():
+    from datetime import datetime, timezone
+
+    closed = datetime(2026, 11, 21, 20, 0, tzinfo=timezone.utc)
+    plans = main_bot.plan_exit_followups(closed)
+    assert [p["horizon_min"] for p in plans] == [15, 30]
+    assert plans[0]["due_at"].startswith("2026-11-21T20:15:00")
+    long_up = main_bot.assess_exit_followup_move(3.00, 3.30, entry_action="BUY")
+    assert long_up["recovery"] is True
+    assert long_up["move_pct"] == pytest.approx(10.0)
+    long_down = main_bot.assess_exit_followup_move(3.00, 2.70, entry_action="BUY")
+    assert long_down["recovery"] is False
+    short_down = main_bot.assess_exit_followup_move(100.0, 95.0, entry_action="SELL")
+    assert short_down["recovery"] is True
+    assert main_bot.assess_exit_followup_move(None, 3.0)["mark"] is None
 
 
 def test_call_index_vwap_gate_blocks_calls_below_vwap():
