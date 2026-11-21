@@ -12040,9 +12040,10 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # MARKET/LIMIT Good-for-Day, 24/7 session (no equity calendar gate).
 # 5.87.1: pin Individual Crypto 888103-8595 as the crypto-only routing target
 # (dash-tolerant id match, Redis crypto pin, refuse crypto as options pin).
-# 5.87.2-eyes: observational trade-eyes capture (MFE/MAE, entry context,
+# 5.88.2-trade-eyes: observational trade-eyes capture (MFE/MAE, entry context,
 # post-exit +15/+30 marks) written to the ledger. No order/stop/gate changes.
-BOT_VERSION = "5.87.2-eyes"
+# MAE adverse % floored at 0; entry-capture race fix writes only eyes_* keys.
+BOT_VERSION = "5.88.2-trade-eyes"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -23889,9 +23890,9 @@ def _peak_value(value: Any) -> Optional[float]:
     return f
 
 
-# ---- TRADE EYES (5.87.2) — observational only, never affects orders --------
-# Records per-trade MFE/MAE, entry context, and post-exit marks on the
-# existing hash-chained ledger. Every public function swallows its own
+# ---- TRADE EYES (5.88.2) — observational only, never affects orders --------
+# Records per-trade MFE/MAE, entry context, and post-exit +15/+30 marks on
+# the existing hash-chained ledger. Every public function swallows its own
 # errors so a capture failure cannot change placement, stops, gates, or
 # flatten behaviour. Named `_trade_eyes_*` so it cannot collide with the
 # existing `_app_eyes_pass` exit-authority path.
@@ -23976,12 +23977,16 @@ def _trade_eyes_note_mark(pos: dict, mark: Any, bid: Any = None, ask: Any = None
     if mae_worse:
         pos["eyes_mae_mark"] = round(mark_f, 4)
         pos["eyes_mae_ts"] = now
-        if entry:
-            # Adverse percent is signed from the trader's view: negative when
-            # the mark is against the position, 0 when it has never gone red.
-            mae_pct = _trade_eyes_pct(entry, mark_f)
-            if mae_pct is not None:
-                pos["eyes_mae_pct"] = mae_pct
+    if entry:
+        # Adverse percent is the WORST signed excursion observed, floored at
+        # 0 from the trader's view: a trade that has never gone red shows a
+        # 0 drawdown, not a positive one. 5.88.2 fix over the draft patch,
+        # which echoed the latest mark's pct and read positive on green trades.
+        signed = _trade_eyes_pct(entry, mark_f)
+        if signed is not None:
+            adverse = min(0.0, signed) if is_buy else min(0.0, -signed)
+            prev = _trade_eyes_num(pos.get("eyes_mae_pct"))
+            pos["eyes_mae_pct"] = round(min(prev if prev is not None else 0.0, adverse), 4)
     # First-poll spread snapshot when the background entry capture missed it.
     bid_f, ask_f = _trade_eyes_num(bid), _trade_eyes_num(ask)
     if bid_f and ask_f and ask_f >= bid_f and not pos.get("eyes_entry_bid"):
@@ -24080,7 +24085,6 @@ async def _trade_eyes_capture_entry(ticker: str) -> None:
                 quotes = scanner_mod.parse_quotes(raw) if raw else []
                 by_sym = {str(q.get("symbol") or "").upper(): q for q in quotes if isinstance(q, dict)}
                 row = _trade_eyes_index_row(by_sym.get(str(ticker).upper()) or {"symbol": ticker})
-                # parse_quotes uses last + vwap; reuse the same shape.
                 if row:
                     pos["eyes_underlying"] = row
                 else:
@@ -24096,6 +24100,18 @@ async def _trade_eyes_capture_entry(ticker: str) -> None:
                         }
             except Exception as e:
                 logger.debug(f"[TRADE EYES] {ticker} underlying VWAP snapshot skipped: {e}")
+        # 5.88.2 RACE FIX. The quote fetches above can take seconds; the trail
+        # worker may persist a stop/trail id in that window. Re-read the stored
+        # position and write ONLY the eyes_* keys, so those ids survive.
+        try:
+            fresh = await state.get_position(ticker)
+            if isinstance(fresh, dict):
+                for k, v in pos.items():
+                    if str(k).startswith("eyes_"):
+                        fresh[k] = v
+                pos = fresh
+        except Exception as e:
+            logger.debug(f"[TRADE EYES] {ticker} eyes save re-read failed: {e}")
         await state.set_position(ticker, pos)
     except Exception as e:
         logger.debug(f"[TRADE EYES] {ticker} entry capture failed: {e}")
@@ -24193,9 +24209,6 @@ async def _trade_eyes_on_close(
         "opened_at": snap["opened_at"],
         "closed_at": _utcnow().isoformat(),
     }
-    # Prefer the booked premium/underlying entry already computed by _record_close.
-    if entry:
-        record["entry"] = entry
     await trade_ledger.record(TRADE_EYES_EVENT, record)
     logger.info(
         f"[TRADE EYES] {ticker} {kind} MFE={record['mfe_pct']} MAE={record['mae_pct']} "
