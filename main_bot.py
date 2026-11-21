@@ -3692,6 +3692,10 @@ async def reconcile_once(
             pos["native_trail_price_type"] = (
                 str(native.get("price_type") or "").upper() if native else None
             )
+            if native_id:
+                # Sticky: survives later cancel-before-close so the journal
+                # does not mislabel an eod_flatten as "no native trail".
+                pos["had_native_trail"] = True
             await state.set_position(ticker, pos)
             if native_id:
                 report["healed"].append(
@@ -5332,12 +5336,14 @@ def observe_water_mark(
 
     Returns None when the mark itself is unusable; otherwise:
 
-      {"high_since", "low_since", "r_multiple" | None, "mfe_percent" | None}
+      {"high_since", "low_since",
+       "r_multiple" | None, "mfe_percent" | None,
+       "mae_r" | None, "mae_percent" | None}
 
-    `r_multiple` and `mfe_percent` are measured on the SAME basis `plan_ratchet`
-    trails on — the option PREMIUM for contracts, the underlying for equities —
-    so a peak may only ever be compared against a realized R booked on that
-    same basis.
+    Favourable excursion (MFE) and adverse excursion (MAE / worst drop) are
+    both measured on the SAME basis `plan_ratchet` trails on — the option
+    PREMIUM for contracts, the underlying for equities — so a peak or trough
+    may only ever be compared against a realized R booked on that same basis.
     """
     mark_f = _finite(mark)
     if mark_f is None or mark_f <= 0:
@@ -5364,16 +5370,22 @@ def observe_water_mark(
         "low_since": _round2(low),
         "r_multiple": None,
         "mfe_percent": None,
+        "mae_r": None,
+        "mae_percent": None,
     }
 
     prev_r = _finite(position.get("trail_r"))
     prev_pct = _finite(position.get("trail_mfe_pct"))
+    prev_mae_r = _finite(position.get("trail_mae_r"))
+    prev_mae_pct = _finite(position.get("trail_mae_pct"))
 
     if entry is None or entry <= 0:
-        # No basis to measure against — carry any peak already observed
+        # No basis to measure against — carry any peak/trough already observed
         # forward untouched rather than dropping or zeroing it.
         out["r_multiple"] = prev_r
         out["mfe_percent"] = prev_pct
+        out["mae_r"] = prev_mae_r
+        out["mae_percent"] = prev_mae_pct
         return out
 
     water_mark = max(entry, high) if is_buy else min(entry, low)
@@ -5381,17 +5393,29 @@ def observe_water_mark(
     if mfe < 0:
         mfe = 0.0
 
+    # Worst drop against the trade: low under entry for longs, high over entry
+    # for shorts. Monotonic — a trough that improves is a bug.
+    adverse_mark = low if is_buy else high
+    mae = (entry - adverse_mark) if is_buy else (adverse_mark - entry)
+    if mae < 0:
+        mae = 0.0
+
     mfe_percent = math.floor(mfe / entry * 10000 + 0.5) / 10000.0
     out["mfe_percent"] = max(mfe_percent, prev_pct) if prev_pct is not None else mfe_percent
+    mae_percent = math.floor(mae / entry * 10000 + 0.5) / 10000.0
+    out["mae_percent"] = max(mae_percent, prev_mae_pct) if prev_mae_pct is not None else mae_percent
 
     risk = abs(entry - initial) if initial is not None else 0.0
     if risk > 0:
         r_multiple = round(mfe / risk * 100) / 100.0
         out["r_multiple"] = max(r_multiple, prev_r) if prev_r is not None else r_multiple
+        mae_r = round(mae / risk * 100) / 100.0
+        out["mae_r"] = max(mae_r, prev_mae_r) if prev_mae_r is not None else mae_r
     else:
         # Percent excursion is measurable without a stop; R is not. Keep the
         # prior R (possibly None) instead of inventing one from a zero risk.
         out["r_multiple"] = prev_r
+        out["mae_r"] = prev_mae_r
 
     return out
 
@@ -10457,7 +10481,17 @@ select
   bot_private.bot_num(e.data->'contract'->>'strike')     as option_strike,
   nullif(e.data->'contract'->>'expiration', '')     as option_expiration,
   bot_private.bot_bool(e.data->>'native_trail')          as native_trail,
-  bot_private.bot_bool(e.data->>'breakeven_locked')      as breakeven_locked
+  bot_private.bot_bool(e.data->>'breakeven_locked')      as breakeven_locked,
+  -- 5.90.0 journal: worst drop, entry tape, post-exit is a separate event.
+  -- Appended LAST so CREATE OR REPLACE upgrades an existing database in place.
+  bot_private.bot_num(e.data->>'trough_r')               as trough_r,
+  bot_private.bot_num(e.data->>'trough_mae_pct')         as trough_mae_frac,
+  bot_private.bot_num(e.data->>'trough_mae_pct') * 100.0 as trough_mae_pct,
+  bot_private.bot_num(e.data->>'entry_spread')           as entry_spread,
+  bot_private.bot_num(e.data->>'entry_spread_pct')       as entry_spread_pct,
+  bot_private.bot_num(e.data->>'entry_bid')              as entry_bid,
+  bot_private.bot_num(e.data->>'entry_ask')              as entry_ask,
+  e.data->'entry_index_vwap'                             as entry_index_vwap
 from bot_private.bot_ledger_events e
 left join lateral (
   select t.value as fix
@@ -10824,7 +10858,8 @@ async def recent_closes(limit: int = 25) -> List[Dict[str, Any]]:
         "origin, signal_id, instrument, trail_mode, trail_tier, atr, atr_source, "
         "option_delta, final_stop, entry_premium, stop_premium, vol_regime, "
         "option_right, option_strike, option_expiration, native_trail, breakeven_locked, "
-        "hold_minutes, entry_score, entry_rvol "
+        "trough_r, trough_mae_pct, entry_spread, entry_spread_pct, entry_bid, entry_ask, "
+        "entry_index_vwap, hold_minutes, entry_score, entry_rvol "
         "from bot_private.bot_trade_closes "
         f"order by seq desc limit {int(limit)}"
     )
@@ -12191,7 +12226,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # MARKET/LIMIT Good-for-Day, 24/7 session (no equity calendar gate).
 # 5.87.1: pin Individual Crypto 888103-8595 as the crypto-only routing target
 # (dash-tolerant id match, Redis crypto pin, refuse crypto as options pin).
-BOT_VERSION = "5.89.0-trade-review"
+BOT_VERSION = "5.90.0-trade-journal"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -12851,6 +12886,11 @@ TRADE_LEDGER_FILE = Path(os.getenv("TRADE_LEDGER_FILE", "trade_ledger.jsonl"))
 # snapshot so GET /trades works even when Postgres study views are offline.
 TRADES_HISTORY_KEY = "trades:history"
 TRADES_HISTORY_MAX = int(os.getenv("TRADES_HISTORY_MAX", "500"))
+# After a close, re-quote the instrument at these horizons (minutes). A stop
+# that was too tight shows up as a recovery here; missing stays missing.
+EXIT_FOLLOWUP_MINUTES: Tuple[int, ...] = (15, 30)
+EXIT_FOLLOWUPS_KEY = "trades:exit_followups"
+EXIT_FOLLOWUP_WORKER_SECONDS = int(os.getenv("EXIT_FOLLOWUP_WORKER_SECONDS", "60"))
 # Option stop protection: when the app doesn't send an explicit option stop
 # premium, protect at this percent below the entry premium (0 disables).
 # 5.54.0: was 30. A 30% blind stop next to winners the journal books at +18.9%
@@ -13706,6 +13746,63 @@ def assess_app_risk_gates(open_count: Any, realized_pnl_today_pct: Any, daily_lo
     return reasons
 
 
+def snapshot_index_vs_vwap(index_quotes: Any) -> List[Dict[str, Any]]:
+    """SPY/QQQ last vs day VWAP for the journal. Pure; missing quotes omitted.
+
+    Each row: {symbol, last, vwap, vs_vwap_pct, above_vwap}. `vs_vwap_pct` is
+    (last - vwap) / vwap * 100 — positive means the index is above VWAP.
+    """
+    out: List[Dict[str, Any]] = []
+    rows = index_quotes.values() if isinstance(index_quotes, dict) else (index_quotes or [])
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sym = str(row.get("symbol") or "").upper().strip()
+        try:
+            last = float(row.get("last") or 0)
+            vwap = float(row.get("vwap") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not sym or last <= 0 or vwap <= 0 or not math.isfinite(last) or not math.isfinite(vwap):
+            continue
+        vs_pct = round((last - vwap) / vwap * 100.0, 4)
+        out.append({
+            "symbol": sym,
+            "last": round(last, 4),
+            "vwap": round(vwap, 4),
+            "vs_vwap_pct": vs_pct,
+            "above_vwap": last + 1e-9 >= vwap,
+            "vwap_source": (str(row.get("vwap_source") or "").strip() or None),
+        })
+    return out
+
+
+def snapshot_entry_spread(bid: Any, ask: Any) -> Dict[str, Optional[float]]:
+    """Bid/ask width at entry. Missing stays None — never invent a zero spread."""
+    try:
+        b = float(bid) if bid is not None else None
+        a = float(ask) if ask is not None else None
+    except (TypeError, ValueError):
+        return {"bid": None, "ask": None, "spread": None, "spread_pct": None}
+    if b is None or a is None or not math.isfinite(b) or not math.isfinite(a):
+        return {"bid": None, "ask": None, "spread": None, "spread_pct": None}
+    if b <= 0 or a <= 0 or a < b:
+        return {
+            "bid": round(b, 4) if b > 0 else None,
+            "ask": round(a, 4) if a > 0 else None,
+            "spread": None,
+            "spread_pct": None,
+        }
+    mid = (a + b) / 2.0
+    spread = a - b
+    return {
+        "bid": round(b, 4),
+        "ask": round(a, 4),
+        "spread": round(spread, 4),
+        "spread_pct": round(spread / mid * 100.0, 4) if mid > 0 else None,
+    }
+
+
 def assess_call_index_vwap_gate(
     option_right: Any,
     index_quotes: Any,
@@ -13725,24 +13822,9 @@ def assess_call_index_vwap_gate(
     right = str(option_right or "").upper().strip()
     if right not in {"CALL", "C"}:
         return None
-    above: List[str] = []
-    below: List[str] = []
-    rows = index_quotes.values() if isinstance(index_quotes, dict) else (index_quotes or [])
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        sym = str(row.get("symbol") or "").upper().strip()
-        try:
-            last = float(row.get("last") or 0)
-            vwap = float(row.get("vwap") or 0)
-        except (TypeError, ValueError):
-            continue
-        if not sym or last <= 0 or vwap <= 0 or not math.isfinite(last) or not math.isfinite(vwap):
-            continue
-        if last + 1e-9 >= vwap:
-            above.append(f"{sym} {last:.2f}≥VWAP {vwap:.2f}")
-        else:
-            below.append(f"{sym} {last:.2f}<VWAP {vwap:.2f}")
+    snap = snapshot_index_vs_vwap(index_quotes)
+    above = [f"{r['symbol']} {r['last']:.2f}≥VWAP {r['vwap']:.2f}" for r in snap if r["above_vwap"]]
+    below = [f"{r['symbol']} {r['last']:.2f}<VWAP {r['vwap']:.2f}" for r in snap if not r["above_vwap"]]
     if above:
         return None
     if below:
@@ -21613,6 +21695,9 @@ async def _arm_native_trail(
     pos["native_trail_source"] = source
     pos["native_trail_field_mode"] = field_mode
     pos["native_trail_offset"] = offset_value
+    # Sticky for the journal: cancel-before-close (3:40 flatten / take-profit)
+    # clears the order id; this flag must still say a native trail was working.
+    pos["had_native_trail"] = True
     pos["native_trail_skip"] = None
     pos["native_trail_retry_after"] = None
     await state.set_position(ticker, pos)
@@ -23791,6 +23876,29 @@ def _finite_or_none(value: Any) -> Optional[float]:
     return f
 
 
+def position_had_native_trail(pos: Optional[dict]) -> bool:
+    """Did a broker-native trailing stop ever protect this position?
+
+    Sticky on purpose. The 3:40 flatten (and take-profit) cancel the resting
+    trail BEFORE `_record_close` runs, so reading only `native_trail_order_id`
+    would mark those trades "no native trail" even when one was working.
+    `had_native_trail` is stamped when the trail is armed/adopted and is never
+    cleared for an exit cancel — readers must pair `native_trail` with
+    `reason` / `final_stop` to see how the trade actually ended.
+    """
+    p = pos or {}
+    if p.get("had_native_trail") is True:
+        return True
+    if p.get("native_trail_order_id"):
+        return True
+    # Offset/source survive the cancel-before-close wipe of the order id.
+    if _finite_or_none(p.get("native_trail_offset")) is not None:
+        return True
+    if str(p.get("native_trail_source") or "").strip():
+        return True
+    return False
+
+
 def build_trade_review_fields(pos: Optional[dict]) -> Dict[str, Any]:
     """Per-trade fields that must survive a close for review and learning.
 
@@ -23813,6 +23921,7 @@ def build_trade_review_fields(pos: Optional[dict]) -> Dict[str, Any]:
     delta = _finite_or_none(p.get("option_delta"))
     if delta is None and contract is not None:
         delta = _finite_or_none(contract.get("delta"))
+    entry_index = p.get("entry_index_vwap") if isinstance(p.get("entry_index_vwap"), list) else None
     return {
         "origin": origin,
         "signal_id": signal_id,
@@ -23839,7 +23948,7 @@ def build_trade_review_fields(pos: Optional[dict]) -> Dict[str, Any]:
         "atr_source": (str(p.get("atr_source") or "").strip() or None),
         "breakeven_locked": bool(p.get("breakeven_locked")) if p.get("breakeven_locked") is not None else None,
         "trail_giveback": bool(p.get("trail_giveback")) if p.get("trail_giveback") is not None else None,
-        "native_trail": bool(p.get("native_trail_order_id")),
+        "native_trail": position_had_native_trail(p),
         "native_trail_offset": _finite_or_none(p.get("native_trail_offset")),
         "native_trail_source": (str(p.get("native_trail_source") or "").strip() or None),
         "app_decides": bool(p.get("app_decides")) if p.get("app_decides") is not None else None,
@@ -23847,6 +23956,12 @@ def build_trade_review_fields(pos: Optional[dict]) -> Dict[str, Any]:
             str((p.get("edge") or {}).get("vol_regime") or "").strip().lower() or None
             if isinstance(p.get("edge"), dict) else None
         ),
+        # Entry tape: SPY/QQQ vs day VWAP and the bid/ask the fill crossed.
+        "entry_spread": _finite_or_none(p.get("entry_spread")),
+        "entry_spread_pct": _finite_or_none(p.get("entry_spread_pct")),
+        "entry_bid": _finite_or_none(p.get("entry_bid")),
+        "entry_ask": _finite_or_none(p.get("entry_ask")),
+        "entry_index_vwap": entry_index,
     }
 
 
@@ -23859,6 +23974,242 @@ async def _remember_trade_review(snapshot: Dict[str, Any]) -> None:
         )
     except Exception as e:
         logger.debug(f"trade review list not updated: {e}")
+
+
+async def _stamp_entry_market_context(
+    ticker: str,
+    pos: Optional[dict] = None,
+    *,
+    bid: Any = None,
+    ask: Any = None,
+) -> dict:
+    """Stamp SPY/QQQ-vs-VWAP and the entry bid/ask onto an open position.
+
+    Called from fill paths once a real quote is known. Missing feeds leave
+    fields null — never invent a zero spread or a flat index.
+    """
+    current = dict(pos or (await state.get_position(ticker)) or {})
+    if not current:
+        return current
+    spread_snap = snapshot_entry_spread(bid, ask)
+    if spread_snap.get("spread") is not None or spread_snap.get("bid") is not None:
+        current["entry_bid"] = spread_snap.get("bid")
+        current["entry_ask"] = spread_snap.get("ask")
+        current["entry_spread"] = spread_snap.get("spread")
+        current["entry_spread_pct"] = spread_snap.get("spread_pct")
+    try:
+        index_rows = snapshot_index_vs_vwap(await _index_vwap_quotes())
+        if index_rows:
+            current["entry_index_vwap"] = index_rows
+    except Exception as e:
+        logger.debug(f"[ENTRY CTX] index VWAP unavailable for {ticker}: {e}")
+    await state.set_position(ticker, current)
+    try:
+        await trade_ledger.record("entry_market_context", {
+            "ticker": ticker,
+            "entry_bid": current.get("entry_bid"),
+            "entry_ask": current.get("entry_ask"),
+            "entry_spread": current.get("entry_spread"),
+            "entry_spread_pct": current.get("entry_spread_pct"),
+            "entry_index_vwap": current.get("entry_index_vwap"),
+        })
+    except Exception as e:
+        logger.debug(f"[ENTRY CTX] ledger stamp failed for {ticker}: {e}")
+    return current
+
+
+def plan_exit_followups(
+    closed_at: Any,
+    horizons_min: Any = EXIT_FOLLOWUP_MINUTES,
+) -> List[Dict[str, Any]]:
+    """When to re-quote after an exit. Pure; used by the scheduler and tests."""
+    try:
+        if isinstance(closed_at, datetime):
+            base = closed_at
+        else:
+            base = datetime.fromisoformat(str(closed_at).replace("Z", "+00:00"))
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return []
+    out: List[Dict[str, Any]] = []
+    for raw in list(horizons_min or []):
+        try:
+            minutes = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if minutes <= 0:
+            continue
+        due = base + timedelta(minutes=minutes)
+        out.append({"horizon_min": minutes, "due_at": due.isoformat()})
+    return out
+
+
+async def _schedule_exit_followups(close_data: Dict[str, Any], pos: Optional[dict]) -> None:
+    """Enqueue 15/30-minute post-exit quote jobs for a closed trade."""
+    closed_at = close_data.get("closed_at") or _utcnow().isoformat()
+    plans = plan_exit_followups(closed_at)
+    if not plans:
+        return
+    contract = None
+    if isinstance(close_data.get("contract"), dict):
+        contract = close_data["contract"]
+    elif isinstance((pos or {}).get("contract"), dict):
+        contract = (pos or {}).get("contract")
+    exit_px = close_data.get("exit")
+    for plan in plans:
+        job = {
+            "ticker": close_data.get("ticker"),
+            "contract": contract,
+            "exit": exit_px,
+            "basis": close_data.get("basis"),
+            "entry_action": close_data.get("entry_action"),
+            "reason": close_data.get("reason"),
+            "closed_at": closed_at,
+            "horizon_min": plan["horizon_min"],
+            "due_at": plan["due_at"],
+            "signal_id": close_data.get("signal_id"),
+        }
+        await state.queue_push(EXIT_FOLLOWUPS_KEY, json.dumps(job, default=str))
+
+
+def assess_exit_followup_move(
+    exit_price: Any,
+    mark: Any,
+    *,
+    entry_action: Any = "BUY",
+) -> Dict[str, Any]:
+    """Did price move FOR or AGAINST the closed side after the exit?
+
+    For a long exit, a higher mark is a recovery (stop may have been tight).
+    For a short exit, a lower mark is a recovery. Missing stays None.
+    """
+    try:
+        exit_f = float(exit_price) if exit_price is not None else None
+        mark_f = float(mark) if mark is not None else None
+    except (TypeError, ValueError):
+        return {"mark": None, "move_pct": None, "recovery": None}
+    if exit_f is None or mark_f is None or exit_f <= 0 or mark_f <= 0:
+        return {"mark": None, "move_pct": None, "recovery": None}
+    if not math.isfinite(exit_f) or not math.isfinite(mark_f):
+        return {"mark": None, "move_pct": None, "recovery": None}
+    action = str(entry_action or "BUY").upper()
+    # Long book sold: recovery = mark rose. Short book covered: recovery = mark fell.
+    long_side = action in {"BUY", "BUY_OPEN", "BUY_TO_OPEN"}
+    move_pct = round((mark_f - exit_f) / exit_f * 100.0, 4)
+    if long_side:
+        recovery = move_pct > 0
+    else:
+        recovery = move_pct < 0
+    return {
+        "mark": round(mark_f, 4),
+        "move_pct": move_pct,
+        "recovery": recovery,
+    }
+
+
+async def _run_due_exit_followups(now: Optional[datetime] = None) -> int:
+    """Process due post-exit quote jobs. Returns how many were recorded."""
+    now_dt = now or _utcnow()
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    try:
+        raw_jobs = await state.list_all(EXIT_FOLLOWUPS_KEY)
+    except Exception as e:
+        logger.debug(f"[EXIT FOLLOWUP] queue unreadable: {e}")
+        return 0
+    recorded = 0
+    for raw in list(raw_jobs or []):
+        try:
+            job = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        except (TypeError, ValueError, json.JSONDecodeError):
+            try:
+                await state.list_remove_value(EXIT_FOLLOWUPS_KEY, raw)
+            except Exception:
+                pass
+            continue
+        due_raw = job.get("due_at")
+        try:
+            due = datetime.fromisoformat(str(due_raw).replace("Z", "+00:00"))
+            if due.tzinfo is None:
+                due = due.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            try:
+                await state.list_remove_value(EXIT_FOLLOWUPS_KEY, raw)
+            except Exception:
+                pass
+            continue
+        if due > now_dt:
+            continue
+        ticker = str(job.get("ticker") or "").upper()
+        if not ticker:
+            try:
+                await state.list_remove_value(EXIT_FOLLOWUPS_KEY, raw)
+            except Exception:
+                pass
+            continue
+        contract = job.get("contract") if isinstance(job.get("contract"), dict) else None
+        bid = ask = 0.0
+        try:
+            bid, ask = await _current_bid_ask(ticker, contract)
+        except Exception as e:
+            logger.debug(f"[EXIT FOLLOWUP] quote failed for {ticker}: {e}")
+        mark = None
+        if bid > 0 and ask > 0:
+            mark = (bid + ask) / 2.0
+        elif bid > 0:
+            mark = bid
+        elif ask > 0:
+            mark = ask
+        move = assess_exit_followup_move(
+            job.get("exit"), mark, entry_action=job.get("entry_action"),
+        )
+        payload = {
+            "ticker": ticker,
+            "horizon_min": job.get("horizon_min"),
+            "closed_at": job.get("closed_at"),
+            "due_at": job.get("due_at"),
+            "checked_at": now_dt.isoformat(),
+            "exit": job.get("exit"),
+            "basis": job.get("basis"),
+            "reason": job.get("reason"),
+            "signal_id": job.get("signal_id"),
+            "bid": round(bid, 4) if bid > 0 else None,
+            "ask": round(ask, 4) if ask > 0 else None,
+            **move,
+        }
+        try:
+            await trade_ledger.record("exit_followup", payload)
+            recorded += 1
+        except Exception as e:
+            logger.warning(f"[EXIT FOLLOWUP] ledger write failed for {ticker}: {e}")
+            continue
+        try:
+            await state.list_remove_value(EXIT_FOLLOWUPS_KEY, raw)
+        except Exception as e:
+            logger.debug(f"[EXIT FOLLOWUP] could not dequeue {ticker}: {e}")
+        if move.get("recovery") is True:
+            logger.info(
+                f"[EXIT FOLLOWUP] {ticker} +{job.get('horizon_min')}m mark "
+                f"{move.get('mark')} vs exit {job.get('exit')} "
+                f"({move.get('move_pct'):+}%) — possible tight stop"
+            )
+    return recorded
+
+
+async def exit_followup_worker():
+    """Re-quote closed trades 15 and 30 minutes later for stop-tightness review."""
+    logger.info(
+        f"[EXIT FOLLOWUP] worker started — horizons {list(EXIT_FOLLOWUP_MINUTES)}m, "
+        f"every {EXIT_FOLLOWUP_WORKER_SECONDS}s"
+    )
+    while not _worker_stop:
+        try:
+            if load_tokens() is not None:
+                await _run_due_exit_followups()
+        except Exception as e:
+            logger.error(f"[EXIT FOLLOWUP] loop error: {e}")
+        await asyncio.sleep(max(15, EXIT_FOLLOWUP_WORKER_SECONDS))
 
 
 async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Optional[float],
@@ -24360,6 +24711,13 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
             _peak_value((pos or {}).get("trail_r"))),
         "peak_mfe_pct": (lambda v: round(v, 4) if v is not None else None)(
             _peak_value((pos or {}).get("trail_mfe_pct"))),
+        # WORST DROP (MAE) — the deepest adverse excursion the trail poller
+        # saw. Together with peak MFE this answers "did the stop sit inside
+        # normal noise?" Missing stays missing (a close inside one poll).
+        "trough_r": (lambda v: round(v, 2) if v is not None else None)(
+            _peak_value((pos or {}).get("trail_mae_r"))),
+        "trough_mae_pct": (lambda v: round(v, 4) if v is not None else None)(
+            _peak_value((pos or {}).get("trail_mae_pct"))),
         # UNIT DISCIPLINE. The trail measures options on the PREMIUM basis and
         # equities on the underlying, which is not always the basis this close
         # is booked on. Recording the peak's own basis lets the reader drop the
@@ -24374,6 +24732,12 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
     }
     await trade_ledger.record("position_closed", close_data)
     await _remember_trade_review(close_data)
+    # Schedule 15/30-minute post-exit marks — a stop that was too tight shows
+    # up as a recovery after the exit. Best-effort; never blocks the close.
+    try:
+        await _schedule_exit_followups(close_data, pos)
+    except Exception as e:
+        logger.debug(f"[EXIT FOLLOWUP] schedule failed for {ticker}: {e}")
     if _stop_slip is not None:
         await trade_ledger.record("stop_slippage", {
             "ticker": ticker, "reason": close_reason,
@@ -26991,6 +27355,13 @@ async def execute_live_order(payload: dict):
                     option_delta=payload.get("option_delta"),
                     instrument="option",
                 )
+                # Journal: SPY/QQQ vs day VWAP + the bid/ask the ticket crossed.
+                try:
+                    await _stamp_entry_market_context(
+                        sym_u, bid=real_bid, ask=real_ask,
+                    )
+                except Exception as e:
+                    logger.debug(f"[ENTRY CTX] {sym_u} stamp failed: {e}")
                 if app_decides:
                     # Marks the position as the APP's to exit while it guards
                     # it (plan_app_exit_standdown). Best effort: a failed stamp
@@ -27498,6 +27869,10 @@ async def execute_live_order(payload: dict):
                                        origin=payload.get(DISPATCH_ORIGIN_FIELD),
                                        signal_id=signal_identity(payload),
                                        instrument="equity")
+                    try:
+                        await _stamp_entry_market_context(str(symbol).upper())
+                    except Exception as e:
+                        logger.debug(f"[ENTRY CTX] {symbol} stamp failed: {e}")
                     return {"status": "success", "response": final, "otoco": True}
                 except OTOCOUnsupported as e:
                     logger.warning(
@@ -27525,6 +27900,10 @@ async def execute_live_order(payload: dict):
                                origin=payload.get(DISPATCH_ORIGIN_FIELD),
                                signal_id=signal_identity(payload),
                                instrument="equity")
+            try:
+                await _stamp_entry_market_context(str(symbol).upper())
+            except Exception as e:
+                logger.debug(f"[ENTRY CTX] {symbol} stamp failed: {e}")
             entry_order_id = _order_id_from_place(final)
             if stop_px > 0:
                 # Arm the stop guard: poll the entry fill, then rest a real STOP
@@ -28300,6 +28679,10 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
             pos["trail_r"] = observed["r_multiple"]
         if observed["mfe_percent"] is not None:
             pos["trail_mfe_pct"] = observed["mfe_percent"]
+        if observed.get("mae_r") is not None:
+            pos["trail_mae_r"] = observed["mae_r"]
+        if observed.get("mae_percent") is not None:
+            pos["trail_mae_pct"] = observed["mae_percent"]
         pos["trail_checked_at"] = _utcnow().isoformat()
         # Persisted BEFORE the branches below so the observation survives a
         # scale-out return, a None plan, or a close booked by another path.
@@ -29229,6 +29612,7 @@ async def start_worker():
     asyncio.create_task(risk_desk_worker())
     asyncio.create_task(app_eyes_worker())
     asyncio.create_task(entry_paths_worker())
+    asyncio.create_task(exit_followup_worker())
     await _start_scanner()
 
 
