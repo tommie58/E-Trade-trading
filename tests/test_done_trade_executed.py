@@ -256,9 +256,112 @@ def test_done_trade_executed_with_zero_qty_places_a_stop_and_stays_tracked(monke
     assert abandoned == []
 
 
-def test_confirmed_flat_holding_finishes_the_stop_guard(monkeypatch):
-    """A broker holding of 0 ends the guard. The position stays tracked."""
+def _guard_clock(monkeypatch, step):
+    """A clock the stop-guard loop can sleep through without waiting wall time."""
+    clock = {"t": 1_700_000_000.0}
+    monkeypatch.setattr(main_bot.time, "time", lambda: clock["t"])
+
+    async def fast_sleep(_seconds):
+        clock["t"] += step
+
+    monkeypatch.setattr(main_bot.asyncio, "sleep", fast_sleep)
+    return clock
+
+
+def _arm_qqq(store, clock, *, deadline_ts):
+    return store.set_guard("QQQ", {
+        "ticker": "QQQ",
+        "kind": "option",
+        "action": "BUY",
+        "stop": 1.25,
+        "contract": {"right": "CALL", "strike": 480, "expiration": "2026-11-24"},
+        "entry_order_id": "ENTRY-1",
+        "entry_client_id": "entry-cid",
+        "guarded_qty": 0,
+        "qty": 9,
+        "done": False,
+        "deadline_ts": deadline_ts,
+        "stop_deadline_ts": clock["t"] + 3600,
+        "fill_detected_ts": None,
+        "placed_ts": clock["t"] - 3600,
+        "armed_ts": clock["t"] - 3600,
+    })
+
+
+def test_lagging_zero_then_a_real_holding_places_a_stop_for_that_qty(monkeypatch):
+    """The first portfolio miss is not flat. The next read of 4 gets a stop."""
+    clock = _guard_clock(monkeypatch, 1.0)
     placed = []
+    cancelled = []
+    reads = {"n": 0}
+
+    async def order_state(_order_id, _client_id):
+        return "DONE_TRADE_EXECUTED", 0
+
+    async def broker(_ticker, _pos):
+        reads["n"] += 1
+        return 0 if reads["n"] == 1 else 4
+
+    async def place_stop(ticker, _contract, qty, stop_premium):
+        placed.append({"ticker": ticker, "qty": qty, "stop": stop_premium})
+        return {"order_id": "STOP-NEW", "client_id": "cid", "qty": qty, "stop": stop_premium}
+
+    async def send(*_args, **_kwargs):
+        return None
+
+    async def record(*_args, **_kwargs):
+        return None
+
+    async def no_true_up(*_args, **_kwargs):
+        return False
+
+    async def no_flatten(*_args, **_kwargs):
+        raise AssertionError("a lagging zero flattened the entry")
+
+    async def cancel(*_args, **_kwargs):
+        cancelled.append(True)
+
+    monkeypatch.setattr(main_bot, "_order_state", order_state)
+    monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", broker)
+    monkeypatch.setattr(main_bot, "_place_option_protective_stop", place_stop)
+    monkeypatch.setattr(main_bot, "_true_up_entry_fill", no_true_up)
+    monkeypatch.setattr(main_bot, "_cancel_order_safe", cancel)
+    monkeypatch.setattr(main_bot, "_emergency_flatten", no_flatten)
+    monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.trade_ledger, "record", record)
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        saved = main_bot.state
+        main_bot.state = store
+        try:
+            await store.set_position("QQQ", {
+                "qty": 2,
+                "filled_qty": 0,
+                "action": "BUY",
+                "contract": {"right": "CALL", "strike": 480, "expiration": "2026-11-24"},
+            })
+            await _arm_qqq(store, clock, deadline_ts=clock["t"] + 3600)
+            await asyncio.wait_for(main_bot._stop_guard_worker("QQQ"), timeout=2)
+            return await store.get_position("QQQ"), await store.get_guard("QQQ")
+        finally:
+            main_bot.state = saved
+
+    pos, guard = _run(scenario())
+    assert reads["n"] >= 2
+    assert placed == [{"ticker": "QQQ", "qty": 4, "stop": 1.25}]
+    assert pos is not None
+    assert pos["stop_order_id"] == "STOP-NEW"
+    assert pos["filled_qty"] == 4
+    assert guard["result"] == "filled_and_protected"
+    assert cancelled == []
+
+
+def test_repeated_zero_reads_past_the_window_finish_flat(monkeypatch):
+    """Two zero reads spanning the confirm window end the guard. One does not."""
+    clock = _guard_clock(monkeypatch, main_bot.BROKER_FLAT_CONFIRM_S)
+    placed = []
+    cancelled = []
 
     async def order_state(_order_id, _client_id):
         return "DONE_TRADE_EXECUTED", 0
@@ -273,12 +376,18 @@ def test_confirmed_flat_holding_finishes_the_stop_guard(monkeypatch):
     async def send(*_args, **_kwargs):
         return None
 
-    async def record(*_args, **_kwargs):
+    async def record(event, *_args, **_kwargs):
+        if event == "entry_abandoned":
+            cancelled.append(event)
         return None
+
+    async def cancel(*_args, **_kwargs):
+        cancelled.append("cancel")
 
     monkeypatch.setattr(main_bot, "_order_state", order_state)
     monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", broker)
     monkeypatch.setattr(main_bot, "_place_option_protective_stop", place_stop)
+    monkeypatch.setattr(main_bot, "_cancel_order_safe", cancel)
     monkeypatch.setattr(main_bot.alerts, "send", send)
     monkeypatch.setattr(main_bot.trade_ledger, "record", record)
 
@@ -287,34 +396,91 @@ def test_confirmed_flat_holding_finishes_the_stop_guard(monkeypatch):
         saved = main_bot.state
         main_bot.state = store
         try:
-            past = time.time() - 30
             await store.set_position("QQQ", {
                 "qty": 2,
                 "action": "BUY",
                 "contract": {"right": "CALL", "strike": 480, "expiration": "2026-11-24"},
             })
-            await store.set_guard("QQQ", {
-                "ticker": "QQQ",
-                "kind": "option",
-                "action": "BUY",
-                "stop": 1.25,
-                "contract": {"right": "CALL", "strike": 480, "expiration": "2026-11-24"},
-                "entry_order_id": "ENTRY-1",
-                "entry_client_id": "entry-cid",
-                "guarded_qty": 0,
-                "qty": 2,
-                "done": False,
-                "deadline_ts": past,
-                "stop_deadline_ts": past,
-            })
-            await main_bot._stop_guard_worker("QQQ")
+            await _arm_qqq(store, clock, deadline_ts=clock["t"] + 10_000)
+            await asyncio.wait_for(main_bot._stop_guard_worker("QQQ"), timeout=2)
             return await store.get_position("QQQ"), await store.get_guard("QQQ")
         finally:
             main_bot.state = saved
 
     pos, guard = _run(scenario())
     assert placed == []
+    assert cancelled == []
     assert pos is not None
-    assert pos["qty"] == 2
     assert guard["done"] is True
     assert guard["result"] == "filled_broker_flat"
+    assert int(guard["broker_zero_reads"]) >= 2
+
+
+def test_deadline_does_not_flatten_a_single_zero_read(monkeypatch):
+    """At the 20-minute deadline one empty portfolio read still is not flat."""
+    clock = _guard_clock(monkeypatch, 1.0)
+    placed = []
+    cancelled = []
+    reads = {"n": 0}
+
+    async def order_state(_order_id, _client_id):
+        return "DONE_TRADE_EXECUTED", 0
+
+    async def broker(_ticker, _pos):
+        reads["n"] += 1
+        return 0 if reads["n"] == 1 else 4
+
+    async def place_stop(ticker, _contract, qty, stop_premium):
+        placed.append(qty)
+        return {"order_id": "STOP-NEW", "client_id": "cid", "qty": qty, "stop": stop_premium}
+
+    async def send(*_args, **_kwargs):
+        return None
+
+    async def record(event, *_args, **_kwargs):
+        if event == "entry_abandoned":
+            cancelled.append(event)
+        return None
+
+    async def no_true_up(*_args, **_kwargs):
+        return False
+
+    async def cancel(*_args, **_kwargs):
+        cancelled.append("cancel")
+
+    async def no_flatten(*_args, **_kwargs):
+        raise AssertionError("filled entry was flattened at the deadline")
+
+    monkeypatch.setattr(main_bot, "_order_state", order_state)
+    monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", broker)
+    monkeypatch.setattr(main_bot, "_place_option_protective_stop", place_stop)
+    monkeypatch.setattr(main_bot, "_true_up_entry_fill", no_true_up)
+    monkeypatch.setattr(main_bot, "_cancel_order_safe", cancel)
+    monkeypatch.setattr(main_bot, "_emergency_flatten", no_flatten)
+    monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.trade_ledger, "record", record)
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        saved = main_bot.state
+        main_bot.state = store
+        try:
+            await store.set_position("QQQ", {
+                "qty": 2,
+                "filled_qty": 0,
+                "action": "BUY",
+                "contract": {"right": "CALL", "strike": 480, "expiration": "2026-11-24"},
+            })
+            # The entry deadline has already passed. A filled status must stay.
+            await _arm_qqq(store, clock, deadline_ts=clock["t"] - 1)
+            await asyncio.wait_for(main_bot._stop_guard_worker("QQQ"), timeout=2)
+            return await store.get_position("QQQ"), await store.get_guard("QQQ")
+        finally:
+            main_bot.state = saved
+
+    pos, guard = _run(scenario())
+    assert cancelled == []
+    assert placed == [4]
+    assert pos is not None
+    assert pos["stop_order_id"] == "STOP-NEW"
+    assert guard["result"] == "filled_and_protected"

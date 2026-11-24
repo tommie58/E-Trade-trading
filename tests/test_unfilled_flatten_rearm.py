@@ -1550,14 +1550,33 @@ def test_stale_close_tie_breaks_toward_the_later_replacement():
             "replacements": 2,
             "placed_at": "2026-11-24T15:01:00+00:00",
         }
-        stale["close_order_id"] = "CLOSE-2"
+        stale["close_order_id"] = "CLOSE-1"
         await store.set_position("SPY", stale)
-        return await store.get_position("SPY")
+        stored = await store.get_position("SPY")
+        def _fill(order_id, price):
+            return {
+                "order_id": order_id,
+                "symbol": "SPY",
+                "status": "DONE_TRADE_EXECUTED",
+                "order_action": "SELL_CLOSE",
+                "filled": 4,
+                "exec_price": price,
+                "executed_ts": 1_700_000_000.0,
+                "price_type": "MARKET",
+            }
 
-    stored = asyncio.run(scenario())
+        ghost = main_bot.reconciliation.plan_ghost_resolution(
+            "SPY", stored, [_fill("CLOSE-1", 9.99), _fill("CLOSE-2", 1.10)],
+        )
+        return stored, ghost
+
+    stored, ghost = asyncio.run(scenario())
     assert stored["pending_flatten_close"]["order_id"] == "CLOSE-2"
     assert stored["close_order_id"] == "CLOSE-2"
     assert stored["entry_premium"] == 1.25
+    assert ghost["kind"] == "closed"
+    assert ghost["order_id"] == "CLOSE-2"
+    assert ghost["exit_price"] == 1.10
 
 
 def test_unlocked_writer_between_repeat_writes_keeps_the_close(monkeypatch):
@@ -1713,6 +1732,34 @@ def test_unlocked_writer_between_repeat_writes_keeps_the_close(monkeypatch):
         assert stored["probe"] == "kept", name
         pending = (stored.get("pending_flatten_close") or {}).get("order_id")
         assert pending or stored.get("close_order_id"), name
+
+
+def test_stale_snapshot_cannot_unwind_a_trail_promotion():
+    """A late guard copy cannot clear sticky trail facts the stored row has."""
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        await store.set_position("SPY", {
+            "qty": 2,
+            "entry_premium": 1.25,
+            "had_native_trail": True,
+            "breakeven_locked": True,
+            "stop_order_id": "STOP-NEW",
+        })
+        stale = await store.get_position("SPY")
+        fresh = await store.get_position("SPY")
+        fresh["trail"] = 1.40
+        await store.set_position("SPY", fresh)
+        stale["had_native_trail"] = False
+        stale["breakeven_locked"] = False
+        stale["qty"] = 8
+        await store.set_position("SPY", stale)
+        return await store.get_position("SPY")
+
+    stored = asyncio.run(scenario())
+    assert stored["had_native_trail"] is True
+    assert stored["breakeven_locked"] is True
+    assert stored["qty"] == 2
 
 
 def test_flatten_save_waits_two_seconds_unless_a_sell_was_sent():

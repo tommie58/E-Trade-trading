@@ -1250,6 +1250,15 @@ class StateStore:
             incoming_live = self._close_field_live(merged.get(field))
             if incoming_live and not current_live:
                 continue
+            if field == "close_order_id" and prefer_incoming_pending:
+                pending = merged.get("pending_flatten_close")
+                winner = str(pending.get("order_id") or "") if isinstance(pending, dict) else ""
+                if winner:
+                    # Ghost resolution reads close_order_id. It has to name
+                    # the same order the winning pending close names.
+                    if str(merged.get(field) or "") != winner:
+                        merged[field] = winner
+                    continue
             if current_live and not incoming_live:
                 merged[field] = copy.deepcopy(current.get(field))
                 reverted.append(field)
@@ -1260,16 +1269,13 @@ class StateStore:
                 ):
                     prefer_incoming_pending = True
                     continue
-                if (
-                    field == "close_order_id"
-                    and prefer_incoming_pending
-                    and incoming_live
-                ):
-                    pending = merged.get("pending_flatten_close")
-                    winner = str(pending.get("order_id") or "") if isinstance(pending, dict) else ""
-                    if winner and winner == str(merged.get(field) or ""):
-                        continue
                 merged[field] = copy.deepcopy(current.get(field))
+                reverted.append(field)
+        # Sticky trail facts. A stale snapshot must not unwind a promotion
+        # the stored row already recorded. A fresh write can still set them.
+        for field in ("had_native_trail", "breakeven_locked"):
+            if current.get(field) is True and merged.get(field) is not True:
+                merged[field] = True
                 reverted.append(field)
         if reverted:
             logger.warning(
@@ -15256,7 +15262,9 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # with no filled quantity is not cancelled or deleted. The stop is
 # min(broker holding, guard quantity) when both are known, otherwise the
 # broker holding, then the guard or tracked quantity. A confirmed holding
-# of 0 finishes the guard and leaves the position tracked. Whether E*TRADE puts
+# of 0 is not a flat account until a second zero read spans about 90s
+# or the entry deadline has passed. The position stays tracked.
+# Whether E*TRADE puts
 # DONE_TRADE_EXECUTED on OrderDetail.status, and what filledQuantity
 # means beside it, is not in the official order-status list (the docs
 # name it only as an order event).
@@ -25058,10 +25066,10 @@ def _positive_qty(raw: Any) -> int:
 async def _unreadable_fill_size(ticker: str, guard: dict) -> Tuple[int, str]:
     """(qty, source) for a filled order whose filledQuantity is missing.
 
-    Source is ``broker``, ``guard``, ``tracked``, ``flat``, or ``unknown``.
+    Source is ``broker``, ``guard``, ``tracked``, ``zero``, or ``unknown``.
     When the broker holding and the guard quantity are both known, the stop
-    is the smaller of the two. A confirmed holding of 0 is ``flat`` and is
-    not replaced with the intended quantity.
+    is the smaller of the two. A holding of 0 is ``zero``, not a confirmed
+    flat: one missing portfolio row is not enough.
     """
     pos: dict = {}
     try:
@@ -25087,13 +25095,48 @@ async def _unreadable_fill_size(ticker: str, guard: dict) -> Tuple[int, str]:
             return min(held_n, guard_n), "broker"
         return held_n, "broker"
     if held_n == 0:
-        return 0, "flat"
+        # One empty portfolio read is lag, not a flat account. The guard
+        # decides when repeated zeros have spanned the confirm window.
+        return 0, "zero"
     if guard_n > 0:
         return guard_n, "guard"
     tracked = _positive_qty(pos.get("qty")) or _positive_qty(pos.get("filled_qty"))
     if tracked > 0:
         return tracked, "tracked"
     return 0, "unknown"
+
+
+# Repeated broker zeros must span this long before a missing portfolio
+# row is a flat account. Inside 60–120s. The entry deadline is the
+# other gate, and a single read is never enough on its own.
+BROKER_FLAT_CONFIRM_S = 90.0
+
+
+async def _note_broker_zero(ticker: str, guard: dict) -> Tuple[bool, dict]:
+    """Record one zero holding. True only after a second read past the window or the deadline."""
+    now = time.time()
+    try:
+        reads = int((guard or {}).get("broker_zero_reads") or 0) + 1
+    except (TypeError, ValueError):
+        reads = 1
+    since = (guard or {}).get("broker_zero_since")
+    try:
+        since_f = float(since) if since not in (None, "") else now
+    except (TypeError, ValueError):
+        since_f = now
+    updated = await state.update_guard(
+        ticker, broker_zero_reads=reads, broker_zero_since=since_f,
+    )
+    guard_out = updated if isinstance(updated, dict) else dict(guard or {})
+    try:
+        deadline = float(guard_out.get("deadline_ts") or 0)
+    except (TypeError, ValueError):
+        deadline = 0.0
+    span = now - since_f
+    confirmed = reads >= 2 and (
+        span >= BROKER_FLAT_CONFIRM_S or (deadline > 0 and now >= deadline)
+    )
+    return confirmed, guard_out
 
 
 async def _protective_qty_for_unreadable_fill(ticker: str, guard: dict) -> int:
@@ -28288,17 +28331,23 @@ async def _stop_guard_worker(ticker: str) -> None:
             # keep the position. One alert, not one per poll.
             if filled <= 0 and _filled_order_status(status):
                 sized, size_source = await _unreadable_fill_size(ticker, guard)
-                if size_source == "flat":
-                    if not guard.get("unreadable_fill_alerted"):
-                        await alerts.send(
-                            "critical", "entry_fill_qty_unreadable",
-                            f"{ticker}: entry is {status} and the broker holding is 0 "
-                            f"— no protective stop. The position stays tracked.",
-                            dedupe_key=f"unreadable_fill:{ticker}",
-                        )
-                    await _finish_guard(ticker, "filled_broker_flat")
-                    return
-                if sized > 0:
+                if size_source == "zero":
+                    confirmed, guard = await _note_broker_zero(ticker, guard)
+                    if confirmed:
+                        if not guard.get("unreadable_fill_alerted"):
+                            await alerts.send(
+                                "critical", "entry_fill_qty_unreadable",
+                                f"{ticker}: entry is {status} and the broker holding "
+                                f"stayed 0 — no protective stop. The position stays tracked.",
+                                dedupe_key=f"unreadable_fill:{ticker}",
+                            )
+                        await _finish_guard(ticker, "filled_broker_flat")
+                        return
+                elif sized > 0:
+                    if guard.get("broker_zero_reads"):
+                        guard = await state.update_guard(
+                            ticker, broker_zero_reads=0, broker_zero_since=None,
+                        ) or guard
                     filled = sized
                     try:
                         async with _position_section(ticker, "unreadable fill qty"):
@@ -28312,15 +28361,23 @@ async def _stop_guard_worker(ticker: str) -> None:
                         logger.error(
                             f"[STOP GUARD] {ticker} could not stamp the sized fill: {e}"
                         )
-                if not guard.get("unreadable_fill_alerted"):
-                    if sized > 0:
-                        detail = f"protective stop sized at {sized}"
-                    else:
-                        detail = "no size was available for a protective stop"
+                    if not guard.get("unreadable_fill_alerted"):
+                        await alerts.send(
+                            "critical", "entry_fill_qty_unreadable",
+                            f"{ticker}: entry is {status} but the filled quantity was "
+                            f"0 or missing — protective stop sized at {sized}. "
+                            f"The position stays tracked.",
+                            dedupe_key=f"unreadable_fill:{ticker}",
+                        )
+                        guard = await state.update_guard(
+                            ticker, unreadable_fill_alerted=True,
+                        ) or guard
+                elif not guard.get("unreadable_fill_alerted"):
                     await alerts.send(
                         "critical", "entry_fill_qty_unreadable",
                         f"{ticker}: entry is {status} but the filled quantity was "
-                        f"0 or missing — {detail}. The position stays tracked.",
+                        f"0 or missing — no size was available for a protective stop. "
+                        f"The position stays tracked.",
                         dedupe_key=f"unreadable_fill:{ticker}",
                     )
                     guard = await state.update_guard(
