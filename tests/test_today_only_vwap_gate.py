@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import fakeredis.aioredis
@@ -70,9 +71,11 @@ def frozen(monkeypatch):
     monkeypatch.setattr(main_bot, "_utcnow", lambda: NOW.astimezone(timezone.utc))
     main_bot._minute_vwap_cache.clear()
     main_bot._minute_vwap_attempt_at.clear()
+    main_bot._minute_vwap_refresh_meta.clear()
     yield
     main_bot._minute_vwap_cache.clear()
     main_bot._minute_vwap_attempt_at.clear()
+    main_bot._minute_vwap_refresh_meta.clear()
 
 
 @pytest.fixture
@@ -110,11 +113,13 @@ def redis_scanner(frozen):
 
 
 async def _seed(store, symbol, samples):
+    """Write the capped list and the uncapped session hash, in order."""
     key = main_bot.scanner_mod.SERIES_KEY_FMT.format(symbol)
     for sample in samples:
         await store.list_push_capped(
             key, json.dumps(sample), max_len=main_bot.scanner_mod.MAX_SAMPLES,
         )
+        await main_bot.scanner_mod.note_session_vwap(store, symbol, sample, None)
 
 
 def _seed_rth(symbol, when, vwap):
@@ -143,15 +148,23 @@ def _agree():
 
 def test_default_sample_floor_is_ten_minutes_of_cadence(monkeypatch):
     monkeypatch.delenv("VWAP_MIN_TODAY_SAMPLES", raising=False)
-    monkeypatch.delenv("SCANNER_INTERVAL_SECONDS", raising=False)
-    assert main_bot.scanner_mod.vwap_min_today_samples() == 10
     monkeypatch.setenv("SCANNER_INTERVAL_SECONDS", "30")
-    assert main_bot.scanner_mod.vwap_min_today_samples() == 20
-    monkeypatch.setenv("VWAP_MIN_TODAY_SAMPLES", "7")
-    assert main_bot.scanner_mod.vwap_min_today_samples() == 7
+    saved = main_bot.scanner_mod._LIVE_INTERVAL_SECONDS
+    main_bot.scanner_mod._LIVE_INTERVAL_SECONDS = None
+    try:
+        # The env seed is not the live cadence. The default interval is 60s.
+        assert main_bot.scanner_mod.vwap_min_today_samples() == 10
+        main_bot.scanner_mod.note_live_interval(30)
+        assert main_bot.scanner_mod.vwap_min_today_samples() == 20
+        monkeypatch.setenv("VWAP_MIN_TODAY_SAMPLES", "7")
+        assert main_bot.scanner_mod.vwap_min_today_samples() == 7
+    finally:
+        main_bot.scanner_mod._LIVE_INTERVAL_SECONDS = saved
     monkeypatch.setenv("VWAP_CROSSCHECK_MAX_BPS", "25")
     assert main_bot.vwap_crosscheck_max_bps() == 25
     assert main_bot.vwap_crosscheck_required() is True
+    monkeypatch.delenv("VWAP_CROSSCHECK_MAX_AGE_S", raising=False)
+    assert main_bot.vwap_crosscheck_max_age_s() == 300
 
 
 def test_eight_forty_two_today_vwap_allows_the_call(redis_scanner, monkeypatch):
@@ -164,6 +177,7 @@ def test_eight_forty_two_today_vwap_allows_the_call(redis_scanner, monkeypatch):
         await _seed(store, "QQQ", qqq)
         loaded = await scan._series("SPY")
         stale = main_bot.scanner_mod.sampled_vwap(loaded)
+        reading = await main_bot.scanner_mod.read_session_vwap(store, "SPY", NOW)
         _agree()
         quotes = await main_bot._index_vwap_quotes()
         reason = main_bot.assess_call_index_vwap_gate("CALL", quotes)
@@ -172,7 +186,7 @@ def test_eight_forty_two_today_vwap_allows_the_call(redis_scanner, monkeypatch):
             loaded,
             {"min_rvol": 0.9, "min_price": 1, "max_spread_pct": 5, "min_score": 0},
             0.2,
-            {"now_et": NOW, "quotes": {}},
+            {"now_et": NOW, "quotes": {}, "session_vwap": {"SPY": reading}},
         )
         return stale, quotes, reason, cand
 
@@ -252,10 +266,11 @@ def test_fewer_than_n_today_samples_fails_closed(redis_scanner):
     quotes, reason = _run(scenario())
     assert all(row["vwap"] is None for row in quotes)
     assert all(row["gate_vwap_verdict"] == "unmeasured" for row in quotes)
-    assert "only 9 today RTH samples" in quotes[0]["gate_vwap_reason"]
+    assert quotes[0]["gate_vwap_reason"] == "today_samples_insufficient"
+    assert quotes[0]["gate_vwap_samples"] == 9
     assert reason is not None
     assert "fail closed" in reason
-    assert "only 9 today RTH samples" in reason
+    assert "today_samples_insufficient" in reason
 
 
 def test_preopen_samples_only_are_unmeasured(redis_scanner):
@@ -272,10 +287,11 @@ def test_preopen_samples_only_are_unmeasured(redis_scanner):
 
     quotes, reason = _run(scenario())
     assert quotes[0]["vwap"] is None
-    assert "pre-open samples only" in quotes[0]["gate_vwap_reason"]
+    assert quotes[0]["gate_vwap_reason"] == "today_samples_insufficient"
+    assert quotes[0]["gate_vwap_samples"] == 0
     assert reason is not None
     assert "fail closed" in reason
-    assert "pre-open samples only" in reason
+    assert "today_samples_insufficient" in reason
 
 
 def test_massive_agreement_within_25_bps_passes(redis_scanner):
@@ -309,10 +325,11 @@ def test_massive_disagreement_fails_closed(redis_scanner):
 
     quotes, reason = _run(scenario())
     assert all(row["vwap"] is None for row in quotes)
-    assert "differs by" in quotes[0]["gate_vwap_reason"]
+    assert quotes[0]["gate_vwap_reason"] == "crosscheck_gap_bps"
     assert reason is not None
     assert "fail closed" in reason
-    assert "730.0000" in reason
+    assert "crosscheck_gap_bps" in reason
+    assert abs(quotes[0]["gate_vwap_crosscheck_bps"]) > 25
 
 
 def test_missing_massive_fails_closed_when_required(redis_scanner):
@@ -327,9 +344,10 @@ def test_missing_massive_fails_closed_when_required(redis_scanner):
 
     quotes, reason = _run(scenario())
     assert all(row["vwap"] is None for row in quotes)
-    assert "cross-check required" in quotes[0]["gate_vwap_reason"]
+    assert quotes[0]["gate_vwap_reason"] == "massive_rth_missing"
     assert reason is not None
     assert "fail closed" in reason
+    assert "massive_rth_missing" in reason
 
 
 def test_missing_massive_uses_today_when_not_required(redis_scanner, monkeypatch):
@@ -507,3 +525,414 @@ def test_order_path_does_not_fetch_massive(redis_scanner, monkeypatch):
     assert spy_row["current_vwap"] == pytest.approx(SPY_TODAY)
     assert spy_row["massive_day_vwap"] == 100.0
     assert spy_row["gate_vwap_verdict"] == "above"
+
+
+def _cfg():
+    return {"min_rvol": 0.9, "min_price": 1, "max_spread_pct": 5, "min_score": 0}
+
+
+def test_full_session_vwap_survives_the_120_sample_cap(redis_scanner, monkeypatch):
+    """300 trending RTH minutes. The gate VWAP is the whole session, not the last 120."""
+    store, scan = redis_scanner
+    start = datetime(2026, 11, 24, tzinfo=ET)
+    prices = [700.0 + i * 0.05 for i in range(300)]
+    samples = _prints(start, 9 * 60 + 30, 300, prices, 1000, 1000)
+    end = datetime(2026, 11, 24, 14, 30, tzinfo=ET)
+    monkeypatch.setattr(main_bot, "_utcnow", lambda: end.astimezone(timezone.utc))
+    full = main_bot.scanner_mod.sampled_vwap(samples)
+    trailing = main_bot.scanner_mod.sampled_vwap(samples[-120:])
+
+    async def scenario():
+        await _seed(store, "SPY", samples)
+        await _seed(store, "QQQ", samples)
+        loaded = await scan._series("SPY")
+        reading = await main_bot.scanner_mod.read_session_vwap(store, "SPY", end)
+        seen = []
+        original = store.hash_get
+
+        async def wrapped(key):
+            seen.append(key)
+            return await original(key)
+
+        store.hash_get = wrapped
+        _seed_rth("SPY", end, full)
+        _seed_rth("QQQ", end, full)
+        saved = main_bot._scanner_fetch_quotes
+
+        async def fetch(symbols, *, dry_run=False):
+            last = prices[-1]
+            return {"QuoteResponse": {"QuoteData": [
+                _quote("SPY", last, 1.0, 1.0),
+                _quote("QQQ", last, 1.0, 1.0),
+            ]}}
+
+        main_bot._scanner_fetch_quotes = fetch
+        try:
+            quotes = await main_bot._index_vwap_quotes()
+            reason = main_bot.assess_call_index_vwap_gate("CALL", quotes)
+            cand = main_bot.scanner_mod.evaluate_quote(
+                {"symbol": "SPY", "last": prices[-1], "bid": prices[-1], "ask": prices[-1] + 0.01, "open": prices[0]},
+                loaded,
+                _cfg(),
+                0.5,
+                {"now_et": end, "quotes": {}, "session_vwap": {"SPY": reading}},
+            )
+            obs = await main_bot._pro_trader_observation({"ticker": "SPY"})
+        finally:
+            main_bot._scanner_fetch_quotes = saved
+        ttl = await store.redis.ttl(main_bot.scanner_mod.session_vwap_key("SPY", "2026-11-24"))
+        return loaded, reading, quotes, reason, cand, obs, seen, ttl
+
+    loaded, reading, quotes, reason, cand, obs, seen, ttl = _run(scenario())
+    assert len(loaded) == main_bot.scanner_mod.MAX_SAMPLES == 120
+    assert full == pytest.approx(reading["vwap"])
+    assert trailing != pytest.approx(full)
+    gap = abs(trailing - full) / full * 10000
+    assert gap > 25
+    assert quotes[0]["vwap"] == pytest.approx(full)
+    assert quotes[0]["gate_vwap_samples"] == 300
+    assert reason is None
+    assert cand["vwap"] == pytest.approx(full)
+    assert cand["vwap"] != pytest.approx(main_bot.scanner_mod.sampled_vwap(
+        main_bot.scanner_mod.session_series(loaded, end)
+    ))
+    full_range = (prices[-1] - prices[0]) / prices[0] * 100.0
+    trail_range = (prices[-1] - prices[-120]) / prices[-120] * 100.0
+    assert obs["realized_range_pct"] == pytest.approx(full_range)
+    assert obs["realized_range_pct"] != pytest.approx(trail_range)
+    assert seen
+    assert all(key.endswith("2026-11-24") for key in seen)
+    assert all("2026-11-23" not in key for key in seen)
+    assert 1.5 * 24 * 3600 < ttl <= 2 * 24 * 3600
+
+
+def test_prior_day_key_is_never_read_and_rollover_starts_fresh(redis_scanner, monkeypatch):
+    store, _scan = redis_scanner
+    day1 = datetime(2026, 11, 24, tzinfo=ET)
+    day2 = datetime(2026, 11, 25, 10, 30, tzinfo=ET)
+
+    async def scenario():
+        await _seed(store, "SPY", _flat(day1, 9 * 60 + 30, 20, 700.0))
+        poison = main_bot.scanner_mod.session_vwap_key("SPY", "2026-11-23")
+        await store.hash_set(poison, {
+            "sum_pv": "999000", "sum_v": "1000", "count": "50",
+            "first_ts": "2026-11-23T10:00:00-05:00",
+            "last_ts": "2026-11-23T15:00:00-05:00",
+        }, 2 * 24 * 3600)
+        seen = []
+        original = store.hash_get
+
+        async def wrapped(key):
+            seen.append(key)
+            return await original(key)
+
+        store.hash_get = wrapped
+        today = await main_bot.scanner_mod.read_session_vwap(store, "SPY", NOW)
+        fresh = await main_bot.scanner_mod.read_session_vwap(store, "SPY", day2)
+        await main_bot.scanner_mod.note_session_vwap(
+            store, "SPY",
+            {"ts": day2.replace(hour=10, minute=0).isoformat(), "last": 50.0, "total_volume": 1000},
+            None,
+        )
+        await main_bot.scanner_mod.note_session_vwap(
+            store, "SPY",
+            {"ts": day2.replace(hour=10, minute=1).isoformat(), "last": 50.0, "total_volume": 2000},
+            None,
+        )
+        # Eleven more so the new day clears the sample floor on its own.
+        for i in range(2, 12):
+            await main_bot.scanner_mod.note_session_vwap(
+                store, "SPY",
+                {
+                    "ts": day2.replace(hour=10, minute=i).isoformat(),
+                    "last": 50.0,
+                    "total_volume": 1000 * (i + 1),
+                },
+                None,
+            )
+        nxt = await main_bot.scanner_mod.read_session_vwap(store, "SPY", day2)
+        return today, fresh, nxt, seen
+
+    today, fresh, nxt, seen = _run(scenario())
+    assert today["vwap"] == pytest.approx(700.0)
+    assert today["vwap"] != pytest.approx(999.0)
+    assert fresh["samples"] == 0
+    assert fresh["measured"] is False
+    assert fresh["vwap"] is None
+    assert nxt["measured"] is True
+    assert nxt["vwap"] == pytest.approx(50.0)
+    assert nxt["samples"] == 12
+    assert all("2026-11-23" not in key for key in seen)
+
+
+def test_stale_massive_cache_fails_closed(redis_scanner):
+    store, _scan = redis_scanner
+    spy, qqq = _live_series()
+    stale_at = NOW - timedelta(seconds=301)
+
+    async def scenario():
+        await _seed(store, "SPY", spy)
+        await _seed(store, "QQQ", qqq)
+        _seed_rth("SPY", stale_at, SPY_RTH)
+        _seed_rth("QQQ", stale_at, QQQ_RTH)
+        quotes = await main_bot._index_vwap_quotes()
+        return quotes, main_bot.assess_call_index_vwap_gate("CALL", quotes)
+
+    quotes, reason = _run(scenario())
+    assert quotes[0]["vwap"] is None
+    assert quotes[0]["gate_vwap_reason"] == "massive_rth_stale"
+    assert quotes[0]["gate_vwap_verdict"] == "unmeasured"
+    view = main_bot._cached_minute_vwap_view("SPY", NOW)
+    assert view["age_seconds"] > 300
+    assert reason is not None
+    assert "massive_rth_stale" in reason
+    assert "fail closed" in reason
+
+
+def test_restart_with_empty_massive_cache_fails_closed_without_raising(redis_scanner):
+    store, _scan = redis_scanner
+    spy, qqq = _live_series()
+
+    async def scenario():
+        await _seed(store, "SPY", spy)
+        await _seed(store, "QQQ", qqq)
+        main_bot._minute_vwap_cache.clear()
+        main_bot._minute_vwap_refresh_meta.clear()
+        main_bot._minute_vwap_attempt_at.clear()
+        quotes = await main_bot._index_vwap_quotes()
+        reason = main_bot.assess_call_index_vwap_gate("CALL", quotes)
+        payload = {"instrument": "option", "option_right": "CALL", "action": "BUY"}
+        blocked = await main_bot._call_index_vwap_block(payload)
+        status = main_bot.massive_rth_cache_status(NOW)
+        return quotes, reason, blocked, status
+
+    quotes, reason, blocked, status = _run(scenario())
+    assert quotes[0]["gate_vwap_reason"] == "massive_rth_missing"
+    assert reason is not None and "massive_rth_missing" in reason
+    assert blocked is not None and "massive_rth_missing" in blocked
+    assert status["symbols"]["SPY"]["refresh_result"] is None
+    assert status["symbols"]["SPY"]["age_seconds"] is None
+    assert status["max_age_s"] == 300
+
+
+def test_scanner_loop_refresh_is_invoked_and_throttled(redis_scanner, monkeypatch):
+    _store, scan = redis_scanner
+    hits = {"n": 0}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, *args, **kwargs):
+            hits["n"] += 1
+            ts = NOW.timestamp() * 1000
+            return type("Resp", (), {
+                "status_code": 200,
+                "json": lambda self: {"results": [{"t": ts, "vw": SPY_RTH, "v": 100, "c": SPY_RTH}]},
+            })()
+
+    monkeypatch.setenv("MASSIVE_API_KEY", "unit-test-key")
+    monkeypatch.setenv("MASSIVE_ENABLED", "true")
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    scan.refresh_index_vwap = main_bot.refresh_massive_minute_vwap
+    assert scan.is_market_open() is True
+
+    async def scenario():
+        await scan._refresh_index_vwap()
+        await scan._refresh_index_vwap()
+        return main_bot.massive_rth_cache_status(NOW)
+
+    status = _run(scenario())
+    assert hits["n"] == 2  # SPY and QQQ, once each
+    assert status["symbols"]["SPY"]["refresh_result"] == "ok"
+    assert status["symbols"]["QQQ"]["refresh_result"] == "ok"
+    assert status["symbols"]["SPY"]["age_seconds"] is not None
+    assert status["symbols"]["SPY"]["age_seconds"] <= 300
+    assert status["symbols"]["SPY"]["refresh_at"]
+
+
+def test_refresh_timeout_does_not_block_the_entry_path(redis_scanner, monkeypatch):
+    store, _scan = redis_scanner
+    spy, qqq = _live_series()
+
+    class Slow:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, *args, **kwargs):
+            await asyncio.sleep(30)
+            raise AssertionError("the refresh waited on a hung Massive call")
+
+    monkeypatch.setenv("MASSIVE_API_KEY", "unit-test-key")
+    monkeypatch.setenv("MASSIVE_ENABLED", "true")
+    monkeypatch.setattr(httpx, "AsyncClient", Slow)
+    _seed_rth("SPY", NOW - timedelta(seconds=10), SPY_RTH)
+    _seed_rth("QQQ", NOW - timedelta(seconds=10), QQQ_RTH)
+
+    async def scenario():
+        await _seed(store, "SPY", spy)
+        await _seed(store, "QQQ", qqq)
+        started = asyncio.get_event_loop().time()
+        task = asyncio.create_task(main_bot.refresh_massive_minute_vwap(["SPY"]))
+        payload = {"instrument": "option", "option_right": "CALL", "action": "BUY"}
+        reason = await main_bot._call_index_vwap_block(payload)
+        elapsed = asyncio.get_event_loop().time() - started
+        await asyncio.wait_for(task, timeout=5)
+        return reason, elapsed, main_bot.massive_rth_cache_status(NOW)
+
+    reason, elapsed, status = _run(scenario())
+    assert reason is None
+    assert elapsed < 1.0
+    assert status["symbols"]["SPY"]["refresh_result"] == "error"
+    assert main_bot._cached_minute_vwap_view("SPY", NOW)["vwap"] == pytest.approx(SPY_RTH)
+
+
+def test_opening_ten_minutes_fail_closed(redis_scanner, monkeypatch):
+    """9:30–9:40 ET is unmeasured on purpose. CALLs stay off until N samples exist."""
+    store, _scan = redis_scanner
+    early = datetime(2026, 11, 24, 9, 39, tzinfo=ET)
+    monkeypatch.setattr(main_bot, "_utcnow", lambda: early.astimezone(timezone.utc))
+    today = datetime(2026, 11, 24, tzinfo=ET)
+    thin = _flat(today, 9 * 60 + 30, 9, SPY_TODAY)
+
+    async def scenario():
+        await _seed(store, "SPY", thin)
+        await _seed(store, "QQQ", thin)
+        _seed_rth("SPY", early, SPY_TODAY)
+        _seed_rth("QQQ", early, QQQ_TODAY)
+        reading = await main_bot.scanner_mod.read_session_vwap(store, "SPY", early)
+        cand = main_bot.scanner_mod.evaluate_quote(
+            {"symbol": "SPY", "last": SPY_LAST, "bid": 716.2, "ask": 716.3, "open": 715.0},
+            thin,
+            _cfg(),
+            0.05,
+            {"now_et": early, "quotes": {}, "session_vwap": {"SPY": reading}},
+        )
+        quotes = await main_bot._index_vwap_quotes()
+        reason = main_bot.assess_call_index_vwap_gate("CALL", quotes)
+        return reading, cand, quotes, reason
+
+    reading, cand, quotes, reason = _run(scenario())
+    assert reading["measured"] is False
+    assert reading["samples"] == 9
+    assert cand["vwap"] is None
+    assert cand["vwap_unmeasured_reason"] == "today_samples_insufficient"
+    factor = next(item for item in cand["score_factors"] if item["key"] == "vwap")
+    assert factor["fill"] == 0
+    assert factor["measured"] is False
+    assert quotes[0]["gate_vwap_reason"] == "today_samples_insufficient"
+    assert reason is not None and "fail closed" in reason
+
+
+def test_nan_and_inf_vwap_are_unmeasured(monkeypatch):
+    today = datetime(2026, 11, 24, tzinfo=ET)
+    series = _flat(today, 9 * 60 + 30, 12, 100.0)
+    for value in (float("nan"), float("inf")):
+        monkeypatch.setattr(main_bot.scanner_mod, "sampled_vwap", lambda _series, value=value: value)
+        out = main_bot.scanner_mod.today_session_vwap(series, NOW)
+        assert out["measured"] is False
+        assert out["vwap"] is None
+        assert out["reason"] == "today_samples_insufficient"
+    nan_series = []
+    for sample in series:
+        copied = dict(sample)
+        copied["last"] = float("nan")
+        nan_series.append(copied)
+    direct = main_bot.scanner_mod.today_session_vwap(nan_series, NOW)
+    assert direct["measured"] is False
+    assert direct["vwap"] is None
+    cand = main_bot.scanner_mod.evaluate_quote(
+        {"symbol": "SPY", "last": 100.0, "bid": 100.0, "ask": 100.01, "open": 100.0},
+        series,
+        _cfg(),
+        0.2,
+        {
+            "now_et": NOW,
+            "quotes": {},
+            "session_vwap": {"SPY": {
+                "vwap": float("nan"), "samples": 12, "measured": True,
+                "reason": None, "source": "session_sampled",
+            }},
+        },
+    )
+    assert cand["vwap"] is None
+    factor = next(item for item in cand["score_factors"] if item["key"] == "vwap")
+    assert factor["fill"] == 0.0
+    assert factor["measured"] is False
+    assert math.isfinite(factor["points"])
+
+
+def test_nan_price_does_not_poison_the_session_accumulator(redis_scanner):
+    store, _scan = redis_scanner
+    today = datetime(2026, 11, 24, tzinfo=ET)
+
+    async def scenario():
+        await _seed(store, "SPY", _flat(today, 9 * 60 + 30, 12, 100.0))
+        await main_bot.scanner_mod.note_session_vwap(store, "SPY", {
+            "ts": datetime(2026, 11, 24, 10, 0, tzinfo=ET).isoformat(),
+            "last": float("nan"),
+            "total_volume": 10_000_000,
+        }, None)
+        await main_bot.scanner_mod.note_session_vwap(store, "SPY", {
+            "ts": datetime(2026, 11, 24, 10, 1, tzinfo=ET).isoformat(),
+            "last": float("inf"),
+            "total_volume": 10_001_000,
+        }, None)
+        return await main_bot.scanner_mod.read_session_vwap(store, "SPY", NOW)
+
+    reading = _run(scenario())
+    assert reading["measured"] is True
+    assert reading["vwap"] == pytest.approx(100.0)
+    assert math.isfinite(reading["vwap"])
+
+
+def test_crosscheck_block_alerts_once_per_fifteen_minutes(redis_scanner, monkeypatch):
+    store, _scan = redis_scanner
+    spy, qqq = _live_series()
+    sent = []
+
+    async def send(*args, **kwargs):
+        sent.append(kwargs.get("dedupe_key") or args)
+
+    monkeypatch.setattr(main_bot.alerts, "send", send)
+
+    async def scenario():
+        await _seed(store, "SPY", spy)
+        await _seed(store, "QQQ", qqq)
+        payload = {"instrument": "option", "option_right": "CALL", "action": "BUY"}
+        first = await main_bot._call_index_vwap_block(payload)
+        second = await main_bot._call_index_vwap_block(dict(payload))
+        return first, second
+
+    first, second = _run(scenario())
+    assert first is not None and "massive_rth_missing" in first
+    assert second is not None and "massive_rth_missing" in second
+    assert sent == ["vwap_crosscheck_blocked"]
+
+
+def test_sample_floor_follows_the_stored_scanner_interval(redis_scanner, monkeypatch):
+    _store, scan = redis_scanner
+    monkeypatch.delenv("VWAP_MIN_TODAY_SAMPLES", raising=False)
+    monkeypatch.setenv("SCANNER_INTERVAL_SECONDS", "60")
+    saved = main_bot.scanner_mod._LIVE_INTERVAL_SECONDS
+
+    async def scenario():
+        await scan.set_config({"interval_seconds": 30})
+        return main_bot.scanner_mod.vwap_min_today_samples()
+
+    try:
+        assert _run(scenario()) == 20
+    finally:
+        main_bot.scanner_mod._LIVE_INTERVAL_SECONDS = saved

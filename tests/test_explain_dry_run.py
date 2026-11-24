@@ -344,6 +344,7 @@ def test_status_exposes_call_index_vwap_gate(monkeypatch):
         "vwap_min_today_samples": main_bot.scanner_mod.vwap_min_today_samples(),
         "vwap_crosscheck_max_bps": main_bot.vwap_crosscheck_max_bps(),
         "vwap_crosscheck_required": main_bot.vwap_crosscheck_required(),
+        "vwap_crosscheck_max_age_s": main_bot.vwap_crosscheck_max_age_s(),
     }
     monkeypatch.setenv("CALL_INDEX_VWAP_GATE", "yes")
     assert main_bot.call_index_vwap_gate_status()["enabled"] is frozen_enabled

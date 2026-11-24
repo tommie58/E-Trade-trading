@@ -299,6 +299,7 @@ def test_session_sampled_vwap_drops_prior_day_and_gate_does_not_keep_full_series
     saved_scanner = main_bot.scanner
     original_fetch = main_bot._scanner_fetch_quotes
     saved_now = main_bot._utcnow
+    saved_state = main_bot.state
 
     async def fetch(symbols, *, dry_run=False):
         return {"QuoteResponse": {"QuoteData": [
@@ -310,12 +311,18 @@ def test_session_sampled_vwap_drops_prior_day_and_gate_does_not_keep_full_series
         main_bot.scanner = Scan()
         main_bot._scanner_fetch_quotes = fetch
         main_bot._utcnow = lambda: now.astimezone(timezone.utc)
+        # The gate reads the per-date hash, not the mocked capped list.
+        # Two today prints are under the floor, so the full-series VWAP is unused.
+        main_bot.state = main_bot.StateStore(None)
+        for sample in series:
+            await main_bot.scanner_mod.note_session_vwap(main_bot.state, "SPY", sample, now)
         try:
             return await main_bot._index_vwap_quotes()
         finally:
             main_bot._scanner_fetch_quotes = original_fetch
             main_bot.scanner = saved_scanner
             main_bot._utcnow = saved_now
+            main_bot.state = saved_state
 
     quotes = _run(run())
     spy = next(q for q in quotes if q["symbol"] == "SPY")
@@ -324,7 +331,7 @@ def test_session_sampled_vwap_drops_prior_day_and_gate_does_not_keep_full_series
     assert spy["vwap"] is None
     assert spy["vwap_source"] is None
     assert spy["gate_vwap_verdict"] == "unmeasured"
-    assert "only 2 today RTH samples" in (spy.get("gate_vwap_reason") or "")
+    assert spy.get("gate_vwap_reason") == "today_samples_insufficient"
     assert spy["vwap"] != pytest.approx(full)
     row = main_bot.observe_index_vwap_row(spy, series, now)
     assert row["current_vwap"] is None
@@ -869,7 +876,7 @@ def test_today_rth_minute_vwap_is_served(monkeypatch):
             return False
 
         async def get(self, url, params=None, headers=None):
-            return _Resp(200, {"results": [bar(9, 30, 200, 100), bar(9, 31, 210, 100)]})
+            return _Resp(200, {"results": [bar(10, 38, 200, 100), bar(10, 39, 210, 100)]})
 
     monkeypatch.setattr(httpx, "AsyncClient", _Rth)
     _run(main_bot.refresh_massive_minute_vwap(["SPY"]))
