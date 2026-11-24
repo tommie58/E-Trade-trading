@@ -6586,10 +6586,11 @@ UP on a noisy run of winners is how an adaptive system turns luck into a
 blow-up; the existing gates already decide what full size is.
 
 THE BOOK CELL never refuses — halting everything is the daily loss limit's
-job, not a statistical one. Its weight shrinks every entry's size and
-stretches the scanner's cadence by 1/weight (≤ ×4): a book that is measurably
-losing trades smaller and looks less often, and keeps producing the closes
-that let it recover.
+job, not a statistical one. Its weight shrinks every entry's size. An ACTIVE
+book that is measurably losing also stretches the scanner cadence by
+1/weight (≤ ×4). Probation keeps that size cut and the standard cadence:
+the re-test has to see candidates often enough to produce the closes that
+let it recover.
 
 UNITS AND HONESTY. Outcomes are realized percent per trade (size-invariant,
 so a down-weighted trade is still full evidence) on the window's best-
@@ -6616,7 +6617,8 @@ PROBATION_WEIGHT = 0.25   # re-tests run small: the cell owes us evidence
 PROBATION_TRADES = 10     # fresh closes a re-test is judged on
 BASE_COOLDOWN_DAYS = 7.0  # one trading week
 MAX_COOLDOWN_DAYS = 56.0  # eight weeks: a relapsing cell is still re-tested
-MAX_THROTTLE = 4.0        # scanner cadence stretch ceiling (1 / MIN_WEIGHT)
+MAX_THROTTLE = 4.0        # ACTIVE-book cadence stretch ceiling (1 / MIN_WEIGHT).
+                          # Probation does not use it — size cuts, scan does not.
 
 RESET_EVENT = "learning_cell_reset"
 ANY = "*"
@@ -6785,13 +6787,20 @@ def learning_state(trades: List[Dict[str, Any]], resets: Dict[str, List[float]],
     cells = {key: replay_cell(rows, resets.get(key, []), now) for key, rows in buckets.items()}
     book = cells[BOOK]
     # The book cell never refuses (see module doc): disabled/probation read as
-    # the smallest weight, never zero.
-    book_weight = book["weight"] if book["state"] == ACTIVE else MIN_WEIGHT
+    # the smallest weight, never zero. Probation still sizes at that floor,
+    # but it must not stretch the scanner — 1/0.25 = 4 turns a 60s pass into
+    # 240s and the re-test never sees enough candidates.
+    book_state = book["state"]
+    book_weight = book["weight"] if book_state == ACTIVE else MIN_WEIGHT
     book_weight = max(MIN_WEIGHT, book_weight)
+    if book_state == PROBATION:
+        throttle = 1.0
+    else:
+        throttle = round(min(MAX_THROTTLE, 1.0 / book_weight), 2)
     return {
         "cells": cells,
         "book_weight": round(book_weight, 3),
-        "scanner_throttle": round(min(MAX_THROTTLE, 1.0 / book_weight), 2),
+        "scanner_throttle": throttle,
         "live_closes": len(ordered),
     }
 
@@ -7126,6 +7135,36 @@ def assess_correlation(
 VIX_PAUSE = 35.0
 SPY_RANGE_PAUSE = 3.0
 SPY_GAP_PAUSE = 2.0
+# Cash open through the opening range. A verified index gap at or above
+# SPY_GAP_PAUSE is still price discovery here, so new entries stay paused.
+# After this, a settled tape (real range, healthy feed, healthy spread) may
+# take a structure setup at SPY_GAP_SETTLED_WEIGHT instead of sitting out
+# the rest of the session. 2026-11-23 was a genuine +5.004% SPY gap
+# (724.33 vs 689.81) and the old rule paused all 268 scans.
+SPY_GAP_STABILIZE_MINUTES = 30.0
+SPY_GAP_SETTLED_WEIGHT = 0.5
+# Wider than any modern SPY cash gap, including the 2020 limit days. Above
+# this the reference is rejected rather than treated as a regime.
+SPY_GAP_MAX_TRUST_PCT = 25.0
+# SPY's book is normally about a basis point. Wider than this is not a
+# healthy index spread, and an unmeasured spread is not a healthy one.
+SPY_GAP_MAX_SPREAD_PCT = 0.20
+# The session has to have traded a range. A frozen open print is not
+# "settled structure".
+SPY_GAP_MIN_RANGE_PCT = 0.15
+# Open/last may sit this far outside the printed high/low (one tick of
+# noise) and still belong to the bar.
+GAP_RANGE_TOLERANCE_PCT = 0.05
+# Vendor change vs (last - previous close). A larger disagreement means the
+# previous close and the vendor's own change are not the same number.
+GAP_CHANGE_TOLERANCE_PCT = 0.40
+GAP_CHANGE_TOLERANCE_REL = 0.002
+# Post-open release is these tape setups only. Momentum and breakout
+# clusters stay paused on a >= 2% index gap — that is the open chase the
+# pause exists to stop.
+SPY_GAP_STRUCTURE_SETUPS = frozenset({
+    "orb", "vwap reclaim", "vwap rejection", "mean reversion",
+})
 # The NAME is in price discovery after an 8% opening gap — the level a stop
 # would rest at did not exist yesterday.
 NAME_GAP_PAUSE = 8.0
@@ -7141,6 +7180,10 @@ UNMEASURED_WEIGHT = 0.75
 RISK_CONTEXT_KEYS = (
     "vix", "spy_range_pct", "spy_gap_pct", "gap_pct", "earnings_nearby",
     "bid_size", "ask_size", "volume", "open_interest",
+    "spy_gap_verified", "spy_structure_valid", "spy_feed_healthy", "spy_spread_healthy",
+)
+_RISK_CONTEXT_FLAGS = (
+    "spy_gap_verified", "spy_structure_valid", "spy_feed_healthy", "spy_spread_healthy",
 )
 
 
@@ -7156,6 +7199,9 @@ def sanitize_risk_context(raw: Any) -> Dict[str, Any]:
     for key in ("spy_gap_pct", "gap_pct"):
         v = _finite(raw.get(key))
         out[key] = v if v is not None and abs(v) < 100 else None
+    for key in _RISK_CONTEXT_FLAGS:
+        flag = raw.get(key)
+        out[key] = flag if isinstance(flag, bool) else None
     if out["vix"] is not None and not 5.0 <= out["vix"] <= 150.0:
         out["vix"] = None
     e = raw.get("earnings_nearby")
@@ -7170,8 +7216,187 @@ def gap_pct(open_px: Any, prev_close: Any) -> Optional[float]:
     return round((o - c) / c * 100.0, 3)
 
 
-def assess_regime_sizing(ctx: Dict[str, Any], vol_regime: Any) -> Dict[str, Any]:
-    """{pause, weight, reasons (pause), notes (trims)} for one entry."""
+def _quote_spread_pct(bid: Any, ask: Any) -> Optional[float]:
+    b, a = _finite(bid), _finite(ask)
+    if b is None or a is None or b <= 0 or a <= 0 or a < b:
+        return None
+    mid = (a + b) / 2.0
+    if mid <= 0:
+        return None
+    return (a - b) / mid * 100.0
+
+
+def _inside_bar(px: Optional[float], lo: float, hi: float) -> bool:
+    if px is None:
+        return False
+    width = max(hi * GAP_RANGE_TOLERANCE_PCT / 100.0, 0.01)
+    return (lo - width) <= px <= (hi + width)
+
+
+def verify_opening_gap(
+    open_px: Any,
+    prev_close: Any,
+    *,
+    last: Any = None,
+    high: Any = None,
+    low: Any = None,
+    vendor_change: Any = None,
+    vendor_change_pct: Any = None,
+    max_trust_pct: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Opening gap only when the open and the prior close belong together.
+
+    `(open - previous_close) / previous_close` is the whole formula. It is
+    right when both numbers are this session's open and the prior cash close
+    (2026-11-23 SPY: 724.33 vs 689.81 = +5.004%, which prints as +5.00%).
+    It is wrong when the day bar is a prior session, the open never printed,
+    or the previous close disagrees with the vendor's own change. Those
+    return gap_pct None and verified False — a bad reference must not pause
+    the book, and it must not be stored as a gap.
+
+    A check that cannot be run (no high/low, no vendor change) does not fail
+    a otherwise finite open/close pair. A check that runs and disagrees does.
+    `max_trust_pct` rejects impossible index gaps (a 25%+ SPY "gap" is a
+    bad scale, not a cash open). Names pass None so a real earnings gap
+    still counts. Pure.
+    """
+    out: Dict[str, Any] = {
+        "gap_pct": None, "verified": False, "bar_consistent": None, "reason": "",
+    }
+    raw = gap_pct(open_px, prev_close)
+    if raw is None:
+        out["reason"] = "open or previous close unmeasured"
+        return out
+    o, c = _finite(open_px), _finite(prev_close)
+    hi, lo, last_px = _finite(high), _finite(low), _finite(last)
+    if hi is not None and lo is not None and lo > 0 and hi + 1e-9 >= lo:
+        open_in = _inside_bar(o, lo, hi)
+        last_in = True if last_px is None else _inside_bar(last_px, lo, hi)
+        out["bar_consistent"] = bool(open_in and last_in)
+        if not out["bar_consistent"]:
+            out["reason"] = (
+                "session bar does not contain the open and the last print — gap reference rejected"
+            )
+            return out
+    vchg = _finite(vendor_change)
+    if vchg is not None and last_px is not None and c is not None and c > 0:
+        implied = last_px - vchg
+        if implied <= 0 or abs(implied - c) / c > GAP_CHANGE_TOLERANCE_REL:
+            out["reason"] = "previous close disagrees with the vendor change — gap reference rejected"
+            return out
+    vpct = _finite(vendor_change_pct)
+    if vpct is not None and last_px is not None and c is not None and c > 0:
+        live_pct = (last_px - c) / c * 100.0
+        if abs(live_pct - vpct) > GAP_CHANGE_TOLERANCE_PCT:
+            out["reason"] = (
+                "previous close disagrees with the vendor percent change — gap reference rejected"
+            )
+            return out
+    if max_trust_pct is not None and abs(raw) > float(max_trust_pct):
+        out["reason"] = (
+            f"gap {raw:+.2f}% wider than the {float(max_trust_pct):g}% trust cap — reference rejected"
+        )
+        return out
+    out["gap_pct"] = raw
+    out["verified"] = True
+    out["reason"] = "opening gap verified"
+    return out
+
+
+def index_session_ready(quote: Any, min_range_pct: float = SPY_GAP_MIN_RANGE_PCT) -> bool:
+    """True when the index bar is a traded session, not a frozen print.
+
+    Needs an open inside the high/low, the last inside that range, and a
+    high-low range of at least `min_range_pct` of the prior close. Missing
+    any piece is not structure.
+    """
+    if not isinstance(quote, dict):
+        return False
+    o, hi, lo, last = (_finite(quote.get(k)) for k in ("open", "high", "low", "last"))
+    prev = _finite(quote.get("previous_close")) or o
+    if o is None or hi is None or lo is None or last is None or prev is None:
+        return False
+    if prev <= 0 or hi <= lo:
+        return False
+    if not _inside_bar(o, lo, hi) or not _inside_bar(last, lo, hi):
+        return False
+    return (hi - lo) / prev * 100.0 + 1e-12 >= float(min_range_pct)
+
+
+def index_gap_context(
+    quote: Any,
+    *,
+    max_trust_pct: float = SPY_GAP_MAX_TRUST_PCT,
+    max_spread_pct: float = SPY_GAP_MAX_SPREAD_PCT,
+    min_range_pct: float = SPY_GAP_MIN_RANGE_PCT,
+) -> Dict[str, Any]:
+    """SPY gap fields for risk_context. Unverified gaps are stored as None.
+
+    `bar_consistent` is for the caller (drop a stale session range) and is
+    not a risk_context key. Feed health here is the quote itself: real-time
+    and not a bar the last print sits outside. The entry path also requires
+    the upstream feed to be healthy before it releases a gap pause.
+    """
+    empty: Dict[str, Any] = {
+        "spy_gap_pct": None,
+        "spy_gap_verified": False,
+        "spy_structure_valid": False,
+        "spy_feed_healthy": False,
+        "spy_spread_healthy": False,
+        "bar_consistent": None,
+    }
+    if not isinstance(quote, dict) or not quote:
+        return empty
+    verdict = verify_opening_gap(
+        quote.get("open"), quote.get("previous_close"),
+        last=quote.get("last"), high=quote.get("high"), low=quote.get("low"),
+        vendor_change=quote.get("change_close"),
+        vendor_change_pct=quote.get("change_close_pct"),
+        max_trust_pct=max_trust_pct,
+    )
+    spread = _quote_spread_pct(quote.get("bid"), quote.get("ask"))
+    return {
+        "spy_gap_pct": verdict["gap_pct"] if verdict["verified"] else None,
+        "spy_gap_verified": bool(verdict["verified"]),
+        "spy_structure_valid": index_session_ready(quote, min_range_pct),
+        "spy_feed_healthy": quote.get("realtime") is True and verdict["bar_consistent"] is not False,
+        "spy_spread_healthy": spread is not None and spread <= float(max_spread_pct),
+        "bar_consistent": verdict["bar_consistent"],
+    }
+
+
+def _spy_gap_settled(tape: Dict[str, Any]) -> bool:
+    """True when a verified gap day may take a reduced-size structure setup."""
+    minutes = _finite(tape.get("minutes_since_open"))
+    stabilize = _finite(tape.get("stabilize_minutes"))
+    if stabilize is None:
+        stabilize = SPY_GAP_STABILIZE_MINUTES
+    if minutes is None or minutes < stabilize:
+        return False
+    if tape.get("structure_valid") is not True:
+        return False
+    if tape.get("feeds_healthy") is not True:
+        return False
+    if tape.get("spreads_healthy") is not True:
+        return False
+    setup = " ".join(str(tape.get("setup") or "").lower().split())
+    return setup in SPY_GAP_STRUCTURE_SETUPS
+
+
+def assess_regime_sizing(
+    ctx: Dict[str, Any],
+    vol_regime: Any,
+    tape: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """{pause, weight, reasons (pause), notes (trims)} for one entry.
+
+    A verified SPY gap at or above SPY_GAP_PAUSE pauses through the open
+    stabilization window. Once `tape` shows a settled session it sizes a
+    structure setup down instead of pausing. An unverified gap
+    (`spy_gap_verified is False`) is ignored — a bad reference is not a
+    crisis. A legacy context that carries only the number still pauses,
+    which is the safe direction when nobody has checked the bar.
+    """
     reasons: List[str] = []
     notes: List[str] = []
     weights: List[float] = [1.0]
@@ -7182,7 +7407,25 @@ def assess_regime_sizing(ctx: Dict[str, Any], vol_regime: Any) -> Dict[str, Any]
     if spy_range is not None and spy_range >= SPY_RANGE_PAUSE:
         reasons.append(f"regime pause: SPY range {spy_range:.2f}% ≥ {SPY_RANGE_PAUSE:g}% — crisis tape")
     if spy_gap is not None and abs(spy_gap) >= SPY_GAP_PAUSE:
-        reasons.append(f"regime pause: SPY opened {spy_gap:+.2f}% — index gap ≥ {SPY_GAP_PAUSE:g}%")
+        verified = ctx.get("spy_gap_verified")
+        if verified is False:
+            notes.append(
+                f"SPY gap {spy_gap:+.2f}% unverified — pause not applied"
+            )
+        elif _spy_gap_settled(tape or {}):
+            settled = _finite((tape or {}).get("settled_weight"))
+            if settled is None:
+                settled = SPY_GAP_SETTLED_WEIGHT
+            settled = min(1.0, max(0.05, float(settled)))
+            weights.append(settled)
+            notes.append(
+                f"SPY gap {spy_gap:+.2f}% ≥ {SPY_GAP_PAUSE:g}% — open stabilization passed "
+                f"with structure and healthy feeds/spreads → ×{settled:g}"
+            )
+        else:
+            reasons.append(
+                f"regime pause: SPY opened {spy_gap:+.2f}% — index gap ≥ {SPY_GAP_PAUSE:g}%"
+            )
     if earnings is True:
         reasons.append("gap risk: earnings inside the holding window — the print gaps through any stop")
     if name_gap is not None and abs(name_gap) >= NAME_GAP_PAUSE:
@@ -7405,6 +7648,9 @@ def thresholds() -> Dict[str, Any]:
     return {
         "correlated_risk_mult": CORRELATED_RISK_MULT, "max_cluster_same_side": MAX_CLUSTER_SAME_SIDE,
         "vix_pause": VIX_PAUSE, "spy_range_pause": SPY_RANGE_PAUSE, "spy_gap_pause": SPY_GAP_PAUSE,
+        "spy_gap_stabilize_minutes": SPY_GAP_STABILIZE_MINUTES,
+        "spy_gap_settled_weight": SPY_GAP_SETTLED_WEIGHT,
+        "spy_gap_max_trust_pct": SPY_GAP_MAX_TRUST_PCT,
         "name_gap_pause": NAME_GAP_PAUSE, "name_gap_trim": NAME_GAP_TRIM, "name_gap_weight": NAME_GAP_WEIGHT,
         "stressed_weight": STRESSED_WEIGHT, "unmeasured_weight": UNMEASURED_WEIGHT,
         "option_book_share": OPTION_BOOK_SHARE, "option_flow_share": OPTION_FLOW_SHARE,
@@ -9092,6 +9338,8 @@ def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
             "high": num(all_q, "high"),
             "low": num(all_q, "low"),
             "previous_close": num(all_q, "previousClose"),
+            "change_close": num(all_q, "changeClose"),
+            "change_close_pct": num(all_q, "changeClosePercentage"),
             "total_volume": num(all_q, "totalVolume"),
             "avg_daily_volume": num(all_q, "volume10Day"),
             "vwap": vwap,
@@ -9337,7 +9585,13 @@ def read_tape(
     if vwap is None:
         vwap = sampled_vwap(today)
     rng = opening_range(today, now_et) if minutes >= ORB_RANGE_MINUTES else None
-    gap = risk_mod.gap_pct(quote.get("open"), quote.get("previous_close"))
+    gap_verdict = risk_mod.verify_opening_gap(
+        quote.get("open"), quote.get("previous_close"),
+        last=quote.get("last"), high=quote.get("high"), low=quote.get("low"),
+        vendor_change=quote.get("change_close"),
+        vendor_change_pct=quote.get("change_close_pct"),
+    )
+    gap = gap_verdict["gap_pct"] if gap_verdict["verified"] else None
     change_open = pct_change(px, quote.get("open"))
     pace = volume_pace(today, quote, now_et)
     volume_ok = pace is not None and pace >= TAPE_TRIGGER_VOLUME_MULT
@@ -9706,13 +9960,26 @@ def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) ->
 def build_risk_context(quote: Dict[str, Any], quotes_by_symbol: Dict[str, Any]) -> Dict[str, Any]:
     """The portfolio-risk readings this pass MEASURED (None otherwise): the
     name's opening gap, SPY's range and gap, the displayed book and the day's
-    volume. No VIX here — the scanner reads quotes, not the index."""
+    volume. No VIX here — the scanner reads quotes, not the index.
+
+    Gaps go through verify_opening_gap. A stale day bar or a previous close
+    that disagrees with the vendor change is stored as unmeasured, not as a
+    pause. SPY's range is dropped with the same bar — a prior session's
+    high/low is not today's crisis range."""
     spy = (quotes_by_symbol or {}).get(edge_mod.BENCHMARK) or {}
-    spy_range = edge_mod.spy_range_pct(spy) if spy else None
+    index = risk_mod.index_gap_context(spy if spy else None)
+    bar_ok = index.pop("bar_consistent", None)
+    spy_range = edge_mod.spy_range_pct(spy) if spy and bar_ok is not False else None
+    name_gap = risk_mod.verify_opening_gap(
+        quote.get("open"), quote.get("previous_close"),
+        last=quote.get("last"), high=quote.get("high"), low=quote.get("low"),
+        vendor_change=quote.get("change_close"),
+        vendor_change_pct=quote.get("change_close_pct"),
+    )
     return risk_mod.sanitize_risk_context({
-        "gap_pct": risk_mod.gap_pct(quote.get("open"), quote.get("previous_close")),
+        "gap_pct": name_gap["gap_pct"] if name_gap["verified"] else None,
         "spy_range_pct": round(spy_range, 3) if spy_range is not None else None,
-        "spy_gap_pct": risk_mod.gap_pct(spy.get("open"), spy.get("previous_close")) if spy else None,
+        **index,
         "bid_size": quote.get("bid_size"),
         "ask_size": quote.get("ask_size"),
         "volume": quote.get("total_volume"),
@@ -10241,8 +10508,10 @@ class Scanner:
                 elif not self.is_market_open():
                     delay = 300
                 else:
-                    # A book the live record shows losing looks less often
+                    # ACTIVE books that are measurably losing look less often
                     # (stretch = 1 / book weight, ≤ 4×, applied to the NEXT wait).
+                    # Probation leaves throttle at 1 so the re-test still scans
+                    # on the configured interval (60s) while size stays cut.
                     delay = int(round(delay * max(1.0, min(learning_mod.MAX_THROTTLE, self.throttle))))
                     lock = self.state.lock(SCANNER_LOCK, ttl_ms=max(30_000, delay * 2000))
                     if await lock.try_acquire():
@@ -12557,6 +12826,44 @@ SETUP_IMPORT_MAX_BATCH = int(os.getenv("SETUP_IMPORT_MAX_BATCH", "500"))
 LOSS_STREAK_ENABLED = os.getenv("LOSS_STREAK_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 STREAK_COOLDOWN_MINUTES = float(os.getenv("STREAK_COOLDOWN_MINUTES", "45"))
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.getenv(name, str(default))).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(str(os.getenv(name, str(default))).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) else default
+
+
+# Post-open release of a verified SPY gap. The 2% threshold itself stays the
+# portfolio_risk constant. These only decide when a settled tape may trade
+# a structure setup smaller instead of staying paused all session.
+SPY_GAP_STABILIZE_MINUTES = max(0, _env_int(
+    "SPY_GAP_STABILIZE_MINUTES", int(portfolio_risk.SPY_GAP_STABILIZE_MINUTES),
+))
+SPY_GAP_SETTLED_WEIGHT = min(1.0, max(0.05, _env_float(
+    "SPY_GAP_SETTLED_WEIGHT", portfolio_risk.SPY_GAP_SETTLED_WEIGHT,
+)))
+# Morning correlated-burst guard. Caps same-direction / same-setup entries
+# in the open window and spaces the next one after a rapid stop-out.
+# Defaults stop a 7-print cluster in five minutes without capping the day.
+MORNING_BURST_GUARD_ENABLED = os.getenv(
+    "MORNING_BURST_GUARD_ENABLED", "true",
+).strip().lower() not in {"false", "0", "no"}
+MORNING_BURST_START_MINUTE = _env_int("MORNING_BURST_START_MINUTE", 9 * 60 + 30)
+MORNING_BURST_END_MINUTE = _env_int("MORNING_BURST_END_MINUTE", 10 * 60 + 30)
+MORNING_BURST_CLUSTER_MINUTES = max(1, _env_int("MORNING_BURST_CLUSTER_MINUTES", 5))
+MORNING_BURST_MAX_SAME = max(1, _env_int("MORNING_BURST_MAX_SAME", 2))
+MORNING_BURST_RAPID_STOP_MINUTES = max(1.0, _env_float("MORNING_BURST_RAPID_STOP_MINUTES", 8.0))
+MORNING_BURST_SPACING_MINUTES = max(1.0, _env_float("MORNING_BURST_SPACING_MINUTES", 15.0))
 # Bounded like SETUP_VETO_LOOKBACK — the entry path must never walk an
 # unbounded file while a signal is waiting.
 STREAK_LOOKBACK = int(os.getenv("STREAK_LOOKBACK", "400"))
@@ -13328,6 +13635,175 @@ def opening_hold_reason(day_iso: str, weekday: int, minute_of_day: int) -> Optio
     return None
 
 
+def _burst_setup(value: Any) -> str:
+    return " ".join(str(value or "").lower().split())
+
+
+def _burst_direction(data: Any) -> int:
+    """+1 bullish / −1 bearish for a ledger open. A bought PUT is bearish."""
+    row = data if isinstance(data, dict) else {}
+    contract = row.get("contract") if isinstance(row.get("contract"), dict) else {}
+    right = str(
+        contract.get("right") or row.get("option_right") or row.get("call_put") or ""
+    ).upper()
+    if right.startswith("P"):
+        return -1
+    if right.startswith("C"):
+        return 1
+    action = str(row.get("action") or "").upper()
+    if action in {"SELL", "SELL_SHORT", "SHORT"}:
+        return -1
+    return 1
+
+
+def _burst_matches(direction: int, setup: str, other_direction: int, other_setup: str) -> bool:
+    if direction == other_direction:
+        return True
+    return bool(setup) and bool(other_setup) and setup == other_setup
+
+
+def assess_morning_burst(
+    records: List[dict],
+    *,
+    now_epoch: float,
+    minute_of_day: int,
+    direction: int,
+    setup: Any = None,
+    enabled: bool = True,
+    zone: Any = None,
+    window_start: int = 9 * 60 + 30,
+    window_end: int = 10 * 60 + 30,
+    cluster_minutes: int = 5,
+    max_same: int = 2,
+    rapid_stop_minutes: float = 8.0,
+    spacing_minutes: float = 15.0,
+    abandoned: Any = None,
+) -> Optional[str]:
+    """Block a correlated open-window cluster. None when the entry may proceed.
+
+    Inside `[window_start, window_end)` ET, refuses the entry when the last
+    `cluster_minutes` already hold `max_same` same-direction or same-setup
+    entries, or that many are still open from this window. After a losing
+    close that lasted at most `rapid_stop_minutes`, the next matching entry
+    waits `spacing_minutes` — including a few minutes past the window, so
+    the cluster does not resume at the bell. A different direction and a
+    different setup is not this cluster. Outside the window, and once the
+    spacing has elapsed, the day is open again. Pure.
+    """
+    if not enabled or direction not in (-1, 1):
+        return None
+    if minute_of_day < window_start:
+        return None
+    tz = zone if zone is not None else _ET_ZONE
+    now_ts = float(now_epoch)
+    idea = _burst_setup(setup)
+    abandon = set(abandoned if abandoned is not None else _ENTRY_ABANDONED_EVENTS)
+
+    def stamp(rec: dict) -> Optional[float]:
+        return _iso_epoch(rec.get("ts"))
+
+    def on_day(ts: float) -> bool:
+        now_day = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(tz).date()
+        rec_day = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz).date()
+        return rec_day == now_day
+
+    def minute_of(ts: float) -> int:
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz)
+        return dt.hour * 60 + dt.minute
+
+    ordered: List[Tuple[float, dict]] = []
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        ts = stamp(rec)
+        if ts is None or not on_day(ts):
+            continue
+        ordered.append((ts, rec))
+    ordered.sort(key=lambda pair: pair[0])
+
+    pending: Dict[str, Dict[str, Any]] = {}
+    opens: List[Dict[str, Any]] = []
+    rapid_stops: List[Dict[str, Any]] = []
+    for ts, rec in ordered:
+        event = str(rec.get("event") or "")
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        ticker = str(data.get("ticker") or "").upper()
+        if event == "position_opened" and ticker:
+            row = {
+                "ts": ts,
+                "minute": minute_of(ts),
+                "direction": _burst_direction(data),
+                "setup": _burst_setup(data.get("setup")),
+                "ticker": ticker,
+            }
+            pending[ticker] = row
+            opens.append(row)
+            continue
+        if event in abandon and ticker:
+            pending.pop(ticker, None)
+            for i in range(len(opens) - 1, -1, -1):
+                if opens[i]["ticker"] == ticker:
+                    opens.pop(i)
+                    break
+            continue
+        if event != "position_closed" or not ticker:
+            continue
+        opened = pending.pop(ticker, None)
+        raw = data.get("realized_pnl_pct")
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            raw = data.get("account_pnl_pct")
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool) or not math.isfinite(float(raw)):
+            continue
+        if float(raw) >= -0.1 or opened is None:
+            continue
+        hold = (ts - float(opened["ts"])) / 60.0
+        if hold > float(rapid_stop_minutes):
+            continue
+        if not (window_start <= int(opened["minute"]) < window_end):
+            continue
+        rapid_stops.append({
+            "ts": ts, "direction": opened["direction"], "setup": opened["setup"], "hold": hold,
+        })
+
+    in_window = window_start <= minute_of_day < window_end
+    if in_window:
+        horizon = now_ts - float(cluster_minutes) * 60.0
+        clustered = [
+            row for row in opens
+            if row["ts"] >= horizon and _burst_matches(direction, idea, row["direction"], row["setup"])
+        ]
+        if len(clustered) >= int(max_same):
+            return (
+                f"morning burst guard: {len(clustered)} same-direction or same-setup entries "
+                f"in {cluster_minutes:g} min (max {max_same}) — spacing the open"
+            )
+        live = [
+            row for row in pending.values()
+            if window_start <= int(row["minute"]) < window_end
+            and _burst_matches(direction, idea, row["direction"], row["setup"])
+        ]
+        if len(live) >= int(max_same):
+            return (
+                f"morning burst guard: {len(live)} same-direction or same-setup positions "
+                f"already open from the morning window (max {max_same})"
+            )
+    spacing = float(spacing_minutes) * 60.0
+    for stop in rapid_stops:
+        if not _burst_matches(direction, idea, stop["direction"], stop["setup"]):
+            continue
+        age = now_ts - float(stop["ts"])
+        if age < 0 or age >= spacing:
+            continue
+        # Spacing follows the stop even a few minutes past the window, so a
+        # 10:25 stop does not immediately re-fire when the window ends.
+        remaining = max(1, int(math.ceil((spacing - age) / 60.0)))
+        return (
+            f"morning burst guard: rapid stop-out ({stop['hold']:.1f} min hold) — "
+            f"next same-direction or same-setup entry waits {remaining} min"
+        )
+    return None
+
+
 def _opening_hold_block() -> Optional[str]:
     """Live read of `opening_hold_reason`. An unreadable clock refuses nothing."""
     try:
@@ -13337,6 +13813,33 @@ def _opening_hold_block() -> Optional[str]:
         )
     except Exception as e:
         logger.warning(f"opening hold check unavailable: {e}")
+        return None
+
+
+def _morning_burst_block(p: dict) -> Optional[str]:
+    """Live morning-burst check. An unreadable ledger refuses nothing — same
+    posture as the loss-streak breaker. The pure rule is `assess_morning_burst`."""
+    if not MORNING_BURST_GUARD_ENABLED:
+        return None
+    try:
+        now_et = _utcnow().astimezone(_ET_ZONE)
+        return assess_morning_burst(
+            _corrected_ledger(STREAK_LOOKBACK),
+            now_epoch=now_et.timestamp(),
+            minute_of_day=now_et.hour * 60 + now_et.minute,
+            direction=portfolio_risk.payload_direction(p),
+            setup=p.get("setup"),
+            enabled=True,
+            zone=_ET_ZONE,
+            window_start=MORNING_BURST_START_MINUTE,
+            window_end=MORNING_BURST_END_MINUTE,
+            cluster_minutes=MORNING_BURST_CLUSTER_MINUTES,
+            max_same=MORNING_BURST_MAX_SAME,
+            rapid_stop_minutes=MORNING_BURST_RAPID_STOP_MINUTES,
+            spacing_minutes=MORNING_BURST_SPACING_MINUTES,
+        )
+    except Exception as e:
+        logger.warning(f"morning burst guard unavailable (entry not blocked): {e}")
         return None
 
 
@@ -13353,7 +13856,8 @@ def _payload_option_right(p: dict) -> str:
 async def _index_vwap_quotes(symbols: Tuple[str, ...] = CALL_INDEX_VWAP_SYMBOLS) -> List[Dict[str, Any]]:
     """SPY/QQQ last + day VWAP for the call gate. Prefers the broker VWAP
     field; falls back to the scanner's sampled session VWAP when the quote
-    omits it. Empty list on a total fetch failure (assess fails open)."""
+    omits it. A total fetch failure returns rows with no VWAP; the gate
+    then fails closed."""
     syms = [s for s in symbols if s]
     if not syms:
         return []
@@ -13386,7 +13890,7 @@ async def _index_vwap_quotes(symbols: Tuple[str, ...] = CALL_INDEX_VWAP_SYMBOLS)
 
 
 async def _call_index_vwap_block(p: dict) -> Optional[str]:
-    """Live CALL-vs-index-VWAP check. Fail-open on fetch errors."""
+    """Live CALL-vs-index-VWAP check. Fail-closed when VWAP is unmeasured."""
     if not CALL_INDEX_VWAP_GATE:
         return None
     right = _payload_option_right(p)
@@ -13396,8 +13900,10 @@ async def _call_index_vwap_block(p: dict) -> Optional[str]:
         quotes = await _index_vwap_quotes()
         return assess_call_index_vwap_gate(right, quotes, enabled=True)
     except Exception as e:
-        logger.warning(f"call-index VWAP gate unavailable (entry not blocked): {e}")
-        return None
+        logger.warning(f"call-index VWAP gate unavailable (CALL entry blocked): {e}")
+        return (
+            "CALL blocked — index VWAP unmeasured (feed error) — fail closed"
+        )
 
 
 def _is_market_open() -> bool:
@@ -13839,10 +14345,10 @@ def assess_call_index_vwap_gate(
     """Refuse CALL entries when every measured index is below its day VWAP.
 
     ``index_quotes`` is an iterable of ``{symbol, last, vwap}`` (SPY / QQQ).
-    Allows when ANY measured index prints at or above VWAP. Unmeasured indexes
-    are ignored — a feed gap is not evidence the market is falling (fail open
-    when nothing is measurable). Puts and non-option entries are untouched.
-    Pure: no I/O, fully unit-testable.
+    Allows when ANY measured index prints at or above VWAP. Measured-below
+    still blocks. When no index VWAP is measured the gate fails closed: a
+    CALL must not slip through on a missing tape. Puts and non-option
+    entries are untouched. Pure: no I/O, fully unit-testable.
     """
     if not enabled:
         return None
@@ -13860,7 +14366,9 @@ def assess_call_index_vwap_gate(
             + "; ".join(below)
             + ") — waiting for SPY or QQQ to reclaim"
         )
-    return None
+    return (
+        "CALL blocked — SPY/QQQ day VWAP unmeasured — fail closed until an index VWAP is measured"
+    )
 
 
 def assess_app_entry_gates(
@@ -14357,6 +14865,34 @@ def _apply_learning_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]])
     return sized
 
 
+def _spy_gap_tape(p: dict, ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Session facts the gap pause needs before it will size instead of block.
+
+    Minutes come from the clock at decision time. Structure, feed and spread
+    come from the quote the scanner verified. An upstream feed that is not
+    ok (including a Massive 403) keeps the pause — DEGRADED_DATA stays
+    fail-closed, and this release does not open a door that feed cannot.
+    """
+    now_et = _utcnow().astimezone(_ET_ZONE)
+    minutes = (now_et.hour * 60 + now_et.minute + now_et.second / 60.0) - (9 * 60 + 30)
+    feed_ok = False
+    try:
+        feed = _pro_trader_feed_health()
+        feed_ok = feed.get("ok") is True
+    except Exception as e:
+        logger.warning(f"SPY gap feed health unreadable (pause stays closed): {e}")
+        feed_ok = False
+    return {
+        "minutes_since_open": minutes,
+        "structure_valid": ctx.get("spy_structure_valid") is True,
+        "feeds_healthy": bool(feed_ok and ctx.get("spy_feed_healthy") is True),
+        "spreads_healthy": ctx.get("spy_spread_healthy") is True,
+        "setup": (p or {}).get("setup"),
+        "stabilize_minutes": SPY_GAP_STABILIZE_MINUTES,
+        "settled_weight": SPY_GAP_SETTLED_WEIGHT,
+    }
+
+
 async def _assess_portfolio_risk(
     p: dict,
     edge_verdict: Optional[Dict[str, Any]] = None,
@@ -14376,7 +14912,7 @@ async def _assess_portfolio_risk(
     notes: List[str] = []
     reasons: List[str] = []
 
-    sizing = portfolio_risk.assess_regime_sizing(ctx, regime)
+    sizing = portfolio_risk.assess_regime_sizing(ctx, regime, _spy_gap_tape(p, ctx))
     reasons.extend(sizing["reasons"])
     notes.extend(sizing["notes"])
 
@@ -14938,6 +15474,10 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
             hold_block = _opening_hold_block()
             if hold_block:
                 blocked.append(hold_block)
+            burst_block = _morning_burst_block(p)
+            if burst_block:
+                blocked.append(burst_block)
+                logger.warning(f"🌅 MORNING BURST — {burst_block}")
         if APP_ENTRY_RISK_GATES:
             # 5.82.1 — book limits (see APP_ENTRY_RISK_GATES). Fails CLOSED: an
             # unreadable book is not permission to add to it.
@@ -15089,6 +15629,10 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
         hold_block = _opening_hold_block()
         if hold_block:
             blocked.append(hold_block)
+        burst_block = _morning_burst_block(p)
+        if burst_block:
+            blocked.append(burst_block)
+            logger.warning(f"🌅 MORNING BURST — {burst_block}")
     else:
         logger.info("🧪 Connectivity test payload — quality gates skipped, risk gates still enforced")
 
@@ -19864,6 +20408,41 @@ def assess_loss_streak(records: List[dict], now_epoch: Any = None,
         f"paused for {remaining} more min. Exits, stops and trails stay fully active."
     )
     return base
+
+
+def loss_streak_status(records: List[dict], now_epoch: Any = None, zone: Any = None) -> Dict[str, Any]:
+    """The live breaker, for /pro-trader/status. Does not change the cooldown.
+
+    `assess_loss_streak` remains the only gate. This reads that verdict and
+    adds the configured threshold so pacing and the streak can be seen together.
+    """
+    live = assess_loss_streak(records, now_epoch=now_epoch, zone=zone)
+    return {
+        "enabled": bool(LOSS_STREAK_ENABLED),
+        "consecutive_losses": int(live.get("streak") or 0),
+        "threshold": int(MAX_CONSECUTIVE_LOSSES),
+        "cooldown_minutes": float(STREAK_COOLDOWN_MINUTES),
+        "cooldown_active": bool(live.get("paused")),
+        "minutes_remaining": int(live.get("minutes_remaining") or 0),
+        "lapsed": bool(live.get("lapsed")),
+        "day": live.get("day"),
+    }
+
+
+def _loss_streak_status_safe() -> Dict[str, Any]:
+    try:
+        return loss_streak_status(_corrected_ledger(STREAK_LOOKBACK))
+    except Exception as e:
+        logger.warning(f"loss streak status unreadable: {e}")
+        return {
+            "enabled": bool(LOSS_STREAK_ENABLED),
+            "consecutive_losses": None,
+            "threshold": int(MAX_CONSECUTIVE_LOSSES),
+            "cooldown_minutes": float(STREAK_COOLDOWN_MINUTES),
+            "cooldown_active": None,
+            "minutes_remaining": None,
+            "unreadable": True,
+        }
 
 
 def setup_attribution_start(records: List[dict]) -> Optional[float]:
@@ -31265,6 +31844,7 @@ def _pro_trader_status_payload(trades_today: Any = None) -> Dict[str, Any]:
     body["min_trades_per_day"] = target
     body["trades_completed"] = int(pacing["trades_completed"])
     body["pacing"] = pacing
+    body["loss_streak"] = _loss_streak_status_safe()
     body["version"] = BOT_VERSION
     return body
 
