@@ -5,6 +5,7 @@ This path never places a stop. Nothing runs at or after the bell.
 """
 import asyncio
 import copy
+import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -1356,3 +1357,238 @@ def test_concurrent_flatten_saves_keep_each_others_fields():
     assert final["beta"] == 2
     assert final["note"] == "keep"
     assert final["qty"] == 4
+
+
+def test_stale_position_write_cannot_clear_a_newer_flatten_close():
+    """An older whole-position copy must not erase a close id written later."""
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        await store.set_position("SPY", {
+            "qty": 4,
+            "entry": 1.25,
+            "trail": 1.0,
+            "pending_flatten_close": {"order_id": "CLOSE-NEW", "replacements": 1},
+            "close_order_id": "CLOSE-NEW",
+        })
+        current = await store.get_position("SPY")
+        stale = {
+            "qty": 4,
+            "entry": 1.25,
+            "trail": 2.5,
+            "_rev": int(current["_rev"]) - 1,
+        }
+        await store.set_position("SPY", stale)
+        kept = await store.get_position("SPY")
+        older = {
+            "qty": 4,
+            "entry": 1.25,
+            "trail": 2.5,
+            "close_order_id": "CLOSE-OLD",
+            "pending_flatten_close": {"order_id": "CLOSE-OLD"},
+            "_rev": int(kept["_rev"]) - 1,
+        }
+        await store.set_position("SPY", older)
+        still = await store.get_position("SPY")
+        fresh = dict(still)
+        fresh["close_order_id"] = "CLOSE-2"
+        fresh["pending_flatten_close"] = {"order_id": "CLOSE-2"}
+        await store.set_position("SPY", fresh)
+        replaced = await store.get_position("SPY")
+        cleared = dict(replaced)
+        cleared.pop("close_order_id")
+        cleared.pop("pending_flatten_close")
+        await store.set_position("SPY", cleared)
+        current = await store.get_position("SPY")
+        resurrect = dict(current)
+        resurrect["close_order_id"] = "CLOSE-OLD"
+        resurrect["pending_flatten_close"] = {"order_id": "CLOSE-OLD"}
+        resurrect["_rev"] = int(current["_rev"]) - 1
+        await store.set_position("SPY", resurrect)
+        gone = await store.get_position("SPY")
+        return kept, still, replaced, gone
+
+    kept, still, replaced, gone = asyncio.run(scenario())
+    assert kept["close_order_id"] == "CLOSE-NEW"
+    assert kept["pending_flatten_close"]["order_id"] == "CLOSE-NEW"
+    assert kept["trail"] == 2.5
+    assert still["close_order_id"] == "CLOSE-NEW"
+    assert still["pending_flatten_close"]["order_id"] == "CLOSE-NEW"
+    assert replaced["close_order_id"] == "CLOSE-2"
+    assert "close_order_id" not in gone
+    assert "pending_flatten_close" not in gone
+
+
+def test_flatten_save_waits_two_seconds_unless_a_sell_was_sent():
+    waits = []
+
+    class _Busy:
+        async def acquire(self):
+            raise main_bot.LockNotAcquired("busy")
+
+        async def release(self):
+            return None
+
+    def lock(ticker, ttl_ms=120_000, wait_timeout=30.0):
+        waits.append(wait_timeout)
+        return _Busy()
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        await store.set_position("SPY", {"qty": 4, "note": "keep"})
+        store.position_lock = lock
+        saved_state = main_bot.state
+        main_bot.state = store
+        try:
+            pos = await store.get_position("SPY")
+            token = main_bot._flatten_bind_baseline(copy.deepcopy(pos))
+            try:
+                working = copy.deepcopy(pos)
+                working["note"] = "bookkeeping"
+                await main_bot._flatten_save("SPY", working)
+            finally:
+                main_bot._FLATTEN_BASELINE.reset(token)
+            untouched = await store.get_position("SPY")
+            placed = main_bot._FLATTEN_ORDER_PLACED.set(True)
+            try:
+                token = main_bot._flatten_bind_baseline(copy.deepcopy(untouched))
+                try:
+                    working = copy.deepcopy(untouched)
+                    working["close_order_id"] = "CLOSE-9"
+                    working["pending_flatten_close"] = {"order_id": "CLOSE-9"}
+                    working["note"] = "sold"
+                    await main_bot._flatten_save("SPY", working)
+                finally:
+                    main_bot._FLATTEN_BASELINE.reset(token)
+            finally:
+                main_bot._FLATTEN_ORDER_PLACED.reset(placed)
+            saved = await store.get_position("SPY")
+        finally:
+            main_bot.state = saved_state
+        return untouched, saved
+
+    untouched, saved = asyncio.run(scenario())
+    assert waits == [
+        main_bot.FLATTEN_SAVE_NO_ORDER_WAIT_S,
+        main_bot.FLATTEN_SAVE_AFTER_SELL_WAIT_S,
+    ]
+    assert main_bot.FLATTEN_SAVE_NO_ORDER_WAIT_S == 2.0
+    assert main_bot.FLATTEN_SAVE_AFTER_SELL_WAIT_S == 30.0
+    assert untouched["note"] == "keep"
+    assert "close_order_id" not in untouched
+    assert saved["close_order_id"] == "CLOSE-9"
+    assert saved["pending_flatten_close"]["order_id"] == "CLOSE-9"
+    assert saved["note"] == "sold"
+
+
+def test_unsaved_close_id_retries_once_then_alerts(monkeypatch, caplog):
+    calls = {"n": 0}
+    sent = []
+
+    class _Held:
+        async def acquire(self):
+            return None
+
+        async def release(self):
+            return None
+
+    async def boom(ticker, delta):
+        calls["n"] += 1
+        raise RuntimeError("store down")
+
+    async def fake_send(severity, event, message, **kwargs):
+        sent.append({"severity": severity, "event": event, "message": message})
+
+    monkeypatch.setattr(main_bot, "_flatten_merge_changed", boom)
+    monkeypatch.setattr(main_bot.alerts, "send", fake_send)
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        await store.set_position("SPY", {
+            "qty": 4,
+            "accountId": ACCOUNT,
+            "accountIdKey": ACCOUNT,
+        })
+        store.position_lock = lambda *args, **kwargs: _Held()
+        saved = main_bot.state
+        main_bot.state = store
+        try:
+            pos = await store.get_position("SPY")
+            token = main_bot._flatten_bind_baseline(copy.deepcopy(pos))
+            placed = main_bot._FLATTEN_ORDER_PLACED.set(True)
+            try:
+                working = copy.deepcopy(pos)
+                working["close_order_id"] = "CLOSE-9"
+                working["pending_flatten_close"] = {"order_id": "CLOSE-9"}
+                await main_bot._flatten_save("SPY", working)
+            finally:
+                main_bot._FLATTEN_ORDER_PLACED.reset(placed)
+                main_bot._FLATTEN_BASELINE.reset(token)
+        finally:
+            main_bot.state = saved
+
+    caplog.set_level(logging.ERROR, logger="etrade-bot")
+    asyncio.run(scenario())
+    assert calls["n"] == 2
+    assert len(sent) == 1
+    assert sent[0]["severity"] == "error"
+    assert sent[0]["event"] == "flatten_close_unsaved"
+    assert sent[0]["message"] == "SPY: close sent, order id not saved (CLOSE-9)"
+    assert ACCOUNT not in sent[0]["message"]
+    assert "close sent, order id not saved" in caplog.text
+    assert "SPY" in caplog.text
+    assert "CLOSE-9" in caplog.text
+    assert ACCOUNT not in caplog.text
+
+
+def test_close_id_retry_that_lands_does_not_alert(monkeypatch):
+    calls = {"n": 0}
+    sent = []
+    original = main_bot._flatten_merge_changed
+
+    class _Held:
+        async def acquire(self):
+            return None
+
+        async def release(self):
+            return None
+
+    async def flaky(ticker, delta):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("once")
+        await original(ticker, delta)
+
+    async def fake_send(*args, **kwargs):
+        sent.append(args)
+
+    monkeypatch.setattr(main_bot, "_flatten_merge_changed", flaky)
+    monkeypatch.setattr(main_bot.alerts, "send", fake_send)
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        await store.set_position("SPY", {"qty": 4, "note": "keep"})
+        store.position_lock = lambda *args, **kwargs: _Held()
+        saved_state = main_bot.state
+        main_bot.state = store
+        try:
+            pos = await store.get_position("SPY")
+            token = main_bot._flatten_bind_baseline(copy.deepcopy(pos))
+            placed = main_bot._FLATTEN_ORDER_PLACED.set(True)
+            try:
+                working = copy.deepcopy(pos)
+                working["close_order_id"] = "CLOSE-9"
+                working["pending_flatten_close"] = {"order_id": "CLOSE-9"}
+                await main_bot._flatten_save("SPY", working)
+            finally:
+                main_bot._FLATTEN_ORDER_PLACED.reset(placed)
+                main_bot._FLATTEN_BASELINE.reset(token)
+            return await store.get_position("SPY")
+        finally:
+            main_bot.state = saved_state
+
+    saved = asyncio.run(scenario())
+    assert calls["n"] == 2
+    assert sent == []
+    assert saved["close_order_id"] == "CLOSE-9"
+    assert saved["note"] == "keep"
