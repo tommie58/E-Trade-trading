@@ -12338,18 +12338,29 @@ class MassiveClient:
             if adv is not None:
                 self._adv[sym] = adv
 
-    async def fetch_quote_response(self, symbols: List[str], *, dry_run: bool = False) -> Dict[str, Any]:
+    async def fetch_quote_response(
+        self,
+        symbols: List[str],
+        *,
+        dry_run: bool = False,
+        include_adv: bool = True,
+    ) -> Dict[str, Any]:
         """Massive snapshot for `symbols`, returned in E*TRADE QuoteResponse shape.
         Raises on transport/auth failure so the caller can fall back.
 
         `dry_run` (keyword-only, default False) runs the same read on a copy of
         this client. Live counters, the ADV cache, last-ok/error, and the
         on_health hook are not touched. The live call does not pass it.
+        The shadow copy skips the ADV refresh (`include_adv=False`): a status
+        or explain read must not pull daily aggregates, and it must not fill
+        the live ADV cache. The live call still refreshes ADV.
         """
         if dry_run:
             shadow = copy.deepcopy(self)
             shadow.on_health = None
-            return await MassiveClient.fetch_quote_response(shadow, symbols)
+            # Shadow reads (/status, /explain) must not refresh ADV. That
+            # refetch is a daily-agg call, and the result would die with the copy.
+            return await MassiveClient.fetch_quote_response(shadow, symbols, include_adv=False)
         import httpx  # local: keeps the pure translators importable without httpx
 
         syms = [s.strip().upper() for s in symbols if s and s.strip()]
@@ -12368,7 +12379,8 @@ class MassiveClient:
                     got = data.get("tickers")
                     if isinstance(got, list):
                         tickers.extend(got)
-                await self._refresh_adv(client, syms)
+                if include_adv:
+                    await self._refresh_adv(client, syms)
         except Exception as e:
             try:
                 message = str(e)
@@ -14701,6 +14713,7 @@ def _null_index_vwap_observe_row(symbol: str) -> Dict[str, Any]:
         "samples_in_window": None,
         "session_samples": None,
         "massive_minute_vwap_rth": None,
+        "massive_minute_vwap_rth_reason": None,
         "massive_minute_vwap_rth_last_bar_ts": None,
         "massive_minute_vwap_rth_bar_age_seconds": None,
         "massive_day_vwap_diff_bps": None,
@@ -14773,22 +14786,62 @@ def minute_aggs_rth_vwap(payload: Any, now_et: datetime) -> Dict[str, Any]:
         return empty
 
 
-def _cached_minute_vwap_view(symbol: str, now_s: float) -> Optional[Dict[str, Any]]:
-    row = _minute_vwap_cache.get(str(symbol or "").upper())
-    if not isinstance(row, dict):
+def _minute_vwap_cache_key(symbol: str, session_date: str) -> str:
+    """Cache key is the ET session date plus the symbol. Yesterday's slot is not today's."""
+    return f"{session_date}:{str(symbol or '').upper()}"
+
+
+def _epoch_et_date(epoch: Any, now_et: datetime):
+    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
         return None
+    try:
+        zone = now_et.tzinfo or _ET_ZONE
+        return datetime.fromtimestamp(float(epoch), timezone.utc).astimezone(zone).date()
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+
+
+def _minute_vwap_gap_reason(now_et: datetime) -> str:
+    """Why a minute VWAP is absent. Before the open there are no RTH bars yet.
+
+    At or after 9:30 ET a value whose last bar is not today is yesterday's VWAP.
+    """
+    minute = now_et.hour * 60 + now_et.minute
+    if minute < scanner_mod._SESSION_OPEN_MIN:
+        return "no_rth_bars_yet"
+    return "minute_vwap_not_today"
+
+
+def _minute_vwap_view_null(reason: str) -> Dict[str, Any]:
+    return {
+        "vwap": None,
+        "reason": reason,
+        "last_bar_ts": None,
+        "age_seconds": None,
+        "bar_count": None,
+    }
+
+
+def _cached_minute_vwap_view(symbol: str, now_et: datetime) -> Dict[str, Any]:
+    """Today's cached RTH minute VWAP, or null. Never a prior session's value."""
+    today = now_et.date()
+    gap = _minute_vwap_gap_reason(now_et)
+    row = _minute_vwap_cache.get(_minute_vwap_cache_key(symbol, today.isoformat()))
+    if not isinstance(row, dict):
+        return _minute_vwap_view_null(gap)
+    if _epoch_et_date(row.get("last_bar_epoch"), now_et) != today:
+        return _minute_vwap_view_null(gap)
     vwap = _positive_vwap(row.get("vwap"))
     if vwap is None:
-        return None
+        return _minute_vwap_view_null("no_rth_bars_yet")
     epoch = row.get("last_bar_epoch")
-    age = None
-    if isinstance(epoch, (int, float)) and not isinstance(epoch, bool):
-        try:
-            age = round(max(0.0, float(now_s) - float(epoch)), 1)
-        except (TypeError, ValueError):
-            age = None
+    try:
+        age = round(max(0.0, now_et.timestamp() - float(epoch)), 1)
+    except (TypeError, ValueError):
+        age = None
     return {
         "vwap": vwap,
+        "reason": None,
         "last_bar_ts": row.get("last_bar_ts"),
         "age_seconds": age,
         "bar_count": row.get("bar_count"),
@@ -14800,41 +14853,51 @@ async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> No
 
     At most once per 90s per symbol, with a 3s timeout. Does not use
     MassiveClient._get, so a failure cannot change auth_status or feed health.
+    The cache is keyed by the ET session date. A response with no positive
+    today-session VWAP does not replace the slot, and a prior day's slot is
+    never read back as today. The lock only records who is due; the HTTP
+    call sits outside it so concurrent polls are not queued on the network.
     """
     try:
         if not massive.enabled():
             return
+        now_et = _utcnow().astimezone(_ET_ZONE)
+        day = now_et.date().isoformat()
+        now = time.time()
         lock = _minute_vwap_lock()
         async with lock:
-            now = time.time()
             due = []
             for sym in [str(s).upper() for s in (symbols or _index_observe_symbols()) if s]:
-                last = float(_minute_vwap_attempt_at.get(sym) or 0)
+                last = float(_minute_vwap_attempt_at.get(_minute_vwap_cache_key(sym, day)) or 0)
                 if now - last >= _MINUTE_VWAP_REFRESH_S:
                     due.append(sym)
             if not due:
                 return
             for sym in due:
-                _minute_vwap_attempt_at[sym] = now
-            day = _utcnow().astimezone(_ET_ZONE).date().isoformat()
-            now_et = _utcnow().astimezone(_ET_ZONE)
-            import httpx
-            headers = {"Authorization": f"Bearer {massive.api_key()}"}
-            async with httpx.AsyncClient(timeout=_MINUTE_VWAP_TIMEOUT_S) as client:
-                for sym in due:
-                    try:
-                        resp = await client.get(
-                            f"{massive.BASE_URL}/v2/aggs/ticker/{sym}/range/1/minute/{day}/{day}",
-                            params={"adjusted": "true", "sort": "asc", "limit": 50000},
-                            headers=headers,
-                        )
-                        if getattr(resp, "status_code", 0) != 200:
-                            continue
-                        parsed = minute_aggs_rth_vwap(resp.json(), now_et)
-                        if _positive_vwap(parsed.get("vwap")) is not None:
-                            _minute_vwap_cache[sym] = parsed
-                    except Exception:
-                        logger.debug("minute vwap unavailable for %s", sym)
+                _minute_vwap_attempt_at[_minute_vwap_cache_key(sym, day)] = now
+        import httpx
+        headers = {"Authorization": f"Bearer {massive.api_key()}"}
+        async with httpx.AsyncClient(timeout=_MINUTE_VWAP_TIMEOUT_S) as client:
+            for sym in due:
+                try:
+                    resp = await client.get(
+                        f"{massive.BASE_URL}/v2/aggs/ticker/{sym}/range/1/minute/{day}/{day}",
+                        params={"adjusted": "true", "sort": "asc", "limit": 50000},
+                        headers=headers,
+                    )
+                    if getattr(resp, "status_code", 0) != 200:
+                        continue
+                    parsed = minute_aggs_rth_vwap(resp.json(), now_et)
+                    if _positive_vwap(parsed.get("vwap")) is None:
+                        continue
+                    if _epoch_et_date(parsed.get("last_bar_epoch"), now_et) != now_et.date():
+                        continue
+                    stored = dict(parsed)
+                    stored["session_date"] = day
+                    async with lock:
+                        _minute_vwap_cache[_minute_vwap_cache_key(sym, day)] = stored
+                except Exception:
+                    logger.debug("minute vwap unavailable for %s", sym)
     except Exception:
         logger.debug("minute vwap refresh skipped")
 
@@ -14869,12 +14932,22 @@ def observe_index_vwap_row(
             row["session_samples"] = len(today)
             session_vwap = _positive_vwap(scanner_mod.sampled_vwap(today))
             row["session_sampled_vwap"] = session_vwap
-        rth = _positive_vwap((minute_rth or {}).get("vwap")) if isinstance(minute_rth, dict) else None
+        if isinstance(minute_rth, dict):
+            rth = _positive_vwap(minute_rth.get("vwap"))
+            reason = minute_rth.get("reason")
+        else:
+            rth = None
+            reason = _minute_vwap_gap_reason(now_et)
         row["massive_minute_vwap_rth"] = rth
-        if isinstance(minute_rth, dict) and rth is not None:
+        if rth is not None and isinstance(minute_rth, dict):
+            row["massive_minute_vwap_rth_reason"] = None
             row["massive_minute_vwap_rth_last_bar_ts"] = minute_rth.get("last_bar_ts")
             age = minute_rth.get("age_seconds")
-            row["massive_minute_vwap_rth_bar_age_seconds"] = age if isinstance(age, (int, float)) else None
+            row["massive_minute_vwap_rth_bar_age_seconds"] = (
+                age if isinstance(age, (int, float)) and not isinstance(age, bool) else None
+            )
+        else:
+            row["massive_minute_vwap_rth_reason"] = reason if isinstance(reason, str) and reason else _minute_vwap_gap_reason(now_et)
         baseline = row["current_vwap"]
         row["massive_day_vwap_diff_bps"] = _vwap_diff_bps(row["massive_day_vwap"], baseline)
         row["massive_minute_vw_diff_bps"] = _vwap_diff_bps(row["massive_minute_vw"], baseline)
@@ -14905,12 +14978,11 @@ async def build_call_index_vwap_observe(
             if isinstance(quote, dict):
                 by_sym[str(quote.get("symbol") or "").upper()] = quote
         now_et = _utcnow().astimezone(_ET_ZONE)
-        now_s = time.time()
         rows: List[Dict[str, Any]] = []
         for sym in symbols:
             try:
                 series = await _observe_series(sym)
-                cached = _cached_minute_vwap_view(sym, now_s)
+                cached = _cached_minute_vwap_view(sym, now_et)
                 rows.append(observe_index_vwap_row(
                     by_sym.get(sym) or {"symbol": sym}, series, now_et, cached,
                 ))
@@ -14921,6 +14993,65 @@ async def build_call_index_vwap_observe(
         return _observe_envelope([_null_index_vwap_observe_row(sym) for sym in symbols])
 
 
+# /status observe snapshot. Short TTL, one entry per ticker. Concurrent polls
+# share the in-flight read instead of each taking a Massive snapshot.
+_STATUS_OBSERVE_TTL_S = 20.0
+_status_observe_quotes: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_status_observe_flight: Optional[asyncio.Task] = None
+_status_observe_guard: Optional[asyncio.Lock] = None
+
+
+def _status_observe_lock() -> asyncio.Lock:
+    global _status_observe_guard
+    if _status_observe_guard is None:
+        _status_observe_guard = asyncio.Lock()
+    return _status_observe_guard
+
+
+def _status_observe_fresh(symbols: List[str], now: float) -> Optional[List[Dict[str, Any]]]:
+    rows: List[Dict[str, Any]] = []
+    for sym in symbols:
+        hit = _status_observe_quotes.get(sym)
+        if not hit or now - hit[0] >= _STATUS_OBSERVE_TTL_S:
+            return None
+        rows.append(dict(hit[1]))
+    return rows
+
+
+async def _fill_status_observe_quotes(symbols: List[str]) -> List[Dict[str, Any]]:
+    """One shadow quote read. Stores each ticker. Does not refresh ADV."""
+    fetched = await _index_vwap_quotes(tuple(symbols), dry_run=True)
+    now = time.monotonic()
+    stored: List[Dict[str, Any]] = []
+    for row in fetched:
+        if not isinstance(row, dict):
+            continue
+        copied = dict(row)
+        stored.append(copied)
+        sym = str(copied.get("symbol") or "").upper()
+        if sym:
+            _status_observe_quotes[sym] = (now, dict(copied))
+    return stored
+
+
+async def _status_observe_index_quotes() -> List[Dict[str, Any]]:
+    """Cached shadow quotes for /status. The lock only publishes the shared task."""
+    global _status_observe_flight
+    symbols = _index_observe_symbols()
+    fresh = _status_observe_fresh(symbols, time.monotonic())
+    if fresh is not None:
+        return fresh
+    async with _status_observe_lock():
+        fresh = _status_observe_fresh(symbols, time.monotonic())
+        if fresh is not None:
+            return fresh
+        flight = _status_observe_flight
+        if flight is None or flight.done():
+            flight = asyncio.create_task(_fill_status_observe_quotes(list(symbols)))
+            _status_observe_flight = flight
+    return await flight
+
+
 async def call_index_vwap_gate_view() -> Dict[str, Any]:
     """/status payload: the import-time gate plus the observe block."""
     view = call_index_vwap_gate_status()
@@ -14929,7 +15060,7 @@ async def call_index_vwap_gate_view() -> Dict[str, Any]:
     except Exception:
         logger.debug("minute vwap refresh skipped")
     try:
-        quotes = await _index_vwap_quotes(dry_run=True)
+        quotes = await _status_observe_index_quotes()
         view["observe"] = await build_call_index_vwap_observe(quotes)
     except Exception:
         view["observe"] = _observe_envelope(

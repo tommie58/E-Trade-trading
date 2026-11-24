@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -35,9 +35,13 @@ def _run(coro):
 def _clear_minute_cache():
     main_bot._minute_vwap_cache.clear()
     main_bot._minute_vwap_attempt_at.clear()
+    main_bot._status_observe_quotes.clear()
+    main_bot._status_observe_flight = None
     yield
     main_bot._minute_vwap_cache.clear()
     main_bot._minute_vwap_attempt_at.clear()
+    main_bot._status_observe_quotes.clear()
+    main_bot._status_observe_flight = None
 
 
 def _save():
@@ -345,13 +349,19 @@ def test_minute_aggs_rth_vwap_starts_at_the_open():
     assert out["vwap"] == pytest.approx(205.0)
     assert out["bar_count"] == 2
     assert out["last_bar_ts"]
-    main_bot._minute_vwap_cache["SPY"] = out
-    view = main_bot._cached_minute_vwap_view("SPY", out["last_bar_epoch"] + 120)
+    day = datetime.fromtimestamp(out["last_bar_epoch"], tz=ET).date().isoformat()
+    seen_at = datetime.fromtimestamp(out["last_bar_epoch"] + 120, tz=ET)
+    main_bot._minute_vwap_cache[main_bot._minute_vwap_cache_key("SPY", day)] = out
+    view = main_bot._cached_minute_vwap_view("SPY", seen_at)
     assert view["vwap"] == pytest.approx(205.0)
+    assert view["reason"] is None
     assert view["age_seconds"] == 120.0
     # A cached 0 is not a VWAP.
-    main_bot._minute_vwap_cache["QQQ"] = {"vwap": 0, "last_bar_epoch": out["last_bar_epoch"]}
-    assert main_bot._cached_minute_vwap_view("QQQ", out["last_bar_epoch"] + 10) is None
+    main_bot._minute_vwap_cache[main_bot._minute_vwap_cache_key("QQQ", day)] = {
+        "vwap": 0, "last_bar_epoch": out["last_bar_epoch"],
+    }
+    zero = main_bot._cached_minute_vwap_view("QQQ", seen_at)
+    assert zero["vwap"] is None
 
 
 def test_block_matches_the_gate_and_observe_failure_does_not_change_it(monkeypatch):
@@ -393,13 +403,17 @@ def test_block_matches_the_gate_and_observe_failure_does_not_change_it(monkeypat
     assert again["call_index_vwap_observe"]["indexes"][0]["massive_day_vwap"] is None
     assert refreshes["n"] == 0
 
-    # A cached minute VWAP is reported. The entry path still does not refresh.
-    epoch = datetime(2026, 11, 24, 10, 31, tzinfo=ET).timestamp()
-    main_bot._minute_vwap_cache["SPY"] = {
+    # A cached minute VWAP from today's session is reported. The entry path still does not refresh.
+    now_et = main_bot._utcnow().astimezone(ET)
+    epoch = now_et.timestamp() - 90
+    if datetime.fromtimestamp(epoch, tz=ET).date() != now_et.date():
+        epoch = now_et.timestamp()
+    main_bot._minute_vwap_cache[main_bot._minute_vwap_cache_key("SPY", now_et.date().isoformat())] = {
         "vwap": 205.0,
         "last_bar_epoch": epoch,
-        "last_bar_ts": "2026-11-24T15:31:00+00:00",
+        "last_bar_ts": datetime.fromtimestamp(epoch, tz=ET).isoformat(),
         "bar_count": 2,
+        "session_date": now_et.date().isoformat(),
     }
     monkeypatch.setattr(main_bot, "build_call_index_vwap_observe", real_build)
     third = {"instrument": "option", "option_right": "CALL"}
@@ -748,3 +762,213 @@ def test_status_day_vw_zero_is_unmeasured(monkeypatch):
     assert "stocks_snapshot_auth_failure_count" in market
     assert "quote_source" in market
     assert "scanner_feed" in market
+
+
+def _seed_minute(symbol, when, vwap):
+    day = when.astimezone(ET).date().isoformat()
+    payload = {
+        "vwap": vwap,
+        "last_bar_epoch": when.timestamp(),
+        "last_bar_ts": when.isoformat(),
+        "bar_count": 4,
+        "session_date": day,
+    }
+    main_bot._minute_vwap_cache[main_bot._minute_vwap_cache_key(symbol, day)] = payload
+    return payload
+
+
+def test_prior_day_minute_vwap_is_null_today():
+    yesterday = datetime(2026, 11, 23, 15, 0, tzinfo=ET)
+    today = datetime(2026, 11, 24, 10, 40, tzinfo=ET)
+    _seed_minute("SPY", yesterday, 199.5)
+    # The old unkeyed slot must not leak through either.
+    main_bot._minute_vwap_cache["SPY"] = {
+        "vwap": 199.5,
+        "last_bar_epoch": yesterday.timestamp(),
+    }
+    view = main_bot._cached_minute_vwap_view("SPY", today)
+    assert view["vwap"] is None
+    assert view["reason"] == "minute_vwap_not_today"
+    row = main_bot.observe_index_vwap_row(
+        {"symbol": "SPY", "vwap": 500.0, "vwap_source": "quote"},
+        [],
+        today,
+        view,
+    )
+    assert row["massive_minute_vwap_rth"] is None
+    assert row["massive_minute_vwap_rth_reason"] == "minute_vwap_not_today"
+    assert row["massive_minute_vwap_rth_diff_bps"] is None
+    assert 199.5 not in row.values()
+
+
+def test_premarket_refresh_with_no_rth_bars_is_null(monkeypatch):
+    frozen = datetime(2026, 11, 24, 8, 0, tzinfo=ET)
+    monkeypatch.setattr(main_bot, "_utcnow", lambda: frozen.astimezone(timezone.utc))
+    monkeypatch.setenv("MASSIVE_API_KEY", "unit-test-key")
+    monkeypatch.setenv("MASSIVE_ENABLED", "true")
+    _seed_minute("SPY", datetime(2026, 11, 23, 15, 0, tzinfo=ET), 188.0)
+
+    class _Quiet:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, params=None, headers=None):
+            ts = datetime(2026, 11, 24, 8, 0, tzinfo=ET).timestamp() * 1000
+            return _Resp(200, {"results": [{"t": ts, "vw": 180.0, "v": 100, "c": 180.0}]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Quiet)
+    _run(main_bot.refresh_massive_minute_vwap(["SPY", "QQQ"]))
+    today_key = main_bot._minute_vwap_cache_key("SPY", "2026-11-24")
+    assert today_key not in main_bot._minute_vwap_cache
+    view = main_bot._cached_minute_vwap_view("SPY", frozen)
+    assert view["vwap"] is None
+    assert view["reason"] == "no_rth_bars_yet"
+    assert view["vwap"] != 188.0
+    row = main_bot.observe_index_vwap_row({"symbol": "SPY", "vwap": 500.0}, [], frozen, view)
+    assert row["massive_minute_vwap_rth"] is None
+    assert row["massive_minute_vwap_rth_reason"] == "no_rth_bars_yet"
+
+
+def test_today_rth_minute_vwap_is_served(monkeypatch):
+    frozen = datetime(2026, 11, 24, 10, 40, tzinfo=ET)
+    monkeypatch.setattr(main_bot, "_utcnow", lambda: frozen.astimezone(timezone.utc))
+    monkeypatch.setenv("MASSIVE_API_KEY", "unit-test-key")
+    monkeypatch.setenv("MASSIVE_ENABLED", "true")
+
+    def bar(hour, minute, vw, vol):
+        ts = datetime(2026, 11, 24, hour, minute, tzinfo=ET)
+        return {"t": ts.timestamp() * 1000, "vw": vw, "v": vol, "c": vw}
+
+    class _Rth:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, params=None, headers=None):
+            return _Resp(200, {"results": [bar(9, 30, 200, 100), bar(9, 31, 210, 100)]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Rth)
+    _run(main_bot.refresh_massive_minute_vwap(["SPY"]))
+    view = main_bot._cached_minute_vwap_view("SPY", frozen)
+    assert view["vwap"] == pytest.approx(205.0)
+    assert view["reason"] is None
+    row = main_bot.observe_index_vwap_row({"symbol": "SPY", "vwap": 500.0}, [], frozen, view)
+    assert row["massive_minute_vwap_rth"] == pytest.approx(205.0)
+    assert row["massive_minute_vwap_rth_reason"] is None
+    assert row["massive_minute_vwap_rth_diff_bps"] is not None
+
+
+class _CountingClient:
+    """Counts snapshot and daily-agg URLs. Never stores request headers."""
+
+    snapshot_urls = []
+    day_urls = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, params=None, headers=None):
+        text = str(url)
+        if "/v2/snapshot/" in text:
+            _CountingClient.snapshot_urls.append(text)
+            now_ns = int(datetime(2026, 11, 24, 10, 40, tzinfo=ET).timestamp() * 1e9)
+            tickers = []
+            for sym, last in (("SPY", 510.0), ("QQQ", 440.0)):
+                tickers.append({
+                    "ticker": sym,
+                    "lastTrade": {"p": last, "t": now_ns},
+                    "day": {"c": last, "v": 1000, "vw": last - 1},
+                    "min": {"c": last, "vw": last},
+                })
+            return _Resp(200, {"tickers": tickers})
+        if "/range/1/day/" in text:
+            _CountingClient.day_urls.append(text)
+            return _Resp(200, {"results": []})
+        return _Resp(200, {"results": []})
+
+
+def test_status_snapshot_is_cached_and_shadow_skips_adv(monkeypatch):
+    saved = _save()
+    client = main_bot.massive_client
+    saved_adv = dict(getattr(client, "_adv", {}) or {})
+    saved_day = getattr(client, "_adv_day", None)
+    saved_calls = client.calls
+    saved_failures = client.failures
+    _CountingClient.snapshot_urls = []
+    _CountingClient.day_urls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _CountingClient)
+    monkeypatch.setenv("MASSIVE_API_KEY", "unit-test-key")
+    monkeypatch.setenv("MASSIVE_ENABLED", "true")
+    monkeypatch.setattr(main_bot, "WEBHOOK_SECRET", "s3cret")
+    client._adv = {}
+    client._adv_day = None
+    main_bot._status_observe_quotes.clear()
+    main_bot._status_observe_flight = None
+
+    try:
+        with TestClient(main_bot.app) as http:
+            first = http.get("/status", headers={"X-Rork-Secret": "s3cret"})
+            second = http.get("/status", headers={"X-Rork-Secret": "s3cret"})
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert len(_CountingClient.snapshot_urls) == 1
+        assert _CountingClient.day_urls == []
+        assert client._adv == {}
+        assert client._adv_day is None
+        assert client.calls == saved_calls
+        assert client.failures == saved_failures
+
+        async def both():
+            main_bot._status_observe_quotes.clear()
+            main_bot._status_observe_flight = None
+            _CountingClient.snapshot_urls = []
+            _CountingClient.day_urls = []
+            await asyncio.gather(
+                main_bot.call_index_vwap_gate_view(),
+                main_bot.call_index_vwap_gate_view(),
+            )
+
+        _run(both())
+        assert len(_CountingClient.snapshot_urls) == 1
+        assert _CountingClient.day_urls == []
+        assert client._adv == {}
+        assert client._adv_day is None
+
+        shadow = main_bot.massive.MassiveClient()
+        shadow._adv = {}
+        shadow._adv_day = None
+        before = (dict(shadow._adv), shadow._adv_day, shadow.calls, shadow.failures)
+        _CountingClient.day_urls = []
+        _run(shadow.fetch_quote_response(["SPY", "QQQ"], dry_run=True))
+        assert _CountingClient.day_urls == []
+        assert (dict(shadow._adv), shadow._adv_day, shadow.calls, shadow.failures) == before
+
+        live = main_bot.massive.MassiveClient()
+        live._adv = {}
+        live._adv_day = None
+        _CountingClient.day_urls = []
+        _run(live.fetch_quote_response(["SPY", "QQQ"]))
+        assert len(_CountingClient.day_urls) == 2
+    finally:
+        client._adv = saved_adv
+        client._adv_day = saved_day
+        client.calls = saved_calls
+        client.failures = saved_failures
+        _restore(saved)
