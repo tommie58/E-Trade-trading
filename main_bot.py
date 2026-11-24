@@ -11768,6 +11768,9 @@ STUDY_LEDGER_WINDOW = 2000
 STUDY_LEDGER_WINDOW_MAX = 5000
 
 _engine: Any = None
+# SQL fallback pool. Separate from the order-path engine so a page that
+# holds a connection for the study budget cannot starve order checkouts.
+_page_engine: Any = None
 
 # Ledger event names this layer reads.
 EVENT_CLOSED = "position_closed"
@@ -12226,10 +12229,21 @@ _DDL: List[Tuple[str, str]] = [
 ]
 
 
-def init(db_engine: Any) -> None:
-    """Attach the SQLAlchemy async engine. None disables the layer cleanly."""
-    global _engine
+def init(db_engine: Any, page_engine: Any = None) -> None:
+    """Attach the SQLAlchemy async engine. None disables the layer cleanly.
+
+    `page_engine` is the GET /study SQL fallback pool. It is a different
+    engine from the order path. When omitted, the page read uses
+    `db_engine` (tests, and the SQLite fallback, which has no sized pool).
+    """
+    global _engine, _page_engine
     _engine = db_engine
+    _page_engine = page_engine
+
+
+def _ledger_page_engine() -> Any:
+    """Pool for one bounded ledger page. Never the order path when a page pool is set."""
+    return _page_engine if _page_engine is not None else _engine
 
 
 def is_available() -> bool:
@@ -12870,28 +12884,100 @@ def _partial_study(reason: str, page: Dict[str, Any], budget: float) -> Dict[str
     return body
 
 
+async def _reset_statement_timeout(conn: Any) -> None:
+    """Clear statement_timeout before this connection returns to its pool.
+
+    A session SET survives commit, and in autocommit it applies immediately.
+    RESET on an aborted transaction fails until rollback. Rolling back an
+    uncommitted SET drops it too; the second RESET covers autocommit, where
+    rollback does not clear a session setting.
+    """
+    try:
+        await conn.exec_driver_sql("RESET statement_timeout")
+        return
+    except Exception:
+        pass
+    try:
+        await conn.rollback()
+    except Exception:
+        pass
+    try:
+        await conn.exec_driver_sql("RESET statement_timeout")
+    except Exception as exc:
+        logger.warning(
+            "study SQL fallback could not reset statement_timeout: %s",
+            type(exc).__name__,
+        )
+        # Do not check a connection back in while a short timeout may
+        # still be set. Drop it so the pool opens a fresh one.
+        invalidate = getattr(conn, "invalidate", None)
+        if invalidate is not None:
+            try:
+                await invalidate()
+            except Exception:
+                pass
+
+
 async def sql_ledger_page(limit: int, offset: int, timeout_s: float) -> Dict[str, Any]:
     """Newest `limit` ledger lines. Never selects the study views.
 
-    statement_timeout is LOCAL to this transaction so a cancelled page cannot
-    leave a short timeout on the shared pool the order path uses.
+    Offset uses the same hard cap as the file page (`_page_bounds`). An
+    offset at or past STUDY_LEDGER_WINDOW_MAX does not query.
+
+    The checkout comes from the study page pool when one is attached.
+    statement_timeout is a session SET, cleared before the connection is
+    checked back in. On the default engine (no AUTOCOMMIT; SQLAlchemy
+    autobegins on the first statement) SET LOCAL already limited the next
+    statement and the checkout rollback cleared it. AUTOCOMMIT makes
+    SET LOCAL a no-op, including inside `begin()`, because the asyncpg
+    dialect does not emit BEGIN in that isolation level. A session SET
+    that is reset before checkin applies in both modes.
     """
-    if _engine is None:
+    lim, off, capped = _page_bounds(limit, offset)
+    if capped:
+        return {"records": [], "more": True, "capped": True}
+    page_engine = _ledger_page_engine()
+    if page_engine is None:
         return {"records": [], "more": False, "offline": True}
-    lim = max(1, min(int(limit), STUDY_LEDGER_WINDOW_MAX))
-    off = max(0, int(offset))
     sql = (
         "SELECT seq, line FROM bot_private.bot_ledger "
         f"ORDER BY seq DESC LIMIT {lim + 1} OFFSET {off}"
     )
-    async with _engine.connect() as conn:
-        try:
-            ms = max(1, int(float(timeout_s) * 1000))
-            await conn.exec_driver_sql(f"SET LOCAL statement_timeout = {ms}")
-        except Exception:
-            logger.debug("study page statement_timeout not set")
-        result = await conn.exec_driver_sql(sql)
-        fetched = list(result.fetchall())
+    try:
+        ms = max(1, int(float(timeout_s) * 1000))
+    except (TypeError, ValueError):
+        ms = max(1, int(STUDY_TIME_BUDGET_S * 1000))
+    try:
+        async with page_engine.connect() as conn:
+            try:
+                try:
+                    await conn.exec_driver_sql(f"SET statement_timeout = {ms}")
+                except Exception as exc:
+                    logger.warning(
+                        "study SQL fallback could not set statement_timeout: %s",
+                        type(exc).__name__,
+                    )
+                result = await conn.exec_driver_sql(sql)
+                fetched = list(result.fetchall())
+            finally:
+                await _reset_statement_timeout(conn)
+    except asyncio.CancelledError:
+        logger.warning(
+            "study SQL fallback cancelled by the time budget; connection released"
+        )
+        raise
+    except Exception as exc:
+        if _is_timeout(exc):
+            logger.warning(
+                "study SQL fallback timed out under statement_timeout=%sms",
+                ms,
+            )
+        else:
+            logger.warning(
+                "study SQL fallback failed: %s",
+                type(exc).__name__,
+            )
+        raise
     more = len(fetched) > lim
     fetched = fetched[:lim]
 
@@ -14582,7 +14668,16 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # closes, and collapses a repeated close identity. Recorded ledger lines
 # are not modified. A parallel change may land as 5.99.0; whichever
 # merges second rebases this version and this changelog entry.
-BOT_VERSION = "5.99.1-pro-day-trader"
+# 5.99.3: GET /study SQL fallback. Offset uses the same 5000-line hard
+# cap as the file page, so an offset of 50000 cannot scan past that
+# window. statement_timeout is set on the connection and cleared before
+# the connection returns to the pool. SET LOCAL is a no-op in autocommit,
+# including inside begin() on asyncpg, because that dialect does not emit
+# BEGIN. A session SET that is reset before checkin works in both modes.
+# A SQL fallback timeout or failure is logged at WARNING with no secrets.
+# The fallback has its own Postgres pool (size 1, no overflow) and does
+# not change the order-path pool.
+BOT_VERSION = "5.99.3-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -15622,6 +15717,8 @@ async def _require_secret_middleware(request: Request, call_next):
 state: StateStore = StateStore(None)
 engine = None
 async_session = None
+# GET /study SQL fallback only. Not the order-path pool.
+_study_page_engine = None
 # Circuit breaker — DISTRIBUTED (Redis `breaker:*` keys) so every worker halts
 # order placement together. Opens after MAX_CONSECUTIVE_FAILURES broker API
 # failures within a rolling BREAKER_FAILURE_WINDOW_SECONDS; auto-resets via
@@ -20787,6 +20884,48 @@ def _normalize_db_url(raw: str) -> Tuple[str, Dict[str, Any], List[str]]:
     return url, connect_args, notes
 
 
+def _open_study_page_engine(url: str, connect_args: Optional[Dict[str, Any]] = None):
+    """Postgres pool for the GET /study SQL fallback only.
+
+    Size 1 and no overflow, so a page that runs for the study budget
+    cannot take an order-path connection. This is a different engine
+    from the one `init_db` builds for orders, tokens, and the ledger
+    mirror. The URL is not logged.
+    """
+    try:
+        page_engine = create_async_engine(
+            url,
+            echo=False,
+            pool_pre_ping=True,
+            pool_size=1,
+            max_overflow=0,
+            connect_args=dict(connect_args or {}),
+        )
+    except Exception as exc:
+        logger.warning(
+            "study SQL pool was not created: %s",
+            type(exc).__name__,
+        )
+        return None
+    logger.info("study SQL pool ready (size 1, no overflow)")
+    return page_engine
+
+
+async def _close_study_page_engine() -> None:
+    global _study_page_engine
+    page_engine = _study_page_engine
+    _study_page_engine = None
+    if page_engine is None:
+        return
+    try:
+        await page_engine.dispose()
+    except Exception as exc:
+        logger.warning(
+            "study SQL pool dispose failed: %s",
+            type(exc).__name__,
+        )
+
+
 async def init_db():
     """Initialize the async DB engine used for token persistence.
 
@@ -20801,7 +20940,8 @@ async def init_db():
     hostname/credential problem when the connection still fails before
     falling back to SQLite so the bot keeps running.
     """
-    global engine, async_session, _db_backend, _db_error, _bot_schema_active
+    global engine, async_session, _db_backend, _db_error, _bot_schema_active, _study_page_engine
+    await _close_study_page_engine()
     engine = None
     async_session = None
     _db_backend = "none"
@@ -20893,6 +21033,10 @@ async def init_db():
                     + f"Falling back to SQLite on an ephemeral disk: tokens, durable "
                     f"state and the trade ledger will NOT survive a restart."
                 )
+        if _db_backend == "postgres" and engine is not None:
+            # Separate from the engine above. A failure here must not
+            # demote the order path to SQLite.
+            _study_page_engine = _open_study_page_engine(url, connect_args)
 
     if engine is None:
         try:
@@ -34908,7 +35052,7 @@ async def on_startup():
     # STUDY LAYER — read-only views over the ledger mirror, so the bot can ask
     # "which setups make money / where am I giving moves back" in SQL instead
     # of parsing every JSONL record in Python. Idempotent; never fatal.
-    study.init(engine)
+    study.init(engine, page_engine=_study_page_engine)
     global _study_views
     _study_views = await study.ensure_views()
     # State next — everything else reads through it. With no Redis, the
