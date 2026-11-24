@@ -263,6 +263,44 @@ else
 end
 """
 
+# Fill a list only when it is empty. One script, so the LLEN check and the
+# pushes cannot interleave with another client's LPUSH. ARGV[1] is max_len.
+# ARGV[2..] are values oldest-first: each LPUSH puts the next value at the
+# head, so the last value (newest) is what LRANGE returns first. Returns 1
+# when this call wrote the list, else 0.
+_FILL_LIST_IF_EMPTY_LUA = """
+if redis.call("LLEN", KEYS[1]) ~= 0 then
+    return 0
+end
+if #ARGV < 2 then
+    return 0
+end
+for i = 2, #ARGV do
+    redis.call("LPUSH", KEYS[1], ARGV[i])
+end
+redis.call("LTRIM", KEYS[1], 0, tonumber(ARGV[1]) - 1)
+return 1
+"""
+
+# LPUSH a review row unless an item already carries the same ledger_seq.
+# ARGV[1] payload, ARGV[2] seq (decimal or ""), ARGV[3] max_len.
+# Returns 1 when pushed, 0 when the seq was already present.
+_REVIEW_PUSH_LUA = """
+local seq = ARGV[2]
+if seq ~= nil and seq ~= "" then
+    local items = redis.call("LRANGE", KEYS[1], 0, -1)
+    for i = 1, #items do
+        local found = string.match(items[i], '"ledger_seq"%s*:%s*(%-?%d+)')
+        if found == seq then
+            return 0
+        end
+    end
+end
+redis.call("LPUSH", KEYS[1], ARGV[1])
+redis.call("LTRIM", KEYS[1], 0, tonumber(ARGV[3]) - 1)
+return 1
+"""
+
 POSITIONS_INDEX = "open_positions:index"
 GUARDS_INDEX = "stop_guards:index"
 DAILY_TTL_SECONDS = 3 * 24 * 3600
@@ -628,6 +666,54 @@ class _MemoryBackend:
     async def list_len(self, key: str) -> int:
         return len(await self.list_all(key))
 
+    def _load_list_unlocked(self, key: str) -> List[str]:
+        existing = self._kv.get(key)
+        if not existing or not existing[0]:
+            return []
+        try:
+            items = json.loads(existing[0])
+        except json.JSONDecodeError:
+            return []
+        return list(items) if isinstance(items, list) else []
+
+    @staticmethod
+    def _item_has_seq(raw: str, seq: int) -> bool:
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if not isinstance(parsed, dict) or parsed.get("ledger_seq") is None:
+            return False
+        try:
+            return int(parsed.get("ledger_seq")) == int(seq)
+        except (TypeError, ValueError):
+            return False
+
+    async def fill_list_if_empty(self, key: str, values_oldest_first: List[str], max_len: int) -> bool:
+        """Store `values` only when the list is empty. One lock covers the
+        LLEN check and the write. Values are oldest-first; the stored list
+        is newest-first (the memory equivalent of LPUSH)."""
+        async with self._lock:
+            items = self._load_list_unlocked(key)
+            if items or not values_oldest_first:
+                return False
+            cap = max(1, int(max_len))
+            newest_first = list(reversed(values_oldest_first))[:cap]
+            self._kv[key] = (json.dumps(newest_first), 0.0)
+            return True
+
+    async def push_review(self, key: str, value: str, seq: Optional[int], max_len: int) -> bool:
+        """LPUSH unless `seq` is already on the list. `seq` None always pushes.
+        Same lock as `fill_list_if_empty`, so the two cannot interleave."""
+        async with self._lock:
+            items = self._load_list_unlocked(key)
+            if seq is not None and any(self._item_has_seq(raw, seq) for raw in items):
+                return False
+            cap = max(1, int(max_len))
+            items.insert(0, value)
+            self._kv[key] = (json.dumps(items[:cap]), 0.0)
+            return True
+
     async def ping(self) -> bool:
         return True
 
@@ -949,6 +1035,46 @@ class StateStore:
         if self.redis is not None:
             return int(await self.redis.llen(key))
         return await self._memory.list_len(key)
+
+    async def list_fill_if_empty(self, key: str, values_oldest_first: List[str], max_len: int = 200) -> bool:
+        """Atomically fill `key` when LLEN == 0.
+
+        Redis runs the LLEN check, LPUSH, and LTRIM in one Lua script, so a
+        concurrent LPUSH (a live close) makes this return False and write
+        nothing. The memory backend holds its lock across the same check and
+        write. Values are oldest-first; LPUSH leaves the newest at the head.
+        Returns True only when this call wrote the list. The only key written
+        is `key`.
+        """
+        cap = max(1, int(max_len))
+        if self.redis is not None:
+            res = await self.redis.eval(
+                _FILL_LIST_IF_EMPTY_LUA, 1, key, str(cap), *list(values_oldest_first),
+            )
+            return bool(int(res or 0))
+        wrote = await self._memory.fill_list_if_empty(key, list(values_oldest_first), cap)
+        if wrote and self._durable_kv(key, None, None):
+            items = await self._memory.lrange_head(key, cap)
+            await self._persist(key, "list", json.dumps(items))
+        return wrote
+
+    async def list_push_review(self, key: str, value: str, seq: Optional[int], max_len: int = 200) -> bool:
+        """LPUSH `value` unless the list already holds `seq`.
+
+        Serialized with `list_fill_if_empty` (Lua on Redis, the memory lock
+        otherwise) so a backfill and a live close cannot store the same
+        ledger_seq twice. `seq` None always pushes. Returns True when pushed.
+        """
+        cap = max(1, int(max_len))
+        if self.redis is not None:
+            seq_arg = "" if seq is None else str(int(seq))
+            res = await self.redis.eval(_REVIEW_PUSH_LUA, 1, key, value, seq_arg, str(cap))
+            return bool(int(res or 0))
+        wrote = await self._memory.push_review(key, value, None if seq is None else int(seq), cap)
+        if wrote and self._durable_kv(key, None, None):
+            items = await self._memory.lrange_head(key, cap)
+            await self._persist(key, "list", json.dumps(items))
+        return wrote
 
     # ---------------- positions ----------------
     # Broker-truth fields a stale writer must never revert (see
@@ -13662,6 +13788,17 @@ TRADE_LEDGER_FILE = Path(os.getenv("TRADE_LEDGER_FILE", "trade_ledger.jsonl"))
 # snapshot so GET /trades works even when Postgres study views are offline.
 TRADES_HISTORY_KEY = "trades:history"
 TRADES_HISTORY_MAX = int(os.getenv("TRADES_HISTORY_MAX", "500"))
+# How far GET /trades (and the empty-list backfill) walk the ledger when
+# trades:history is empty. Aligned with EDGE_LOOKBACK — the window
+# GET /learning/report already reads — so /trades?count=500 reaches the same
+# live closes that report counts. The old window was min(count * 3, 1500):
+# at the default count=50 that is 150 records, which the entry_rejected /
+# setup_evidence_imported / shadow tail outran on 2026-11-23.
+TRADES_LEDGER_FALLBACK_CAP = EDGE_LOOKBACK
+# A live close is appended and then pushed. The matching position_closed is
+# normally the last line; this bounds the stamp so the close path never
+# walks TRADES_LEDGER_FALLBACK_CAP.
+TRADES_REVIEW_SEQ_LOOKBACK = 64
 # After a close, re-quote the instrument at these horizons (minutes). A stop
 # that was too tight shows up as a recovery here; missing stays missing.
 EXIT_FOLLOWUP_MINUTES: Tuple[int, ...] = (15, 30)
@@ -25342,13 +25479,29 @@ def build_trade_review_fields(pos: Optional[dict]) -> Dict[str, Any]:
 
 async def _remember_trade_review(snapshot: Dict[str, Any]) -> None:
     """Cap a Redis/memory list of full close snapshots for GET /trades when
-    Postgres study views are offline. Best-effort — never blocks a close."""
+    Postgres study views are offline. Best-effort — never blocks a close.
+
+    Stamps `ledger_seq` from the ledger line just written and skips the push
+    when that seq is already on the list, so a boot backfill that stored the
+    same close cannot be duplicated by this path. Does not book P&L, counters,
+    or learning — the snapshot is already built by the caller.
+    """
     try:
-        await state.list_push_capped(
-            TRADES_HISTORY_KEY, json.dumps(snapshot, default=str), max_len=TRADES_HISTORY_MAX,
+        stamped = _stamp_review_ledger_seq(snapshot)
+        seq = stamped.get("ledger_seq") if isinstance(stamped, dict) else None
+        if seq is not None:
+            try:
+                seq = int(seq)
+            except (TypeError, ValueError):
+                seq = None
+        await state.list_push_review(
+            TRADES_HISTORY_KEY,
+            json.dumps(stamped, default=str),
+            seq,
+            max_len=TRADES_HISTORY_MAX,
         )
     except Exception as e:
-        logger.debug(f"trade review list not updated: {e}")
+        logger.debug(f"trade review list not updated: {type(e).__name__}")
 
 
 async def _stamp_entry_market_context(
@@ -31136,6 +31289,10 @@ async def on_startup():
     # OLD-RULES AUDIT (5.80) — after every deploy, say which open positions
     # still follow the legacy bot rules, so none of them surprises anyone.
     await _announce_exit_rules()
+    # Fill trades:history from the ledger when a restart left it empty.
+    # Not awaited: boot and the order path do not wait on the scan. The task
+    # catches every exception.
+    _schedule_trades_history_backfill()
 
 
 async def _announce_exit_rules() -> None:
@@ -32561,6 +32718,196 @@ async def ledger_tail(count: int = Query(100, ge=1, le=500), verify: bool = Quer
     return out
 
 
+def _active_ledger_path() -> Optional[Path]:
+    led = getattr(trade_ledger, "_ledger", None)
+    path = getattr(led, "path", None) if led is not None else None
+    if path is None:
+        return None
+    return Path(path)
+
+
+def _jsonl_tail_lines(path: Path, cap: int) -> List[bytes]:
+    """Last `cap` non-empty JSONL lines, oldest of that window first.
+
+    Reads backward from EOF and stops once `cap` newlines are buffered (plus
+    at most one extra chunk). Bytes older than that window are not read.
+    At `cap` == TRADES_LEDGER_FALLBACK_CAP (EDGE_LOOKBACK, default 3000) the
+    cost is one tail read of those lines — not a full-file materialization —
+    followed by at most that many `json.loads` calls in the caller.
+    """
+    if cap <= 0:
+        return []
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return []
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            pos = handle.tell()
+            buf = b""
+            while pos > 0 and buf.count(b"\n") <= cap:
+                step = min(65536, pos)
+                pos -= step
+                handle.seek(pos)
+                buf = handle.read(step) + buf
+    except OSError as e:
+        logger.warning("ledger tail read failed: %s", type(e).__name__)
+        return []
+    if pos > 0:
+        cut = buf.find(b"\n")
+        if cut != -1:
+            buf = buf[cut + 1:]
+    lines = [ln for ln in buf.splitlines() if ln.strip()]
+    if len(lines) > cap:
+        lines = lines[-cap:]
+    return lines
+
+
+def _review_row_from_ledger(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Booked position_closed payload plus ledger_seq / ledger_ts. None for
+    every other event. Same shape the old /trades fallback returned."""
+    if str(rec.get("event") or "") != "position_closed":
+        return None
+    data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+    row = dict(data)
+    row["ledger_seq"] = rec.get("seq")
+    row["ledger_ts"] = rec.get("ts")
+    return row
+
+
+def ledger_review_rows(count: int, cap: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Newest-first position_closed rows, scanning at most `cap` ledger records.
+
+    Stops once `count` closes are in hand. Duplicate `ledger_seq` values keep
+    the newest copy. Default cap is TRADES_LEDGER_FALLBACK_CAP (EDGE_LOOKBACK),
+    the same newest slice GET /learning/report reads, so a count of 500 reaches
+    the live closes that report counts. Worst case at that cap: buffer and
+    parse EDGE_LOOKBACK (default 3000) JSONL records from the end of the file.
+    """
+    limit = TRADES_LEDGER_FALLBACK_CAP if cap is None else int(cap)
+    want = int(count)
+    if want <= 0 or limit <= 0:
+        return []
+    path = _active_ledger_path()
+    if path is None:
+        return []
+    lines = _jsonl_tail_lines(path, limit)
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for raw in reversed(lines):
+        try:
+            rec = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        row = _review_row_from_ledger(rec)
+        if row is None:
+            continue
+        seq = row.get("ledger_seq")
+        if seq is not None and not isinstance(seq, (dict, list)):
+            if seq in seen:
+                continue
+            seen.add(seq)
+        out.append(row)
+        if len(out) >= want:
+            break
+    return out
+
+
+def _stamp_review_ledger_seq(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy ledger_seq onto a live close snapshot when the matching
+    position_closed line is still in the newest TRADES_REVIEW_SEQ_LOOKBACK
+    lines. Missing stays missing — a wrong seq would suppress the push."""
+    if not isinstance(snapshot, dict) or snapshot.get("ledger_seq") is not None:
+        return snapshot
+    closed_at = snapshot.get("closed_at")
+    ticker = str(snapshot.get("ticker") or "").upper()
+    if not ticker or closed_at is None:
+        return snapshot
+    path = _active_ledger_path()
+    if path is None:
+        return snapshot
+    try:
+        lines = _jsonl_tail_lines(path, TRADES_REVIEW_SEQ_LOOKBACK)
+    except OSError:
+        return snapshot
+    for raw in reversed(lines):
+        try:
+            rec = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(rec, dict) or str(rec.get("event") or "") != "position_closed":
+            continue
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        if str(data.get("ticker") or "").upper() != ticker:
+            continue
+        if data.get("closed_at") != closed_at:
+            continue
+        stamped = dict(snapshot)
+        stamped["ledger_seq"] = rec.get("seq")
+        return stamped
+    return snapshot
+
+
+async def backfill_trades_history(before_commit: Any = None) -> Dict[str, Any]:
+    """Fill `trades:history` from the ledger when the list is empty.
+
+    Fill-if-empty and atomic. `list_fill_if_empty` checks LLEN == 0 and writes
+    in one Redis Lua script (or under the memory lock). A live close that
+    lands after the scan — including one injected via `before_commit` — makes
+    LLEN != 0 and this writes nothing, so the close is not duplicated.
+
+    Rows are pushed oldest to newest. The list primitive is LPUSH, so the
+    head reads newest-first. Capped at TRADES_HISTORY_MAX. Each row carries
+    `ledger_seq`; duplicate seqs are dropped before the push.
+
+    Writes ONLY `trades:history`. Does not call `_record_close`, daily
+    counters, P&L adjusters, loss-streak, probation, pacing, or learning
+    announcers. Best-effort: callers that must not fail wrap this.
+    """
+    if await state.list_len(TRADES_HISTORY_KEY) != 0:
+        return {"status": "skipped", "reason": "not_empty"}
+    # The scan is sync file IO. Run it off the loop so a 3000-line tail does
+    # not stall an order on this worker. The LLEN check that decides the
+    # write happens after this, inside list_fill_if_empty.
+    rows = await asyncio.to_thread(
+        ledger_review_rows, TRADES_HISTORY_MAX, TRADES_LEDGER_FALLBACK_CAP,
+    )
+    if before_commit is not None:
+        await before_commit()
+    if not rows:
+        if await state.list_len(TRADES_HISTORY_KEY) != 0:
+            return {"status": "skipped", "reason": "not_empty"}
+        return {"status": "empty", "rows": 0}
+    oldest_first = [json.dumps(row, default=str) for row in reversed(rows)]
+    wrote = await state.list_fill_if_empty(
+        TRADES_HISTORY_KEY, oldest_first, TRADES_HISTORY_MAX,
+    )
+    if not wrote:
+        return {"status": "skipped", "reason": "not_empty"}
+    return {"status": "filled", "rows": len(oldest_first)}
+
+
+def _schedule_trades_history_backfill() -> None:
+    """Boot hook. Background, so startup and the order path do not wait.
+    Every exception stays inside the task."""
+    async def _run() -> None:
+        try:
+            result = await backfill_trades_history()
+            logger.info(
+                "[trades] history backfill %s (%s row(s))",
+                result.get("status"),
+                result.get("rows", 0),
+            )
+        except Exception as e:
+            logger.warning("[trades] history backfill failed (non-fatal): %s", type(e).__name__)
+
+    try:
+        asyncio.get_running_loop().create_task(_run(), name="trades-history-backfill")
+    except Exception as e:
+        logger.warning("[trades] history backfill not scheduled (non-fatal): %s", type(e).__name__)
+
+
 @app.get("/trades")
 async def trades_review(
     count: int = Query(50, ge=1, le=500),
@@ -32570,8 +32917,12 @@ async def trades_review(
 
     Prefers the Redis/memory review list stamped on every close; falls back to
     `position_closed` rows in the immutable ledger when that list is empty
-    (e.g. after a cold boot before the first close of the process). Requires
-    the webhook secret — these rows carry fills, stops and P&L.
+    (e.g. after a cold boot before the backfill finishes). The fallback walks
+    newest-first until `count` closes are found, and never examines more than
+    TRADES_LEDGER_FALLBACK_CAP records (EDGE_LOOKBACK, default 3000 — the same
+    window as GET /learning/report). At that cap the cost is a tail read plus
+    at most 3000 JSON parses. Requires the webhook secret — these rows carry
+    fills, stops and P&L.
     """
     await _require_control_auth(x_rork_secret, "/trades")
     trades: List[Dict[str, Any]] = []
@@ -32586,19 +32937,12 @@ async def trades_review(
             if isinstance(parsed, dict):
                 trades.append(parsed)
     except Exception as e:
-        logger.warning(f"/trades history list unreadable: {e}")
+        logger.warning("/trades history list unreadable: %s", type(e).__name__)
     if not trades:
         source = "ledger"
-        for rec in trade_ledger.tail(min(count * 3, 1500)):
-            if not isinstance(rec, dict) or str(rec.get("event") or "") != "position_closed":
-                continue
-            data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
-            row = dict(data)
-            row["ledger_seq"] = rec.get("seq")
-            row["ledger_ts"] = rec.get("ts")
-            trades.append(row)
-            if len(trades) >= count:
-                break
+        trades = await asyncio.to_thread(
+            ledger_review_rows, count, TRADES_LEDGER_FALLBACK_CAP,
+        )
     return {
         "trades": trades[:count],
         "count": len(trades[:count]),
