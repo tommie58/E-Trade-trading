@@ -31,6 +31,8 @@ A value set on the host overrides these.
 | `DAY_TRADE_MODE` | `true` (3:40 ET flattens every open option; 0–7 DTE expression) |
 | `LEARNING_ENABLED` | `true` (live closes resize / disable setup×regime cells) |
 | `SCHEDULED_EXIT_ENABLED` | `true` |
+| `PRO_TRADER_MODE` | `shadow` (classify and log; no order changes until `active`) |
+| `MIN_TRADES_PER_DAY` | `4` (pace target; B+ rotation only, rails stay put) |
 
 `DAILY_LOSS_LIMIT_DOLLARS` is not read. `PAPER_MODE` is not read. Paper versus live is the payload `mode` plus `LIVE_TRADING` and `ETRADE_ENV`.
 
@@ -58,6 +60,12 @@ Market or limit (`limit_price`), Good for Day. Crypto is **24/7** (no equity cal
 ### Per-trade review & learning
 
 Every close writes a full review snapshot to the immutable ledger (`position_closed`) and a capped Redis list. That includes setup, origin (app/scanner), signal id, contract, stops, trail/eyes ATR, peak R/MFE, worst drop (MAE), entry spread, SPY/QQQ vs day VWAP, and realized P&L. `native_trail` stays true when a broker trail was armed even if the 3:40 flatten cancelled it before booking — read it with `reason` and `final_stop`. The bot also re-quotes 15 and 30 minutes after exit (`exit_followup`) to flag stops that may have been too tight. The learning loop still sizes/disables setup×regime cells from those closes when `LEARNING_ENABLED=true`.
+
+### Pro Day Trader
+
+`PRO_TRADER_MODE=shadow` is the default. The desk classifies the session, rotates playbooks, and records allow / reduce / block verdicts, including whether the book is behind `MIN_TRADES_PER_DAY`. Shadow does not change an order. Set `PRO_TRADER_MODE=active` only after the shadow log looks right. Active mode can block or cut size. It cannot raise the 8% per-trade cap, raise the daily loss limit, waive a wide spread, trade through a Massive 403, or change the fixed stop → breakeven → `TRAILING_STOP_CNST` path or the 3:40 ET flatten.
+
+`POST /policy` accepts `pro_trader_mode` (`off`, `shadow`, `active`) and `min_trades_per_day` (1–12). `GET /pro-trader/status`, `GET /pro-trader/report`, and `GET /pro-trader/corrective-actions` use the same `X-Rork-Secret` as the other routes. The corrective-action payload is what the Pro Day Trader assistant reads before opening a follow-up PR.
 
 | Endpoint | Purpose |
 | --- | --- |
