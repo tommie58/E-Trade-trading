@@ -165,8 +165,8 @@ async def _seed_store(store):
     await store.queue_push("seed:list", "delta")
 
 
-def test_bot_version_is_pro_day_trader_596():
-    assert main_bot.BOT_VERSION == "5.96.0-pro-day-trader"
+def test_bot_version_is_pro_day_trader_597():
+    assert main_bot.BOT_VERSION == "5.97.0-pro-day-trader"
 
 
 def test_dry_run_is_keyword_only_and_defaults_false():
@@ -229,7 +229,7 @@ def test_explain_leaves_memory_desk_and_ledger_unchanged(monkeypatch):
 
             result = await main_bot.explain_signal(_payload())
 
-            assert result["bot_version"] == "5.96.0-pro-day-trader"
+            assert result["bot_version"] == "5.97.0-pro-day-trader"
             assert result["dry_run"] is True
             assert result["placed"] is False
             assert isinstance(result.get("pro_trader"), dict)
@@ -340,6 +340,11 @@ def test_status_exposes_call_index_vwap_gate(monkeypatch):
         "enabled": frozen_enabled,
         "symbols": list(frozen_symbols),
         "mode": "fail_closed" if frozen_enabled else "off",
+        "vwap_source": "session_sampled",
+        "vwap_min_today_samples": main_bot.scanner_mod.vwap_min_today_samples(),
+        "vwap_crosscheck_max_bps": main_bot.vwap_crosscheck_max_bps(),
+        "vwap_crosscheck_required": main_bot.vwap_crosscheck_required(),
+        "vwap_crosscheck_max_age_s": main_bot.vwap_crosscheck_max_age_s(),
     }
     monkeypatch.setenv("CALL_INDEX_VWAP_GATE", "yes")
     assert main_bot.call_index_vwap_gate_status()["enabled"] is frozen_enabled

@@ -549,6 +549,15 @@ class _MemoryBackend:
             fields, _ = self._hashes.get(key, ({}, 0.0))
             return dict(fields)
 
+    async def hset_fields(self, key: str, fields: Dict[str, str], ex: int) -> None:
+        """Merge hash fields and refresh the TTL. Values are stored as strings."""
+        async with self._lock:
+            self._purge()
+            current, _ = self._hashes.get(key, ({}, 0.0))
+            merged = dict(current)
+            merged.update({str(k): str(v) for k, v in (fields or {}).items()})
+            self._hashes[key] = (merged, time.time() + ex if ex else 0.0)
+
     async def hincrbyfloat_existing(self, key: str, field: str, amount: float) -> Optional[float]:
         """Increment a field of an EXISTING hash, keeping its expiry. None when
         the hash is gone — a correction must never resurrect an expired day."""
@@ -1351,6 +1360,21 @@ class StateStore:
         if self.redis is not None:
             return dict(await self.redis.hgetall(key) or {})
         return await self._memory.hgetall(key)
+
+    async def hash_get(self, key: str) -> Dict[str, str]:
+        """Hash fields, or empty when the key is missing or expired."""
+        return await self._hash_fields(key)
+
+    async def hash_set(self, key: str, fields: Dict[str, Any], ex: int) -> None:
+        """Write hash fields and set the TTL. Redis keeps the key; memory does not persist it."""
+        payload = {str(k): str(v) for k, v in (fields or {}).items()}
+        if self.redis is not None:
+            if payload:
+                await self.redis.hset(key, mapping=payload)
+            if ex:
+                await self.redis.expire(key, int(ex))
+            return
+        await self._memory.hset_fields(key, payload, int(ex))
 
     @staticmethod
     def _trading_day_view(fields: Dict[str, str], day: str) -> Dict[str, Any]:
@@ -9300,6 +9324,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -9376,6 +9401,60 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # the real risk limit look four times smaller than it is. A stored value
     # is now simply ignored.
 }
+
+# About 10 minutes of scanner cadence before a today-only VWAP is measured.
+_VWAP_WINDOW_MINUTES = 10
+
+
+# The interval the running scanner last loaded (POST /scanner/config or the
+# stored config). The sample floor uses this, not SCANNER_INTERVAL_SECONDS.
+# None until the scanner loads a config; the default cadence is 60s.
+_LIVE_INTERVAL_SECONDS: Optional[int] = None
+
+
+def note_live_interval(seconds: Any) -> Optional[int]:
+    """Remember the cadence the scanner is actually running.
+
+    ``normalize_config`` clamps ``interval_seconds`` to 20–600. The env var
+    ``SCANNER_INTERVAL_SECONDS`` only seeds the first stored config; it is
+    not the live cadence and does not change the sample floor.
+    """
+    global _LIVE_INTERVAL_SECONDS
+    try:
+        cadence = int(seconds)
+    except (TypeError, ValueError):
+        return _LIVE_INTERVAL_SECONDS
+    if cadence <= 0:
+        return _LIVE_INTERVAL_SECONDS
+    _LIVE_INTERVAL_SECONDS = max(20, min(600, cadence))
+    return _LIVE_INTERVAL_SECONDS
+
+
+def _scanner_cadence_seconds() -> int:
+    """Live scanner interval, else the 60s default. Never the env seed."""
+    if isinstance(_LIVE_INTERVAL_SECONDS, int) and _LIVE_INTERVAL_SECONDS > 0:
+        return _LIVE_INTERVAL_SECONDS
+    return int(DEFAULT_CONFIG["interval_seconds"])
+
+
+def vwap_min_today_samples() -> int:
+    """Today's regular-session samples required before a VWAP is measured.
+
+    ``VWAP_MIN_TODAY_SAMPLES`` overrides. The default is about 10 minutes
+    of the scanner's live interval: ``round(10 * 60 / cadence)``. The live
+    interval defaults to 60 seconds, so the default N is 10.
+    """
+    text = str(os.getenv("VWAP_MIN_TODAY_SAMPLES", "")).strip()
+    if text:
+        try:
+            asked = int(text)
+        except (TypeError, ValueError):
+            asked = 0
+        if asked >= 2:
+            return asked
+    cadence = _scanner_cadence_seconds()
+    return max(2, int(round(_VWAP_WINDOW_MINUTES * 60 / cadence)))
+
 
 # Symbols may never exceed this — one pasted watchlist must not blow the
 # broker's quote budget. Mirrored by the app's parseUniverse().
@@ -9894,29 +9973,52 @@ def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _finite_number(raw: Any) -> Optional[float]:
+    """A finite float, or None. Booleans and NaN/inf are not prices or volumes."""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
+
+
 def sampled_vwap(series: List[Dict[str, Any]]) -> Optional[float]:
     """Volume-weighted average price built from the scanner's OWN samples,
     weighting each observation by the volume traded since the previous one.
-    Returns None until at least two samples with a positive volume delta."""
+    Returns None until at least two samples with a positive volume delta.
+    A NaN or infinite price never enters the average."""
     num = 0.0
     den = 0.0
     prev_vol: Optional[float] = None
     for sample in series:
-        price = sample.get("last")
+        price = _finite_number(sample.get("last"))
         vol = sample.get("total_volume")
         if price is None:
+            if sample.get("last") is not None:
+                prev_vol = None
             continue
         if vol is None:
             prev_vol = None
             continue
-        if prev_vol is not None and vol > prev_vol:
-            delta = vol - prev_vol
-            num += float(price) * delta
+        vol_f = _finite_number(vol)
+        if vol_f is None:
+            prev_vol = None
+            continue
+        if prev_vol is not None and vol_f > prev_vol:
+            delta = vol_f - prev_vol
+            num += price * delta
             den += delta
-        prev_vol = float(vol)
+        prev_vol = vol_f
     if den <= 0:
         return None
-    return round(num / den, 4)
+    vwap = num / den
+    if not math.isfinite(vwap) or vwap <= 0:
+        return None
+    return round(vwap, 4)
 
 
 def pct_change(now: Optional[float], base: Optional[float]) -> Optional[float]:
@@ -10088,6 +10190,280 @@ def session_series(series: List[Dict[str, Any]], now_et: datetime) -> List[Dict[
         if _SESSION_OPEN_MIN <= m < session_close_minute(now_et) and ts <= now_et:
             out.append(s)
     return out
+
+
+def _vwap_unmeasured(samples: int, *, preopen: int = 0) -> Dict[str, Any]:
+    return {
+        "vwap": None, "samples": samples, "measured": False,
+        "reason": "today_samples_insufficient", "source": None,
+        "preopen_samples": preopen, "high": None, "low": None, "first_price": None,
+    }
+
+
+def today_session_vwap(
+    series: List[Dict[str, Any]],
+    now_et: Optional[datetime],
+    *,
+    min_samples: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Sampled VWAP of today's regular session, or unmeasured.
+
+    Built on ``session_series``. Prior-day prints left in the rolling
+    ``scanner:series`` list are ignored, and so are pre-open and
+    after-close prints. Fewer than N regular-session samples, a
+    pre-open-only window, or a NaN/infinite result is unmeasured.
+    The CALL gate does not use this list; it reads the uncapped
+    per-date accumulator. This helper remains for callers that already
+    hold a series.
+    """
+    need = vwap_min_today_samples() if min_samples is None else int(min_samples)
+    if now_et is None:
+        return _vwap_unmeasured(0)
+    clean = [s for s in (series or []) if isinstance(s, dict)]
+    preopen = 0
+    after = 0
+    close_m = session_close_minute(now_et)
+    for sample in clean:
+        ts = _ts_et(sample, now_et.tzinfo)
+        if ts is None or ts.date() != now_et.date() or ts > now_et or sample.get("last") is None:
+            continue
+        minute = ts.hour * 60 + ts.minute
+        if minute < _SESSION_OPEN_MIN:
+            preopen += 1
+        elif minute >= close_m:
+            after += 1
+    today = session_series(clean, now_et)
+    added = _volume_delta_count(today)
+    if added < need:
+        return _vwap_unmeasured(added, preopen=preopen)
+    vwap = sampled_vwap(today)
+    if vwap is None or not isinstance(vwap, (int, float)) or isinstance(vwap, bool):
+        return _vwap_unmeasured(added, preopen=preopen)
+    if not math.isfinite(float(vwap)) or float(vwap) <= 0:
+        return _vwap_unmeasured(added, preopen=preopen)
+    return {
+        "vwap": float(vwap), "samples": added, "measured": True,
+        "reason": None, "source": "session_sampled", "preopen_samples": preopen,
+    }
+
+
+# Uncapped today-only VWAP. scanner:series stays capped at MAX_SAMPLES for
+# trails, relative volume, and setup windows. This hash is the session VWAP.
+SESSION_VWAP_KEY_FMT = "vwap:session:{ticker}:{day}"
+SESSION_VWAP_TTL_S = 2 * 24 * 3600
+
+
+def session_vwap_key(ticker: str, day: str) -> str:
+    return SESSION_VWAP_KEY_FMT.format(ticker=str(ticker or "").upper(), day=str(day))
+
+
+def _acc_from_fields(fields: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    src = fields if isinstance(fields, dict) else {}
+
+    def num(name: str) -> Optional[float]:
+        raw = src.get(name)
+        if raw is None or raw == "":
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
+    return {
+        "sum_pv": num("sum_pv") or 0.0,
+        "sum_v": num("sum_v") or 0.0,
+        "count": int(num("count") or 0),
+        "first_ts": src.get("first_ts") or None,
+        "last_ts": src.get("last_ts") or None,
+        "last_volume": num("last_volume"),
+        "high": num("high"),
+        "low": num("low"),
+        "first_price": num("first_price"),
+    }
+
+
+def _acc_to_fields(acc: Dict[str, Any]) -> Dict[str, str]:
+    out = {
+        "sum_pv": repr(float(acc["sum_pv"])),
+        "sum_v": repr(float(acc["sum_v"])),
+        "count": str(int(acc["count"])),
+        "last_ts": str(acc.get("last_ts") or ""),
+        "last_volume": "" if acc.get("last_volume") is None else repr(float(acc["last_volume"])),
+    }
+    if acc.get("first_ts"):
+        out["first_ts"] = str(acc["first_ts"])
+    for name in ("high", "low", "first_price"):
+        if acc.get(name) is not None:
+            out[name] = repr(float(acc[name]))
+    return out
+
+
+def reading_from_accumulator(
+    fields: Optional[Dict[str, Any]],
+    *,
+    min_samples: Optional[int] = None,
+) -> Dict[str, Any]:
+    """VWAP and sample count from one day's hash. Non-finite results are unmeasured."""
+    acc = _acc_from_fields(fields)
+    need = vwap_min_today_samples() if min_samples is None else int(min_samples)
+    samples = int(acc["count"])
+    reading = _vwap_unmeasured(samples)
+    reading["high"] = acc["high"]
+    reading["low"] = acc["low"]
+    reading["first_price"] = acc["first_price"]
+    if samples < need or acc["sum_v"] <= 0:
+        return reading
+    vwap = acc["sum_pv"] / acc["sum_v"]
+    if not math.isfinite(vwap) or vwap <= 0:
+        return reading
+    reading["vwap"] = round(vwap, 4)
+    reading["measured"] = True
+    reading["reason"] = None
+    reading["source"] = "session_sampled"
+    return reading
+
+
+_VWAP_ET = ZoneInfo("America/New_York")
+
+
+def _as_et(when: datetime) -> datetime:
+    """America/New_York. A naive datetime is UTC, the same clock ``_utcnow`` uses."""
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(_VWAP_ET)
+
+
+def _sample_clock(sample: Dict[str, Any]) -> Optional[datetime]:
+    """Sample time in ET. ``Z``, ``+00:00``, and naive stamps are UTC.
+
+    The open, the close, and the ``vwap:session`` date all use this clock.
+    A UTC wall time must not be compared with 9:30 or 16:00.
+    """
+    raw = sample.get("ts") if isinstance(sample, dict) else None
+    if raw is None or not str(raw).strip():
+        return None
+    text = str(raw).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        when = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    return _as_et(when)
+
+
+def _volume_delta_count(series: List[Dict[str, Any]]) -> int:
+    """How many samples added volume. The first print of a stretch does not.
+
+    The sample floor counts these, not every quote. A flat ``total_volume``
+    does not move VWAP and does not satisfy N.
+    """
+    count = 0
+    prev: Optional[float] = None
+    for sample in series or []:
+        if not isinstance(sample, dict):
+            continue
+        price = _finite_number(sample.get("last"))
+        if price is None:
+            if sample.get("last") is not None:
+                prev = None
+            continue
+        vol = _finite_number(sample.get("total_volume"))
+        if vol is None or vol < 0:
+            prev = None
+            continue
+        if prev is not None and vol > prev:
+            count += 1
+        prev = vol
+    return count
+
+
+def fold_session_sample(
+    fields: Optional[Dict[str, Any]],
+    sample: Dict[str, Any],
+    now_et: Optional[datetime],
+) -> Optional[Dict[str, Any]]:
+    """Fold one regular-session sample. None when it is not today's RTH print.
+
+    The stamp is converted to America/New_York before the 9:30/close test.
+    The delta matches ``sampled_vwap``: price times the volume added since the
+    previous counted sample. ``count`` increments only when that delta is
+    positive. Pre-open, after ``session_close_minute`` (half-day aware), a
+    future stamp, and a NaN or infinite price are not counted. The caller
+    stores the result under the sample's ET date.
+    """
+    if not isinstance(sample, dict):
+        return None
+    ts = _sample_clock(sample)
+    if ts is None:
+        return None
+    if isinstance(now_et, datetime) and ts > _as_et(now_et):
+        return None
+    price = _finite_number(sample.get("last"))
+    if price is None:
+        return None
+    minute = ts.hour * 60 + ts.minute
+    if minute < _SESSION_OPEN_MIN or minute >= session_close_minute(ts):
+        return None
+    acc = _acc_from_fields(fields)
+    if not acc.get("first_ts"):
+        acc["first_ts"] = ts.isoformat()
+        acc["first_price"] = price
+    acc["last_ts"] = ts.isoformat()
+    acc["high"] = price if acc["high"] is None else max(float(acc["high"]), price)
+    acc["low"] = price if acc["low"] is None else min(float(acc["low"]), price)
+    vol = _finite_number(sample.get("total_volume"))
+    if vol is None or vol < 0:
+        acc["last_volume"] = None
+    else:
+        prev = acc["last_volume"]
+        if prev is not None and vol > prev:
+            delta = vol - prev
+            acc["sum_pv"] = float(acc["sum_pv"]) + price * delta
+            acc["sum_v"] = float(acc["sum_v"]) + delta
+            acc["count"] = int(acc["count"]) + 1
+        acc["last_volume"] = vol
+    return acc
+
+
+async def read_session_vwap(state: Any, ticker: str, now_et: Optional[datetime]) -> Dict[str, Any]:
+    """Today's hash only. A prior-day key is never requested."""
+    if state is None or not isinstance(now_et, datetime):
+        return _vwap_unmeasured(0)
+    key = session_vwap_key(ticker, _as_et(now_et).date().isoformat())
+    try:
+        fields = await state.hash_get(key)
+    except Exception as e:
+        logger.warning(f"session VWAP read failed for {ticker}: {e}")
+        return _vwap_unmeasured(0)
+    return reading_from_accumulator(fields)
+
+
+async def note_session_vwap(
+    state: Any,
+    ticker: str,
+    sample: Dict[str, Any],
+    now_et: Optional[datetime],
+) -> None:
+    """Update the sample's own ET-date hash. A failure is logged and swallowed."""
+    if state is None or not ticker or not isinstance(sample, dict):
+        return
+    ts = _sample_clock(sample)
+    if ts is None:
+        return
+    # The date in the key is the ET session date, not the UTC calendar date.
+    key = session_vwap_key(ticker, ts.date().isoformat())
+    try:
+        fields = await state.hash_get(key)
+        folded = fold_session_sample(fields, sample, now_et)
+        if folded is None:
+            return
+        await state.hash_set(key, _acc_to_fields(folded), SESSION_VWAP_TTL_S)
+    except Exception as e:
+        logger.warning(f"session VWAP write failed for {ticker}: {e}")
 
 
 def volume_pace(today: List[Dict[str, Any]], quote: Dict[str, Any], now_et: datetime) -> Optional[float]:
@@ -10618,7 +10994,22 @@ def evaluate_quote(
     )
     rvol = resolved["rvol"]
     spread = spread_pct(quote.get("bid"), quote.get("ask"))
-    vwap = sampled_vwap(series)
+    clock = now_et if isinstance(now_et, datetime) else None
+    bag = (context or {}).get("session_vwap") if isinstance(context, dict) else None
+    if isinstance(bag, dict) and isinstance(bag.get(symbol), dict):
+        # The scan pass read the uncapped per-date accumulator. The capped
+        # series is not the VWAP once that reading is present.
+        resolved_vwap = bag[symbol]
+    else:
+        resolved_vwap = today_session_vwap(series, clock)
+    vwap = resolved_vwap.get("vwap")
+    if (
+        isinstance(vwap, bool)
+        or not isinstance(vwap, (int, float))
+        or not math.isfinite(float(vwap))
+        or float(vwap) <= 0
+    ):
+        vwap = None
     change_open = pct_change(last, quote.get("open"))
     vwap_dist = pct_change(last, vwap) if vwap else None
     # The tape reader first: ORB on a gap day, VWAP reclaim/rejection, mean
@@ -10718,6 +11109,8 @@ def evaluate_quote(
         "spread_pct": spread,
         "change_from_open_pct": change_open,
         "vwap": vwap,
+        "vwap_source": resolved_vwap.get("source"),
+        "vwap_unmeasured_reason": resolved_vwap.get("reason"),
         "setup": setup,
         "score": score,
         "score_base": SCORE_BASE,
@@ -10802,6 +11195,9 @@ class Scanner:
         # Cadence stretch from the book's learning weight (1.0 = as configured).
         self.throttle: float = 1.0
         self._config: Dict[str, Any] = dict(DEFAULT_CONFIG)
+        # Host hook: refresh the Massive RTH minute-VWAP cache. The order
+        # path does not call it. None in unit tests that do not wire it.
+        self.refresh_index_vwap: Optional[Callable[[], Awaitable[Any]]] = None
 
     # ---- config -----------------------------------------------------------
     async def load_config(self) -> Dict[str, Any]:
@@ -10812,11 +11208,13 @@ class Scanner:
             except (json.JSONDecodeError, TypeError):
                 logger.warning("scanner config unreadable — using defaults")
                 self._config = dict(DEFAULT_CONFIG)
+        note_live_interval(self._config.get("interval_seconds"))
         return dict(self._config)
 
     async def set_config(self, patch: Dict[str, Any]) -> Dict[str, Any]:
         merged = {**self._config, **(patch or {})}
         self._config = normalize_config(merged)
+        note_live_interval(self._config.get("interval_seconds"))
         await self.state.set(CONFIG_KEY, json.dumps(self._config))
         logger.info(
             f"🔭 Scanner config updated — mode={self._config['mode']} "
@@ -10870,6 +11268,13 @@ class Scanner:
             )
         except Exception as e:
             logger.warning(f"series write failed for {quote.get('symbol')}: {e}")
+        # Same print, separate uncapped session hash. The list cap is unchanged.
+        try:
+            # The sample's own stamp is the clock. The pass clock can be a
+            # few seconds older, which would drop this print as "future".
+            await note_session_vwap(self.state, quote.get("symbol"), sample, None)
+        except Exception as e:
+            logger.warning(f"session VWAP write failed for {quote.get('symbol')}: {e}")
 
     # ---- emission tally (observability only) -------------------------------
     def _emit_key(self) -> str:
@@ -11043,6 +11448,16 @@ class Scanner:
             except Exception as e:
                 logger.warning(f"shadow marking failed this pass: {e}")
         candidates: List[Dict[str, Any]] = []
+        session_vwap: Dict[str, Any] = {}
+        for quote in quotes:
+            try:
+                session_vwap[quote["symbol"]] = await read_session_vwap(
+                    self.state, quote["symbol"], now_et,
+                )
+            except Exception as e:
+                logger.warning(f"session VWAP unavailable for {quote.get('symbol')}: {e}")
+                session_vwap[quote["symbol"]] = _vwap_unmeasured(0)
+        context["session_vwap"] = session_vwap
         for quote in quotes:
             series = await self._series(quote["symbol"])
             if quote["symbol"] in universe:
@@ -11168,6 +11583,21 @@ class Scanner:
             "last_scan": await self.last_report(),
         }
 
+    async def _refresh_index_vwap(self) -> None:
+        """Ask the host to refresh the Massive RTH cache. Never raises.
+
+        Called from the scanner loop while the session is open. The CALL
+        gate does not call this, and a failure leaves the previous cache
+        entry to age out.
+        """
+        fn = self.refresh_index_vwap
+        if fn is None or not self.is_market_open():
+            return
+        try:
+            await fn()
+        except Exception as e:
+            logger.debug(f"index VWAP refresh skipped: {e}")
+
     # ---- loop -------------------------------------------------------------
     async def run(self) -> None:
         await self.load_config()
@@ -11179,6 +11609,8 @@ class Scanner:
             cfg = await self.load_config()  # picks up live config changes
             delay = int(cfg["interval_seconds"])
             try:
+                if self.is_market_open():
+                    await self._refresh_index_vwap()
                 if cfg["mode"] == "off":
                     delay = 60
                 elif not self.has_tokens():
@@ -13395,7 +13827,12 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # fresh MARKET SELL_CLOSE is sent for the broker-confirmed remainder.
 # This path never re-arms a stop. UNFILLED_FLATTEN_REPLACE_ENABLED is
 # read every trail tick (false = alert only).
-BOT_VERSION = "5.96.0-pro-day-trader"
+# 5.97.0: the CALL index VWAP gate, evaluate_quote's VWAP, and the
+# pro-trader SPY range use today's regular-session samples only. A thin
+# or pre-open window is unmeasured, and the CALL gate stays fail-closed.
+# A cached Massive RTH minute VWAP that is missing or too far from that
+# today VWAP is unmeasured too. day.vw is not a gate input.
+BOT_VERSION = "5.97.0-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -13911,6 +14348,39 @@ CALL_INDEX_VWAP_SYMBOLS = tuple(
 ) or ("SPY", "QQQ")
 
 
+def _env_flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() not in {"false", "0", "no", "off"}
+
+
+def vwap_crosscheck_required() -> bool:
+    """Read on each decision. Default true: a missing Massive RTH VWAP fails closed."""
+    return _env_flag("VWAP_CROSSCHECK_REQUIRED", "true")
+
+
+def vwap_crosscheck_max_bps() -> float:
+    """Absolute basis-point gap allowed between today VWAP and Massive RTH. Default 25."""
+    raw = os.getenv("VWAP_CROSSCHECK_MAX_BPS", "25")
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return 25.0
+    if not math.isfinite(value) or value < 0:
+        return 25.0
+    return value
+
+
+def vwap_crosscheck_max_age_s() -> float:
+    """Max age of the cached Massive RTH VWAP. Older is unmeasured. Default 300s."""
+    raw = os.getenv("VWAP_CROSSCHECK_MAX_AGE_S", "300")
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return 300.0
+    if not math.isfinite(value) or value <= 0:
+        return 300.0
+    return value
+
+
 def call_index_vwap_gate_status() -> Dict[str, Any]:
     """Read-only view of the gate this process is actually running.
 
@@ -13918,6 +14388,10 @@ def call_index_vwap_gate_status() -> Dict[str, Any]:
     the environment does not change the gate and does not change this report.
     `mode` is `fail_closed` only while the gate is on. While it is off,
     `_call_index_vwap_block` returns without blocking.
+
+    The sample floor and the Massive cross-check are read on each decision
+    so an operator can tighten them without a restart. They do not change
+    `enabled`.
     """
     enabled = bool(CALL_INDEX_VWAP_GATE)
     symbols = list(CALL_INDEX_VWAP_SYMBOLS)
@@ -13925,6 +14399,11 @@ def call_index_vwap_gate_status() -> Dict[str, Any]:
         "enabled": enabled,
         "symbols": symbols,
         "mode": "fail_closed" if enabled else "off",
+        "vwap_source": "session_sampled",
+        "vwap_min_today_samples": scanner_mod.vwap_min_today_samples(),
+        "vwap_crosscheck_max_bps": vwap_crosscheck_max_bps(),
+        "vwap_crosscheck_required": vwap_crosscheck_required(),
+        "vwap_crosscheck_max_age_s": vwap_crosscheck_max_age_s(),
     }
 # Pro Day Trader realignment. Shadow classifies and records verdicts without
 # changing an order. Active may only block or scale size down.
@@ -14870,15 +15349,36 @@ def _payload_option_right(p: dict) -> str:
     return ""
 
 
+async def _load_index_series(symbol: str) -> List[Dict[str, Any]]:
+    """Chronological scanner samples. Empty when the list cannot be read."""
+    try:
+        if scanner is not None:
+            loaded = await scanner._series(symbol)
+        else:
+            loaded = await _scanner_series_for(symbol)
+    except Exception as e:
+        logger.debug("today VWAP series unavailable for %s: %s", symbol, e)
+        return []
+    if not isinstance(loaded, list):
+        return []
+    return [row for row in loaded if isinstance(row, dict)]
+
+
 async def _index_vwap_quotes(
     symbols: Tuple[str, ...] = CALL_INDEX_VWAP_SYMBOLS,
     *,
     dry_run: bool = False,
 ) -> List[Dict[str, Any]]:
-    """SPY/QQQ last + day VWAP for the call gate. Prefers the broker VWAP
-    field; falls back to the scanner's sampled session VWAP when the quote
-    omits it. A total fetch failure returns rows with no VWAP; the gate
-    then fails closed."""
+    """SPY/QQQ last plus today's session VWAP for the call gate.
+
+    The gate value is the uncapped per-ET-date accumulator
+    ``vwap:session:{symbol}:{date}``. The capped ``scanner:series`` list, a
+    broker VWAP field, and Massive day.vw are not the gate input. The Massive
+    check reads the today-keyed RTH cache only and does not call Massive.
+    Unmeasured leaves ``vwap`` empty so the gate fails closed. A quote-fetch
+    failure returns rows with no VWAP. An empty cache after a restart is
+    unmeasured; it does not raise.
+    """
     syms = [s for s in symbols if s]
     if not syms:
         return []
@@ -14892,32 +15392,49 @@ async def _index_vwap_quotes(
         logger.warning(f"call-index VWAP quote fetch failed ({e})")
         quotes = []
     by_sym = {str(q.get("symbol") or "").upper(): q for q in quotes if isinstance(q, dict)}
+    now_et = _utcnow().astimezone(_ET_ZONE)
     out: List[Dict[str, Any]] = []
     for sym in syms:
         row = dict(by_sym.get(sym) or {"symbol": sym})
         row["symbol"] = sym
-        vwap = row.get("vwap")
-        if (vwap is None or float(vwap or 0) <= 0) and scanner is not None:
-            try:
-                series = await scanner._series(sym)
-                sampled = scanner_mod.sampled_vwap(series)
-                if sampled is not None and sampled > 0:
-                    row["vwap"] = sampled
-                    row["vwap_source"] = "scanner_sampled"
-            except Exception as e:
-                logger.debug(f"call-index sampled VWAP for {sym} unavailable: {e}")
-        elif vwap is not None and float(vwap or 0) > 0:
-            row["vwap_source"] = "quote"
+        try:
+            resolved = await scanner_mod.read_session_vwap(state, sym, now_et)
+        except Exception as e:
+            logger.debug("session VWAP unavailable for %s: %s", sym, e)
+            resolved = scanner_mod._vwap_unmeasured(0)
+        checked = _crosscheck_today_vwap(resolved, _cached_minute_vwap_view(sym, now_et))
+        side = _gate_side_verdict(row.get("last"), checked)
+        if checked["measured"] and side in {"above", "below"}:
+            row["vwap"] = checked["vwap"]
+            row["vwap_source"] = "session_sampled"
+            row["gate_vwap_source"] = "session_sampled"
+            row["gate_vwap_reason"] = None
+        else:
+            row["vwap"] = None
+            row["vwap_source"] = None
+            side = "unmeasured"
+            row["gate_vwap_source"] = None
+            row["gate_vwap_reason"] = checked["reason"]
+        # The broker field is not the source, even when the quote carried one.
+        row["vwap_field"] = None
+        row["gate_vwap_verdict"] = side
+        row["gate_vwap_samples"] = resolved.get("samples")
+        row["gate_vwap_crosscheck_bps"] = checked.get("diff_bps")
         out.append(row)
     return out
 
 
-# Observe-only SPY/QQQ VWAP comparison. Nothing here is an input to
-# assess_call_index_vwap_gate, evaluate_quote, or the pro-trader range.
+# Massive RTH minute VWAP, cached by ET session date. The scanner loop
+# refreshes it during the session (90s throttle, 3s timeout). /status may
+# refresh too. The CALL gate only reads the cache and does not fetch.
+# Massive day.vw and the snapshot minute `vw` stay telemetry. They are not
+# gate inputs. A restart begins with an empty cache and fails closed until
+# the first successful refresh.
 _MINUTE_VWAP_REFRESH_S = 90.0
 _MINUTE_VWAP_TIMEOUT_S = 3.0
 _minute_vwap_cache: Dict[str, Dict[str, Any]] = {}
 _minute_vwap_attempt_at: Dict[str, float] = {}
+_minute_vwap_refresh_meta: Dict[str, Dict[str, Any]] = {}
 _minute_vwap_guard: Optional[asyncio.Lock] = None
 
 
@@ -14979,13 +15496,31 @@ def _null_index_vwap_observe_row(symbol: str) -> Dict[str, Any]:
         "massive_minute_vw_diff_bps": None,
         "session_sampled_vwap_diff_bps": None,
         "massive_minute_vwap_rth_diff_bps": None,
+        "gate_vwap_source": None,
+        "gate_vwap_verdict": None,
+        "gate_vwap_reason": None,
+        "gate_vwap_crosscheck_bps": None,
     }
+
+
+def _call_verdict_from_rows(rows: List[Dict[str, Any]]) -> str:
+    """CALL verdict implied by per-index gate fields. Any above allows."""
+    verdicts = [
+        row.get("gate_vwap_verdict") for row in rows or [] if isinstance(row, dict)
+    ]
+    if any(item == "above" for item in verdicts):
+        return "allow"
+    if any(item == "below" for item in verdicts):
+        return "block"
+    return "unmeasured"
 
 
 def _observe_envelope(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "read_only": True,
         "massive_day_vwap_label": massive.DAY_VW_LABEL,
+        "gate_vwap_source": "session_sampled",
+        "gate_vwap_verdict": _call_verdict_from_rows(rows),
         "indexes": rows,
     }
 
@@ -15081,8 +15616,37 @@ def _minute_vwap_view_null(reason: str) -> Dict[str, Any]:
     }
 
 
+def _minute_vwap_age_seconds(row: Dict[str, Any], now_et: datetime) -> Optional[float]:
+    """Age of the cached value. The older of the fetch time and the last bar."""
+    now_ts = now_et.timestamp()
+    ages: List[float] = []
+    for key in ("fetched_at", "last_bar_epoch"):
+        raw = row.get(key)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            continue
+        try:
+            ages.append(max(0.0, now_ts - float(raw)))
+        except (TypeError, ValueError):
+            continue
+    if not ages:
+        return None
+    return round(max(ages), 1)
+
+
+def _note_minute_vwap_refresh(symbol: str, result: str) -> None:
+    _minute_vwap_refresh_meta[str(symbol or "").upper()] = {
+        "result": "ok" if result == "ok" else "error",
+        "at": time.time(),
+    }
+
+
 def _cached_minute_vwap_view(symbol: str, now_et: datetime) -> Dict[str, Any]:
-    """Today's cached RTH minute VWAP, or null. Never a prior session's value."""
+    """Today's cached RTH minute VWAP, or null. Never a prior session's value.
+
+    A value older than ``VWAP_CROSSCHECK_MAX_AGE_S`` is unmeasured
+    (``massive_rth_stale``). Missing is left for the cross-check to name
+    ``massive_rth_missing``.
+    """
     today = now_et.date()
     gap = _minute_vwap_gap_reason(now_et)
     row = _minute_vwap_cache.get(_minute_vwap_cache_key(symbol, today.isoformat()))
@@ -15091,13 +15655,18 @@ def _cached_minute_vwap_view(symbol: str, now_et: datetime) -> Dict[str, Any]:
     if _epoch_et_date(row.get("last_bar_epoch"), now_et) != today:
         return _minute_vwap_view_null(gap)
     vwap = _positive_vwap(row.get("vwap"))
+    age = _minute_vwap_age_seconds(row, now_et)
     if vwap is None:
         return _minute_vwap_view_null("no_rth_bars_yet")
-    epoch = row.get("last_bar_epoch")
-    try:
-        age = round(max(0.0, now_et.timestamp() - float(epoch)), 1)
-    except (TypeError, ValueError):
-        age = None
+    max_age = vwap_crosscheck_max_age_s()
+    if age is None or age > max_age:
+        return {
+            "vwap": None,
+            "reason": "massive_rth_stale",
+            "last_bar_ts": row.get("last_bar_ts"),
+            "age_seconds": age,
+            "bar_count": row.get("bar_count"),
+        }
     return {
         "vwap": vwap,
         "reason": None,
@@ -15107,16 +15676,120 @@ def _cached_minute_vwap_view(symbol: str, now_et: datetime) -> Dict[str, Any]:
     }
 
 
-async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> None:
-    """Refresh cached regular-hours minute VWAPs. /status only. Never raises.
+def _crosscheck_today_vwap(resolved: Dict[str, Any], minute_view: Any) -> Dict[str, Any]:
+    """Today's accumulator VWAP versus the cached Massive RTH minute VWAP.
 
-    At most once per 90s per symbol, with a 3s timeout. Does not use
-    MassiveClient._get, so a failure cannot change auth_status or feed health.
-    The cache is keyed by the ET session date. A response with no positive
-    today-session VWAP does not replace the slot, and a prior day's slot is
-    never read back as today. The lock only records who is due; the HTTP
-    call sits outside it so concurrent polls are not queued on the network.
+    Does not read Massive day.vw and does not fetch. While
+    ``VWAP_CROSSCHECK_REQUIRED`` is true, a missing cache is
+    ``massive_rth_missing``, a cache older than ``VWAP_CROSSCHECK_MAX_AGE_S``
+    is ``massive_rth_stale``, and a gap wider than ``VWAP_CROSSCHECK_MAX_BPS``
+    is ``crosscheck_gap_bps``. Too few today samples is
+    ``today_samples_insufficient``.
     """
+    required = vwap_crosscheck_required()
+    max_bps = vwap_crosscheck_max_bps()
+    today = _positive_vwap(resolved.get("vwap")) if resolved.get("measured") else None
+    view = minute_view if isinstance(minute_view, dict) else {}
+    massive_px = _positive_vwap(view.get("vwap"))
+    massive_reason = view.get("reason") if isinstance(view.get("reason"), str) else None
+    if today is None:
+        why = resolved.get("reason")
+        if why not in {"today_samples_insufficient"}:
+            why = "today_samples_insufficient"
+        return {
+            "measured": False, "vwap": None, "source": None, "verdict": "unmeasured",
+            "reason": why, "diff_bps": None,
+        }
+    diff = _vwap_diff_bps(massive_px, today)
+    if massive_px is None:
+        if required:
+            code = "massive_rth_stale" if massive_reason == "massive_rth_stale" else "massive_rth_missing"
+            return {
+                "measured": False, "vwap": None, "source": None, "verdict": "unmeasured",
+                "reason": code, "diff_bps": None,
+            }
+        return {
+            "measured": True, "vwap": today, "source": "session_sampled",
+            "verdict": "measured", "reason": None, "diff_bps": None,
+        }
+    if diff is not None and abs(diff) > max_bps:
+        return {
+            "measured": False, "vwap": None, "source": None, "verdict": "unmeasured",
+            "reason": "crosscheck_gap_bps", "diff_bps": diff,
+        }
+    return {
+        "measured": True, "vwap": today, "source": "session_sampled",
+        "verdict": "measured", "reason": None, "diff_bps": diff,
+    }
+
+
+def _gate_side_verdict(last: Any, checked: Dict[str, Any]) -> str:
+    if not checked.get("measured"):
+        return "unmeasured"
+    px = _positive_vwap(last)
+    vwap = _positive_vwap(checked.get("vwap"))
+    if px is None or vwap is None:
+        return "unmeasured"
+    return "above" if px + 1e-9 >= vwap else "below"
+
+
+def _gate_fields_for_observe(
+    quote: Dict[str, Any],
+    series: Optional[List[Dict[str, Any]]],
+    now_et: datetime,
+    minute_rth: Optional[Dict[str, Any]],
+    last: Any,
+) -> Dict[str, Any]:
+    """Gate source and verdict for one index. Prefers a verdict already on the quote."""
+    verdict = (quote or {}).get("gate_vwap_verdict")
+    if verdict in {"above", "below", "unmeasured"}:
+        source = (quote or {}).get("gate_vwap_source")
+        reason = (quote or {}).get("gate_vwap_reason")
+        cross = (quote or {}).get("gate_vwap_crosscheck_bps")
+        return {
+            "gate_vwap_source": source if source == "session_sampled" and verdict != "unmeasured" else None,
+            "gate_vwap_verdict": verdict,
+            "gate_vwap_reason": reason if isinstance(reason, str) and reason else None,
+            "gate_vwap_crosscheck_bps": (
+                cross if isinstance(cross, (int, float)) and not isinstance(cross, bool) else None
+            ),
+        }
+    if series is None:
+        resolved = {
+            "measured": False, "vwap": None, "samples": 0,
+            "reason": "today_samples_insufficient",
+        }
+    else:
+        resolved = scanner_mod.today_session_vwap(series, now_et)
+    view = minute_rth if isinstance(minute_rth, dict) else {
+        "vwap": None, "reason": _minute_vwap_gap_reason(now_et),
+    }
+    checked = _crosscheck_today_vwap(resolved, view)
+    side = _gate_side_verdict(last, checked)
+    cross = checked.get("diff_bps")
+    return {
+        "gate_vwap_source": checked["source"] if side != "unmeasured" else None,
+        "gate_vwap_verdict": side,
+        "gate_vwap_reason": None if side != "unmeasured" else checked["reason"],
+        "gate_vwap_crosscheck_bps": (
+            cross if isinstance(cross, (int, float)) and not isinstance(cross, bool) else None
+        ),
+    }
+
+
+async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> None:
+    """Refresh cached regular-hours minute VWAPs. Never raises.
+
+    The scanner loop calls this during the session. /status may call it too.
+    The CALL gate does not. At most once per 90s per symbol, with a 3s timeout
+    per request. Does not use MassiveClient._get, so a failure cannot change
+    auth_status or feed health. A timeout or a bad response leaves the previous
+    slot in place and records ``error``. A response with no positive
+    today-session VWAP does not replace the slot. A prior day's slot is never
+    read back as today. The lock only records who is due; the HTTP call sits
+    outside it so one slow symbol cannot queue the others on the lock.
+    """
+    due: List[str] = []
     try:
         if not massive.enabled():
             return
@@ -15125,7 +15798,6 @@ async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> No
         now = time.time()
         lock = _minute_vwap_lock()
         async with lock:
-            due = []
             for sym in [str(s).upper() for s in (symbols or _index_observe_symbols()) if s]:
                 last = float(_minute_vwap_attempt_at.get(_minute_vwap_cache_key(sym, day)) or 0)
                 if now - last >= _MINUTE_VWAP_REFRESH_S:
@@ -15139,25 +15811,36 @@ async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> No
         async with httpx.AsyncClient(timeout=_MINUTE_VWAP_TIMEOUT_S) as client:
             for sym in due:
                 try:
-                    resp = await client.get(
-                        f"{massive.BASE_URL}/v2/aggs/ticker/{sym}/range/1/minute/{day}/{day}",
-                        params={"adjusted": "true", "sort": "asc", "limit": 50000},
-                        headers=headers,
+                    resp = await asyncio.wait_for(
+                        client.get(
+                            f"{massive.BASE_URL}/v2/aggs/ticker/{sym}/range/1/minute/{day}/{day}",
+                            params={"adjusted": "true", "sort": "asc", "limit": 50000},
+                            headers=headers,
+                        ),
+                        timeout=_MINUTE_VWAP_TIMEOUT_S,
                     )
                     if getattr(resp, "status_code", 0) != 200:
+                        _note_minute_vwap_refresh(sym, "error")
                         continue
                     parsed = minute_aggs_rth_vwap(resp.json(), now_et)
                     if _positive_vwap(parsed.get("vwap")) is None:
+                        _note_minute_vwap_refresh(sym, "error")
                         continue
                     if _epoch_et_date(parsed.get("last_bar_epoch"), now_et) != now_et.date():
+                        _note_minute_vwap_refresh(sym, "error")
                         continue
                     stored = dict(parsed)
                     stored["session_date"] = day
+                    stored["fetched_at"] = now_et.timestamp()
                     async with lock:
                         _minute_vwap_cache[_minute_vwap_cache_key(sym, day)] = stored
+                    _note_minute_vwap_refresh(sym, "ok")
                 except Exception:
+                    _note_minute_vwap_refresh(sym, "error")
                     logger.debug("minute vwap unavailable for %s", sym)
     except Exception:
+        for sym in due:
+            _note_minute_vwap_refresh(sym, "error")
         logger.debug("minute vwap refresh skipped")
 
 
@@ -15212,6 +15895,11 @@ def observe_index_vwap_row(
         row["massive_minute_vw_diff_bps"] = _vwap_diff_bps(row["massive_minute_vw"], baseline)
         row["session_sampled_vwap_diff_bps"] = _vwap_diff_bps(session_vwap, baseline)
         row["massive_minute_vwap_rth_diff_bps"] = _vwap_diff_bps(rth, baseline)
+        row.update(_gate_fields_for_observe(
+            quote or {}, series, now_et,
+            minute_rth if isinstance(minute_rth, dict) else None,
+            (quote or {}).get("last"),
+        ))
         return row
     except Exception:
         return _null_index_vwap_observe_row(symbol)
@@ -15311,8 +15999,35 @@ async def _status_observe_index_quotes() -> List[Dict[str, Any]]:
     return await flight
 
 
+def massive_rth_cache_status(now_et: Optional[datetime] = None) -> Dict[str, Any]:
+    """Cache age and the last refresh result for /status. Does not fetch."""
+    clock = now_et if isinstance(now_et, datetime) else _utcnow().astimezone(_ET_ZONE)
+    symbols: Dict[str, Any] = {}
+    for sym in _index_observe_symbols():
+        view = _cached_minute_vwap_view(sym, clock)
+        meta = _minute_vwap_refresh_meta.get(sym) or {}
+        at = meta.get("at")
+        refresh_at = None
+        if isinstance(at, (int, float)) and not isinstance(at, bool):
+            try:
+                refresh_at = datetime.fromtimestamp(float(at), timezone.utc).isoformat()
+            except (OverflowError, OSError, ValueError):
+                refresh_at = None
+        result = meta.get("result")
+        symbols[sym] = {
+            "age_seconds": view.get("age_seconds"),
+            "refresh_result": result if result in {"ok", "error"} else None,
+            "refresh_at": refresh_at,
+        }
+    return {"max_age_s": vwap_crosscheck_max_age_s(), "symbols": symbols}
+
+
 async def call_index_vwap_gate_view() -> Dict[str, Any]:
-    """/status payload: the import-time gate plus the observe block."""
+    """/status payload: the import-time gate plus the observe block.
+
+    The refresh here is optional. The scanner loop is what keeps the cache
+    warm. The gate does not call this function.
+    """
     view = call_index_vwap_gate_status()
     try:
         await refresh_massive_minute_vwap()
@@ -15325,6 +16040,7 @@ async def call_index_vwap_gate_view() -> Dict[str, Any]:
         view["observe"] = _observe_envelope(
             [_null_index_vwap_observe_row(sym) for sym in _index_observe_symbols()]
         )
+    view["massive_rth"] = massive_rth_cache_status()
     return view
 
 
@@ -15369,7 +16085,66 @@ async def _call_index_vwap_block(p: dict, *, dry_run: bool = False) -> Optional[
             p["call_index_vwap_observe"] = _observe_envelope(
                 [_null_index_vwap_observe_row(sym) for sym in _index_observe_symbols()]
             )
+    if reason and not dry_run:
+        await _alert_vwap_crosscheck_block(reason)
     return reason
+
+
+_vwap_alert_tasks: set = set()
+
+
+_VWAP_CROSSCHECK_ALERT_CODES = (
+    "massive_rth_stale",
+    "massive_rth_missing",
+    "crosscheck_gap_bps",
+)
+_VWAP_CROSSCHECK_ALERT_S = 15 * 60
+_VWAP_CROSSCHECK_ALERT_KEY = "vwap:crosscheck:alert"
+
+
+def _spawn_vwap_crosscheck_alert(reason: str) -> None:
+    """Deliver the warning off the entry path. The webhook may take 8s."""
+    async def _deliver() -> None:
+        try:
+            await alerts.send(
+                "warning",
+                "vwap_crosscheck_blocked",
+                f"CALL entries blocked by the VWAP cross-check — {reason[:400]}",
+                dedupe_key="vwap_crosscheck_blocked",
+            )
+        except Exception:
+            logger.debug("vwap crosscheck alert failed")
+
+    try:
+        task = asyncio.create_task(_deliver())
+    except RuntimeError:
+        logger.debug("vwap crosscheck alert not scheduled")
+        return
+    _vwap_alert_tasks.add(task)
+    task.add_done_callback(_vwap_alert_tasks.discard)
+
+
+async def _alert_vwap_crosscheck_block(reason: str) -> None:
+    """One warning per 15 minutes while CALLs are blocked on the cross-check.
+
+    The dedupe write stays on the caller. The webhook does not: the entry
+    path returns without waiting on it. A below-VWAP block and the opening
+    sample floor are not this alert. A dedupe failure must not raise.
+    """
+    if not isinstance(reason, str) or not any(code in reason for code in _VWAP_CROSSCHECK_ALERT_CODES):
+        return
+    try:
+        fresh = True
+        if state is not None:
+            fresh = await state.set(
+                _VWAP_CROSSCHECK_ALERT_KEY, "1", ex=_VWAP_CROSSCHECK_ALERT_S, nx=True,
+            )
+        if not fresh:
+            return
+    except Exception:
+        logger.debug("vwap crosscheck alert failed")
+        return
+    _spawn_vwap_crosscheck_alert(reason)
 
 
 def _is_market_open() -> bool:
@@ -15808,20 +16583,37 @@ def assess_call_index_vwap_gate(
     *,
     enabled: bool = True,
 ) -> Optional[str]:
-    """Refuse CALL entries when every measured index is below its day VWAP.
+    """Refuse CALL entries when every measured index is below today's VWAP.
 
     ``index_quotes`` is an iterable of ``{symbol, last, vwap}`` (SPY / QQQ).
     Allows when ANY measured index prints at or above VWAP. Measured-below
-    still blocks. When no index VWAP is measured the gate fails closed: a
-    CALL must not slip through on a missing tape. Puts and non-option
-    entries are untouched. Pure: no I/O, fully unit-testable.
+    still blocks. A row marked ``gate_vwap_verdict=unmeasured`` is not a
+    measurement, even if a broker VWAP or Massive day.vw is sitting on it.
+    When no index VWAP is measured the gate fails closed. Puts and
+    non-option entries are untouched. Pure: no I/O, fully unit-testable.
     """
     if not enabled:
         return None
     right = str(option_right or "").upper().strip()
     if right not in {"CALL", "C"}:
         return None
-    snap = snapshot_index_vs_vwap(index_quotes)
+    rows = index_quotes.values() if isinstance(index_quotes, dict) else (index_quotes or [])
+    usable: List[Dict[str, Any]] = []
+    details: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        copied = dict(row)
+        # An explicit unmeasured verdict wins over any number on the row,
+        # including a broker VWAP field or Massive day.vw.
+        if str(copied.get("gate_vwap_verdict") or "") == "unmeasured":
+            copied["vwap"] = None
+            why = copied.get("gate_vwap_reason")
+            sym = str(copied.get("symbol") or "").upper().strip()
+            if sym and isinstance(why, str) and why.strip():
+                details.append(f"{sym}: {why.strip()}")
+        usable.append(copied)
+    snap = snapshot_index_vs_vwap(usable)
     above = [f"{r['symbol']} {r['last']:.2f}≥VWAP {r['vwap']:.2f}" for r in snap if r["above_vwap"]]
     below = [f"{r['symbol']} {r['last']:.2f}<VWAP {r['vwap']:.2f}" for r in snap if not r["above_vwap"]]
     if above:
@@ -15831,6 +16623,12 @@ def assess_call_index_vwap_gate(
             "CALL blocked while the index is below day VWAP ("
             + "; ".join(below)
             + ") — waiting for SPY or QQQ to reclaim"
+        )
+    if details:
+        return (
+            "CALL blocked — SPY/QQQ today VWAP unmeasured — fail closed ("
+            + "; ".join(details)
+            + ")"
         )
     return (
         "CALL blocked — SPY/QQQ day VWAP unmeasured — fail closed until an index VWAP is measured"
@@ -16839,13 +17637,34 @@ async def _pro_trader_observation(p: dict, *, dry_run: bool = False) -> Dict[str
     prices: List[float] = []
     if scanner is not None:
         try:
-            for sample in await scanner._series("SPY"):
-                if isinstance(sample, dict) and isinstance(sample.get("last"), (int, float)):
-                    prices.append(float(sample["last"]))
+            series = await scanner._series("SPY")
+            for sample in scanner_mod.session_series(series, now_et):
+                last = sample.get("last") if isinstance(sample, dict) else None
+                if isinstance(last, bool) or not isinstance(last, (int, float)):
+                    continue
+                if not math.isfinite(float(last)):
+                    continue
+                prices.append(float(last))
         except Exception as e:
             logger.debug(f"pro trader SPY series unavailable: {e}")
     realized = None
-    if len(prices) >= 2 and min(prices) > 0:
+    session = None
+    try:
+        session = await scanner_mod.read_session_vwap(state, "SPY", now_et)
+    except Exception as e:
+        logger.debug(f"pro trader SPY session VWAP unavailable: {e}")
+    if isinstance(session, dict) and int(session.get("samples") or 0) >= 2:
+        first = session.get("first_price")
+        high = session.get("high")
+        low = session.get("low")
+        if (
+            isinstance(first, (int, float)) and not isinstance(first, bool) and first > 0
+            and isinstance(high, (int, float)) and not isinstance(high, bool)
+            and isinstance(low, (int, float)) and not isinstance(low, bool)
+            and math.isfinite(float(first)) and math.isfinite(float(high)) and math.isfinite(float(low))
+        ):
+            realized = (float(high) - float(low)) / float(first) * 100.0
+    if realized is None and len(prices) >= 2 and min(prices) > 0:
         realized = (max(prices) - min(prices)) / prices[0] * 100.0
     return {
         "minute_et": minute,
@@ -33126,6 +33945,7 @@ async def _start_scanner() -> None:
         core_reinstated=_core_reinstated,
     )
     scanner.adv_cache = _massive_adv_cache
+    scanner.refresh_index_vwap = refresh_massive_minute_vwap
     # Stored config wins (survives restarts, changed live from the app); env
     # vars only seed the very first boot.
     stored = await scanner.load_config()
