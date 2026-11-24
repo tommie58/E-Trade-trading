@@ -12022,10 +12022,24 @@ answer the give-back question with a lie.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+import os
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("etrade-bot.study")
+
+# GET /study used to run the study views on the request. Those views parse
+# every ledger line in plpgsql and, for each close, laterally rescan the
+# chain. On a production ledger that returns 0 bytes: the handler writes
+# nothing until every unbounded query finishes, and the client gives up at
+# 20s and again at 60s. The request path now reads one bounded page and
+# stops at this budget.
+STUDY_TIME_BUDGET_S = 8.0
+STUDY_LEDGER_WINDOW = 2000
+STUDY_LEDGER_WINDOW_MAX = 5000
 
 _engine: Any = None
 
@@ -12623,23 +12637,687 @@ async def coverage() -> Dict[str, Any]:
     return out
 
 
-async def summary(min_samples: int = 1, recent: int = 10) -> Dict[str, Any]:
-    """Everything the learning loop needs in one read."""
-    if _engine is None:
-        return {"available": False, "error": "no DATABASE_URL — study layer offline"}
+def study_time_budget_s() -> float:
+    """Hard ceiling under the client's 20s retry. A bad env cannot raise it."""
+    raw = os.getenv("STUDY_TIME_BUDGET_S", "").strip()
     try:
+        value = float(raw) if raw else STUDY_TIME_BUDGET_S
+    except ValueError:
+        value = STUDY_TIME_BUDGET_S
+    if value != value:
+        value = STUDY_TIME_BUDGET_S
+    return max(0.05, min(value, 12.0))
+
+
+def _page_bounds(window: Optional[int], offset: Optional[int]) -> Tuple[int, int, bool]:
+    try:
+        limit = int(STUDY_LEDGER_WINDOW if window is None else window)
+    except (TypeError, ValueError):
+        limit = STUDY_LEDGER_WINDOW
+    try:
+        off = int(offset or 0)
+    except (TypeError, ValueError):
+        off = 0
+    limit = max(1, min(limit, STUDY_LEDGER_WINDOW_MAX))
+    off = max(0, off)
+    if off >= STUDY_LEDGER_WINDOW_MAX:
+        return limit, off, True
+    if off + limit > STUDY_LEDGER_WINDOW_MAX:
+        limit = STUDY_LEDGER_WINDOW_MAX - off
+    return limit, off, False
+
+
+def _num(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or abs(number) == float("inf"):
+        return None
+    return number
+
+
+def _blank(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _as_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"t", "true", "y", "yes", "1"}:
+            return True
+        if text in {"f", "false", "n", "no", "0"}:
+            return False
+    return None
+
+
+def _evidence_key(data: Dict[str, Any]) -> str:
+    import_id = str(data.get("import_id") or "").strip()
+    if import_id:
+        return "id:" + import_id
+    ticker = str(data.get("symbol") or data.get("ticker") or "")
+    setup = str(data.get("setup") or "").strip().lower()
+    closed = str(data.get("closed_at") or "")
+    return "fallback:" + ticker + "|" + setup + "|" + closed
+
+
+def _apply_page_corrections(records: List[dict]) -> List[dict]:
+    """Apply pnl_sign_corrected targets found in this page. Never mutates input."""
+    fixes: Dict[str, Dict[str, Any]] = {}
+    for rec in records:
+        if str(rec.get("event") or "") != "pnl_sign_corrected":
+            continue
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        for target in data.get("targets") or []:
+            if isinstance(target, dict) and isinstance(target.get("now"), dict):
+                key = f"{target.get('seq')}|{target.get('ts')}|{str(target.get('ticker') or '').upper()}"
+                fixes[key] = target
+    if not fixes:
+        return [rec for rec in records if str(rec.get("event") or "") != "pnl_sign_corrected"]
+    out: List[dict] = []
+    for rec in records:
+        event = str(rec.get("event") or "")
+        if event == "pnl_sign_corrected":
+            continue
+        if event == "position_closed":
+            data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+            key = f"{rec.get('seq')}|{rec.get('ts')}|{str(data.get('ticker') or '').upper()}"
+            fix = fixes.get(key)
+            if fix is not None:
+                patched = dict(data)
+                for field, value in fix["now"].items():
+                    if field in {"realized_pnl_pct", "account_pnl_pct", "realized_pnl_usd"}:
+                        patched[field] = value
+                patched["sign_corrected"] = True
+                out.append({**rec, "data": patched})
+                continue
+        out.append(rec)
+    return out
+
+
+def _empty_study() -> Dict[str, Any]:
+    return {
+        "coverage": {
+            "closes": 0,
+            "labeled": 0,
+            "peak_instrumented": 0,
+            "premium_basis": 0,
+            "underlying_basis": 0,
+            "first_close": None,
+            "last_close": None,
+            "evidence_records": 0,
+            "evidence_setups": 0,
+            "evidence_basis_qualified": 0,
+            "ledger_records": 0,
+            "labeled_pct": None,
+            "attribution_ready": False,
+            "windowed": False,
+        },
+        "setup_priors": [],
+        "setup_performance": [],
+        "setup_expectancy": [],
+        "exit_reasons": [],
+        "recent_closes": [],
+    }
+
+
+def _parse_ledger_line(seq: Any, line: Any) -> Optional[dict]:
+    if isinstance(line, (bytes, bytearray)):
+        try:
+            line = line.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(line, str):
+        return None
+    try:
+        rec = json.loads(line)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    if rec.get("seq") is None and seq is not None and not isinstance(seq, bool):
+        rec = dict(rec)
+        try:
+            rec["seq"] = int(seq)
+        except (TypeError, ValueError):
+            rec["seq"] = seq
+    return rec
+
+
+def _round_or_none(total: float, count: int, places: int) -> Optional[float]:
+    if count <= 0:
+        return None
+    return round(total / count, places)
+
+
+def summarize_records(
+    records: List[Any],
+    min_samples: int,
+    recent: int,
+    deadline: float,
+    clock: Callable[[], float],
+    more: bool,
+    limit: int,
+    offset: int,
+) -> Dict[str, Any]:
+    """Fold one bounded ledger page into the study response.
+
+    `clock() >= deadline` stops the fold. Rows not yet read are absent, and
+    the response says so with truncated=true. This function does no I/O.
+    """
+    parsed = 0
+    stopped = False
+    usable: List[dict] = []
+    total = len(records or [])
+    for rec in records or []:
+        if clock() >= deadline:
+            stopped = True
+            break
+        parsed += 1
+        if isinstance(rec, dict):
+            usable.append(rec)
+    corrected = _apply_page_corrections(usable)
+    opens: Dict[str, str] = {}
+    closes: List[Dict[str, Any]] = []
+    evidence: List[dict] = []
+    for rec in corrected:
+        event = str(rec.get("event") or "")
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        ticker = str(data.get("ticker") or data.get("symbol") or "").upper()
+        if event == "position_opened":
+            setup = _blank(data.get("setup"))
+            if ticker and setup:
+                opens[ticker] = setup
+            continue
+        if event == "setup_evidence_imported":
+            evidence.append(rec)
+            continue
+        if event != "position_closed":
+            continue
+        setup = _blank(data.get("setup")) or opens.get(ticker)
+        frac = _num(data.get("peak_mfe_pct"))
+        closes.append({
+            "seq": rec.get("seq"),
+            "closed_at": rec.get("ts") or data.get("closed_at"),
+            "ticker": ticker or None,
+            "setup": setup,
+            "exit_reason": _blank(data.get("reason")),
+            "pnl_basis": _blank(data.get("basis")) or _blank(data.get("pnl_basis")),
+            "realized_pnl_pct": _num(data.get("realized_pnl_pct")),
+            "realized_pnl_usd": _num(data.get("realized_pnl_usd")),
+            "account_pnl_pct": _num(data.get("account_pnl_pct")),
+            "peak_r": _num(data.get("peak_r")),
+            "peak_mfe_frac": frac,
+            "peak_mfe_pct": None if frac is None else frac * 100.0,
+            "peak_basis": _blank(data.get("peak_basis")),
+            "underlying_entry": None,
+            "underlying_stop": None,
+            "origin": _blank(data.get("origin")),
+            "signal_id": _blank(data.get("signal_id")),
+            "instrument": _blank(data.get("instrument")),
+        })
+
+    labeled = sum(1 for row in closes if row["setup"])
+    evidence_setups = set()
+    evidence_records = 0
+    evidence_basis = 0
+    for rec in evidence:
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        setup = _blank(data.get("setup"))
+        if not setup:
+            continue
+        evidence_records += 1
+        evidence_setups.add(setup)
+        if _blank(data.get("pnl_basis")):
+            evidence_basis += 1
+    stamps = [row["closed_at"] for row in closes if row["closed_at"] is not None]
+    coverage_body = {
+        "closes": len(closes),
+        "labeled": labeled,
+        "peak_instrumented": sum(1 for row in closes if row["peak_mfe_frac"] is not None),
+        "premium_basis": sum(1 for row in closes if row["pnl_basis"] == "premium"),
+        "underlying_basis": sum(1 for row in closes if row["pnl_basis"] == "underlying"),
+        "first_close": min(stamps) if stamps else None,
+        "last_close": max(stamps) if stamps else None,
+        "evidence_records": evidence_records,
+        "evidence_setups": len(evidence_setups),
+        "evidence_basis_qualified": evidence_basis,
+        "ledger_records": parsed,
+        "labeled_pct": round(labeled * 100.0 / len(closes), 1) if closes else None,
+        "attribution_ready": labeled >= 5,
+        "windowed": bool(more or offset or stopped),
+    }
+
+    floor = max(1, int(min_samples))
+    pooled: List[Tuple[str, bool, str]] = []
+    for row in closes:
+        if row["setup"] and row["realized_pnl_pct"] is not None:
+            pooled.append((row["setup"], row["realized_pnl_pct"] > 0, "live"))
+    best_evidence: Dict[str, Tuple[float, dict]] = {}
+    for index, rec in enumerate(evidence):
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        if not _blank(data.get("setup")):
+            continue
+        seq = rec.get("seq")
+        seq_n = float(seq) if isinstance(seq, (int, float)) and not isinstance(seq, bool) else float(index)
+        key = _evidence_key(data)
+        prev = best_evidence.get(key)
+        if prev is None or seq_n >= prev[0]:
+            best_evidence[key] = (seq_n, rec)
+    expectancy_evidence: List[Tuple[str, str, float, str]] = []
+    for _seq, rec in best_evidence.values():
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        setup = _blank(data.get("setup"))
+        if not setup:
+            continue
+        won = _as_bool(data.get("won"))
+        if won is not None:
+            pooled.append((setup, won, "evidence"))
+        basis = _blank(data.get("pnl_basis"))
+        pct = _num(data.get("realized_pnl_pct"))
+        if basis in {"premium", "underlying"} and pct is not None:
+            expectancy_evidence.append((setup, basis, pct, "evidence"))
+
+    prior_groups: Dict[str, Dict[str, Any]] = {}
+    for setup, won, src in pooled:
+        key = setup.strip().lower()
+        group = prior_groups.setdefault(key, {
+            "samples": 0, "wins": 0, "live": 0, "evidence": 0, "spellings": {},
+        })
+        group["samples"] += 1
+        if won:
+            group["wins"] += 1
+        if src == "live":
+            group["live"] += 1
+        else:
+            group["evidence"] += 1
+        group["spellings"][setup] = group["spellings"].get(setup, 0) + 1
+    priors: List[Dict[str, Any]] = []
+    for key, group in prior_groups.items():
+        if group["samples"] < floor:
+            continue
+        spelling = sorted(group["spellings"].items(), key=lambda item: (-item[1], item[0]))[0][0]
+        samples = int(group["samples"])
+        wins = int(group["wins"])
+        priors.append({
+            "setup": spelling,
+            "samples": samples,
+            "wins": wins,
+            "win_rate_pct": round(wins * 100.0 / samples, 1) if samples else None,
+            "live_trades": int(group["live"]),
+            "evidence_trades": int(group["evidence"]),
+            "setup_key": key,
+        })
+    priors.sort(key=lambda row: (-(row["win_rate_pct"] if row["win_rate_pct"] is not None else -1), -row["samples"], row["setup_key"]))
+
+    def _accumulate(rows_for_group: List[Tuple[Any, ...]], kind: str) -> List[Dict[str, Any]]:
+        groups: Dict[Any, Dict[str, Any]] = {}
+        for item in rows_for_group:
+            if kind == "performance":
+                setup, basis, row = item
+                group_key = (setup, basis)
+            else:
+                reason, basis, row = item
+                group_key = (reason, basis)
+            acc = groups.setdefault(group_key, {
+                "trades": 0, "wins": 0, "losses": 0, "pnl_sum": 0.0, "pnl_n": 0,
+                "usd_sum": 0.0, "usd_n": 0, "peak_observed": 0, "giveback_sum": 0.0,
+                "giveback_n": 0, "peak_r_sum": 0.0, "peak_r_n": 0, "peak_dropped": 0,
+            })
+            acc["trades"] += 1
+            pct = row["realized_pnl_pct"]
+            if pct is not None:
+                if pct > 0:
+                    acc["wins"] += 1
+                elif pct < 0:
+                    acc["losses"] += 1
+                acc["pnl_sum"] += pct
+                acc["pnl_n"] += 1
+            usd = row["realized_pnl_usd"]
+            if usd is not None:
+                acc["usd_sum"] += usd
+                acc["usd_n"] += 1
+            agree = (
+                row["peak_basis"] is not None
+                and row["pnl_basis"] is not None
+                and row["peak_basis"] == row["pnl_basis"]
+            )
+            if row["peak_mfe_frac"] is not None:
+                if agree:
+                    acc["peak_observed"] += 1
+                    if pct is not None and row["peak_mfe_pct"] is not None:
+                        acc["giveback_sum"] += row["peak_mfe_pct"] - pct
+                        acc["giveback_n"] += 1
+                else:
+                    acc["peak_dropped"] += 1
+            if agree and row["peak_r"] is not None:
+                acc["peak_r_sum"] += row["peak_r"]
+                acc["peak_r_n"] += 1
+        built: List[Dict[str, Any]] = []
+        for group_key, acc in groups.items():
+            trades = int(acc["trades"])
+            body = {
+                "pnl_basis": group_key[1],
+                "trades": trades,
+                "wins": int(acc["wins"]),
+                "win_rate_pct": round(acc["wins"] * 100.0 / trades, 1) if trades else None,
+                "avg_pnl_pct": _round_or_none(acc["pnl_sum"], acc["pnl_n"], 2),
+                "total_pnl_usd": round(acc["usd_sum"], 2) if acc["usd_n"] else None,
+                "avg_peak_r": _round_or_none(acc["peak_r_sum"], acc["peak_r_n"], 2),
+                "peak_observed": int(acc["peak_observed"]),
+                "avg_giveback_pct": _round_or_none(acc["giveback_sum"], acc["giveback_n"], 2),
+                "peak_dropped_basis": int(acc["peak_dropped"]),
+            }
+            if kind == "performance":
+                body["setup"] = group_key[0]
+                body["losses"] = int(acc["losses"])
+            else:
+                body["exit_reason"] = group_key[0]
+            built.append(body)
+        return built
+
+    performance = _accumulate(
+        [(row["setup"], row["pnl_basis"], row) for row in closes if row["setup"]],
+        "performance",
+    )
+    performance.sort(key=lambda row: (
+        row["total_pnl_usd"] is None,
+        -(row["total_pnl_usd"] or 0),
+        str(row.get("setup") or ""),
+    ))
+    exits = _accumulate(
+        [(row["exit_reason"], row["pnl_basis"], row) for row in closes if row["exit_reason"]],
+        "exit",
+    )
+    exits.sort(key=lambda row: (-row["trades"], str(row.get("exit_reason") or "")))
+
+    exp_groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    def _add_exp(setup: str, basis: str, pct: float, src: str) -> None:
+        key = (setup.strip().lower(), basis)
+        group = exp_groups.setdefault(key, {
+            "trades": 0, "live": 0, "evidence": 0, "wins": 0, "pct_sum": 0.0, "spellings": {},
+        })
+        group["trades"] += 1
+        if src == "live":
+            group["live"] += 1
+        else:
+            group["evidence"] += 1
+        if pct > 0:
+            group["wins"] += 1
+        group["pct_sum"] += pct
+        group["spellings"][setup] = group["spellings"].get(setup, 0) + 1
+
+    for row in closes:
+        if row["setup"] and row["pnl_basis"] in {"premium", "underlying"} and row["realized_pnl_pct"] is not None:
+            _add_exp(row["setup"], row["pnl_basis"], row["realized_pnl_pct"], "live")
+    for setup, basis, pct, src in expectancy_evidence:
+        _add_exp(setup, basis, pct, src)
+    expectancy: List[Dict[str, Any]] = []
+    for (setup_key, basis), group in exp_groups.items():
+        trades = int(group["trades"])
+        spelling = sorted(group["spellings"].items(), key=lambda item: (-item[1], item[0]))[0][0]
+        expectancy.append({
+            "setup_key": setup_key,
+            "setup": spelling,
+            "pnl_basis": basis,
+            "trades": trades,
+            "live_trades": int(group["live"]),
+            "evidence_trades": int(group["evidence"]),
+            "wins": int(group["wins"]),
+            "win_rate_pct": round(group["wins"] * 100.0 / trades, 1) if trades else None,
+            "expectancy_pct": round(group["pct_sum"] / trades, 2) if trades else None,
+        })
+    expectancy.sort(key=lambda row: (-row["trades"], str(row["setup"])))
+
+    def _seq_sort(item: Tuple[int, Dict[str, Any]]) -> Tuple[int, float]:
+        index, row = item
+        seq = row.get("seq")
+        if isinstance(seq, (int, float)) and not isinstance(seq, bool):
+            return (1, float(seq))
+        return (0, float(index))
+
+    newest = [row for _index, row in sorted(enumerate(closes), key=_seq_sort, reverse=True)]
+    recent_rows = []
+    for row in newest[: max(1, int(recent))]:
+        public = dict(row)
+        public.pop("peak_mfe_frac", None)
+        recent_rows.append(public)
+
+    reasons: List[str] = []
+    if stopped:
+        reasons.append(
+            "time budget exhausted while reading the ledger page "
+            f"(parsed {parsed} of {total} records)"
+        )
+    if more:
+        reasons.append(
+            "bounded ledger page: older records were not scanned "
+            f"(limit={int(limit)}, offset={int(offset)})"
+        )
+    body = _empty_study()
+    body["coverage"] = coverage_body
+    body["setup_priors"] = priors
+    body["setup_performance"] = performance
+    body["setup_expectancy"] = expectancy
+    body["exit_reasons"] = exits
+    body["recent_closes"] = recent_rows
+    body["available"] = True
+    body["truncated"] = bool(reasons)
+    body["truncated_reason"] = "; ".join(reasons) if reasons else None
+    body["sections_completed"] = [
+        "coverage", "setup_priors", "setup_performance",
+        "setup_expectancy", "exit_reasons", "recent_closes",
+    ]
+    return body
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    name = type(exc).__name__.lower()
+    if "timeout" in name or "cancel" in name:
+        return True
+    text = str(exc).lower()
+    return "timeout" in text or "canceling statement" in text or "query canceled" in text
+
+
+def _partial_study(reason: str, page: Dict[str, Any], budget: float) -> Dict[str, Any]:
+    body = _empty_study()
+    body.update({
+        "available": True,
+        "truncated": True,
+        "truncated_reason": reason,
+        "page": page,
+        "sections_completed": [],
+        "time_budget_s": budget,
+    })
+    return body
+
+
+async def sql_ledger_page(limit: int, offset: int, timeout_s: float) -> Dict[str, Any]:
+    """Newest `limit` ledger lines. Never selects the study views.
+
+    statement_timeout is LOCAL to this transaction so a cancelled page cannot
+    leave a short timeout on the shared pool the order path uses.
+    """
+    if _engine is None:
+        return {"records": [], "more": False, "offline": True}
+    lim = max(1, min(int(limit), STUDY_LEDGER_WINDOW_MAX))
+    off = max(0, int(offset))
+    sql = (
+        "SELECT seq, line FROM bot_private.bot_ledger "
+        f"ORDER BY seq DESC LIMIT {lim + 1} OFFSET {off}"
+    )
+    async with _engine.connect() as conn:
+        try:
+            ms = max(1, int(float(timeout_s) * 1000))
+            await conn.exec_driver_sql(f"SET LOCAL statement_timeout = {ms}")
+        except Exception:
+            logger.debug("study page statement_timeout not set")
+        result = await conn.exec_driver_sql(sql)
+        fetched = list(result.fetchall())
+    more = len(fetched) > lim
+    fetched = fetched[:lim]
+
+    def _parse(rows: List[Any]) -> List[dict]:
+        out: List[dict] = []
+        for seq, line in reversed(rows):
+            rec = _parse_ledger_line(seq, line)
+            if rec is not None:
+                out.append(rec)
+        return out
+
+    records = await asyncio.to_thread(_parse, fetched)
+    return {"records": records, "more": more}
+
+
+async def summary(
+    min_samples: int = 1,
+    recent: int = 10,
+    offset: int = 0,
+    window: Optional[int] = None,
+    load_page: Optional[Callable[..., Any]] = None,
+    budget_s: Optional[float] = None,
+    clock: Optional[Callable[[], float]] = None,
+) -> Dict[str, Any]:
+    """Study response for one bounded ledger page, under a hard time budget.
+
+    The same keys as before (coverage, setup_priors, setup_performance,
+    setup_expectancy, exit_reasons, recent_closes). `truncated` and
+    `truncated_reason` are added. A partial page is still `available` true.
+    `available` false is only the offline / query-error case.
+    """
+    tick = clock or time.monotonic
+    if budget_s is None:
+        budget = study_time_budget_s()
+    else:
+        try:
+            budget = float(budget_s)
+        except (TypeError, ValueError):
+            budget = study_time_budget_s()
+        if budget != budget:
+            budget = study_time_budget_s()
+        budget = max(0.0, min(budget, 12.0))
+    started = tick()
+    deadline = started + budget
+    limit, off, offset_capped = _page_bounds(window, offset)
+    page = {"limit": limit, "offset": off, "returned": 0}
+    if offset_capped:
+        return _partial_study(
+            f"offset is outside the bounded window of {STUDY_LEDGER_WINDOW_MAX} newest ledger lines",
+            page,
+            budget,
+        )
+    if load_page is None and _engine is None:
         return {
-            "available": True,
-            "coverage": await coverage(),
-            "setup_priors": await setup_priors(min_samples),
-            "setup_performance": await setup_performance(),
-            "setup_expectancy": await setup_expectancy(),
-            "exit_reasons": await exit_reasons(),
-            "recent_closes": await recent_closes(recent),
+            "available": False,
+            "error": "no DATABASE_URL — study layer offline",
+            "truncated": False,
+            "truncated_reason": None,
+            "page": page,
+            "sections_completed": [],
+            "time_budget_s": budget,
         }
-    except Exception as e:
-        logger.error(f"study summary failed: {e}")
-        return {"available": False, "error": f"{type(e).__name__}: {e}"}
+
+    async def _default_page(page_limit: int, page_offset: int) -> Dict[str, Any]:
+        remaining = max(0.05, deadline - tick())
+        return await sql_ledger_page(page_limit, page_offset, remaining)
+
+    loader = load_page or _default_page
+    remaining = deadline - tick()
+    if remaining <= 0:
+        return _partial_study(
+            f"time budget {budget:g}s exhausted before the ledger page was read",
+            page,
+            budget,
+        )
+    try:
+        loaded = await asyncio.wait_for(loader(limit, off), timeout=remaining)
+    except asyncio.TimeoutError:
+        return _partial_study(
+            f"time budget {budget:g}s exhausted before the bounded ledger page returned",
+            page,
+            budget,
+        )
+    except Exception as exc:
+        if _is_timeout(exc):
+            return _partial_study(
+                f"time budget {budget:g}s exhausted before the bounded ledger page returned",
+                page,
+                budget,
+            )
+        logger.error(f"study summary failed: {exc}")
+        return {
+            "available": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "truncated": False,
+            "truncated_reason": None,
+            "page": page,
+            "sections_completed": [],
+            "time_budget_s": budget,
+        }
+    if not isinstance(loaded, dict):
+        loaded = {"records": [], "more": False}
+    if loaded.get("offline") and not loaded.get("records"):
+        return {
+            "available": False,
+            "error": "no DATABASE_URL — study layer offline",
+            "truncated": False,
+            "truncated_reason": None,
+            "page": page,
+            "sections_completed": [],
+            "time_budget_s": budget,
+        }
+    records = [rec for rec in (loaded.get("records") or []) if isinstance(rec, dict)]
+    more = bool(loaded.get("more"))
+    page["returned"] = len(records)
+    remaining = deadline - tick()
+    if remaining <= 0:
+        return _partial_study(
+            f"time budget {budget:g}s exhausted before aggregation",
+            page,
+            budget,
+        )
+    try:
+        built = await asyncio.wait_for(
+            asyncio.to_thread(
+                summarize_records,
+                records,
+                min_samples,
+                recent,
+                deadline,
+                tick,
+                more,
+                limit,
+                off,
+            ),
+            timeout=max(0.05, remaining),
+        )
+    except asyncio.TimeoutError:
+        return _partial_study(
+            f"time budget {budget:g}s exhausted during aggregation",
+            page,
+            budget,
+        )
+    if isinstance(built, dict):
+        built["page"] = page
+        built["time_budget_s"] = budget
+        return built
+    return _partial_study(
+        f"time budget {budget:g}s exhausted during aggregation",
+        page,
+        budget,
+    )
 
 ''')
 
@@ -14352,6 +15030,17 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # rails, 3:40 PM ET flatten, scanner 84-A, and the fail-closed VWAP gate
 # stay as they are. Forty paired entries is a floor for the pre-registered
 # comparison, not a flip. A live flip is a later default-off PR.
+# 5.99.1: GET /study no longer runs the unbounded study views on the
+# request. Those views parse every ledger line and laterally rescan the
+# chain per close, which returned 0 bytes after the 20s and 60s client
+# timeouts. The handler reads a bounded page off the event loop, stops at
+# a hard time budget, and returns the rows it finished with truncated=true
+# and the reason. GET /pro-trader/report adds a read-only reconciliation
+# of that report, GET /trades, and GET /learning. The report reads the
+# same sign-corrected EDGE_LOOKBACK tail as learning, skips unpriced
+# closes, and collapses a repeated close identity. Recorded ledger lines
+# are not modified. A parallel change may land as 5.99.0; whichever
+# merges second rebases this version and this changelog entry.
 # 5.99.2: a flatten close reported as DONE_TRADE_EXECUTED is filled, same
 # as EXECUTED, so the path does not send a second sell. Flatten
 # bookkeeping re-reads the position and writes only the fields this pass
@@ -37426,23 +38115,48 @@ def _pro_trader_status_payload(trades_today: Any = None) -> Dict[str, Any]:
     return body
 
 
+def _report_ledger_window(count: int) -> List[dict]:
+    """Sign-corrected newest `count` ledger lines. Bounded tail, not a full read.
+
+    Same window `_corrected_ledger` returns. The tail helper stops after
+    `count` lines, so a long chain does not have to be loaded to answer
+    the report.
+    """
+    path = _active_ledger_path()
+    if path is None:
+        return []
+    lines = _jsonl_tail_lines(path, count)
+    records: List[dict] = []
+    for raw in lines:
+        try:
+            rec = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, AttributeError):
+            continue
+        if isinstance(rec, dict):
+            records.append(rec)
+    return apply_pnl_sign_corrections(records)
+
+
 async def _pro_trader_report_payload() -> Dict[str, Any]:
     decisions: List[Dict[str, Any]] = []
-    closes: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
     try:
-        for rec in trade_ledger.recent(1200):
+        # Same sign-corrected tail GET /learning/report reads. The old raw
+        # recent(1200) dropped closes once non-close events filled the tail
+        # and summed the booked sign instead of the corrected one. The read
+        # is the bounded tail, off the event loop.
+        records = await asyncio.to_thread(_report_ledger_window, EDGE_LOOKBACK)
+        for rec in records:
             if not isinstance(rec, dict):
                 continue
             data = rec.get("data") if isinstance(rec.get("data"), dict) else None
             if not data:
                 continue
-            event = str(rec.get("event") or "")
-            if event == "pro_trader_decision":
+            if str(rec.get("event") or "") == "pro_trader_decision":
                 decisions.append(data)
-            elif event == "position_closed":
-                closes.append(data)
     except Exception as e:
         logger.warning(f"pro trader report ledger unreadable: {e}")
+    closes = pro_trader.report_closes(records)
     if not decisions:
         decisions = list(_PRO_TRADER.decisions)
     try:
@@ -37465,6 +38179,26 @@ async def _pro_trader_report_payload() -> Dict[str, Any]:
     )
     report["mode"] = str(live_policy("pro_trader_mode") or "shadow")
     report["version"] = BOT_VERSION
+    history_rows: List[Dict[str, Any]] = []
+    history_read = False
+    try:
+        raw_items = await state.list_range(TRADES_HISTORY_KEY, TRADES_HISTORY_MAX)
+        for raw in raw_items:
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(parsed, dict):
+                history_rows.append(parsed)
+        history_read = True
+    except Exception as e:
+        logger.warning("pro trader report history list unreadable: %s", type(e).__name__)
+    report["reconciliation"] = pro_trader.reconcile_report_sources(
+        records,
+        history_rows,
+        history_read=history_read,
+        window=EDGE_LOOKBACK,
+    )
     try:
         report["chain_shadow"] = chain_shadow_report(trade_ledger.recent(4000))
     except Exception as e:
@@ -37646,8 +38380,10 @@ def _review_row_from_ledger(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def ledger_review_rows(count: int, cap: Optional[int] = None) -> List[Dict[str, Any]]:
     """Newest-first position_closed rows, scanning at most `cap` ledger records.
 
-    Stops once `count` closes are in hand. Duplicate `ledger_seq` values keep
-    the newest copy. Default cap is TRADES_LEDGER_FALLBACK_CAP (EDGE_LOOKBACK),
+    Stops once `count` closes are in hand. A repeated seq|ledger_ts|ticker
+    keeps the newest copy. seq alone is not the identity: a chain restart
+    reuses seq, and two different closes that share it both stay. Default
+    cap is TRADES_LEDGER_FALLBACK_CAP (EDGE_LOOKBACK),
     the same newest slice GET /learning/report reads, so a count of 500 reaches
     the live closes that report counts. Worst case at that cap: buffer and
     parse EDGE_LOOKBACK (default 3000) JSONL records from the end of the file.
@@ -37672,11 +38408,11 @@ def ledger_review_rows(count: int, cap: Optional[int] = None) -> List[Dict[str, 
         row = _review_row_from_ledger(rec)
         if row is None:
             continue
-        seq = row.get("ledger_seq")
-        if seq is not None and not isinstance(seq, (dict, list)):
-            if seq in seen:
+        ident = pro_trader.review_identity(row)
+        if ident is not None:
+            if ident in seen:
                 continue
-            seen.add(seq)
+            seen.add(ident)
         out.append(row)
         if len(out) >= want:
             break
@@ -37850,6 +38586,7 @@ async def trades_review(
                 trades.append(parsed)
     except Exception as e:
         logger.warning("/trades history list unreadable: %s", type(e).__name__)
+    trades = pro_trader.dedupe_review_rows(trades)
     if not trades:
         source = "ledger"
         trades = await asyncio.to_thread(
@@ -37864,10 +38601,69 @@ async def trades_review(
     }
 
 
+def _study_file_page(limit: int, offset: int) -> Optional[Dict[str, Any]]:
+    """Newest ledger lines from the local chain, reading only that page.
+
+    Returns None when there is no ledger file or the file is empty, so the
+    caller can fall back to a bounded SQL tail. An empty local file after a
+    restart is not proof the mirror is empty.
+    """
+    path = _active_ledger_path()
+    if path is None or not path.is_file():
+        return None
+    try:
+        if path.stat().st_size == 0:
+            return None
+    except OSError:
+        return None
+    limit = max(1, min(int(limit), study.STUDY_LEDGER_WINDOW_MAX))
+    offset = max(0, int(offset))
+    if offset >= study.STUDY_LEDGER_WINDOW_MAX:
+        return {"records": [], "more": True, "capped": True}
+    if offset + limit > study.STUDY_LEDGER_WINDOW_MAX:
+        limit = study.STUDY_LEDGER_WINDOW_MAX - offset
+    probe = offset + limit + 1
+    lines = _jsonl_tail_lines(path, probe)
+    more = len(lines) > offset + limit
+    if more:
+        lines = lines[-(offset + limit):]
+    if offset:
+        selected = lines[: max(0, len(lines) - offset)] if len(lines) > offset else []
+    else:
+        selected = lines
+    if len(selected) > limit:
+        selected = selected[-limit:]
+    records: List[Dict[str, Any]] = []
+    for raw in selected:
+        try:
+            rec = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, AttributeError):
+            continue
+        if isinstance(rec, dict):
+            records.append(rec)
+    return {"records": records, "more": more}
+
+
+async def _study_ledger_page(limit: int, offset: int) -> Dict[str, Any]:
+    """Bounded study page. File tail first, then a LIMITed SQL tail.
+
+    The file read and the SQL parse run off the event loop. Neither path
+    selects bot_trade_closes or bot_ledger_events.
+    """
+    page = await asyncio.to_thread(_study_file_page, limit, offset)
+    if page is not None:
+        return page
+    if study.is_available():
+        return await study.sql_ledger_page(limit, offset, study.study_time_budget_s())
+    return {"records": [], "more": False, "offline": True}
+
+
 @app.get("/study")
 async def study_endpoint(
     min_samples: int = Query(1, ge=1, le=500),
     recent: int = Query(10, ge=1, le=200),
+    offset: int = Query(0, ge=0, le=50000),
+    window: int = Query(study.STUDY_LEDGER_WINDOW, ge=1, le=study.STUDY_LEDGER_WINDOW_MAX),
 ):
     """What the ledger has actually taught this bot.
 
@@ -37879,8 +38675,19 @@ async def study_endpoint(
     percent describes a levered option contract, an underlying percent
     describes the stock, and averaging the two produces a confident number
     that means nothing.
+
+    The page is the newest `window` ledger lines (offset pages backward inside
+    a hard cap). The handler stops at a time budget and returns what it
+    finished with truncated=true and the reason, instead of scanning the
+    study views on the request.
     """
-    out = await study.summary(min_samples=min_samples, recent=recent)
+    out = await study.summary(
+        min_samples=min_samples,
+        recent=recent,
+        offset=offset,
+        window=window,
+        load_page=_study_ledger_page,
+    )
     if _study_views is not None:
         out["views"] = _study_views
     return out
