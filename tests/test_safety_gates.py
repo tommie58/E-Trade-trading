@@ -494,10 +494,13 @@ def test_call_index_vwap_gate_blocks_calls_below_vwap():
         {"symbol": "SPY", "last": 500.0, "vwap": 505.0},
     ]) is None
     assert main_bot.assess_call_index_vwap_gate("CALL", [], enabled=False) is None
-    # Unmeasured → fail open.
-    assert main_bot.assess_call_index_vwap_gate("CALL", [
+    # Unmeasured → fail closed. A missing VWAP is not permission to buy calls.
+    unmeasured = main_bot.assess_call_index_vwap_gate("CALL", [
         {"symbol": "SPY", "last": 500.0, "vwap": None},
-    ]) is None
+        {"symbol": "QQQ", "last": 400.0},
+    ])
+    assert unmeasured is not None and "unmeasured" in unmeasured
+    assert main_bot.assess_call_index_vwap_gate("CALL", []) is not None
 
 
 def test_native_trail_retry_waits_until_the_stamp():

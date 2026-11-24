@@ -364,6 +364,11 @@ def test_pro_trader_endpoints_use_the_webhook_secret(monkeypatch):
     assert body["morning_loss_shutoff"] is False
     assert "pacing" in body
     assert body["pacing"]["min_trades_per_day"] == 4
+    assert body["loss_streak"]["enabled"] is True
+    assert body["loss_streak"]["threshold"] == main_bot.MAX_CONSECUTIVE_LOSSES
+    assert body["loss_streak"]["cooldown_minutes"] == main_bot.STREAK_COOLDOWN_MINUTES
+    assert "cooldown_active" in body["loss_streak"]
+    assert "consecutive_losses" in body["loss_streak"]
     assert body["hard_rails"]["max_size_multiplier"] == 1.0
     assert body["hard_rails"]["flatten_et"] == "15:40"
     assert report.status_code == 200
