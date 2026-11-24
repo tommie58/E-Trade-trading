@@ -4998,8 +4998,6 @@ def plan_scheduled_exit(
     expiry: Any = None,
     today: Any = None,
     flatten_all: bool = True,
-    *,
-    retry_until_minute: Any = None,
 ) -> Dict[str, Any]:
     """Do the CLOCK-driven exits fire? Returns
     ``{"fire": bool, "reason": str|None, "detail": str}``.
@@ -5039,14 +5037,7 @@ def plan_scheduled_exit(
 
     due_for_eod = bool(flatten_all) or contract_expires_by(expiry, today)
     if eod_enabled and minutes is not None and not is_weekend and due_for_eod:
-        # Regular window is [close-20, close). `retry_until_minute` is only
-        # the post-bell flatten retry (close through close+15) and does not
-        # move the window the rest of the session uses.
-        grace = _finite(retry_until_minute)
-        in_window = window_open <= minutes < close
-        if not in_window and grace is not None and close <= minutes <= grace:
-            in_window = True
-        if in_window:
+        if window_open <= minutes < close:
             hh, mm = divmod(int(minutes), 60)
             why = (
                 "day-trade flatten — no overnight holds"
@@ -14526,9 +14517,6 @@ def _install_session_clock() -> None:
 
 _install_session_clock()
 
-# How long after the bell a failed scheduled flatten may still be retried.
-# 13:15 ET on a half day, 16:15 ET on a full day. Entries stay closed.
-FLATTEN_RETRY_GRACE_MIN = 15
 FLATTEN_WINDOW_ENTRY_REASON = "flatten window open — entry refused"
 
 
@@ -14547,56 +14535,6 @@ def _flatten_window_open(now_et: datetime) -> bool:
     minute = now_et.hour * 60 + now_et.minute
     close = _session_close_minute(now_et)
     return (close - _flatten_lead_minutes()) <= minute < close
-
-
-def flatten_retry_window(now_et: datetime) -> bool:
-    """True from the bell through close+15, weekdays that are not holidays.
-
-    13:00–13:15 on a half day, 16:00–16:15 on a full day. 13:16 is outside.
-    """
-    if now_et.weekday() >= 5:
-        return False
-    if now_et.date().isoformat() in _MARKET_HOLIDAYS:
-        return False
-    minute = now_et.hour * 60 + now_et.minute
-    close = _session_close_minute(now_et)
-    return close <= minute <= close + FLATTEN_RETRY_GRACE_MIN
-
-
-def flatten_retry_claim(pos: Any) -> Optional[dict]:
-    """A copy of a tracked option position claimed for one flatten close.
-
-    None when the position is missing, not an option, already flat, or a
-    close is already pending, working, or finished. Claiming does not place
-    an order and never describes an entry.
-    """
-    if not isinstance(pos, dict):
-        return None
-    if pos.get("pending_close") or pos.get("close_order_id") or pos.get("scheduled_exit_done") or pos.get("flatten_close_pending"):
-        return None
-    contract = pos.get("contract") if isinstance(pos.get("contract"), dict) else {}
-    if not contract.get("right"):
-        return None
-    try:
-        qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
-    except (TypeError, ValueError):
-        return None
-    if qty < 1:
-        return None
-    return {**pos, "flatten_close_pending": True}
-
-
-def plan_flatten_retry_tick(positions: Any, now_et: datetime) -> List[str]:
-    """Tracked names that may receive one flatten close on this retry tick.
-
-    Empty outside the grace window and empty when a close is already
-    pending, working, or done. The result is a list of existing positions,
-    never a new entry.
-    """
-    if not isinstance(now_et, datetime) or not flatten_retry_window(now_et):
-        return []
-    book = positions if isinstance(positions, dict) else {}
-    return [str(ticker) for ticker in sorted(book.keys()) if flatten_retry_claim(book.get(ticker)) is not None]
 
 
 def _is_market_open_at(now_et: datetime) -> bool:
@@ -25336,8 +25274,7 @@ async def _app_owns_exit(ticker: str, pos: dict) -> bool:
         return False
 
 
-async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float,
-                                retry_until_minute: Any = None) -> bool:
+async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
     """Close the position when the CLOCK says it must go.
 
     THE OTHER TWO MISSING EXITS. The Auto-Exit card promises four things; the
@@ -25394,7 +25331,6 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float,
         # A half day closes at 13:00 — the flatten must land at 12:40, not
         # hours after the bell when the contract is already stuck.
         close_minute=_session_close_minute(now_et),
-        retry_until_minute=retry_until_minute,
         # Day-trade mode: 3:40 closes every open option. Overnight mode:
         # only a contract expiring TODAY (longer-dated left to stop/trail).
         expiry=contract.get("expiration"),
@@ -31577,62 +31513,9 @@ async def _trail_pass() -> None:
             logger.warning(f"[TRAIL] {ticker} pass failed: {e}")
 
 
-async def _flatten_retry_pass() -> None:
-    """Retry the scheduled flatten for positions still open after the bell.
-
-    Exits only, and only names the bot already tracks. A position with a
-    pending or working close is skipped, so two ticks send at most one
-    close. The claim is cleared when this tick did not leave a working
-    close, so a later tick inside the grace can try again. Entries are
-    not placed here.
-    """
-    now_et = _utcnow().astimezone(_ET_ZONE)
-    if not flatten_retry_window(now_et) or load_tokens() is None:
-        return
-    try:
-        positions = await state.all_positions()
-    except Exception as e:
-        logger.warning(f"[FLATTEN RETRY] position read failed: {e}")
-        return
-    grace = _session_close_minute(now_et) + FLATTEN_RETRY_GRACE_MIN
-    for ticker in plan_flatten_retry_tick(positions, now_et):
-        claimed = flatten_retry_claim((positions or {}).get(ticker))
-        if claimed is None:
-            continue
-        try:
-            await state.set_position(ticker, claimed)
-        except Exception as e:
-            logger.warning(f"[FLATTEN RETRY] {ticker} claim not persisted: {e}")
-            continue
-        try:
-            await _maybe_scheduled_exit(ticker, claimed, 0.0, retry_until_minute=grace)
-        except Exception as e:
-            logger.error(f"[FLATTEN RETRY] {ticker} close failed: {e}")
-        try:
-            fresh = await state.get_position(ticker)
-        except Exception:
-            fresh = None
-        if not isinstance(fresh, dict):
-            continue
-        working = bool(
-            fresh.get("pending_close") or fresh.get("close_order_id") or fresh.get("scheduled_exit_done")
-        )
-        if not working and fresh.get("flatten_close_pending"):
-            fresh["flatten_close_pending"] = False
-            try:
-                await state.set_position(ticker, fresh)
-            except Exception as e:
-                logger.warning(f"[FLATTEN RETRY] {ticker} claim clear failed: {e}")
-
-
 async def trailing_worker():
     """Continuous server-side trail. Runs each pass under the distributed
-    `lock:trail_engine` so exactly one worker trails at a time.
-
-    After the bell, and only until close+15, the same lock runs the flatten
-    retry instead of the ratchet. That pass closes positions already open.
-    It does not trail and it does not open anything.
-    """
+    `lock:trail_engine` so exactly one worker trails at a time."""
     if not TRAIL_ENGINE_ENABLED:
         logger.info("[TRAIL] server-side trailing engine DISABLED (TRAIL_ENGINE_ENABLED=false)")
         return
@@ -31645,15 +31528,11 @@ async def trailing_worker():
             # Guardian beat: this loop is alive (in session or not).
             await state.set(GUARDIAN_TRAIL_BEAT_KEY, f"{time.time():.3f}",
                             ex=max(600, GUARDIAN_STALE_SECONDS * 5))
-            retrying = (not _is_market_open()) and flatten_retry_window(_utcnow().astimezone(_ET_ZONE))
-            if load_tokens() is not None and (_is_market_open() or retrying):
+            if _is_market_open() and load_tokens() is not None:
                 lock = state.lock("trail_engine", ttl_ms=max(60_000, TRAIL_INTERVAL_SECONDS * 2000))
                 if await lock.try_acquire():
                     try:
-                        if _is_market_open():
-                            await _trail_pass()
-                        else:
-                            await _flatten_retry_pass()
+                        await _trail_pass()
                     finally:
                         await lock.release()
         except Exception as e:

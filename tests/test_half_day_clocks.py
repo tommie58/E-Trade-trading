@@ -3,6 +3,7 @@
 Frozen America/New_York datetimes. Full-day numbers stay the historical
 constants. The one full-day live change is the 15:40 ET entry block.
 """
+import asyncio
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -23,13 +24,18 @@ def _freeze(monkeypatch, when: datetime) -> None:
     monkeypatch.setattr(main_bot, "_utcnow", lambda: when.astimezone(timezone.utc))
 
 
-def _option(ticker: str = "SPY") -> dict:
+def _open_option(when: datetime, stop_id: str = "resting-stop-1") -> dict:
     return {
-        ticker: {
-            "qty": 1,
-            "filled_qty": 1,
-            "contract": {"right": "CALL", "expiration": "2026-11-27", "strike": 500},
-        }
+        "qty": 1,
+        "filled_qty": 1,
+        "stop_order_id": stop_id,
+        "ts": when.astimezone(timezone.utc).isoformat(),
+        "action": "BUY",
+        "contract": {
+            "right": "CALL",
+            "expiration": when.date().isoformat(),
+            "strike": 500,
+        },
     }
 
 
@@ -225,39 +231,100 @@ def test_information_diffusion_runway_scales_and_full_day_stays_330():
     assert any("330" not in item and "150" in item for item in half_late["unmet"])
 
 
-def test_flatten_retry_is_bounded_idempotent_and_exits_only():
-    half = datetime(2026, 11, 27, 13, 5, tzinfo=ET)
-    book = _option()
-    sent = []
-    for _ in range(2):
-        due = main_bot.plan_flatten_retry_tick(book, half)
-        for ticker in due:
-            claimed = main_bot.flatten_retry_claim(book[ticker])
-            assert claimed is not None
-            assert "action" not in claimed or claimed.get("action") != "BUY"
-            book[ticker] = claimed
-            sent.append(ticker)
-    assert sent == ["SPY"]
-    assert main_bot.plan_flatten_retry_tick(book, half) == []
+class _Book:
+    """In-memory positions. A trail lock or a position write after the bell fails the test."""
 
-    working = _option()
-    working["SPY"]["close_order_id"] = "working-close"
-    assert main_bot.plan_flatten_retry_tick(working, half) == []
-    pending = _option()
-    pending["SPY"]["pending_close"] = True
-    assert main_bot.plan_flatten_retry_tick(pending, half) == []
+    def __init__(self, ticker: str, pos: dict, calls: dict):
+        self.pos = dict(pos)
+        self.ticker = ticker
+        self.calls = calls
 
-    too_late = datetime(2026, 11, 27, 13, 16, tzinfo=ET)
-    assert main_bot.flatten_retry_window(too_late) is False
-    assert main_bot.plan_flatten_retry_tick(_option(), too_late) == []
-    assert main_bot.flatten_retry_window(datetime(2026, 11, 27, 13, 15, tzinfo=ET)) is True
+    async def set(self, *_args, **_kwargs):
+        return None
 
-    # A normal entry is refused after the bell. The retry list is positions
-    # already tracked, not a new order.
-    assert main_bot._entry_session_block(half, "option", False, {}) == (
-        "market closed — entry refused (exchange-aware calendar)"
+    async def all_positions(self):
+        return {self.ticker: dict(self.pos)}
+
+    async def get_position(self, ticker):
+        return dict(self.pos) if ticker == self.ticker else None
+
+    async def set_position(self, ticker, pos):
+        self.calls["writes"].append((ticker, dict(pos)))
+        self.pos = dict(pos)
+
+    def lock(self, *_args, **_kwargs):
+        self.calls["lock"].append(True)
+        raise AssertionError("trail lock acquired after the bell")
+
+
+def _record(calls, name):
+    async def _fn(*args, **kwargs):
+        calls[name].append((args, kwargs))
+        raise AssertionError(f"{name} called after the bell")
+
+    return _fn
+
+
+@pytest.mark.parametrize(
+    "when",
+    (
+        datetime(2026, 11, 27, 13, 0, 1, tzinfo=ET),
+        datetime(2026, 11, 24, 16, 0, 1, tzinfo=ET),
+    ),
+    ids=("2026-11-27 13:00:01", "2026-11-24 16:00:01"),
+)
+def test_after_the_bell_an_open_position_keeps_its_stop(when, monkeypatch):
+    """No flatten, no stop cancel, and no order once the session is over."""
+    stop_id = "resting-stop-1"
+    _freeze(monkeypatch, when)
+    assert main_bot._is_market_open() is False
+    close = main_bot._session_close_minute(when)
+    minute = when.hour * 60 + when.minute
+    verdict = main_bot.trailing_engine.plan_scheduled_exit(
+        held_seconds=600,
+        et_minutes=minute,
+        weekday=when.strftime("%a"),
+        expiry=when.date().isoformat(),
+        today=when.date().isoformat(),
+        flatten_all=True,
+        close_minute=close,
     )
-    assert main_bot._entry_session_block(half, "option", True, {}) is None
+    assert verdict["fire"] is False
+
+    calls = {"cancel": [], "order": [], "flatten": [], "trail": [], "lock": [], "writes": []}
+    pos = _open_option(when, stop_id)
+    book = _Book("SPY", pos, calls)
+    monkeypatch.setattr(main_bot, "state", book)
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", _record(calls, "cancel"))
+    monkeypatch.setattr(main_bot, "_place_option_market_close", _record(calls, "order"))
+
+    closed = asyncio.run(main_bot._maybe_scheduled_exit("SPY", dict(pos), 1.25))
+    assert closed is False
+    assert calls["cancel"] == []
+    assert calls["order"] == []
+    assert calls["writes"] == []
+    assert book.pos["stop_order_id"] == stop_id
+
+    monkeypatch.setattr(main_bot, "TRAIL_ENGINE_ENABLED", True)
+    monkeypatch.setattr(main_bot, "load_tokens", lambda: {"access_token": "present"})
+    monkeypatch.setattr(main_bot, "_worker_stop", False)
+    monkeypatch.setattr(main_bot, "_maybe_scheduled_exit", _record(calls, "flatten"))
+    monkeypatch.setattr(main_bot, "_trail_pass", _record(calls, "trail"))
+
+    async def _one_sleep(_seconds):
+        main_bot._worker_stop = True
+
+    monkeypatch.setattr(main_bot.asyncio, "sleep", _one_sleep)
+    asyncio.run(main_bot.trailing_worker())
+
+    assert calls["flatten"] == []
+    assert calls["trail"] == []
+    assert calls["lock"] == []
+    assert calls["cancel"] == []
+    assert calls["order"] == []
+    assert calls["writes"] == []
+    assert book.pos["stop_order_id"] == stop_id
+    assert book.pos["contract"] == pos["contract"]
 
 
 def test_display_clocks_follow_the_close_and_full_day_labels_stay():
