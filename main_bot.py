@@ -9651,6 +9651,31 @@ def spread_pct(bid: Optional[float], ask: Optional[float]) -> Optional[float]:
 REALTIME_QUOTE_STATUSES = {"REALTIME", "EH_REALTIME"}
 
 
+def _copy_observe_vwap(
+    entry: Dict[str, Any],
+    value_key: str,
+    reason_key: str,
+    unmeasured: str,
+) -> Tuple[Optional[float], Optional[str]]:
+    """Carry a telemetry VWAP off the quote. Zero and non-numeric stay unmeasured.
+
+    Absent keys stay (None, None) so an E*TRADE quote is not labeled as a
+    Massive day VWAP. This never writes the gate's `vwap` field.
+    """
+    if value_key not in entry and reason_key not in entry:
+        return None, None
+    raw = entry.get(value_key)
+    if isinstance(raw, bool) or raw is None or raw == "":
+        return None, unmeasured
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None, unmeasured
+    if not math.isfinite(value) or value <= 0:
+        return None, unmeasured
+    return value, None
+
+
 def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Flatten an E*TRADE QuoteResponse into measured per-symbol readings.
     Only fields the broker actually returned are populated — absent numbers
@@ -9694,7 +9719,27 @@ def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
         # E*TRADE's All quote sometimes carries a session VWAP; Massive may
         # too. Absent → None so the call-index gate can fall through to the
         # scanner's sampled VWAP rather than inventing one.
-        vwap = num(all_q, "vwap") or num(all_q, "VWAP") or num(all_q, "averagePrice")
+        # `vwap` stays the first truthy of vwap / VWAP / averagePrice.
+        # `vwap_field` only names which of those keys won. The gate does not
+        # read it.
+        primary = num(all_q, "vwap")
+        upper = num(all_q, "VWAP")
+        average = num(all_q, "averagePrice")
+        vwap = primary or upper or average
+        if primary:
+            vwap_field = "vwap"
+        elif upper:
+            vwap_field = "VWAP"
+        elif average:
+            vwap_field = "averagePrice"
+        else:
+            vwap_field = None
+        massive_day_vwap, massive_day_vwap_reason = _copy_observe_vwap(
+            entry, "massive_day_vwap", "massive_day_vwap_reason", "day_vw_zero_or_missing",
+        )
+        massive_minute_vw, massive_minute_vw_reason = _copy_observe_vwap(
+            entry, "massive_minute_vw", "massive_minute_vw_reason", "min_vw_zero_or_missing",
+        )
         out.append({
             "symbol": symbol,
             "last": last,
@@ -9711,6 +9756,11 @@ def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
             "total_volume": num(all_q, "totalVolume"),
             "avg_daily_volume": num(all_q, "volume10Day"),
             "vwap": vwap,
+            "vwap_field": vwap_field,
+            "massive_day_vwap": massive_day_vwap,
+            "massive_day_vwap_reason": massive_day_vwap_reason,
+            "massive_minute_vw": massive_minute_vw,
+            "massive_minute_vw_reason": massive_minute_vw_reason,
             # Top-of-book size — the order-book imbalance feature (edge.py).
             "bid_size": num(all_q, "bidSize"),
             "ask_size": num(all_q, "askSize"),
@@ -11969,6 +12019,31 @@ def _ts_seconds(raw: Any) -> Optional[float]:
     return v
 
 
+# A zero day VWAP is what Massive publishes before the open (premarket
+# day.vw is 0). It is not a price. Wiring it into the gate's `vwap` would
+# mark every CALL as above VWAP. These constants are observe-only.
+DAY_VW_UNMEASURED = "day_vw_zero_or_missing"
+MIN_VW_UNMEASURED = "min_vw_zero_or_missing"
+DAY_VW_LABEL = "includes premarket (from 4:00 ET)"
+
+
+def classify_vwap(raw: Any, unmeasured_reason: str) -> Dict[str, Any]:
+    """Positive finite VWAP, or unmeasured.
+
+    Zero, negative, missing, NaN and non-numeric all return
+    ``{"value": None, "reason": unmeasured_reason}``. A 0.0 is never a VWAP.
+    """
+    if isinstance(raw, bool) or raw is None or raw == "":
+        return {"value": None, "reason": unmeasured_reason}
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return {"value": None, "reason": unmeasured_reason}
+    if not math.isfinite(value) or value <= 0:
+        return {"value": None, "reason": unmeasured_reason}
+    return {"value": value, "reason": None}
+
+
 def snapshot_to_quote_data(
     ticker: Dict[str, Any],
     now_s: float,
@@ -12025,12 +12100,23 @@ def snapshot_to_quote_data(
     put("changeClosePercentage", _num(ticker.get("todaysChangePerc")), positive=False)
     put("volume10Day", adv)
 
+    # Official day VWAP and the snapshot's current minute VWAP. Observe-only:
+    # they are NOT copied into All.vwap / VWAP / averagePrice, which is the
+    # key the call-index gate reads after parse_quotes. Zero stays unmeasured.
+    day_obs = classify_vwap(day.get("vw"), DAY_VW_UNMEASURED)
+    minute_obs = classify_vwap(minute.get("vw"), MIN_VW_UNMEASURED)
+
     return {
         "Product": {"symbol": symbol},
         "quoteStatus": status,
         "dateTimeUTC": int(trade_ts) if trade_ts is not None else None,
         "source": "massive",
         "All": all_q,
+        "massive_day_vwap": day_obs["value"],
+        "massive_day_vwap_reason": day_obs["reason"],
+        "massive_day_vwap_label": DAY_VW_LABEL,
+        "massive_minute_vw": minute_obs["value"],
+        "massive_minute_vw_reason": minute_obs["reason"],
     }
 
 
@@ -12206,6 +12292,11 @@ class MassiveClient:
         self.auth_status: Optional[int] = None
         self.calls = 0
         self.failures = 0
+        # Stocks-snapshot auth trail for /status. Not feed-health, not a gate.
+        # `auth_status` above is what the regime fail-safe already reads.
+        self.snapshot_auth: Optional[str] = None
+        self.snapshot_auth_failure_count: int = 0
+        self.snapshot_auth_failed_at: Optional[float] = None
         # Optional async/sync hook. The bot persists counters through StateStore;
         # tests leave it unset and the client still works with no Redis.
         self.on_health: Optional[Any] = None
@@ -12247,18 +12338,29 @@ class MassiveClient:
             if adv is not None:
                 self._adv[sym] = adv
 
-    async def fetch_quote_response(self, symbols: List[str], *, dry_run: bool = False) -> Dict[str, Any]:
+    async def fetch_quote_response(
+        self,
+        symbols: List[str],
+        *,
+        dry_run: bool = False,
+        include_adv: bool = True,
+    ) -> Dict[str, Any]:
         """Massive snapshot for `symbols`, returned in E*TRADE QuoteResponse shape.
         Raises on transport/auth failure so the caller can fall back.
 
         `dry_run` (keyword-only, default False) runs the same read on a copy of
         this client. Live counters, the ADV cache, last-ok/error, and the
         on_health hook are not touched. The live call does not pass it.
+        The shadow copy skips the ADV refresh (`include_adv=False`): a status
+        or explain read must not pull daily aggregates, and it must not fill
+        the live ADV cache. The live call still refreshes ADV.
         """
         if dry_run:
             shadow = copy.deepcopy(self)
             shadow.on_health = None
-            return await MassiveClient.fetch_quote_response(shadow, symbols)
+            # Shadow reads (/status, /explain) must not refresh ADV. That
+            # refetch is a daily-agg call, and the result would die with the copy.
+            return await MassiveClient.fetch_quote_response(shadow, symbols, include_adv=False)
         import httpx  # local: keeps the pure translators importable without httpx
 
         syms = [s.strip().upper() for s in symbols if s and s.strip()]
@@ -12277,8 +12379,17 @@ class MassiveClient:
                     got = data.get("tickers")
                     if isinstance(got, list):
                         tickers.extend(got)
-                await self._refresh_adv(client, syms)
+                if include_adv:
+                    await self._refresh_adv(client, syms)
         except Exception as e:
+            try:
+                message = str(e)
+                if "HTTP 401" in message or "HTTP 403" in message:
+                    self.snapshot_auth_failure_count = int(self.snapshot_auth_failure_count or 0) + 1
+                    self.snapshot_auth_failed_at = time.time()
+                    self.snapshot_auth = "not_authorized" if "HTTP 403" in message else "unauthorized"
+            except Exception:
+                pass
             self.failures += 1
             self.last_error = str(e)[:200]
             await self._notify_health()
@@ -12292,6 +12403,7 @@ class MassiveClient:
         self.last_ok_at = time.time()
         self.last_error = None
         self.auth_status = None
+        self.snapshot_auth = "ok"
         await self._notify_health()
         return out
 
@@ -12420,6 +12532,35 @@ class MassiveClient:
                 if f > 0:
                     cleaned[str(sym).upper()] = f
             self._adv = cleaned
+
+    def stocks_snapshot_telemetry(self) -> Dict[str, Any]:
+        """Read-only stocks-snapshot auth trail for /status.
+
+        Separate from `status()` so feed health, which reads `auth_status`,
+        does not see this counter. A 401 or 403 still raises; the caller
+        still falls back and still calls the snapshot on the next pass.
+        """
+        auth = getattr(self, "snapshot_auth", None)
+        if auth not in ("ok", "not_authorized", "unauthorized"):
+            auth = None
+        try:
+            count = int(getattr(self, "snapshot_auth_failure_count", 0) or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count < 0:
+            count = 0
+        at = getattr(self, "snapshot_auth_failed_at", None)
+        iso = None
+        if isinstance(at, (int, float)) and not isinstance(at, bool):
+            try:
+                iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(at)))
+            except (OverflowError, OSError, ValueError):
+                iso = None
+        return {
+            "stocks_snapshot_auth": auth,
+            "stocks_snapshot_auth_at": iso,
+            "stocks_snapshot_auth_failure_count": count,
+        }
 
     def status(self) -> Dict[str, Any]:
         return {
@@ -13091,7 +13232,9 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # MARKET/LIMIT Good-for-Day, 24/7 session (no equity calendar gate).
 # 5.87.1: pin Individual Crypto 888103-8595 as the crypto-only routing target
 # (dash-tolerant id match, Redis crypto pin, refuse crypto as options pin).
-BOT_VERSION = "5.93.0-pro-day-trader"
+# 5.94.0: observe-only SPY/QQQ VWAP comparison and stocks-snapshot 403
+# telemetry on /status. The gate, filters, sizing, and orders do not read it.
+BOT_VERSION = "5.94.0-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -13608,20 +13751,20 @@ CALL_INDEX_VWAP_SYMBOLS = tuple(
 
 
 def call_index_vwap_gate_status() -> Dict[str, Any]:
-    """Read-only /status view. Re-reads the env at call time.
+    """Read-only view of the gate this process is actually running.
 
-    The gate itself keeps the import-time `CALL_INDEX_VWAP_GATE` value and
-    its fail-closed behavior. This does not change either. `enabled` is the
-    effective boolean (`true` only), and `symbols` is the same list the gate
-    was given, uppercased, with the SPY,QQQ default when the env is blank.
+    `enabled` and `symbols` are the import-time constants. A later edit to
+    the environment does not change the gate and does not change this report.
+    `mode` is `fail_closed` only while the gate is on. While it is off,
+    `_call_index_vwap_block` returns without blocking.
     """
-    enabled = os.getenv("CALL_INDEX_VWAP_GATE", "true").lower() == "true"
-    symbols = [
-        s.strip().upper()
-        for s in os.getenv("CALL_INDEX_VWAP_SYMBOLS", "SPY,QQQ").split(",")
-        if s.strip()
-    ] or ["SPY", "QQQ"]
-    return {"enabled": enabled, "symbols": symbols, "mode": "fail_closed"}
+    enabled = bool(CALL_INDEX_VWAP_GATE)
+    symbols = list(CALL_INDEX_VWAP_SYMBOLS)
+    return {
+        "enabled": enabled,
+        "symbols": symbols,
+        "mode": "fail_closed" if enabled else "off",
+    }
 # Pro Day Trader realignment. Shadow classifies and records verdicts without
 # changing an order. Active may only block or scale size down.
 import pro_trader
@@ -14510,6 +14653,439 @@ async def _index_vwap_quotes(
     return out
 
 
+# Observe-only SPY/QQQ VWAP comparison. Nothing here is an input to
+# assess_call_index_vwap_gate, evaluate_quote, or the pro-trader range.
+_MINUTE_VWAP_REFRESH_S = 90.0
+_MINUTE_VWAP_TIMEOUT_S = 3.0
+_minute_vwap_cache: Dict[str, Dict[str, Any]] = {}
+_minute_vwap_attempt_at: Dict[str, float] = {}
+_minute_vwap_guard: Optional[asyncio.Lock] = None
+
+
+def _minute_vwap_lock() -> asyncio.Lock:
+    global _minute_vwap_guard
+    if _minute_vwap_guard is None:
+        _minute_vwap_guard = asyncio.Lock()
+    return _minute_vwap_guard
+
+
+def _index_observe_symbols() -> List[str]:
+    return list(CALL_INDEX_VWAP_SYMBOLS) or ["SPY", "QQQ"]
+
+
+def _positive_vwap(raw: Any) -> Optional[float]:
+    """A VWAP that can be shown or differenced. Zero is unmeasured."""
+    if isinstance(raw, bool) or raw is None or raw == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
+def _vwap_diff_bps(candidate: Any, baseline: Any) -> Optional[float]:
+    """Basis points of candidate versus baseline. Null when either side is unmeasured.
+
+    Never divides by zero and never treats 0.0 as a VWAP.
+    """
+    current = _positive_vwap(baseline)
+    other = _positive_vwap(candidate)
+    if current is None or other is None:
+        return None
+    return round((other - current) / current * 10000.0, 2)
+
+
+def _null_index_vwap_observe_row(symbol: str) -> Dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "current_vwap": None,
+        "vwap_source": None,
+        "vwap_field": None,
+        "massive_day_vwap": None,
+        "massive_day_vwap_reason": massive.DAY_VW_UNMEASURED,
+        "massive_day_vwap_label": massive.DAY_VW_LABEL,
+        "massive_minute_vw": None,
+        "massive_minute_vw_reason": massive.MIN_VW_UNMEASURED,
+        "session_sampled_vwap": None,
+        "samples_in_window": None,
+        "session_samples": None,
+        "massive_minute_vwap_rth": None,
+        "massive_minute_vwap_rth_reason": None,
+        "massive_minute_vwap_rth_last_bar_ts": None,
+        "massive_minute_vwap_rth_bar_age_seconds": None,
+        "massive_day_vwap_diff_bps": None,
+        "massive_minute_vw_diff_bps": None,
+        "session_sampled_vwap_diff_bps": None,
+        "massive_minute_vwap_rth_diff_bps": None,
+    }
+
+
+def _observe_envelope(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "read_only": True,
+        "massive_day_vwap_label": massive.DAY_VW_LABEL,
+        "indexes": rows,
+    }
+
+
+def minute_aggs_rth_vwap(payload: Any, now_et: datetime) -> Dict[str, Any]:
+    """Real-time regular-hours VWAP from Massive 1-minute aggregates. Pure.
+
+    Bars before 9:30 ET are left out. Each bar prefers its own `vw`, weighted
+    by `v`, and falls back to the close. Never raises.
+    """
+    empty: Dict[str, Any] = {
+        "vwap": None, "last_bar_epoch": None, "last_bar_ts": None, "bar_count": 0,
+    }
+    try:
+        results = (payload or {}).get("results") if isinstance(payload, dict) else None
+        if not isinstance(results, list):
+            return empty
+        open_m = scanner_mod._SESSION_OPEN_MIN
+        close_m = scanner_mod._SESSION_CLOSE_MIN
+        zone = now_et.tzinfo or _ET_ZONE
+        num = 0.0
+        den = 0.0
+        count = 0
+        last_ts: Optional[float] = None
+        for bar in results:
+            if not isinstance(bar, dict):
+                continue
+            ts = massive._ts_seconds(bar.get("t"))
+            if ts is None:
+                continue
+            bar_et = datetime.fromtimestamp(ts, timezone.utc).astimezone(zone)
+            if bar_et.date() != now_et.date() or bar_et > now_et:
+                continue
+            minute = bar_et.hour * 60 + bar_et.minute
+            if minute < open_m or minute >= close_m:
+                continue
+            vol = _positive_vwap(bar.get("v"))
+            px = _positive_vwap(bar.get("vw"))
+            if px is None:
+                px = _positive_vwap(bar.get("c"))
+            if vol is None or px is None:
+                continue
+            num += px * vol
+            den += vol
+            count += 1
+            if last_ts is None or ts > last_ts:
+                last_ts = ts
+        if den <= 0 or last_ts is None:
+            return empty
+        return {
+            "vwap": round(num / den, 4),
+            "last_bar_epoch": last_ts,
+            "last_bar_ts": datetime.fromtimestamp(last_ts, timezone.utc).isoformat(),
+            "bar_count": count,
+        }
+    except Exception:
+        return empty
+
+
+def _minute_vwap_cache_key(symbol: str, session_date: str) -> str:
+    """Cache key is the ET session date plus the symbol. Yesterday's slot is not today's."""
+    return f"{session_date}:{str(symbol or '').upper()}"
+
+
+def _epoch_et_date(epoch: Any, now_et: datetime):
+    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
+        return None
+    try:
+        zone = now_et.tzinfo or _ET_ZONE
+        return datetime.fromtimestamp(float(epoch), timezone.utc).astimezone(zone).date()
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+
+
+def _minute_vwap_gap_reason(now_et: datetime) -> str:
+    """Why a minute VWAP is absent. Before the open there are no RTH bars yet.
+
+    At or after 9:30 ET a value whose last bar is not today is yesterday's VWAP.
+    """
+    minute = now_et.hour * 60 + now_et.minute
+    if minute < scanner_mod._SESSION_OPEN_MIN:
+        return "no_rth_bars_yet"
+    return "minute_vwap_not_today"
+
+
+def _minute_vwap_view_null(reason: str) -> Dict[str, Any]:
+    return {
+        "vwap": None,
+        "reason": reason,
+        "last_bar_ts": None,
+        "age_seconds": None,
+        "bar_count": None,
+    }
+
+
+def _cached_minute_vwap_view(symbol: str, now_et: datetime) -> Dict[str, Any]:
+    """Today's cached RTH minute VWAP, or null. Never a prior session's value."""
+    today = now_et.date()
+    gap = _minute_vwap_gap_reason(now_et)
+    row = _minute_vwap_cache.get(_minute_vwap_cache_key(symbol, today.isoformat()))
+    if not isinstance(row, dict):
+        return _minute_vwap_view_null(gap)
+    if _epoch_et_date(row.get("last_bar_epoch"), now_et) != today:
+        return _minute_vwap_view_null(gap)
+    vwap = _positive_vwap(row.get("vwap"))
+    if vwap is None:
+        return _minute_vwap_view_null("no_rth_bars_yet")
+    epoch = row.get("last_bar_epoch")
+    try:
+        age = round(max(0.0, now_et.timestamp() - float(epoch)), 1)
+    except (TypeError, ValueError):
+        age = None
+    return {
+        "vwap": vwap,
+        "reason": None,
+        "last_bar_ts": row.get("last_bar_ts"),
+        "age_seconds": age,
+        "bar_count": row.get("bar_count"),
+    }
+
+
+async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> None:
+    """Refresh cached regular-hours minute VWAPs. /status only. Never raises.
+
+    At most once per 90s per symbol, with a 3s timeout. Does not use
+    MassiveClient._get, so a failure cannot change auth_status or feed health.
+    The cache is keyed by the ET session date. A response with no positive
+    today-session VWAP does not replace the slot, and a prior day's slot is
+    never read back as today. The lock only records who is due; the HTTP
+    call sits outside it so concurrent polls are not queued on the network.
+    """
+    try:
+        if not massive.enabled():
+            return
+        now_et = _utcnow().astimezone(_ET_ZONE)
+        day = now_et.date().isoformat()
+        now = time.time()
+        lock = _minute_vwap_lock()
+        async with lock:
+            due = []
+            for sym in [str(s).upper() for s in (symbols or _index_observe_symbols()) if s]:
+                last = float(_minute_vwap_attempt_at.get(_minute_vwap_cache_key(sym, day)) or 0)
+                if now - last >= _MINUTE_VWAP_REFRESH_S:
+                    due.append(sym)
+            if not due:
+                return
+            for sym in due:
+                _minute_vwap_attempt_at[_minute_vwap_cache_key(sym, day)] = now
+        import httpx
+        headers = {"Authorization": f"Bearer {massive.api_key()}"}
+        async with httpx.AsyncClient(timeout=_MINUTE_VWAP_TIMEOUT_S) as client:
+            for sym in due:
+                try:
+                    resp = await client.get(
+                        f"{massive.BASE_URL}/v2/aggs/ticker/{sym}/range/1/minute/{day}/{day}",
+                        params={"adjusted": "true", "sort": "asc", "limit": 50000},
+                        headers=headers,
+                    )
+                    if getattr(resp, "status_code", 0) != 200:
+                        continue
+                    parsed = minute_aggs_rth_vwap(resp.json(), now_et)
+                    if _positive_vwap(parsed.get("vwap")) is None:
+                        continue
+                    if _epoch_et_date(parsed.get("last_bar_epoch"), now_et) != now_et.date():
+                        continue
+                    stored = dict(parsed)
+                    stored["session_date"] = day
+                    async with lock:
+                        _minute_vwap_cache[_minute_vwap_cache_key(sym, day)] = stored
+                except Exception:
+                    logger.debug("minute vwap unavailable for %s", sym)
+    except Exception:
+        logger.debug("minute vwap refresh skipped")
+
+
+def observe_index_vwap_row(
+    quote: Dict[str, Any],
+    series: Optional[List[Dict[str, Any]]],
+    now_et: datetime,
+    minute_rth: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """One index's observe-only VWAP row. Never raises. Never returns 0.0 as a VWAP."""
+    symbol = str((quote or {}).get("symbol") or "").upper()
+    try:
+        row = _null_index_vwap_observe_row(symbol)
+        current = _positive_vwap((quote or {}).get("vwap"))
+        if current is not None:
+            row["current_vwap"] = round(current, 6)
+            source = str((quote or {}).get("vwap_source") or "").strip()
+            row["vwap_source"] = source or None
+            field = (quote or {}).get("vwap_field")
+            row["vwap_field"] = field if field in ("vwap", "VWAP", "averagePrice") else None
+        day = massive.classify_vwap((quote or {}).get("massive_day_vwap"), massive.DAY_VW_UNMEASURED)
+        minute_vw = massive.classify_vwap((quote or {}).get("massive_minute_vw"), massive.MIN_VW_UNMEASURED)
+        row["massive_day_vwap"] = day["value"]
+        row["massive_day_vwap_reason"] = day["reason"]
+        row["massive_minute_vw"] = minute_vw["value"]
+        row["massive_minute_vw_reason"] = minute_vw["reason"]
+        session_vwap = None
+        if series is not None:
+            today = scanner_mod.session_series(series, now_et)
+            row["samples_in_window"] = len(series)
+            row["session_samples"] = len(today)
+            session_vwap = _positive_vwap(scanner_mod.sampled_vwap(today))
+            row["session_sampled_vwap"] = session_vwap
+        if isinstance(minute_rth, dict):
+            rth = _positive_vwap(minute_rth.get("vwap"))
+            reason = minute_rth.get("reason")
+        else:
+            rth = None
+            reason = _minute_vwap_gap_reason(now_et)
+        row["massive_minute_vwap_rth"] = rth
+        if rth is not None and isinstance(minute_rth, dict):
+            row["massive_minute_vwap_rth_reason"] = None
+            row["massive_minute_vwap_rth_last_bar_ts"] = minute_rth.get("last_bar_ts")
+            age = minute_rth.get("age_seconds")
+            row["massive_minute_vwap_rth_bar_age_seconds"] = (
+                age if isinstance(age, (int, float)) and not isinstance(age, bool) else None
+            )
+        else:
+            row["massive_minute_vwap_rth_reason"] = reason if isinstance(reason, str) and reason else _minute_vwap_gap_reason(now_et)
+        baseline = row["current_vwap"]
+        row["massive_day_vwap_diff_bps"] = _vwap_diff_bps(row["massive_day_vwap"], baseline)
+        row["massive_minute_vw_diff_bps"] = _vwap_diff_bps(row["massive_minute_vw"], baseline)
+        row["session_sampled_vwap_diff_bps"] = _vwap_diff_bps(session_vwap, baseline)
+        row["massive_minute_vwap_rth_diff_bps"] = _vwap_diff_bps(rth, baseline)
+        return row
+    except Exception:
+        return _null_index_vwap_observe_row(symbol)
+
+
+async def _observe_series(symbol: str) -> Optional[List[Dict[str, Any]]]:
+    try:
+        if scanner is not None:
+            return await scanner._series(symbol)
+        return await _scanner_series_for(symbol)
+    except Exception:
+        return None
+
+
+async def build_call_index_vwap_observe(
+    quotes: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Read-only comparison. Does not fetch minute aggregates. Never raises."""
+    symbols = _index_observe_symbols()
+    try:
+        by_sym: Dict[str, Dict[str, Any]] = {}
+        for quote in quotes or []:
+            if isinstance(quote, dict):
+                by_sym[str(quote.get("symbol") or "").upper()] = quote
+        now_et = _utcnow().astimezone(_ET_ZONE)
+        rows: List[Dict[str, Any]] = []
+        for sym in symbols:
+            try:
+                series = await _observe_series(sym)
+                cached = _cached_minute_vwap_view(sym, now_et)
+                rows.append(observe_index_vwap_row(
+                    by_sym.get(sym) or {"symbol": sym}, series, now_et, cached,
+                ))
+            except Exception:
+                rows.append(_null_index_vwap_observe_row(sym))
+        return _observe_envelope(rows)
+    except Exception:
+        return _observe_envelope([_null_index_vwap_observe_row(sym) for sym in symbols])
+
+
+# /status observe snapshot. Short TTL, one entry per ticker. Concurrent polls
+# share the in-flight read instead of each taking a Massive snapshot.
+_STATUS_OBSERVE_TTL_S = 20.0
+_status_observe_quotes: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_status_observe_flight: Optional[asyncio.Task] = None
+_status_observe_guard: Optional[asyncio.Lock] = None
+
+
+def _status_observe_lock() -> asyncio.Lock:
+    global _status_observe_guard
+    if _status_observe_guard is None:
+        _status_observe_guard = asyncio.Lock()
+    return _status_observe_guard
+
+
+def _status_observe_fresh(symbols: List[str], now: float) -> Optional[List[Dict[str, Any]]]:
+    rows: List[Dict[str, Any]] = []
+    for sym in symbols:
+        hit = _status_observe_quotes.get(sym)
+        if not hit or now - hit[0] >= _STATUS_OBSERVE_TTL_S:
+            return None
+        rows.append(dict(hit[1]))
+    return rows
+
+
+async def _fill_status_observe_quotes(symbols: List[str]) -> List[Dict[str, Any]]:
+    """One shadow quote read. Stores each ticker. Does not refresh ADV."""
+    fetched = await _index_vwap_quotes(tuple(symbols), dry_run=True)
+    now = time.monotonic()
+    stored: List[Dict[str, Any]] = []
+    for row in fetched:
+        if not isinstance(row, dict):
+            continue
+        copied = dict(row)
+        stored.append(copied)
+        sym = str(copied.get("symbol") or "").upper()
+        if sym:
+            _status_observe_quotes[sym] = (now, dict(copied))
+    return stored
+
+
+async def _status_observe_index_quotes() -> List[Dict[str, Any]]:
+    """Cached shadow quotes for /status. The lock only publishes the shared task."""
+    global _status_observe_flight
+    symbols = _index_observe_symbols()
+    fresh = _status_observe_fresh(symbols, time.monotonic())
+    if fresh is not None:
+        return fresh
+    async with _status_observe_lock():
+        fresh = _status_observe_fresh(symbols, time.monotonic())
+        if fresh is not None:
+            return fresh
+        flight = _status_observe_flight
+        if flight is None or flight.done():
+            flight = asyncio.create_task(_fill_status_observe_quotes(list(symbols)))
+            _status_observe_flight = flight
+    return await flight
+
+
+async def call_index_vwap_gate_view() -> Dict[str, Any]:
+    """/status payload: the import-time gate plus the observe block."""
+    view = call_index_vwap_gate_status()
+    try:
+        await refresh_massive_minute_vwap()
+    except Exception:
+        logger.debug("minute vwap refresh skipped")
+    try:
+        quotes = await _status_observe_index_quotes()
+        view["observe"] = await build_call_index_vwap_observe(quotes)
+    except Exception:
+        view["observe"] = _observe_envelope(
+            [_null_index_vwap_observe_row(sym) for sym in _index_observe_symbols()]
+        )
+    return view
+
+
+def _scanner_quote_source_name() -> Optional[str]:
+    last = _scanner_quote_source.get("last")
+    if last == "massive":
+        return "massive"
+    if last == "etrade":
+        return "etrade_fallback"
+    return None
+
+
+def _market_data_status() -> Dict[str, Any]:
+    """Quote-feed telemetry for /status. Does not change which feed is called."""
+    base = {**massive_client.status(), "scanner_feed": dict(_scanner_quote_source)}
+    base.update(massive_client.stocks_snapshot_telemetry())
+    base["quote_source"] = _scanner_quote_source_name()
+    return base
+
+
 async def _call_index_vwap_block(p: dict, *, dry_run: bool = False) -> Optional[str]:
     """Live CALL-vs-index-VWAP check. Fail-closed when VWAP is unmeasured."""
     if not CALL_INDEX_VWAP_GATE:
@@ -14517,14 +15093,24 @@ async def _call_index_vwap_block(p: dict, *, dry_run: bool = False) -> Optional[
     right = _payload_option_right(p)
     if right != "CALL":
         return None
+    quotes: Optional[List[Dict[str, Any]]] = None
     try:
         quotes = await _index_vwap_quotes(dry_run=True) if dry_run else await _index_vwap_quotes()
-        return assess_call_index_vwap_gate(right, quotes, enabled=True)
+        reason = assess_call_index_vwap_gate(right, quotes, enabled=True)
     except Exception as e:
         logger.warning(f"call-index VWAP gate unavailable (CALL entry blocked): {e}")
-        return (
+        reason = (
             "CALL blocked — index VWAP unmeasured (feed error) — fail closed"
         )
+    try:
+        if isinstance(p, dict):
+            p["call_index_vwap_observe"] = await build_call_index_vwap_observe(quotes)
+    except Exception:
+        if isinstance(p, dict):
+            p["call_index_vwap_observe"] = _observe_envelope(
+                [_null_index_vwap_observe_row(sym) for sym in _index_observe_symbols()]
+            )
+    return reason
 
 
 def _is_market_open() -> bool:
@@ -25505,6 +26091,7 @@ def build_trade_review_fields(pos: Optional[dict]) -> Dict[str, Any]:
     if delta is None and contract is not None:
         delta = _finite_or_none(contract.get("delta"))
     entry_index = p.get("entry_index_vwap") if isinstance(p.get("entry_index_vwap"), list) else None
+    entry_observe = p.get("entry_index_vwap_observe") if isinstance(p.get("entry_index_vwap_observe"), dict) else None
     return {
         "origin": origin,
         "signal_id": signal_id,
@@ -25545,6 +26132,7 @@ def build_trade_review_fields(pos: Optional[dict]) -> Dict[str, Any]:
         "entry_bid": _finite_or_none(p.get("entry_bid")),
         "entry_ask": _finite_or_none(p.get("entry_ask")),
         "entry_index_vwap": entry_index,
+        "entry_index_vwap_observe": entry_observe,
         "pro_trader": p.get("pro_trader") if isinstance(p.get("pro_trader"), dict) else None,
     }
 
@@ -25615,12 +26203,18 @@ async def _stamp_entry_market_context(
         current["entry_ask"] = spread_snap.get("ask")
         current["entry_spread"] = spread_snap.get("spread")
         current["entry_spread_pct"] = spread_snap.get("spread_pct")
+    quotes = None
     try:
-        index_rows = snapshot_index_vs_vwap(await _index_vwap_quotes())
+        quotes = await _index_vwap_quotes()
+        index_rows = snapshot_index_vs_vwap(quotes)
         if index_rows:
             current["entry_index_vwap"] = index_rows
     except Exception as e:
         logger.debug(f"[ENTRY CTX] index VWAP unavailable for {ticker}: {e}")
+    try:
+        current["entry_index_vwap_observe"] = await build_call_index_vwap_observe(quotes)
+    except Exception as e:
+        logger.debug(f"[ENTRY CTX] index VWAP observe unavailable for {ticker}: {e}")
     await state.set_position(ticker, current)
     try:
         await trade_ledger.record("entry_market_context", {
@@ -25630,6 +26224,7 @@ async def _stamp_entry_market_context(
             "entry_spread": current.get("entry_spread"),
             "entry_spread_pct": current.get("entry_spread_pct"),
             "entry_index_vwap": current.get("entry_index_vwap"),
+            "entry_index_vwap_observe": current.get("entry_index_vwap_observe"),
         })
     except Exception as e:
         logger.debug(f"[ENTRY CTX] ledger stamp failed for {ticker}: {e}")
@@ -31139,8 +31734,8 @@ async def _scanner_fetch_quotes(symbols: List[str], *, dry_run: bool = False) ->
     """Batched quote read for the scanner: Massive first, E*TRADE fallback.
 
     `dry_run` is keyword-only and defaults False. The live body below is the
-    original path. Only /explain passes True, and that returns before any
-    persist or counter update on the live client.
+    original path. /explain and the /status observe read pass True, and that
+    returns before any persist or counter update on the live client.
     """
     if dry_run:
         return await _scanner_fetch_quotes_readonly(symbols)
@@ -32083,11 +32678,14 @@ async def process_signal(pd: dict, replay: bool = False) -> dict:
             if core_v.get("shadow_key") and blocked == [core_v.get("reason")]:
                 await _record_shadow(pd, core_v)
             await state.set(sig_key, "rejected", ex=86400)
-            await trade_ledger.record("entry_rejected", {
+            rejected = {
                 "ticker": str(pd.get("ticker") or "").upper(),
                 "action": pd.get("action"),
                 "blocked_by": blocked,
-            })
+            }
+            if pd.get("call_index_vwap_observe") is not None:
+                rejected["call_index_vwap_observe"] = pd.get("call_index_vwap_observe")
+            await trade_ledger.record("entry_rejected", rejected)
             await _record_dispatch_verdict(pd, "rejected", "; ".join(blocked))
             return {"status": "rejected", "reason": "; ".join(blocked), "signal_id": sig_key}
         cooldown_key = f"cooldown:{str(pd.get('ticker') or '').upper()}"
@@ -32374,7 +32972,7 @@ async def status():
         **_token_session_fields(),
         "scanner": await scanner.status() if scanner else None,
         # WHERE THE SCANNER'S PRICES COME FROM: Massive (primary) or E*TRADE.
-        "market_data": {**massive_client.status(), "scanner_feed": dict(_scanner_quote_source)},
+        "market_data": _market_data_status(),
         # WHO CAN PLACE A LIVE ENTRY RIGHT NOW — the bot is the arbiter; the
         # app renders this verbatim instead of guessing (assess_entry_paths).
         "entry_paths": await _entry_paths_snapshot(),
@@ -32402,9 +33000,9 @@ async def status():
             "core_book_enabled": CORE_BOOK_ENABLED,
             "itm_expression_enabled": ITM_EXPRESSION_ENABLED,
             "day_trade_mode": DAY_TRADE_MODE,
-            # Read-only. Effective env value at request time; the gate still
-            # uses the import-time constant and fails closed when VWAP is missing.
-            "call_index_vwap_gate": call_index_vwap_gate_status(),
+            # Read-only. Import-time constant the running gate uses.
+            # mode is fail_closed only while that constant is on.
+            "call_index_vwap_gate": await call_index_vwap_gate_view(),
             "require_proven_ev": REQUIRE_PROVEN_EV,
             "risk_per_trade_pct": live_policy("risk_per_trade_pct"),
             "daily_loss_limit_pct": live_policy("daily_loss_limit_pct"),
