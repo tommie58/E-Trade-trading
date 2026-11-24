@@ -2650,20 +2650,27 @@ def restore_lines(path: Path, lines: List[str]) -> int:
         return 0
 
 
-async def record(event: str, data: Optional[Dict[str, Any]] = None) -> None:
-    """Append an event. Never raises — a ledger failure must not block trading."""
+async def record(event: str, data: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """Append an event. Never raises — a ledger failure must not block trading.
+
+    Returns the appended record's seq, or None when the append did not land.
+    Callers that ignore the return value are unchanged.
+    """
     try:
         if _ledger is None:
             logger.warning(f"ledger not initialised — dropped event '{event}'")
-            return
+            return None
         rec = await _ledger.record(event, data)
+        seq = int(rec["seq"])
         if _mirror is not None:
             try:
-                await _mirror(int(rec["seq"]), str(rec["hash"]), _canonical(rec))
+                await _mirror(seq, str(rec["hash"]), _canonical(rec))
             except Exception as e:
                 logger.warning(f"ledger mirror write failed (non-fatal, {event}): {e}")
+        return seq
     except Exception as e:
         logger.error(f"ledger append failed ({event}): {e}")
+        return None
 
 
 def tail(count: int = 100) -> List[Dict[str, Any]]:
@@ -13795,9 +13802,10 @@ TRADES_HISTORY_MAX = int(os.getenv("TRADES_HISTORY_MAX", "500"))
 # at the default count=50 that is 150 records, which the entry_rejected /
 # setup_evidence_imported / shadow tail outran on 2026-11-23.
 TRADES_LEDGER_FALLBACK_CAP = EDGE_LOOKBACK
-# A live close is appended and then pushed. The matching position_closed is
-# normally the last line; this bounds the stamp so the close path never
-# walks TRADES_LEDGER_FALLBACK_CAP.
+# Live closes pass the seq from trade_ledger.record into the review push and
+# do not read the ledger file. This lookback is only the fallback when that
+# seq is missing. The matching position_closed is normally the last line, so
+# the fallback never walks TRADES_LEDGER_FALLBACK_CAP.
 TRADES_REVIEW_SEQ_LOOKBACK = 64
 # After a close, re-quote the instrument at these horizons (minutes). A stop
 # that was too tight shows up as a recovery here; missing stays missing.
@@ -25477,23 +25485,41 @@ def build_trade_review_fields(pos: Optional[dict]) -> Dict[str, Any]:
     }
 
 
-async def _remember_trade_review(snapshot: Dict[str, Any]) -> None:
+async def _remember_trade_review(
+    snapshot: Dict[str, Any],
+    ledger_seq: Optional[int] = None,
+) -> None:
     """Cap a Redis/memory list of full close snapshots for GET /trades when
     Postgres study views are offline. Best-effort — never blocks a close.
 
-    Stamps `ledger_seq` from the ledger line just written and skips the push
-    when that seq is already on the list, so a boot backfill that stored the
-    same close cannot be duplicated by this path. Does not book P&L, counters,
-    or learning — the snapshot is already built by the caller.
+    When `ledger_seq` is the seq just returned by `trade_ledger.record`, it is
+    stamped onto a copy of the snapshot and used for dedupe, and the ledger
+    file is not read. When it is omitted, `_stamp_review_ledger_seq` is the
+    fallback. A seq already on the list skips the push, so a boot backfill
+    that stored the same close cannot be duplicated by this path. Does not
+    book P&L, counters, or learning — the snapshot is already built by the
+    caller.
     """
     try:
-        stamped = _stamp_review_ledger_seq(snapshot)
-        seq = stamped.get("ledger_seq") if isinstance(stamped, dict) else None
-        if seq is not None:
+        if ledger_seq is not None:
+            # Passed seq is authoritative. Do not open the ledger on this path,
+            # including when the value cannot be coerced: a file read here is
+            # the synchronous event-loop hit this argument exists to avoid.
+            stamped = dict(snapshot) if isinstance(snapshot, dict) else snapshot
             try:
-                seq = int(seq)
+                seq = int(ledger_seq)
             except (TypeError, ValueError):
                 seq = None
+            if seq is not None and isinstance(stamped, dict):
+                stamped["ledger_seq"] = seq
+        else:
+            stamped = _stamp_review_ledger_seq(snapshot)
+            seq = stamped.get("ledger_seq") if isinstance(stamped, dict) else None
+            if seq is not None:
+                try:
+                    seq = int(seq)
+                except (TypeError, ValueError):
+                    seq = None
         await state.list_push_review(
             TRADES_HISTORY_KEY,
             json.dumps(stamped, default=str),
@@ -26262,8 +26288,8 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         # visible without reconstructing Redis after the fact.
         **_review,
     }
-    await trade_ledger.record("position_closed", close_data)
-    await _remember_trade_review(close_data)
+    ledger_seq = await trade_ledger.record("position_closed", close_data)
+    await _remember_trade_review(close_data, ledger_seq=ledger_seq)
     # Schedule 15/30-minute post-exit marks — a stop that was too tight shows
     # up as a recovery after the exit. Best-effort; never blocks the close.
     try:
@@ -32814,10 +32840,53 @@ def ledger_review_rows(count: int, cap: Optional[int] = None) -> List[Dict[str, 
     return out
 
 
+def _parse_closed_at(value: Any) -> Optional[datetime]:
+    """UTC datetime for a close stamp, or None when it is not a timestamp.
+
+    datetime and an ISO string (a trailing Z included) parse to the same
+    instant. Anything else stays unparsed so the fallback compare cannot
+    treat two unrelated values as one close.
+    """
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _closed_at_match(left: Any, right: Any) -> bool:
+    """True when two close stamps are the same value or the same instant."""
+    try:
+        if left == right:
+            return True
+    except TypeError:
+        pass
+    left_dt = _parse_closed_at(left)
+    right_dt = _parse_closed_at(right)
+    if left_dt is None or right_dt is None:
+        return False
+    return left_dt == right_dt
+
+
 def _stamp_review_ledger_seq(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    """Copy ledger_seq onto a live close snapshot when the matching
-    position_closed line is still in the newest TRADES_REVIEW_SEQ_LOOKBACK
-    lines. Missing stays missing — a wrong seq would suppress the push."""
+    """Copy ledger_seq onto a close snapshot when the matching position_closed
+    line is still in the newest TRADES_REVIEW_SEQ_LOOKBACK lines.
+
+    Fallback only. The live close path passes the seq from trade_ledger.record
+    and does not call this. closed_at is compared as an instant, so a
+    datetime and the ISO string written on the ledger line still match.
+    Missing stays missing — a wrong seq would suppress the push.
+    """
     if not isinstance(snapshot, dict) or snapshot.get("ledger_seq") is not None:
         return snapshot
     closed_at = snapshot.get("closed_at")
@@ -32841,7 +32910,7 @@ def _stamp_review_ledger_seq(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
         if str(data.get("ticker") or "").upper() != ticker:
             continue
-        if data.get("closed_at") != closed_at:
+        if not _closed_at_match(data.get("closed_at"), closed_at):
             continue
         stamped = dict(snapshot)
         stamped["ledger_seq"] = rec.get("seq")

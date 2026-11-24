@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -321,6 +322,242 @@ def test_backfill_writes_only_trades_history(trades_env, monkeypatch):
     assert after[2] == before[2]
     assert "daily:2026-11-24" in after[1]
     assert "daily_et:2026-11-24" in after[1]
+
+
+def test_record_wrapper_returns_seq(trades_env):
+    trade_ledger.init(trades_env)
+
+    first = _run(trade_ledger.record("position_closed", {"ticker": "UBER"}))
+    second = _run(trade_ledger.record("entry_rejected", {"ticker": "UBER"}))
+
+    assert first == 1
+    assert second == 2
+    # Callers that ignore the return value still append.
+    _run(trade_ledger.record("startup_reconcile", {"ok": True}))
+    tail = trade_ledger.tail(3)
+    assert [row["seq"] for row in tail] == [3, 2, 1]
+    assert [row["event"] for row in tail] == [
+        "startup_reconcile", "entry_rejected", "position_closed",
+    ]
+
+
+def test_record_wrapper_returns_none_on_ledger_failure(trades_env, monkeypatch):
+    trade_ledger.init(trades_env)
+
+    def boom(self, line):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(trade_ledger.TradeLedger, "_append_line", boom)
+
+    assert _run(trade_ledger.record("position_closed", {"ticker": "UBER"})) is None
+
+    trade_ledger._ledger = None
+    assert _run(trade_ledger.record("position_closed", {"ticker": "UBER"})) is None
+
+
+def test_record_wrapper_returns_seq_when_mirror_fails(trades_env):
+    trade_ledger.init(trades_env)
+    previous = trade_ledger._mirror
+
+    async def bad_mirror(seq, digest, line):
+        raise RuntimeError("mirror down")
+
+    trade_ledger.set_mirror(bad_mirror)
+    try:
+        seq = _run(trade_ledger.record("position_closed", {"ticker": "UBER"}))
+    finally:
+        trade_ledger.set_mirror(previous)
+
+    assert seq == 1
+    assert trade_ledger.tail(1)[0]["event"] == "position_closed"
+
+
+def test_passed_seq_does_not_read_the_ledger_and_dedupes(trades_env, monkeypatch):
+    ts = "2026-11-20T20:40:16+00:00"
+    events = [
+        _close("AAPL", "2026-11-18T15:00:00+00:00"),
+        _close("UBER", ts, 2.0),
+    ]
+    _init_ledger(trades_env, events)
+    _run(main_bot.backfill_trades_history())
+
+    # `_remember_trade_review` swallows exceptions, so a raised read has to be
+    # recorded here or a skipped push looks like a successful dedupe.
+    reads = []
+
+    def boom(*_args, **_kwargs):
+        reads.append(1)
+        raise AssertionError("review push read the ledger file")
+
+    monkeypatch.setattr(main_bot, "_jsonl_tail_lines", boom)
+    monkeypatch.setattr(main_bot, "_stamp_review_ledger_seq", boom)
+    monkeypatch.setattr(main_bot, "_active_ledger_path", boom)
+    monkeypatch.setattr(trade_ledger.TradeLedger, "recent", boom)
+    monkeypatch.setattr(trade_ledger.TradeLedger, "tail", boom)
+
+    async def scenario():
+        before = await main_bot.state.list_len(main_bot.TRADES_HISTORY_KEY)
+        await main_bot._remember_trade_review(
+            {
+                "ticker": "UBER",
+                "closed_at": datetime.fromisoformat(ts),
+                "realized_pnl_pct": 2.0,
+                "origin": "live",
+            },
+            ledger_seq=2,
+        )
+        after = await main_bot.state.list_len(main_bot.TRADES_HISTORY_KEY)
+        return before, after
+
+    before, after = _run(scenario())
+    rows = _history()
+
+    assert reads == []
+    assert before == after == 2
+    assert [row["ledger_seq"] for row in rows] == [2, 1]
+    assert rows[0]["ticker"] == "UBER"
+    assert "origin" not in rows[0]
+
+
+def test_passed_seq_stamps_a_new_close_without_reading_the_ledger(trades_env, monkeypatch):
+    trade_ledger.init(trades_env)
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("review push read the ledger file")
+
+    monkeypatch.setattr(main_bot, "_jsonl_tail_lines", boom)
+    monkeypatch.setattr(main_bot, "_stamp_review_ledger_seq", boom)
+    monkeypatch.setattr(main_bot, "_active_ledger_path", boom)
+
+    _run(main_bot._remember_trade_review(
+        {"ticker": "UBER", "closed_at": "2026-11-20T20:40:16+00:00"},
+        ledger_seq=41,
+    ))
+    rows = _history()
+
+    assert len(rows) == 1
+    assert rows[0]["ledger_seq"] == 41
+    assert rows[0]["ticker"] == "UBER"
+
+
+def test_fallback_stamp_matches_closed_at_str_and_datetime(trades_env):
+    ts = "2026-11-20T20:40:16+00:00"
+    zulu = "2026-11-20T20:40:16Z"
+    events = [
+        _close("AAPL", "2026-11-18T15:00:00+00:00"),
+        _close("UBER", ts, 2.0),
+    ]
+    _init_ledger(trades_env, events)
+    when = datetime.fromisoformat(ts)
+
+    stamped = main_bot._stamp_review_ledger_seq({
+        "ticker": "uber",
+        "closed_at": when,
+        "realized_pnl_pct": 2.0,
+    })
+    assert stamped["ledger_seq"] == 2
+    assert stamped["closed_at"] == when
+
+    naive = main_bot._stamp_review_ledger_seq({
+        "ticker": "UBER",
+        "closed_at": datetime(2026, 11, 20, 20, 40, 16),
+    })
+    assert naive["ledger_seq"] == 2
+
+    other = main_bot._stamp_review_ledger_seq({
+        "ticker": "UBER",
+        "closed_at": datetime(2026, 11, 20, 21, 0, tzinfo=timezone.utc),
+    })
+    assert other.get("ledger_seq") is None
+    wrong_ticker = main_bot._stamp_review_ledger_seq({
+        "ticker": "QQQ",
+        "closed_at": when,
+    })
+    assert wrong_ticker.get("ledger_seq") is None
+
+    # Rewrite the UBER line with a Z suffix and a datetime snapshot still matches.
+    raw = trades_env.read_text(encoding="utf-8").replace(ts, zulu)
+    trades_env.write_text(raw, encoding="utf-8")
+    trade_ledger.init(trades_env)
+    zulu_stamp = main_bot._stamp_review_ledger_seq({
+        "ticker": "UBER",
+        "closed_at": when,
+    })
+    assert zulu_stamp["ledger_seq"] == 2
+
+    async def scenario():
+        await main_bot.backfill_trades_history()
+        before = await main_bot.state.list_len(main_bot.TRADES_HISTORY_KEY)
+        await main_bot._remember_trade_review({
+            "ticker": "UBER",
+            "closed_at": when,
+            "realized_pnl_pct": 2.0,
+        })
+        after = await main_bot.state.list_len(main_bot.TRADES_HISTORY_KEY)
+        return before, after
+
+    before, after = _run(scenario())
+    rows = _history()
+
+    assert before == after == 2
+    assert [row["ledger_seq"] for row in rows] == [2, 1]
+
+
+def test_fill_and_review_lua_against_a_lua_engine():
+    pytest.importorskip("lupa")
+    fakeredis_aioredis = pytest.importorskip("fakeredis.aioredis")
+    try:
+        client = fakeredis_aioredis.FakeRedis(decode_responses=True)
+    except Exception as exc:
+        pytest.skip(f"fakeredis client unavailable: {type(exc).__name__}")
+
+    async def scenario():
+        try:
+            probe = await client.eval("return 1", 0)
+        except Exception as exc:
+            return exc
+        if int(probe) != 1:
+            return RuntimeError("lua probe failed")
+        store = main_bot.StateStore(client)
+        key = "trades:history:lua"
+        empty = await store.list_fill_if_empty(key, [], 10)
+        capped = await store.list_fill_if_empty(
+            key, ["oldest", "mid", "newest"], 2,
+        )
+        again = await store.list_fill_if_empty(key, ["should-not-land"], 10)
+        filled = await store.list_all(key)
+        row = json.dumps({"ticker": "UBER", "ledger_seq": 7})
+        pushed = await store.list_push_review(key, row, 7, 10)
+        duplicate = await store.list_push_review(
+            key, json.dumps({"ticker": "UBER", "ledger_seq": 7, "origin": "live"}), 7, 10,
+        )
+        fresh = await store.list_push_review(
+            key, json.dumps({"ticker": "MSFT", "ledger_seq": 8}), 8, 10,
+        )
+        unsequenced = await store.list_push_review(
+            key, json.dumps({"ticker": "NOSEQ"}), None, 10,
+        )
+        final = await store.list_all(key)
+        return empty, capped, again, filled, pushed, duplicate, fresh, unsequenced, final
+
+    result = _run(scenario())
+    if isinstance(result, Exception):
+        pytest.skip(f"lua engine unavailable: {type(result).__name__}: {result}")
+
+    empty, capped, again, filled, pushed, duplicate, fresh, unsequenced, final = result
+    assert empty is False
+    assert capped is True
+    assert again is False
+    assert filled == ["newest", "mid"]
+    assert pushed is True
+    assert duplicate is False
+    assert fresh is True
+    assert unsequenced is True
+    review = [json.loads(item) for item in final[:3]]
+    assert [row["ticker"] for row in review] == ["NOSEQ", "MSFT", "UBER"]
+    assert review[2]["ledger_seq"] == 7
+    assert "origin" not in review[2]
+    assert final[3:] == ["newest", "mid"]
 
 
 def test_backfill_schedule_swallows_errors(monkeypatch):
