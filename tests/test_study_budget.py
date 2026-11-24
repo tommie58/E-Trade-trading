@@ -7,7 +7,9 @@ the 20s and 60s client retries. These tests never open a database.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import logging
 import time
 
 import main_bot
@@ -228,15 +230,20 @@ def test_sql_page_is_a_bounded_tail_and_not_the_views():
             return _Conn()
 
     previous = study._engine
+    previous_page = study._page_engine
     study._engine = _Engine()
+    study._page_engine = None
     try:
         out = asyncio.run(study.sql_ledger_page(10, 3, 1.5))
     finally:
         study._engine = previous
-    joined = " ".join(executed).lower()
+        study._page_engine = previous_page
+    lowered = [sql.lower() for sql in executed]
+    joined = " ".join(lowered)
     assert "limit 11" in joined
     assert "offset 3" in joined
-    assert "statement_timeout" in joined
+    assert "set statement_timeout = 1500" in joined
+    assert lowered[-1].startswith("reset statement_timeout")
     assert "bot_trade_closes" not in joined
     assert "bot_ledger_events" not in joined
     assert "bot_setup_priors" not in joined
@@ -288,3 +295,236 @@ def test_endpoint_keeps_the_old_keys_and_adds_truncation(monkeypatch):
     assert out["coverage"]["closes"] == 1
     assert out["page"]["limit"] == 25
     assert "setup_priors" in out and "recent_closes" in out
+
+
+class _Rows:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+
+def _use_engines(order, page):
+    previous = (study._engine, study._page_engine)
+    study._engine = order
+    study._page_engine = page
+    return previous
+
+
+def _restore_engines(previous):
+    study._engine, study._page_engine = previous
+
+
+def test_sql_page_caps_offset_at_the_file_page_window():
+    executed = []
+    connects = {"n": 0}
+
+    class _Conn:
+        async def exec_driver_sql(self, sql):
+            executed.append(sql)
+            return _Rows([])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class _Page:
+        def connect(self):
+            connects["n"] += 1
+            return _Conn()
+
+    class _Order:
+        def connect(self):
+            raise AssertionError("order-path pool was checked out")
+
+    previous = _use_engines(_Order(), _Page())
+    try:
+        blocked = asyncio.run(study.sql_ledger_page(10, 50000, 1.5))
+        at_cap = asyncio.run(study.sql_ledger_page(
+            10, study.STUDY_LEDGER_WINDOW_MAX, 1.5,
+        ))
+        assert connects["n"] == 0
+        assert executed == []
+        for out in (blocked, at_cap):
+            assert out["records"] == []
+            assert out["more"] is True
+            assert out["capped"] is True
+
+        shrunk = asyncio.run(study.sql_ledger_page(2000, 4000, 1.5))
+    finally:
+        _restore_engines(previous)
+    assert connects["n"] == 1
+    joined = " ".join(executed).lower()
+    assert "offset 4000" in joined
+    assert "limit 1001" in joined
+    assert "offset 50000" not in joined
+    assert "offset 5000" not in joined
+    assert shrunk["records"] == []
+    assert shrunk["more"] is False
+
+
+def test_sql_path_time_budget_returns_partial_and_releases_the_connection(caplog):
+    events = []
+
+    class _Conn:
+        async def exec_driver_sql(self, sql):
+            upper = sql.strip().upper()
+            if upper.startswith("RESET"):
+                events.append("reset")
+                return _Rows([])
+            if upper.startswith("SET"):
+                events.append("set")
+                return _Rows([])
+            events.append("query")
+            await asyncio.sleep(30)
+            raise AssertionError("sql page ran past the time budget")
+
+        async def rollback(self):
+            events.append("rollback")
+
+        async def __aenter__(self):
+            events.append("checkout")
+            return self
+
+        async def __aexit__(self, *_args):
+            events.append("release")
+            return False
+
+    class _Page:
+        def connect(self):
+            return _Conn()
+
+    class _Order:
+        def connect(self):
+            raise AssertionError("order-path pool was checked out")
+
+    previous = _use_engines(_Order(), _Page())
+
+    async def run():
+        started = time.monotonic()
+        out = await study.summary(budget_s=0.25, window=10, offset=0, recent=5, min_samples=1)
+        return out, time.monotonic() - started
+
+    try:
+        with caplog.at_level(logging.DEBUG, logger="etrade-bot.study"):
+            out, elapsed = asyncio.run(run())
+    finally:
+        _restore_engines(previous)
+
+    assert elapsed < 2
+    assert out["available"] is True
+    assert out["truncated"] is True
+    assert "time budget" in out["truncated_reason"]
+    assert out["coverage"]["closes"] == 0
+    assert out["sections_completed"] == []
+    assert events[:3] == ["checkout", "set", "query"]
+    assert "reset" in events
+    assert events.index("reset") < events.index("release")
+    assert events[-1] == "release"
+    study_logs = [rec for rec in caplog.records if rec.name == "etrade-bot.study"]
+    assert study_logs
+    assert all(rec.levelno >= logging.WARNING for rec in study_logs)
+    assert any(
+        "time budget" in rec.message and "connection released" in rec.message
+        for rec in study_logs
+    )
+    assert not any("statement_timeout not set" in rec.message for rec in study_logs)
+    for rec in study_logs:
+        assert "postgres://" not in rec.message
+        assert "password" not in rec.message.lower()
+        assert "secret" not in rec.message.lower()
+
+
+def test_sql_timeout_logs_a_warning_and_releases_without_secrets(caplog):
+    events = []
+    secret = "postgres://user:secret-token@db.example/ledger acct-999000111"
+
+    class QueryCanceled(Exception):
+        pass
+
+    class _Conn:
+        async def exec_driver_sql(self, sql):
+            upper = sql.strip().upper()
+            if upper.startswith("RESET"):
+                events.append("reset")
+                return _Rows([])
+            if upper.startswith("SET"):
+                events.append("set")
+                return _Rows([])
+            events.append("query")
+            raise QueryCanceled(
+                "canceling statement due to statement timeout " + secret
+            )
+
+        async def rollback(self):
+            events.append("rollback")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            events.append("release")
+            return False
+
+    class _Page:
+        def connect(self):
+            return _Conn()
+
+    class _Order:
+        def connect(self):
+            raise AssertionError("order-path pool was checked out")
+
+    previous = _use_engines(_Order(), _Page())
+    try:
+        with caplog.at_level(logging.DEBUG, logger="etrade-bot.study"):
+            out = asyncio.run(study.summary(budget_s=2, window=10, offset=0))
+    finally:
+        _restore_engines(previous)
+
+    assert out["truncated"] is True
+    assert out["available"] is True
+    assert "time budget" in out["truncated_reason"]
+    assert secret not in out["truncated_reason"]
+    assert events.index("reset") < events.index("release")
+    warnings = [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert any("study SQL fallback timed out" in rec.message for rec in warnings)
+    blob = "\n".join(rec.message for rec in caplog.records)
+    assert "secret-token" not in blob
+    assert "acct-999000111" not in blob
+    assert "postgres://" not in blob
+    assert secret not in blob
+
+
+def test_study_page_pool_is_size_one_and_not_the_order_engine(monkeypatch):
+    seen = {}
+
+    def fake_create(url, **kwargs):
+        seen["url"] = url
+        seen["kwargs"] = kwargs
+        return {"pool": "study"}
+
+    monkeypatch.setattr(main_bot, "create_async_engine", fake_create)
+    connect_args = {"statement_cache_size": 0}
+    page = main_bot._open_study_page_engine(
+        "postgresql+asyncpg://db.example/ledger",
+        connect_args,
+    )
+    assert page == {"pool": "study"}
+    assert seen["kwargs"]["pool_size"] == 1
+    assert seen["kwargs"]["max_overflow"] == 0
+    assert seen["kwargs"]["pool_pre_ping"] is True
+    assert seen["kwargs"]["echo"] is False
+    assert seen["kwargs"]["connect_args"] == {"statement_cache_size": 0}
+    assert connect_args == {"statement_cache_size": 0}
+    assert "password" not in str(seen)
+    helper = inspect.getsource(main_bot._open_study_page_engine)
+    init_src = inspect.getsource(main_bot.init_db)
+    assert "pool_size=1" in helper
+    assert "max_overflow=0" in helper
+    assert "pool_size" not in init_src
+    assert "max_overflow" not in init_src
+    assert "_open_study_page_engine(" in init_src
+    assert "page_engine=_study_page_engine" in inspect.getsource(main_bot.on_startup)
