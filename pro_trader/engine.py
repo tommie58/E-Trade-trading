@@ -4,7 +4,7 @@ so shadow mode can be proven identical to the baseline sizer.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pro_trader.pacing import pace_state
 from pro_trader.playbook import adjudicate, rotation_ids
@@ -16,11 +16,32 @@ DEFAULT_MODE = "shadow"
 SESSION_CAP = 400
 
 
-def normalize_mode(value: Any, default: str = DEFAULT_MODE) -> str:
-    text = str(value or "").strip().lower()
+def interpret_mode(value: Any, default: str = DEFAULT_MODE) -> Tuple[str, Optional[str]]:
+    """Resolve a configured mode.
+
+    Unset (None or blank) stays the default and says nothing. A known mode is
+    returned as given. Anything else — including ``live``, which is a scanner
+    mode, not a desk mode — is rejected: the default is kept and the caller
+    gets an explicit warning instead of a silent coerce to shadow.
+    """
+    kept = default if default in MODES else DEFAULT_MODE
+    if value is None:
+        return kept, None
+    text = str(value).strip().lower()
+    if text == "":
+        return kept, None
     if text in MODES:
-        return text
-    return default if default in MODES else DEFAULT_MODE
+        return text, None
+    return kept, (
+        f"pro_trader_mode {value!r} rejected — not off|shadow|active; kept {kept}"
+    )
+
+
+def normalize_mode(value: Any, default: str = DEFAULT_MODE) -> str:
+    """Internal coerce. Configuration and /policy use interpret_mode so an
+    invalid value is reported instead of disappearing into the default."""
+    mode, _warning = interpret_mode(value, default=default)
+    return mode
 
 
 def passthrough(mode: str = "off") -> Dict[str, Any]:
@@ -186,6 +207,53 @@ class Desk:
     def note_fill(self) -> None:
         """Count a fill toward today's pace. The bot may instead pass trades_today."""
         self.trades_completed += 1
+
+    def snapshot(self) -> Dict[str, Any]:
+        """JSON-safe desk memory. A restart restores this instead of an empty desk."""
+        return {
+            "memory": {
+                "regime": self.memory.get("regime") if isinstance(self.memory.get("regime"), str) else None,
+                "pending": self.memory.get("pending") if isinstance(self.memory.get("pending"), str) else None,
+                "pending_count": int(self.memory.get("pending_count") or 0),
+            },
+            "decisions": [dict(row) for row in self.decisions[-SESSION_CAP:]],
+            "last": dict(self.last) if isinstance(self.last, dict) else None,
+            "trades_completed": int(self.trades_completed),
+            "min_trades": int(self.min_trades),
+        }
+
+    def restore(self, raw: Any) -> bool:
+        """Load a snapshot. A bad payload leaves the desk empty rather than half-applied."""
+        if not isinstance(raw, dict):
+            return False
+        memory = raw.get("memory") if isinstance(raw.get("memory"), dict) else {}
+        regime = memory.get("regime")
+        pending = memory.get("pending")
+        try:
+            pending_count = int(memory.get("pending_count") or 0)
+        except (TypeError, ValueError):
+            pending_count = 0
+        self.memory = {
+            "regime": regime if isinstance(regime, str) else None,
+            "pending": pending if isinstance(pending, str) else None,
+            "pending_count": max(0, pending_count),
+        }
+        rows = raw.get("decisions")
+        self.decisions = (
+            [dict(row) for row in rows if isinstance(row, dict)][-SESSION_CAP:]
+            if isinstance(rows, list) else []
+        )
+        last = raw.get("last")
+        self.last = dict(last) if isinstance(last, dict) else None
+        try:
+            self.trades_completed = max(0, int(raw.get("trades_completed") or 0))
+        except (TypeError, ValueError):
+            self.trades_completed = 0
+        try:
+            self.min_trades = max(1, int(raw.get("min_trades") or 4))
+        except (TypeError, ValueError):
+            self.min_trades = 4
+        return True
 
     def evaluate(
         self,

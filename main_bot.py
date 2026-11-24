@@ -71,6 +71,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("etrade-bot.state")
 
@@ -287,6 +288,15 @@ def _utcnow() -> datetime:
 
 def _today() -> str:
     return _utcnow().date().isoformat()
+
+
+# Trading-day counters (daily_et) follow the cash session, not UTC midnight.
+# 00:00 UTC is 7:00 PM ET / 6:00 PM CT — after the close, still the same ET day.
+_ET_ZONE = ZoneInfo("America/New_York")
+
+
+def _today_et() -> str:
+    return datetime.now(_ET_ZONE).date().isoformat()
 
 
 def _dumps(value: Any) -> str:
@@ -1156,6 +1166,7 @@ class StateStore:
         if self.redis is not None:
             val = await self.redis.hincrby(key, "trades_today", 1)
             await self.redis.expire(key, DAILY_TTL_SECONDS)
+            await self._mirror_trading_day("trades_today", 1.0)
             return int(val)
         result = int(await self._memory.hincrbyfloat(key, "trades_today", 1, DAILY_TTL_SECONDS))
         # The daily counters are the loss limit's memory — a restart must not
@@ -1163,6 +1174,7 @@ class StateStore:
         # hydrated day simply never gets read.
         if self._persistence is not None:
             await self._persist_hash(key)
+        await self._mirror_trading_day("trades_today", 1.0)
         return result
 
     # ET-day counters (5.84.1). The daily key above is UTC-dated; caps that
@@ -1185,15 +1197,78 @@ class StateStore:
             await self._persist_hash(key)
         return result
 
+    async def _bump_hash(self, key: str, field: str, amount: float, ttl: int) -> float:
+        if self.redis is not None:
+            val = await self.redis.hincrbyfloat(key, field, amount)
+            await self.redis.expire(key, ttl)
+            return float(val)
+        result = await self._memory.hincrbyfloat(key, field, amount, ttl)
+        if self._persistence is not None:
+            await self._persist_hash(key)
+        return float(result)
+
+    async def _mirror_trading_day(self, field: str, amount: float) -> None:
+        """Copy a counter onto `daily_et:{ET date}` while the UTC and ET dates
+        still match (the cash session). After 00:00 UTC the UTC key rolls and
+        this mirror stops, so an evening read of the ET key still shows the
+        session that already closed. The UTC `daily:` key — the loss-limit
+        rail — is never redirected here."""
+        utc_day, et_day = _today(), _today_et()
+        if utc_day != et_day:
+            return
+        try:
+            await self._bump_hash(f"daily_et:{et_day}", field, amount, DAILY_TTL_SECONDS)
+        except Exception as e:
+            logger.warning(f"ET trading-day counter {field} not updated (non-fatal): {e}")
+
+    async def _hash_fields(self, key: str) -> Dict[str, str]:
+        if self.redis is not None:
+            return dict(await self.redis.hgetall(key) or {})
+        return await self._memory.hgetall(key)
+
+    @staticmethod
+    def _trading_day_view(fields: Dict[str, str], day: str) -> Dict[str, Any]:
+        return {
+            "day_et": day,
+            "trades_today": int(float(fields.get("trades_today", "0") or 0)),
+            "realized_pnl_today_pct": float(fields.get("realized_pnl_today_pct", "0") or 0),
+        }
+
+    async def get_trading_day(self) -> Dict[str, Any]:
+        """Session counters for the Eastern Time trading day.
+
+        Same field names as `get_daily`, different key. Pacing and `/status`
+        read this so 6 PM CT does not look like a fresh day. The loss-limit
+        rail keeps reading `get_daily` (UTC).
+
+        Counters mirrored onto `daily_et` win. If this process has not mirrored
+        yet, the UTC hash for that same calendar date still holds the session
+        (market hours write both dates as the same day) and is used so an
+        evening read is not a false zero.
+        """
+        day = _today_et()
+        fields = await self._hash_fields(f"daily_et:{day}")
+        # ET fields win. A field this process has not mirrored yet is filled
+        # from daily:{ET date} — the key the session was written to before the
+        # mirror existed, which is the same calendar day during market hours.
+        if "trades_today" not in fields or "realized_pnl_today_pct" not in fields:
+            legacy = await self._hash_fields(f"daily:{day}")
+            merged = dict(legacy)
+            merged.update(fields)
+            fields = merged
+        return self._trading_day_view(fields, day)
+
     async def add_realized_pnl(self, pct: float) -> float:
         key = self._daily_key()
         if self.redis is not None:
             val = await self.redis.hincrbyfloat(key, "realized_pnl_today_pct", pct)
             await self.redis.expire(key, DAILY_TTL_SECONDS)
+            await self._mirror_trading_day("realized_pnl_today_pct", float(pct))
             return float(val)
         result = await self._memory.hincrbyfloat(key, "realized_pnl_today_pct", pct, DAILY_TTL_SECONDS)
         if self._persistence is not None:
             await self._persist_hash(key)
+        await self._mirror_trading_day("realized_pnl_today_pct", float(pct))
         return result
 
     async def add_realized_usd(self, usd: float) -> float:
@@ -8689,10 +8764,12 @@ cooldown, cap, kill switch and stop-guard still applies).
 
 DATA-TRUST RULES (non-negotiable)
 ---------------------------------
-* RVOL is computed ONLY from broker-reported `totalVolume` and the 10-day
-  average daily volume, prorated by how much of the session has elapsed. If
-  either input is missing, rvol is None — the candidate can never be sent
-  live (the entry filter refuses unmeasured RVOL).
+* RVOL comes from broker-reported `totalVolume` and the 10-day average,
+  prorated by how much of the session has elapsed. When that snapshot is
+  missing (Massive 403 / fallback), a same-day history sample or the last
+  valid reading may fill in, and only inside RVOL_FALLBACK_TTL_SECONDS.
+  A missing, zero, or stale reading stays None — min_rvol is never waived,
+  and the entry filter still refuses unmeasured RVOL.
 * Scores are a weighted blend of MEASURED factors (rvol, momentum vs. open,
   position vs. sampled VWAP, spread). Nothing is invented to clear a gate.
 * A candidate needs at least MIN_SAMPLES observations of its own before any
@@ -8719,7 +8796,7 @@ import json
 import logging
 import math
 import re
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -8745,6 +8822,11 @@ CONFIG_KEY = "scanner:config"
 REPORT_KEY = "scanner:last"
 SERIES_KEY_FMT = "scanner:series:{}"
 EMIT_KEY_FMT = "scanner:emits:{}"
+RVOL_LAST_KEY = "scanner:rvol_last"
+# Last valid RVOL may be reused only this long, and only on the same ET day.
+# Long enough to cover a short Massive blip, short enough that a dead feed
+# cannot keep clearing min_rvol on a number from an hour ago.
+RVOL_FALLBACK_TTL_SECONDS = 15 * 60
 
 # A ticker must have this many of its own samples before a setup may be
 # claimed — no judging a symbol the scanner just started watching.
@@ -9015,6 +9097,159 @@ def compute_rvol(
     if expected <= 0:
         return None
     return round(tv / expected, 2)
+
+
+def _epoch_of(ts: Any) -> Optional[float]:
+    """Epoch seconds for a scanner timestamp. Naive values are UTC."""
+    if isinstance(ts, bool) or ts is None:
+        return None
+    if isinstance(ts, (int, float)):
+        value = float(ts)
+        return value if math.isfinite(value) and value > 0 else None
+    if isinstance(ts, datetime):
+        when = ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+        return when.timestamp()
+    text = str(ts).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.timestamp()
+
+
+def _carry_rvol(
+    prior: Any,
+    now_et: Optional[datetime],
+    ttl_seconds: float,
+) -> Optional[float]:
+    """Last valid reading, only inside the TTL and the same ET trading day."""
+    if not isinstance(prior, dict) or now_et is None:
+        return None
+    if str(prior.get("day_et") or "") != now_et.date().isoformat():
+        return None
+    raw = prior.get("rvol")
+    if isinstance(raw, bool):
+        return None
+    try:
+        rvol = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(rvol) or rvol <= 0:
+        return None
+    ts = _epoch_of(prior.get("ts"))
+    if ts is None:
+        return None
+    age = now_et.timestamp() - ts
+    if age < -5 or age > float(ttl_seconds):
+        return None
+    return round(rvol, 2)
+
+
+def _rvol_from_series(
+    series: List[Dict[str, Any]],
+    avg_daily_volume: Optional[float],
+    progress: float,
+    now_et: Optional[datetime],
+    ttl_seconds: float,
+) -> Optional[float]:
+    """Newest same-day volume sample still inside the TTL, against a known ADV."""
+    if now_et is None or avg_daily_volume is None:
+        return None
+    day = now_et.date().isoformat()
+    now_s = now_et.timestamp()
+    for sample in reversed(series or []):
+        if not isinstance(sample, dict):
+            continue
+        ts = _epoch_of(sample.get("ts"))
+        if ts is None:
+            continue
+        age = now_s - ts
+        if age < -5 or age > float(ttl_seconds):
+            continue
+        if _session_day(sample.get("ts")) != day:
+            continue
+        vol = sample.get("total_volume")
+        if isinstance(vol, bool) or vol is None:
+            continue
+        measured = compute_rvol(vol, avg_daily_volume, progress)
+        if measured is not None:
+            return measured
+    return None
+
+
+def _prune_rvol_priors(priors: Any, now_et: datetime) -> Dict[str, Dict[str, Any]]:
+    """Drop readings that can no longer be carried. Fail-closed on the way out."""
+    if not isinstance(priors, dict):
+        return {}
+    kept: Dict[str, Dict[str, Any]] = {}
+    for sym, row in priors.items():
+        carried = _carry_rvol(row, now_et, RVOL_FALLBACK_TTL_SECONDS)
+        if carried is None or not isinstance(row, dict):
+            continue
+        kept[str(sym).upper()] = {
+            "rvol": carried,
+            "ts": row.get("ts"),
+            "day_et": now_et.date().isoformat(),
+        }
+    return kept
+
+
+def resolve_rvol(
+    quote: Optional[Dict[str, Any]],
+    series: Optional[List[Dict[str, Any]]],
+    progress: float,
+    now_et: Optional[datetime] = None,
+    prior: Optional[Dict[str, Any]] = None,
+    cached_adv: Optional[float] = None,
+    ttl_seconds: float = RVOL_FALLBACK_TTL_SECONDS,
+) -> Dict[str, Any]:
+    """Relative volume for one quote. Never invents a number past the TTL.
+
+    A live broker reading wins. When the snapshot is missing volume (Massive
+    403, or an E*TRADE fallback with no volume fields), use the newest
+    same-day history sample inside the TTL, then the last valid reading if
+    that reading is still inside the TTL and the same ET session. A quote
+    that reported volume but cannot form an RVOL stays unmeasured — min_rvol
+    is not skipped, and a stale carry is not substituted for a real zero.
+    """
+    quote = quote or {}
+    tv = quote.get("total_volume")
+    adv = quote.get("avg_daily_volume")
+    if tv is not None and adv is not None:
+        measured = compute_rvol(tv, adv, progress)
+        if measured is not None:
+            return {"rvol": measured, "basis": "measured", "refresh": True, "forget": False}
+        return {"rvol": None, "basis": "unmeasured", "refresh": False, "forget": True}
+    if tv is not None:
+        try:
+            tv_f = float(tv)
+            reported = math.isfinite(tv_f)
+        except (TypeError, ValueError):
+            tv_f, reported = 0.0, False
+        if not reported or tv_f <= 0:
+            return {"rvol": None, "basis": "unmeasured", "refresh": False, "forget": True}
+        if cached_adv is not None:
+            measured = compute_rvol(tv, cached_adv, progress)
+            if measured is not None:
+                return {"rvol": measured, "basis": "broker_history", "refresh": True, "forget": False}
+        carried = _carry_rvol(prior, now_et, ttl_seconds)
+        if carried is not None:
+            return {"rvol": carried, "basis": "carried", "refresh": False, "forget": False}
+        return {"rvol": None, "basis": "unmeasured", "refresh": False, "forget": False}
+    adv_value = adv if adv is not None else cached_adv
+    historic = _rvol_from_series(series or [], adv_value, progress, now_et, ttl_seconds)
+    if historic is not None:
+        return {"rvol": historic, "basis": "broker_history", "refresh": True, "forget": False}
+    carried = _carry_rvol(prior, now_et, ttl_seconds)
+    if carried is not None:
+        return {"rvol": carried, "basis": "carried", "refresh": False, "forget": False}
+    return {"rvol": None, "basis": "unmeasured", "refresh": False, "forget": False}
 
 
 def spread_pct(bid: Optional[float], ask: Optional[float]) -> Optional[float]:
@@ -9770,12 +10005,20 @@ def evaluate_quote(
     volatility regime. Without it no edge features are measured and the
     thesis is not judged here (the entry filter still judges it)."""
     last = float(quote["last"])
-    rvol = compute_rvol(quote.get("total_volume"), quote.get("avg_daily_volume"), progress)
+    now_et = (context or {}).get("now_et")
+    prior_map = (context or {}).get("rvol_prior") if isinstance((context or {}).get("rvol_prior"), dict) else {}
+    adv_map = (context or {}).get("adv_cache") if isinstance((context or {}).get("adv_cache"), dict) else {}
+    symbol = str(quote.get("symbol") or "").upper()
+    resolved = resolve_rvol(
+        quote, series, progress, now_et if isinstance(now_et, datetime) else None,
+        prior=prior_map.get(symbol) if isinstance(prior_map.get(symbol), dict) else None,
+        cached_adv=adv_map.get(symbol),
+    )
+    rvol = resolved["rvol"]
     spread = spread_pct(quote.get("bid"), quote.get("ask"))
     vwap = sampled_vwap(series)
     change_open = pct_change(last, quote.get("open"))
     vwap_dist = pct_change(last, vwap) if vwap else None
-    now_et = (context or {}).get("now_et")
     # The tape reader first: ORB on a gap day, VWAP reclaim/rejection, mean
     # reversion — each with its own structural stop/target. Then the legacy
     # (retired, shadow-tracked) family. A readable tape OWNS the core labels:
@@ -9869,6 +10112,7 @@ def evaluate_quote(
         "stop": stop,
         "target": target,
         "rvol": rvol,
+        "rvol_basis": resolved["basis"],
         "spread_pct": spread,
         "change_from_open_pct": change_open,
         "vwap": vwap,
@@ -10050,6 +10294,94 @@ class Scanner:
             logger.warning(f"emit counter failed ({e}) — today's tally unavailable")
             return used
 
+    # ---- bounded RVOL memory ----------------------------------------------
+    def _adv_for_pass(self, now_et: datetime) -> Dict[str, float]:
+        """Same-day ADV cache, if the host injected one. Empty when it is not."""
+        lookup = getattr(self, "adv_cache", None)
+        if lookup is None:
+            return {}
+        try:
+            blob = lookup() or {}
+        except Exception as e:
+            logger.warning(f"ADV cache unreadable: {e}")
+            return {}
+        if not isinstance(blob, dict):
+            return {}
+        values = blob.get("values") if "values" in blob else blob
+        day = blob.get("day") if "values" in blob else None
+        allowed = {now_et.date().isoformat(), date.today().isoformat()}
+        if day is not None and str(day) not in allowed:
+            return {}
+        out: Dict[str, float] = {}
+        if not isinstance(values, dict):
+            return out
+        for sym, vol in values.items():
+            if isinstance(vol, bool):
+                continue
+            try:
+                f = float(vol)
+            except (TypeError, ValueError):
+                continue
+            if f > 0:
+                out[str(sym).upper()] = f
+        return out
+
+    async def _load_rvol_priors(self) -> Dict[str, Any]:
+        cached = getattr(self, "_rvol_priors", None)
+        if isinstance(cached, dict):
+            return cached
+        loaded: Dict[str, Any] = {}
+        try:
+            raw = await self.state.get(RVOL_LAST_KEY)
+            parsed = json.loads(raw) if raw else {}
+            if isinstance(parsed, dict):
+                loaded = {str(k).upper(): v for k, v in parsed.items() if isinstance(v, dict)}
+        except Exception as e:
+            logger.warning(f"rvol memory unreadable — measuring fresh: {e}")
+            loaded = {}
+        self._rvol_priors = loaded
+        return loaded
+
+    async def _save_rvol_priors(self, priors: Dict[str, Any]) -> None:
+        self._rvol_priors = priors
+        try:
+            await self.state.set(RVOL_LAST_KEY, json.dumps(priors))
+        except Exception as e:
+            logger.warning(f"rvol memory not saved (non-fatal): {e}")
+
+    def _absorb_rvol(
+        self,
+        symbol: str,
+        quote: Dict[str, Any],
+        cand: Dict[str, Any],
+        now_et: datetime,
+        priors: Dict[str, Any],
+    ) -> bool:
+        """Remember a fresh reading. A carry does not refresh its own clock.
+        A quote that reported volume and still could not measure RVOL forgets
+        the prior so a later gap cannot resurrect it."""
+        name = str(symbol or "").upper()
+        if not name:
+            return False
+        basis = cand.get("rvol_basis")
+        rvol = cand.get("rvol")
+        if basis in {"measured", "broker_history"} and isinstance(rvol, (int, float)) and not isinstance(rvol, bool):
+            priors[name] = {
+                "rvol": float(rvol),
+                "ts": now_et.timestamp(),
+                "day_et": now_et.date().isoformat(),
+            }
+            return True
+        if (
+            quote.get("total_volume") is not None
+            and quote.get("avg_daily_volume") is not None
+            and rvol is None
+            and name in priors
+        ):
+            priors.pop(name, None)
+            return True
+        return False
+
     # ---- one pass ---------------------------------------------------------
     async def scan_once(self) -> Dict[str, Any]:
         cfg = self._config
@@ -10076,8 +10408,14 @@ class Scanner:
                 errors.append(f"{chunk[0]}…: {str(e)[:120]}")
                 logger.warning(f"scanner quote fetch failed for {len(chunk)} symbols: {e}")
 
-        progress = session_progress(self.now_et())
-        context: Dict[str, Any] = {"quotes": {q["symbol"]: q for q in quotes}, "now_et": self.now_et()}
+        now_et = self.now_et()
+        progress = session_progress(now_et)
+        context: Dict[str, Any] = {"quotes": {q["symbol"]: q for q in quotes}, "now_et": now_et}
+        loaded_priors = await self._load_rvol_priors()
+        priors = _prune_rvol_priors(loaded_priors, now_et)
+        context["rvol_prior"] = priors
+        context["adv_cache"] = self._adv_for_pass(now_et)
+        rvol_dirty = priors != loaded_priors
         # LEARNING LOOP — one snapshot per pass. Unreadable → no learning
         # verdicts and no throttle (fails open, like the entry filter).
         snapshot: Optional[Dict[str, Any]] = None
@@ -10106,8 +10444,13 @@ class Scanner:
         for quote in quotes:
             series = await self._series(quote["symbol"])
             if quote["symbol"] in universe:
-                candidates.append(evaluate_quote(quote, series, cfg, progress, context))
+                cand = evaluate_quote(quote, series, cfg, progress, context)
+                candidates.append(cand)
+                if self._absorb_rvol(quote["symbol"], quote, cand, now_et, priors):
+                    rvol_dirty = True
             await self._append_sample(quote)
+        if rvol_dirty:
+            await self._save_rvol_priors(priors)
 
         candidates.sort(key=lambda c: (c["qualifies"], c["score"]), reverse=True)
         emitted: List[Dict[str, Any]] = []
@@ -11457,8 +11800,12 @@ class MassiveClient:
         self._adv_day: Optional[str] = None
         self.last_ok_at: Optional[float] = None
         self.last_error: Optional[str] = None
+        self.auth_status: Optional[int] = None
         self.calls = 0
         self.failures = 0
+        # Optional async/sync hook. The bot persists counters through StateStore;
+        # tests leave it unset and the client still works with no Redis.
+        self.on_health: Optional[Any] = None
 
     def _headers(self) -> Dict[str, str]:
         return {"Authorization": f"Bearer {api_key()}"}
@@ -11467,6 +11814,7 @@ class MassiveClient:
         self.calls += 1
         resp = await client.get(f"{BASE_URL}{path}", params=params or {}, headers=self._headers())
         if resp.status_code == 401 or resp.status_code == 403:
+            self.auth_status = int(resp.status_code)
             raise RuntimeError(f"Massive rejected the API key (HTTP {resp.status_code})")
         if resp.status_code == 429:
             raise RuntimeError("Massive rate limit (HTTP 429)")
@@ -11521,14 +11869,18 @@ class MassiveClient:
         except Exception as e:
             self.failures += 1
             self.last_error = str(e)[:200]
+            await self._notify_health()
             raise
         out = snapshot_to_quote_response({"tickers": tickers}, adv_by_symbol=self._adv)
         if not out["QuoteResponse"]["QuoteData"]:
             self.failures += 1
             self.last_error = "Massive returned no priced tickers"
+            await self._notify_health()
             raise RuntimeError(self.last_error)
         self.last_ok_at = time.time()
         self.last_error = None
+        self.auth_status = None
+        await self._notify_health()
         return out
 
     async def fetch_option_quote(self, underlying: str, expiry_iso: str, call_put: str,
@@ -11554,7 +11906,9 @@ class MassiveClient:
         try:
             import httpx
         except Exception as e:  # pragma: no cover - httpx ships with the bot
-            return failed(e, "option quote")
+            out = failed(e, "option quote")
+            await self._notify_health()
+            return out
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
             # 1) NBBO quotes feed, NEWEST tick only (order=desc). The docs
             #    default (asc) would return the oldest tick ever recorded.
@@ -11566,6 +11920,9 @@ class MassiveClient:
                 qv = failed(e, "quotes feed")
             if qv.get("live") is True:
                 self.last_ok_at = time.time()
+                self.last_error = None
+                self.auth_status = None
+                await self._notify_health()
                 return qv
             # 2) Contract snapshot (carries Massive's own timeframe flag).
             try:
@@ -11577,7 +11934,80 @@ class MassiveClient:
         out = pick_option_quote(qv, sv)
         if out.get("live") is True:
             self.last_ok_at = time.time()
+            self.last_error = None
+            self.auth_status = None
+        await self._notify_health()
         return out
+
+    async def _notify_health(self) -> None:
+        hook = getattr(self, "on_health", None)
+        if hook is None:
+            return
+        try:
+            result = hook()
+            if hasattr(result, "__await__"):
+                await result
+        except Exception:
+            return
+
+    def export_counters(self) -> Dict[str, Any]:
+        """Counters worth surviving a restart. No key, no account, no token."""
+        adv: Dict[str, float] = {}
+        for sym, vol in list(self._adv.items())[:500]:
+            try:
+                f = float(vol)
+            except (TypeError, ValueError):
+                continue
+            if f > 0:
+                adv[str(sym).upper()] = f
+        auth = self.auth_status if self.auth_status in (401, 403) else None
+        return {
+            "last_ok_at": self.last_ok_at if isinstance(self.last_ok_at, (int, float)) else None,
+            "last_error": (str(self.last_error)[:200] if self.last_error else None),
+            "auth_status": auth,
+            "calls": int(self.calls or 0),
+            "failures": int(self.failures or 0),
+            "adv_day": self._adv_day,
+            "adv": adv,
+        }
+
+    def load_counters(self, raw: Any) -> None:
+        """Restore a previous export. A bad payload leaves the client as it is."""
+        if not isinstance(raw, dict):
+            return
+        last_ok = raw.get("last_ok_at")
+        try:
+            self.last_ok_at = float(last_ok) if isinstance(last_ok, (int, float)) and not isinstance(last_ok, bool) else None
+        except (TypeError, ValueError):
+            self.last_ok_at = None
+        err = raw.get("last_error")
+        self.last_error = str(err)[:200] if err else None
+        try:
+            self.calls = max(0, int(raw.get("calls") or 0))
+        except (TypeError, ValueError):
+            self.calls = 0
+        try:
+            self.failures = max(0, int(raw.get("failures") or 0))
+        except (TypeError, ValueError):
+            self.failures = 0
+        try:
+            auth = int(raw.get("auth_status"))
+        except (TypeError, ValueError):
+            auth = None
+        self.auth_status = auth if auth in (401, 403) else None
+        day = raw.get("adv_day")
+        self._adv_day = str(day) if day else self._adv_day
+        adv = raw.get("adv")
+        if isinstance(adv, dict):
+            cleaned: Dict[str, float] = {}
+            for sym, vol in list(adv.items())[:500]:
+                try:
+                    f = float(vol)
+                except (TypeError, ValueError):
+                    continue
+                if f > 0:
+                    cleaned[str(sym).upper()] = f
+            self._adv = cleaned
 
     def status(self) -> Dict[str, Any]:
         return {
@@ -11585,6 +12015,7 @@ class MassiveClient:
             "key_configured": bool(api_key()),
             "last_ok_at": self.last_ok_at,
             "last_error": self.last_error,
+            "auth_status": self.auth_status if self.auth_status in (401, 403) else None,
             "calls": self.calls,
             "failures": self.failures,
             "adv_cached": len(self._adv),
@@ -12726,7 +13157,18 @@ CALL_INDEX_VWAP_SYMBOLS = tuple(
 # Pro Day Trader realignment. Shadow classifies and records verdicts without
 # changing an order. Active may only block or scale size down.
 import pro_trader
-PRO_TRADER_MODE = pro_trader.normalize_mode(os.getenv("PRO_TRADER_MODE", "shadow"))
+
+
+def resolve_pro_trader_mode(raw: Any) -> Tuple[str, Optional[str]]:
+    """Env/config resolver. Blank stays shadow. ``live`` and other junk are
+    rejected out loud — they are not quietly rewritten to shadow."""
+    mode, warning = pro_trader.interpret_mode(raw)
+    if warning:
+        logging.getLogger("etrade-bot").error("⛔ %s", warning)
+    return mode, warning
+
+
+PRO_TRADER_MODE, PRO_TRADER_MODE_WARNING = resolve_pro_trader_mode(os.getenv("PRO_TRADER_MODE"))
 MIN_TRADES_PER_DAY = pro_trader.clamp_min_trades(os.getenv("MIN_TRADES_PER_DAY", "4"))
 _PRO_TRADER = pro_trader.Desk()
 # After a handoff that cancelled the stop and failed to rest the trail, wait
@@ -14056,9 +14498,10 @@ def plan_policy_sync(current: Dict[str, Any], patch: Any) -> Dict[str, Any]:
             value = None
         policy[key] = value if (value is not None and math.isfinite(value)) else None
     policy["allowed_setups"] = clean_setups(current.get("allowed_setups")) or []
-    policy["pro_trader_mode"] = pro_trader.normalize_mode(
+    mode, mode_warning = pro_trader.interpret_mode(
         current.get("pro_trader_mode"), default=PRO_TRADER_MODE,
     )
+    policy["pro_trader_mode"] = mode
     policy["min_trades_per_day"] = pro_trader.clamp_min_trades(
         current.get("min_trades_per_day") if current.get("min_trades_per_day") is not None else MIN_TRADES_PER_DAY,
     )
@@ -14066,6 +14509,8 @@ def plan_policy_sync(current: Dict[str, Any], patch: Any) -> Dict[str, Any]:
     changes: List[str] = []
     clamped: List[str] = []
     ignored: List[str] = []
+    if mode_warning:
+        ignored.append(mode_warning)
 
     if not isinstance(patch, dict):
         return {"policy": policy, "changes": changes, "clamped": clamped,
@@ -14119,8 +14564,8 @@ def plan_policy_sync(current: Dict[str, Any], patch: Any) -> Dict[str, Any]:
         raw_mode = str(patch.get("pro_trader_mode") or "").strip().lower()
         if raw_mode not in {"off", "shadow", "active"}:
             ignored.append(
-                f"pro_trader_mode: {patch.get('pro_trader_mode')!r} is not off|shadow|active "
-                f"— kept {policy['pro_trader_mode']}"
+                f"pro_trader_mode: {patch.get('pro_trader_mode')!r} rejected — "
+                f"not off|shadow|active; kept {policy['pro_trader_mode']}"
             )
         elif requested != policy["pro_trader_mode"]:
             changes.append(f"pro_trader_mode {policy['pro_trader_mode']} → {requested}")
@@ -14214,6 +14659,9 @@ async def apply_policy_patch(patch: Any, source: str) -> Dict[str, Any]:
         "clamped": result["clamped"],
         "ignored": result["ignored"],
     }
+    for note in result["ignored"]:
+        if str(note).startswith("pro_trader_mode"):
+            logger.error(f"⛔ {note}")
     # The scanner's own floors must follow the gate, or its eyes stay shut on
     # exactly the band the operator just opened (see set_entry_gate_floors).
     try:
@@ -14654,25 +15102,45 @@ def _payload_vol_annual(p: dict) -> Optional[float]:
     return sigma * math.sqrt(cost_model.TRADING_DAYS * cost_model.SESSION_SECONDS) if sigma else None
 
 
+FEED_HEALTH_KEY = "massive:feed_health"
+DESK_STATE_KEY = "pro_trader:desk"
+
+
 def _pro_trader_feed_health() -> Dict[str, Any]:
-    """Massive snapshot health for the regime fail-safe. A 403 is degraded
-    even when the scanner has fallen back to E*TRADE — that fallback is named,
-    not treated as a healthy primary feed."""
+    """Massive snapshot health for the regime fail-safe.
+
+    A 401/403 is degraded even after the scanner falls back to E*TRADE — that
+    fallback is named, not treated as a healthy primary feed. A configured key
+    with no successful read (`last_ok_at` null) is unproven, not healthy.
+    No key configured means Massive is not the feed; that stays ok.
+    """
     status = massive_client.status() if massive_client is not None else {}
     err = str(status.get("last_error") or _scanner_quote_source.get("fallback_reason") or "")
-    http = 403 if "403" in err else (401 if "401" in err else None)
-    age = None
-    if isinstance(status.get("last_ok_at"), (int, float)):
-        age = max(0.0, time.time() - float(status["last_ok_at"]))
+    try:
+        auth = int(status.get("auth_status")) if status.get("auth_status") is not None else None
+    except (TypeError, ValueError):
+        auth = None
+    if auth not in (401, 403):
+        auth = 403 if "403" in err else (401 if "401" in err else None)
+    http = auth
+    last_ok = status.get("last_ok_at")
+    proven = isinstance(last_ok, (int, float)) and not isinstance(last_ok, bool)
+    age = max(0.0, time.time() - float(last_ok)) if proven else None
     ok = True
     if not status.get("key_configured"):
         err = ""
         http = None
+        proven = False
     elif http in (401, 403):
         ok = False
+    elif not proven:
+        ok = False
+        if not err:
+            err = "Massive feed unproven (no successful read)"
     return {
         "provider": "massive",
         "ok": ok,
+        "proven": proven and ok,
         "http_status": http,
         "stale": bool(age is not None and age > 180 and not ok),
         "age_seconds": None if age is None else round(age, 1),
@@ -14680,6 +15148,78 @@ def _pro_trader_feed_health() -> Dict[str, Any]:
         "endpoint": "/v2/snapshot/locale/us/markets/stocks/tickers",
         "fallback": _scanner_quote_source.get("last"),
     }
+
+
+def _feed_health_blob() -> Dict[str, Any]:
+    counters = massive_client.export_counters() if massive_client is not None else {}
+    return {
+        **counters,
+        "scanner_feed": {
+            "last": _scanner_quote_source.get("last"),
+            "at": _scanner_quote_source.get("at"),
+            "fallback_reason": _scanner_quote_source.get("fallback_reason"),
+        },
+    }
+
+
+def _apply_feed_health_blob(raw: Any) -> None:
+    if not isinstance(raw, dict):
+        return
+    if massive_client is not None:
+        massive_client.load_counters(raw)
+    feed = raw.get("scanner_feed") if isinstance(raw.get("scanner_feed"), dict) else {}
+    if not feed:
+        return
+    _scanner_quote_source["last"] = feed.get("last")
+    _scanner_quote_source["at"] = feed.get("at")
+    _scanner_quote_source["fallback_reason"] = feed.get("fallback_reason")
+
+
+async def _persist_feed_health() -> None:
+    """Write Massive counters and the scanner fallback through StateStore.
+    Redis when it is up; the memory backend when it is not. Never raises."""
+    try:
+        await state.set(FEED_HEALTH_KEY, json.dumps(_feed_health_blob()))
+    except Exception as e:
+        logger.warning(f"feed health persist failed (non-fatal): {e}")
+
+
+async def _restore_feed_health() -> None:
+    try:
+        raw = await state.get(FEED_HEALTH_KEY)
+    except Exception as e:
+        logger.warning(f"feed health restore failed — cold feed: {e}")
+        return
+    if not raw:
+        return
+    try:
+        _apply_feed_health_blob(json.loads(raw))
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning(f"feed health payload unreadable — cold feed: {e}")
+
+
+async def _persist_desk() -> None:
+    try:
+        await state.set(DESK_STATE_KEY, json.dumps(_PRO_TRADER.snapshot(), default=str))
+    except Exception as e:
+        logger.warning(f"pro trader desk persist failed (non-fatal): {e}")
+
+
+async def _restore_desk() -> None:
+    try:
+        raw = await state.get(DESK_STATE_KEY)
+    except Exception as e:
+        logger.warning(f"pro trader desk restore failed — empty desk: {e}")
+        return
+    if not raw:
+        return
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning(f"pro trader desk payload unreadable — empty desk: {e}")
+        return
+    if not _PRO_TRADER.restore(loaded):
+        logger.warning("pro trader desk payload rejected — empty desk")
 
 
 def _pro_trader_candidate(p: dict) -> Dict[str, Any]:
@@ -14758,7 +15298,7 @@ async def _fold_pro_trader(p: dict, blocked: List[str]) -> List[str]:
     if mode == "off" or _is_connectivity_test(p) or str(p.get("instrument") or "").lower() == "crypto":
         return blocked
     try:
-        daily = await state.get_daily()
+        daily = await state.get_trading_day()
         decision = _PRO_TRADER.evaluate(
             await _pro_trader_observation(p),
             _pro_trader_candidate(p),
@@ -14775,6 +15315,7 @@ async def _fold_pro_trader(p: dict, blocked: List[str]) -> List[str]:
             blocked.append("pro trader unavailable — active mode stands down")
         return blocked
     p["_pro_trader"] = decision
+    await _persist_desk()
     if mode == "active" and decision.get("verdict") == "BLOCK":
         blocked.append(str(decision.get("summary") or "pro trader blocked"))
     elif mode == "shadow":
@@ -14817,6 +15358,7 @@ async def _note_pro_trader_decision(pd: dict, accepted: bool) -> None:
         return
     try:
         _PRO_TRADER.remember(decision, accepted=accepted)
+        await _persist_desk()
         await trade_ledger.record("pro_trader_decision", {
             **pro_trader.journal_metadata(decision),
             "accepted_by_filters": bool(accepted),
@@ -29749,7 +30291,16 @@ scanner: Optional[scanner_mod.Scanner] = None
 # is set; E*TRADE is the fallback. massive.py translates its snapshot into the
 # E*TRADE QuoteResponse shape, so parse_quotes and every gate run unchanged.
 massive_client = massive.MassiveClient()
+massive_client.on_health = _persist_feed_health
 _scanner_quote_source: Dict[str, Any] = {"last": None, "at": None, "fallback_reason": None}
+
+
+def _massive_adv_cache() -> Dict[str, Any]:
+    """Same-day ADV the scanner may use when a fallback quote omits volume10Day."""
+    return {
+        "day": getattr(massive_client, "_adv_day", None),
+        "values": dict(getattr(massive_client, "_adv", {}) or {}),
+    }
 
 
 async def _scanner_fetch_quotes(symbols: List[str]) -> Dict[str, Any]:
@@ -29758,12 +30309,15 @@ async def _scanner_fetch_quotes(symbols: List[str]) -> Dict[str, Any]:
         try:
             resp = await massive_client.fetch_quote_response(list(symbols))
             _scanner_quote_source.update({"last": "massive", "at": _utcnow().isoformat(), "fallback_reason": None})
+            await _persist_feed_health()
             return resp
         except Exception as e:
             logger.warning(f"Massive quote fetch failed ({e}) — falling back to E*TRADE")
             _scanner_quote_source["fallback_reason"] = str(e)[:200]
+            await _persist_feed_health()
     resp = await _scanner_fetch_etrade_quotes(symbols)
     _scanner_quote_source.update({"last": "etrade", "at": _utcnow().isoformat()})
+    await _persist_feed_health()
     return resp
 
 
@@ -29862,6 +30416,7 @@ async def _start_scanner() -> None:
         shadow_symbols=_scanner_shadow_symbols,
         core_reinstated=_core_reinstated,
     )
+    scanner.adv_cache = _massive_adv_cache
     # Stored config wins (survives restarts, changed live from the app); env
     # vars only seed the very first boot.
     stored = await scanner.load_config()
@@ -29957,6 +30512,8 @@ async def on_startup():
     # reverts to defaults while the settings screen keeps showing the
     # operator's numbers, which is the drift the sync exists to end.
     await restore_policy()
+    await _restore_feed_health()
+    await _restore_desk()
     await preload_tokens()
     # One-time migration of the legacy JSON STATE_FILE into Redis (skipped when
     # Redis already holds state; the file is renamed *.migrated afterwards).
@@ -30913,7 +31470,7 @@ async def status():
     shape matches etrade_bot_handler's /status (open_positions keyed by ticker
     with qty/entry/stop/target/ts/contract), now read from reconciled Redis
     state and enriched with the last reconciliation report."""
-    daily = await state.get_daily()
+    daily = await state.get_trading_day()
     broker_snapshot = await _load_account_snapshot()
     last_reconcile = None
     raw_report = await state.get("reconcile:last")
@@ -31289,7 +31846,7 @@ async def _pro_trader_report_payload() -> Dict[str, Any]:
     if not decisions:
         decisions = list(_PRO_TRADER.decisions)
     try:
-        daily = await state.get_daily()
+        daily = await state.get_trading_day()
         done = daily.get("trades_today")
     except Exception:
         done = _PRO_TRADER.trades_completed
@@ -31317,7 +31874,7 @@ async def pro_trader_status():
     Same auth as the rest of the bot: X-Rork-Secret, except /health and /healthz.
     """
     try:
-        daily = await state.get_daily()
+        daily = await state.get_trading_day()
         done = daily.get("trades_today")
     except Exception:
         done = None

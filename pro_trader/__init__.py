@@ -6,7 +6,7 @@ scale size down, inside the locked rails in `risk.HARD_RAILS`.
 """
 from pro_trader.attribution import build_report, journal_metadata
 from pro_trader.corrective import build_corrective_actions
-from pro_trader.engine import Desk, evaluate, normalize_mode, order_effect, passthrough
+from pro_trader.engine import Desk, evaluate, interpret_mode, normalize_mode, order_effect, passthrough
 from pro_trader.execution import guard_live_quote
 from pro_trader.pacing import MIN_TRADES_DEFAULT, clamp_min_trades, pace_state
 from pro_trader.regime import classify
@@ -22,6 +22,7 @@ __all__ = [
     "clamp_multiplier",
     "classify",
     "evaluate",
+    "interpret_mode",
     "pace_state",
     "guard_live_quote",
     "journal_metadata",
