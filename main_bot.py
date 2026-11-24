@@ -9278,6 +9278,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -9354,6 +9355,42 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # the real risk limit look four times smaller than it is. A stored value
     # is now simply ignored.
 }
+
+# About 10 minutes of scanner cadence before a today-only VWAP is measured.
+_VWAP_WINDOW_MINUTES = 10
+
+
+def _scanner_cadence_seconds() -> int:
+    """Host SCANNER_INTERVAL_SECONDS, else the scanner's 60s default."""
+    fallback = int(DEFAULT_CONFIG["interval_seconds"])
+    text = str(os.getenv("SCANNER_INTERVAL_SECONDS", "")).strip()
+    if not text:
+        return fallback
+    try:
+        cadence = int(text)
+    except (TypeError, ValueError):
+        return fallback
+    return cadence if cadence > 0 else fallback
+
+
+def vwap_min_today_samples() -> int:
+    """Today's regular-session samples required before a VWAP is measured.
+
+    ``VWAP_MIN_TODAY_SAMPLES`` overrides. The default is about 10 minutes
+    of the scanner cadence: ``round(10 * 60 / cadence)``. Cadence defaults
+    to 60 seconds, so the default N is 10.
+    """
+    text = str(os.getenv("VWAP_MIN_TODAY_SAMPLES", "")).strip()
+    if text:
+        try:
+            asked = int(text)
+        except (TypeError, ValueError):
+            asked = 0
+        if asked >= 2:
+            return asked
+    cadence = _scanner_cadence_seconds()
+    return max(2, int(round(_VWAP_WINDOW_MINUTES * 60 / cadence)))
+
 
 # Symbols may never exceed this — one pasted watchlist must not blow the
 # broker's quote budget. Mirrored by the app's parseUniverse().
@@ -10068,6 +10105,66 @@ def session_series(series: List[Dict[str, Any]], now_et: datetime) -> List[Dict[
     return out
 
 
+def today_session_vwap(
+    series: List[Dict[str, Any]],
+    now_et: Optional[datetime],
+    *,
+    min_samples: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Sampled VWAP of today's regular session, or unmeasured.
+
+    Built on ``session_series``. Prior-day prints left in the rolling
+    ``scanner:series`` list are ignored, and so are pre-open and
+    after-close prints. Fewer than N regular-session samples, or a
+    window that is only pre-open, is unmeasured. ``sampled_vwap`` itself
+    is unchanged; this chooses which samples it sees.
+    """
+    need = vwap_min_today_samples() if min_samples is None else int(min_samples)
+    if now_et is None:
+        return {
+            "vwap": None, "samples": 0, "measured": False,
+            "reason": "no session clock — today VWAP unmeasured",
+            "source": None, "preopen_samples": 0,
+        }
+    clean = [s for s in (series or []) if isinstance(s, dict)]
+    preopen = 0
+    after = 0
+    close_m = session_close_minute(now_et)
+    for sample in clean:
+        ts = _ts_et(sample, now_et.tzinfo)
+        if ts is None or ts.date() != now_et.date() or ts > now_et or sample.get("last") is None:
+            continue
+        minute = ts.hour * 60 + ts.minute
+        if minute < _SESSION_OPEN_MIN:
+            preopen += 1
+        elif minute >= close_m:
+            after += 1
+    today = session_series(clean, now_et)
+    if len(today) < need:
+        if len(today) == 0 and preopen > 0 and after == 0:
+            reason = "pre-open samples only — today RTH VWAP unmeasured"
+        else:
+            reason = (
+                f"only {len(today)} today RTH samples — need {need} "
+                "(VWAP_MIN_TODAY_SAMPLES) — today VWAP unmeasured"
+            )
+        return {
+            "vwap": None, "samples": len(today), "measured": False,
+            "reason": reason, "source": None, "preopen_samples": preopen,
+        }
+    vwap = sampled_vwap(today)
+    if vwap is None or vwap <= 0:
+        return {
+            "vwap": None, "samples": len(today), "measured": False,
+            "reason": "today RTH samples have no positive volume delta — VWAP unmeasured",
+            "source": None, "preopen_samples": preopen,
+        }
+    return {
+        "vwap": vwap, "samples": len(today), "measured": True,
+        "reason": None, "source": "session_sampled", "preopen_samples": preopen,
+    }
+
+
 def volume_pace(today: List[Dict[str, Any]], quote: Dict[str, Any], now_et: datetime) -> Optional[float]:
     """Volume rate since the last sample ÷ the session's average rate, or None
     when either side is unmeasured."""
@@ -10596,7 +10693,9 @@ def evaluate_quote(
     )
     rvol = resolved["rvol"]
     spread = spread_pct(quote.get("bid"), quote.get("ask"))
-    vwap = sampled_vwap(series)
+    clock = now_et if isinstance(now_et, datetime) else None
+    resolved_vwap = today_session_vwap(series, clock)
+    vwap = resolved_vwap["vwap"]
     change_open = pct_change(last, quote.get("open"))
     vwap_dist = pct_change(last, vwap) if vwap else None
     # The tape reader first: ORB on a gap day, VWAP reclaim/rejection, mean
@@ -10696,6 +10795,8 @@ def evaluate_quote(
         "spread_pct": spread,
         "change_from_open_pct": change_open,
         "vwap": vwap,
+        "vwap_source": resolved_vwap.get("source"),
+        "vwap_unmeasured_reason": resolved_vwap.get("reason"),
         "setup": setup,
         "score": score,
         "score_base": SCORE_BASE,
@@ -13368,7 +13469,13 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # option entries refuse once the flatten window is open (15:40 ET on a
 # full day, 12:40 on a 13:00 half day). Crypto stays exempt from that
 # block. force_execute does not bypass it.
-BOT_VERSION = "5.95.0-pro-day-trader"
+# 5.97.0: the CALL index VWAP gate, evaluate_quote's VWAP, and the
+# pro-trader SPY range use today's regular-session samples only. A thin
+# or pre-open window is unmeasured, and the CALL gate stays fail-closed.
+# A cached Massive RTH minute VWAP that is missing or too far from that
+# today VWAP is unmeasured too. day.vw is not a gate input. This number
+# may be renumbered when the branch is rebased after #22 and #23 land.
+BOT_VERSION = "5.97.0-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -13884,6 +13991,27 @@ CALL_INDEX_VWAP_SYMBOLS = tuple(
 ) or ("SPY", "QQQ")
 
 
+def _env_flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() not in {"false", "0", "no", "off"}
+
+
+def vwap_crosscheck_required() -> bool:
+    """Read on each decision. Default true: a missing Massive RTH VWAP fails closed."""
+    return _env_flag("VWAP_CROSSCHECK_REQUIRED", "true")
+
+
+def vwap_crosscheck_max_bps() -> float:
+    """Absolute basis-point gap allowed between today VWAP and Massive RTH. Default 25."""
+    raw = os.getenv("VWAP_CROSSCHECK_MAX_BPS", "25")
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return 25.0
+    if not math.isfinite(value) or value < 0:
+        return 25.0
+    return value
+
+
 def call_index_vwap_gate_status() -> Dict[str, Any]:
     """Read-only view of the gate this process is actually running.
 
@@ -13891,6 +14019,10 @@ def call_index_vwap_gate_status() -> Dict[str, Any]:
     the environment does not change the gate and does not change this report.
     `mode` is `fail_closed` only while the gate is on. While it is off,
     `_call_index_vwap_block` returns without blocking.
+
+    The sample floor and the Massive cross-check are read on each decision
+    so an operator can tighten them without a restart. They do not change
+    `enabled`.
     """
     enabled = bool(CALL_INDEX_VWAP_GATE)
     symbols = list(CALL_INDEX_VWAP_SYMBOLS)
@@ -13898,6 +14030,10 @@ def call_index_vwap_gate_status() -> Dict[str, Any]:
         "enabled": enabled,
         "symbols": symbols,
         "mode": "fail_closed" if enabled else "off",
+        "vwap_source": "session_sampled",
+        "vwap_min_today_samples": scanner_mod.vwap_min_today_samples(),
+        "vwap_crosscheck_max_bps": vwap_crosscheck_max_bps(),
+        "vwap_crosscheck_required": vwap_crosscheck_required(),
     }
 # Pro Day Trader realignment. Shadow classifies and records verdicts without
 # changing an order. Active may only block or scale size down.
@@ -14824,15 +14960,34 @@ def _payload_option_right(p: dict) -> str:
     return ""
 
 
+async def _load_index_series(symbol: str) -> List[Dict[str, Any]]:
+    """Chronological scanner samples. Empty when the list cannot be read."""
+    try:
+        if scanner is not None:
+            loaded = await scanner._series(symbol)
+        else:
+            loaded = await _scanner_series_for(symbol)
+    except Exception as e:
+        logger.debug("today VWAP series unavailable for %s: %s", symbol, e)
+        return []
+    if not isinstance(loaded, list):
+        return []
+    return [row for row in loaded if isinstance(row, dict)]
+
+
 async def _index_vwap_quotes(
     symbols: Tuple[str, ...] = CALL_INDEX_VWAP_SYMBOLS,
     *,
     dry_run: bool = False,
 ) -> List[Dict[str, Any]]:
-    """SPY/QQQ last + day VWAP for the call gate. Prefers the broker VWAP
-    field; falls back to the scanner's sampled session VWAP when the quote
-    omits it. A total fetch failure returns rows with no VWAP; the gate
-    then fails closed."""
+    """SPY/QQQ last plus today's regular-session VWAP for the call gate.
+
+    The gate value comes from ``session_series`` via ``today_session_vwap``.
+    The raw rolling list, a broker VWAP field, and Massive day.vw are not
+    the gate input. The Massive check reads the today-keyed RTH cache only
+    and does not call Massive. Unmeasured leaves ``vwap`` empty so the gate
+    fails closed. A quote-fetch failure returns rows with no VWAP.
+    """
     syms = [s for s in symbols if s]
     if not syms:
         return []
@@ -14846,28 +15001,39 @@ async def _index_vwap_quotes(
         logger.warning(f"call-index VWAP quote fetch failed ({e})")
         quotes = []
     by_sym = {str(q.get("symbol") or "").upper(): q for q in quotes if isinstance(q, dict)}
+    now_et = _utcnow().astimezone(_ET_ZONE)
     out: List[Dict[str, Any]] = []
     for sym in syms:
         row = dict(by_sym.get(sym) or {"symbol": sym})
         row["symbol"] = sym
-        vwap = row.get("vwap")
-        if (vwap is None or float(vwap or 0) <= 0) and scanner is not None:
-            try:
-                series = await scanner._series(sym)
-                sampled = scanner_mod.sampled_vwap(series)
-                if sampled is not None and sampled > 0:
-                    row["vwap"] = sampled
-                    row["vwap_source"] = "scanner_sampled"
-            except Exception as e:
-                logger.debug(f"call-index sampled VWAP for {sym} unavailable: {e}")
-        elif vwap is not None and float(vwap or 0) > 0:
-            row["vwap_source"] = "quote"
+        series = await _load_index_series(sym)
+        resolved = scanner_mod.today_session_vwap(series, now_et)
+        checked = _crosscheck_today_vwap(resolved, _cached_minute_vwap_view(sym, now_et))
+        side = _gate_side_verdict(row.get("last"), checked)
+        if checked["measured"] and side in {"above", "below"}:
+            row["vwap"] = checked["vwap"]
+            row["vwap_source"] = "session_sampled"
+            row["gate_vwap_source"] = "session_sampled"
+            row["gate_vwap_reason"] = None
+        else:
+            row["vwap"] = None
+            row["vwap_source"] = None
+            side = "unmeasured"
+            row["gate_vwap_source"] = None
+            row["gate_vwap_reason"] = checked["reason"]
+        # The broker field is not the source, even when the quote carried one.
+        row["vwap_field"] = None
+        row["gate_vwap_verdict"] = side
+        row["gate_vwap_samples"] = resolved.get("samples")
+        row["gate_vwap_crosscheck_bps"] = checked.get("diff_bps")
         out.append(row)
     return out
 
 
-# Observe-only SPY/QQQ VWAP comparison. Nothing here is an input to
-# assess_call_index_vwap_gate, evaluate_quote, or the pro-trader range.
+# Massive RTH minute VWAP, cached by ET session date. /status refreshes it.
+# The CALL gate reads that cache for its cross-check and does not fetch.
+# Massive day.vw and the snapshot minute `vw` stay telemetry. They are not
+# gate inputs. evaluate_quote and the pro-trader range do not read the cache.
 _MINUTE_VWAP_REFRESH_S = 90.0
 _MINUTE_VWAP_TIMEOUT_S = 3.0
 _minute_vwap_cache: Dict[str, Dict[str, Any]] = {}
@@ -14933,13 +15099,31 @@ def _null_index_vwap_observe_row(symbol: str) -> Dict[str, Any]:
         "massive_minute_vw_diff_bps": None,
         "session_sampled_vwap_diff_bps": None,
         "massive_minute_vwap_rth_diff_bps": None,
+        "gate_vwap_source": None,
+        "gate_vwap_verdict": None,
+        "gate_vwap_reason": None,
+        "gate_vwap_crosscheck_bps": None,
     }
+
+
+def _call_verdict_from_rows(rows: List[Dict[str, Any]]) -> str:
+    """CALL verdict implied by per-index gate fields. Any above allows."""
+    verdicts = [
+        row.get("gate_vwap_verdict") for row in rows or [] if isinstance(row, dict)
+    ]
+    if any(item == "above" for item in verdicts):
+        return "allow"
+    if any(item == "below" for item in verdicts):
+        return "block"
+    return "unmeasured"
 
 
 def _observe_envelope(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "read_only": True,
         "massive_day_vwap_label": massive.DAY_VW_LABEL,
+        "gate_vwap_source": "session_sampled",
+        "gate_vwap_verdict": _call_verdict_from_rows(rows),
         "indexes": rows,
     }
 
@@ -15061,6 +15245,110 @@ def _cached_minute_vwap_view(symbol: str, now_et: datetime) -> Dict[str, Any]:
     }
 
 
+def _crosscheck_today_vwap(resolved: Dict[str, Any], minute_view: Any) -> Dict[str, Any]:
+    """Today-only VWAP versus the cached Massive RTH minute VWAP.
+
+    Does not read Massive day.vw and does not fetch. A missing or not-today
+    cache is unmeasured while ``VWAP_CROSSCHECK_REQUIRED`` is true. A gap
+    wider than ``VWAP_CROSSCHECK_MAX_BPS`` is unmeasured.
+    """
+    required = vwap_crosscheck_required()
+    max_bps = vwap_crosscheck_max_bps()
+    today = _positive_vwap(resolved.get("vwap")) if resolved.get("measured") else None
+    view = minute_view if isinstance(minute_view, dict) else {}
+    massive_px = _positive_vwap(view.get("vwap"))
+    massive_reason = view.get("reason") if isinstance(view.get("reason"), str) else None
+    if today is None:
+        return {
+            "measured": False, "vwap": None, "source": None, "verdict": "unmeasured",
+            "reason": resolved.get("reason") or "today VWAP unmeasured",
+            "diff_bps": None,
+        }
+    diff = _vwap_diff_bps(massive_px, today)
+    if massive_px is None:
+        if required:
+            why = massive_reason or "missing"
+            return {
+                "measured": False, "vwap": None, "source": None, "verdict": "unmeasured",
+                "reason": (
+                    f"Massive RTH minute VWAP {why} — cross-check required "
+                    "— today VWAP unmeasured"
+                ),
+                "diff_bps": None,
+            }
+        return {
+            "measured": True, "vwap": today, "source": "session_sampled",
+            "verdict": "measured", "reason": None, "diff_bps": None,
+        }
+    if diff is not None and abs(diff) > max_bps:
+        return {
+            "measured": False, "vwap": None, "source": None, "verdict": "unmeasured",
+            "reason": (
+                f"today VWAP {today:.4f} vs Massive RTH {massive_px:.4f} "
+                f"differs by {abs(diff):.2f} bps > {max_bps:g} — unmeasured"
+            ),
+            "diff_bps": diff,
+        }
+    return {
+        "measured": True, "vwap": today, "source": "session_sampled",
+        "verdict": "measured", "reason": None, "diff_bps": diff,
+    }
+
+
+def _gate_side_verdict(last: Any, checked: Dict[str, Any]) -> str:
+    if not checked.get("measured"):
+        return "unmeasured"
+    px = _positive_vwap(last)
+    vwap = _positive_vwap(checked.get("vwap"))
+    if px is None or vwap is None:
+        return "unmeasured"
+    return "above" if px + 1e-9 >= vwap else "below"
+
+
+def _gate_fields_for_observe(
+    quote: Dict[str, Any],
+    series: Optional[List[Dict[str, Any]]],
+    now_et: datetime,
+    minute_rth: Optional[Dict[str, Any]],
+    last: Any,
+) -> Dict[str, Any]:
+    """Gate source and verdict for one index. Prefers a verdict already on the quote."""
+    verdict = (quote or {}).get("gate_vwap_verdict")
+    if verdict in {"above", "below", "unmeasured"}:
+        source = (quote or {}).get("gate_vwap_source")
+        reason = (quote or {}).get("gate_vwap_reason")
+        cross = (quote or {}).get("gate_vwap_crosscheck_bps")
+        return {
+            "gate_vwap_source": source if source == "session_sampled" and verdict != "unmeasured" else None,
+            "gate_vwap_verdict": verdict,
+            "gate_vwap_reason": reason if isinstance(reason, str) and reason else None,
+            "gate_vwap_crosscheck_bps": (
+                cross if isinstance(cross, (int, float)) and not isinstance(cross, bool) else None
+            ),
+        }
+    if series is None:
+        resolved = {
+            "measured": False, "vwap": None, "samples": 0,
+            "reason": "scanner series unavailable — today VWAP unmeasured",
+        }
+    else:
+        resolved = scanner_mod.today_session_vwap(series, now_et)
+    view = minute_rth if isinstance(minute_rth, dict) else {
+        "vwap": None, "reason": _minute_vwap_gap_reason(now_et),
+    }
+    checked = _crosscheck_today_vwap(resolved, view)
+    side = _gate_side_verdict(last, checked)
+    cross = checked.get("diff_bps")
+    return {
+        "gate_vwap_source": checked["source"] if side != "unmeasured" else None,
+        "gate_vwap_verdict": side,
+        "gate_vwap_reason": None if side != "unmeasured" else checked["reason"],
+        "gate_vwap_crosscheck_bps": (
+            cross if isinstance(cross, (int, float)) and not isinstance(cross, bool) else None
+        ),
+    }
+
+
 async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> None:
     """Refresh cached regular-hours minute VWAPs. /status only. Never raises.
 
@@ -15166,6 +15454,11 @@ def observe_index_vwap_row(
         row["massive_minute_vw_diff_bps"] = _vwap_diff_bps(row["massive_minute_vw"], baseline)
         row["session_sampled_vwap_diff_bps"] = _vwap_diff_bps(session_vwap, baseline)
         row["massive_minute_vwap_rth_diff_bps"] = _vwap_diff_bps(rth, baseline)
+        row.update(_gate_fields_for_observe(
+            quote or {}, series, now_et,
+            minute_rth if isinstance(minute_rth, dict) else None,
+            (quote or {}).get("last"),
+        ))
         return row
     except Exception:
         return _null_index_vwap_observe_row(symbol)
@@ -15762,20 +16055,37 @@ def assess_call_index_vwap_gate(
     *,
     enabled: bool = True,
 ) -> Optional[str]:
-    """Refuse CALL entries when every measured index is below its day VWAP.
+    """Refuse CALL entries when every measured index is below today's VWAP.
 
     ``index_quotes`` is an iterable of ``{symbol, last, vwap}`` (SPY / QQQ).
     Allows when ANY measured index prints at or above VWAP. Measured-below
-    still blocks. When no index VWAP is measured the gate fails closed: a
-    CALL must not slip through on a missing tape. Puts and non-option
-    entries are untouched. Pure: no I/O, fully unit-testable.
+    still blocks. A row marked ``gate_vwap_verdict=unmeasured`` is not a
+    measurement, even if a broker VWAP or Massive day.vw is sitting on it.
+    When no index VWAP is measured the gate fails closed. Puts and
+    non-option entries are untouched. Pure: no I/O, fully unit-testable.
     """
     if not enabled:
         return None
     right = str(option_right or "").upper().strip()
     if right not in {"CALL", "C"}:
         return None
-    snap = snapshot_index_vs_vwap(index_quotes)
+    rows = index_quotes.values() if isinstance(index_quotes, dict) else (index_quotes or [])
+    usable: List[Dict[str, Any]] = []
+    details: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        copied = dict(row)
+        # An explicit unmeasured verdict wins over any number on the row,
+        # including a broker VWAP field or Massive day.vw.
+        if str(copied.get("gate_vwap_verdict") or "") == "unmeasured":
+            copied["vwap"] = None
+            why = copied.get("gate_vwap_reason")
+            sym = str(copied.get("symbol") or "").upper().strip()
+            if sym and isinstance(why, str) and why.strip():
+                details.append(f"{sym}: {why.strip()}")
+        usable.append(copied)
+    snap = snapshot_index_vs_vwap(usable)
     above = [f"{r['symbol']} {r['last']:.2f}≥VWAP {r['vwap']:.2f}" for r in snap if r["above_vwap"]]
     below = [f"{r['symbol']} {r['last']:.2f}<VWAP {r['vwap']:.2f}" for r in snap if not r["above_vwap"]]
     if above:
@@ -15785,6 +16095,12 @@ def assess_call_index_vwap_gate(
             "CALL blocked while the index is below day VWAP ("
             + "; ".join(below)
             + ") — waiting for SPY or QQQ to reclaim"
+        )
+    if details:
+        return (
+            "CALL blocked — SPY/QQQ today VWAP unmeasured — fail closed ("
+            + "; ".join(details)
+            + ")"
         )
     return (
         "CALL blocked — SPY/QQQ day VWAP unmeasured — fail closed until an index VWAP is measured"
@@ -16793,9 +17109,12 @@ async def _pro_trader_observation(p: dict, *, dry_run: bool = False) -> Dict[str
     prices: List[float] = []
     if scanner is not None:
         try:
-            for sample in await scanner._series("SPY"):
-                if isinstance(sample, dict) and isinstance(sample.get("last"), (int, float)):
-                    prices.append(float(sample["last"]))
+            series = await scanner._series("SPY")
+            for sample in scanner_mod.session_series(series, now_et):
+                last = sample.get("last") if isinstance(sample, dict) else None
+                if isinstance(last, bool) or not isinstance(last, (int, float)):
+                    continue
+                prices.append(float(last))
         except Exception as e:
             logger.debug(f"pro trader SPY series unavailable: {e}")
     realized = None
