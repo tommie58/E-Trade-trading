@@ -146,6 +146,21 @@ def test_unreadable_fill_qty_prefers_the_broker_then_the_guard(monkeypatch):
     assert _run(scenario(unread)) == 9
     assert _run(scenario(flat)) == 0
 
+    async def smaller_guard(fetch):
+        store = main_bot.StateStore(None)
+        saved = main_bot.state
+        main_bot.state = store
+        monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", fetch)
+        try:
+            await store.set_position("QQQ", {"qty": 2, "filled_qty": 2})
+            return await main_bot._protective_qty_for_unreadable_fill(
+                "QQQ", {"qty": 2, "contract": {"right": "CALL"}},
+            )
+        finally:
+            main_bot.state = saved
+
+    assert _run(smaller_guard(broker)) == 2
+
 
 def test_done_trade_executed_with_zero_qty_places_a_stop_and_stays_tracked(monkeypatch):
     """Worker loop: filled status, filledQuantity 0, both deadlines already past."""
@@ -239,3 +254,67 @@ def test_done_trade_executed_with_zero_qty_places_a_stop_and_stays_tracked(monke
     assert "QQQ" in critical[0]["message"]
     assert cancelled == []
     assert abandoned == []
+
+
+def test_confirmed_flat_holding_finishes_the_stop_guard(monkeypatch):
+    """A broker holding of 0 ends the guard. The position stays tracked."""
+    placed = []
+
+    async def order_state(_order_id, _client_id):
+        return "DONE_TRADE_EXECUTED", 0
+
+    async def broker(_ticker, _pos):
+        return 0
+
+    async def place_stop(*_args, **_kwargs):
+        placed.append(True)
+        return {"order_id": "STOP-NEW", "client_id": "cid", "qty": 1, "stop": 1.0}
+
+    async def send(*_args, **_kwargs):
+        return None
+
+    async def record(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(main_bot, "_order_state", order_state)
+    monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", broker)
+    monkeypatch.setattr(main_bot, "_place_option_protective_stop", place_stop)
+    monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.trade_ledger, "record", record)
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        saved = main_bot.state
+        main_bot.state = store
+        try:
+            past = time.time() - 30
+            await store.set_position("QQQ", {
+                "qty": 2,
+                "action": "BUY",
+                "contract": {"right": "CALL", "strike": 480, "expiration": "2026-11-24"},
+            })
+            await store.set_guard("QQQ", {
+                "ticker": "QQQ",
+                "kind": "option",
+                "action": "BUY",
+                "stop": 1.25,
+                "contract": {"right": "CALL", "strike": 480, "expiration": "2026-11-24"},
+                "entry_order_id": "ENTRY-1",
+                "entry_client_id": "entry-cid",
+                "guarded_qty": 0,
+                "qty": 2,
+                "done": False,
+                "deadline_ts": past,
+                "stop_deadline_ts": past,
+            })
+            await main_bot._stop_guard_worker("QQQ")
+            return await store.get_position("QQQ"), await store.get_guard("QQQ")
+        finally:
+            main_bot.state = saved
+
+    pos, guard = _run(scenario())
+    assert placed == []
+    assert pos is not None
+    assert pos["qty"] == 2
+    assert guard["done"] is True
+    assert guard["result"] == "filled_broker_flat"

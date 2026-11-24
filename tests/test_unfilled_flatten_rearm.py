@@ -1493,6 +1493,228 @@ def test_eod_flatten_over_a_resting_stop_keeps_the_pending_close(monkeypatch):
     assert stored["stop_order_id"] is None
 
 
+def test_stale_caller_second_write_keeps_the_merged_close():
+    """Monitor f1copyback: a stale write must not launder a fresh revision."""
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        await store.set_position("SPY", {
+            "qty": 4, "filled_qty": 4, "stop_order_id": "STOP-1",
+            "entry_premium": 1.00,
+        })
+        stale = await store.get_position("SPY")
+        fresh = await store.get_position("SPY")
+        fresh["pending_flatten_close"] = {"order_id": "CLOSE-1", "qty": 4}
+        fresh["close_order_id"] = "CLOSE-1"
+        fresh["entry_premium"] = 1.25
+        await store.set_position("SPY", fresh)
+        stale["hwm"] = 1.5
+        await store.set_position("SPY", stale)
+        after_first = {
+            "close": stale.get("close_order_id"),
+            "pending": (stale.get("pending_flatten_close") or {}).get("order_id"),
+            "entry": stale.get("entry_premium"),
+        }
+        stale["hwm"] = 1.6
+        await store.set_position("SPY", stale)
+        stored = await store.get_position("SPY")
+        return after_first, stored
+
+    after_first, stored = asyncio.run(scenario())
+    assert after_first == {"close": "CLOSE-1", "pending": "CLOSE-1", "entry": 1.25}
+    assert stored["close_order_id"] == "CLOSE-1"
+    assert stored["pending_flatten_close"]["order_id"] == "CLOSE-1"
+    assert stored["entry_premium"] == 1.25
+    assert stored["hwm"] == 1.6
+
+
+def test_stale_close_tie_breaks_toward_the_later_replacement():
+    async def scenario():
+        store = main_bot.StateStore(None)
+        await store.set_position("SPY", {
+            "qty": 4,
+            "entry_premium": 1.25,
+            "close_order_id": "CLOSE-1",
+            "pending_flatten_close": {
+                "order_id": "CLOSE-1",
+                "replacements": 0,
+                "placed_at": "2026-11-24T15:00:00+00:00",
+            },
+        })
+        stale = await store.get_position("SPY")
+        bump = await store.get_position("SPY")
+        bump["note"] = "fresh"
+        await store.set_position("SPY", bump)
+        stale["pending_flatten_close"] = {
+            "order_id": "CLOSE-2",
+            "replacements": 2,
+            "placed_at": "2026-11-24T15:01:00+00:00",
+        }
+        stale["close_order_id"] = "CLOSE-2"
+        await store.set_position("SPY", stale)
+        return await store.get_position("SPY")
+
+    stored = asyncio.run(scenario())
+    assert stored["pending_flatten_close"]["order_id"] == "CLOSE-2"
+    assert stored["close_order_id"] == "CLOSE-2"
+    assert stored["entry_premium"] == 1.25
+
+
+def test_unlocked_writer_between_repeat_writes_keeps_the_close(monkeypatch):
+    """A close recorded without the lock survives the next write of the same dict."""
+    when = datetime(2026, 11, 24, 15, 41, tzinfo=ET)
+    monkeypatch.setattr(main_bot, "_utcnow", lambda: when.astimezone(timezone.utc))
+    monkeypatch.setattr(main_bot, "DAY_TRADE_MODE", True)
+    monkeypatch.setattr(main_bot, "SCHEDULED_EXIT_ENABLED", True)
+    monkeypatch.setattr(main_bot, "SCALE_OUT_ENABLED", True)
+
+    async def yes(*_args, **_kwargs):
+        return True
+
+    def trusted(*_args, **_kwargs):
+        return True
+
+    async def no(*_args, **_kwargs):
+        return False
+
+    async def none(*_args, **_kwargs):
+        return None
+
+    async def cancel(*_args, **_kwargs):
+        return main_bot.CANCEL_CONFIRMED
+
+    async def place(*_args, **_kwargs):
+        return "CLOSE-FN"
+
+    async def quotes(*_args, **_kwargs):
+        return (1.5, 1.55)
+
+    async def same_pos(_ticker, pos):
+        return pos
+
+    def water(_pos, _mark):
+        return {
+            "high_since": 1.5, "low_since": 1.0, "r_multiple": 0.2,
+            "mfe_percent": 2.0, "mae_r": 0.0, "mae_percent": 0.0,
+        }
+
+    def ratchet(pos, _mark, **_kwargs):
+        return {
+            "initial_stop": 0.8,
+            "high_since": 1.5,
+            "low_since": 1.0,
+            "current_stop": float(pos.get("stop_premium") or 0.9),
+            "new_stop": float(pos.get("stop_premium") or 0.9),
+            "should_replace": False,
+            "trail": {
+                "tier": "fixed", "r_multiple": 0.2, "mfe_percent": 2.0,
+                "breakeven_locked": False, "giveback_active": False,
+            },
+        }
+
+    monkeypatch.setattr(main_bot, "_exit_retry_gate", yes)
+    monkeypatch.setattr(main_bot, "_stop_churn_gate", yes)
+    monkeypatch.setattr(main_bot, "_mark_trusted_for_harvest", trusted)
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel)
+    monkeypatch.setattr(main_bot, "_place_option_market_close", place)
+    monkeypatch.setattr(main_bot, "_resolve_exit_fill", none)
+    monkeypatch.setattr(main_bot, "_reconcile_rearm_guard", none)
+    monkeypatch.setattr(main_bot, "_finish_guard", none)
+    monkeypatch.setattr(main_bot, "_alert_fill", none)
+    monkeypatch.setattr(main_bot, "_current_bid_ask", quotes)
+    monkeypatch.setattr(main_bot, "_refresh_trail_eyes", same_pos)
+    monkeypatch.setattr(main_bot, "_app_owns_exit", no)
+    monkeypatch.setattr(main_bot.alerts, "send", none)
+    monkeypatch.setattr(main_bot.trade_ledger, "record", none)
+    monkeypatch.setattr(main_bot.trailing_engine, "observe_water_mark", water)
+    monkeypatch.setattr(main_bot.trailing_engine, "plan_ratchet", ratchet)
+
+    class Store(main_bot.StateStore):
+        def __init__(self):
+            super().__init__(None)
+            self.seen = 0
+            self.injected = False
+            self.last = None
+
+        async def set_position(self, ticker, position):
+            self.last = position
+            if self.seen == 1 and not self.injected:
+                self.injected = True
+                fresh = await self.get_position(ticker)
+                fresh["pending_flatten_close"] = {
+                    "order_id": "CLOSE-1",
+                    "qty": 4,
+                    "replacements": 0,
+                    "placed_at": "2020-01-01T00:00:00+00:00",
+                }
+                fresh["close_order_id"] = "CLOSE-1"
+                fresh["entry_premium"] = 1.25
+                await main_bot.StateStore.set_position(self, ticker, fresh)
+            self.seen += 1
+            await main_bot.StateStore.set_position(self, ticker, position)
+
+    contract = {"right": "CALL", "strike": 500, "expiration": "2026-11-24"}
+    base = {
+        "qty": 4,
+        "filled_qty": 4,
+        "action": "BUY",
+        "entry_premium": 1.00,
+        "stop_premium": 0.90,
+        "stop_order_id": "STOP-1",
+        "ts": "2026-11-24T14:00:00+00:00",
+        "contract": contract,
+    }
+
+    async def run(call):
+        store = Store()
+        saved = main_bot.state
+        main_bot.state = store
+        try:
+            await store.set_position("SPY", dict(base))
+            pos = await store.get_position("SPY")
+            store.seen = 0
+            store.injected = False
+            await call(pos)
+            assert store.injected, "the unlocked close never landed between writes"
+            store.last["probe"] = "kept"
+            await main_bot.StateStore.set_position(store, "SPY", store.last)
+            return await store.get_position("SPY")
+        finally:
+            main_bot.state = saved
+
+    async def scale(pos):
+        assert await main_bot._maybe_scale_out("SPY", pos, 2.0) is True
+
+    async def profit(pos):
+        pos["target_premium"] = 1.20
+        assert await main_bot._maybe_take_profit("SPY", pos, 1.30) is True
+
+    async def flatten(pos):
+        assert await main_bot._maybe_scheduled_exit("SPY", pos, 1.0) is True
+
+    async def trail(pos):
+        monkeypatch.setattr(main_bot, "_maybe_scheduled_exit", no)
+        monkeypatch.setattr(main_bot, "_maybe_take_profit", no)
+        monkeypatch.setattr(main_bot, "_maybe_scale_out", no)
+        monkeypatch.setattr(main_bot, "_maybe_hand_off_native_trail", no)
+        await main_bot._trail_ratchet_one("SPY", pos)
+
+    async def scenario():
+        return {
+            "scale": await run(scale),
+            "profit": await run(profit),
+            "flatten": await run(flatten),
+            "trail": await run(trail),
+        }
+
+    saved = asyncio.run(scenario())
+    for name, stored in saved.items():
+        assert stored["entry_premium"] == 1.25, name
+        assert stored["probe"] == "kept", name
+        pending = (stored.get("pending_flatten_close") or {}).get("order_id")
+        assert pending or stored.get("close_order_id"), name
+
+
 def test_flatten_save_waits_two_seconds_unless_a_sell_was_sent():
     waits = []
 

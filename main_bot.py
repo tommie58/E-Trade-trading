@@ -1169,6 +1169,29 @@ class StateStore:
             await self._persist_set_members(index_key)
 
     @staticmethod
+    def _prefer_incoming_close(incoming: Any, current: Any) -> bool:
+        """True when the incoming close is the later replacement.
+
+        Higher `replacements` wins. Equal counts use a later `placed_at`.
+        Anything unreadable keeps the stored close.
+        """
+        def rank(value: Any) -> Tuple[int, str]:
+            if not isinstance(value, dict):
+                return (0, "")
+            try:
+                reps = int(value.get("replacements") or 0)
+            except (TypeError, ValueError):
+                reps = 0
+            return (reps, str(value.get("placed_at") or ""))
+
+        inc, cur = rank(incoming), rank(current)
+        if inc[0] != cur[0]:
+            return inc[0] > cur[0]
+        if inc[1] and cur[1] and inc[1] != cur[1]:
+            return inc[1] > cur[1]
+        return False
+
+    @staticmethod
     def _close_field_live(value: Any) -> bool:
         """True when a flatten close field names an order id."""
         if isinstance(value, str):
@@ -1201,7 +1224,8 @@ class StateStore:
            that old copy back would erase the id. The next tick would sell
            again. A stale write may ADD a non-empty close id the stored row
            lacks. It must not CLEAR a non-empty id the stored row already
-           has. When both name a close, the stored id wins.
+           has. When both name a close, the higher `replacements` count wins,
+           then the newer `placed_at`. A tie keeps the stored id.
         """
         merged = dict(incoming)
         reverted: List[str] = []
@@ -1220,6 +1244,7 @@ class StateStore:
             if stored_n and incoming_n > stored_n:
                 merged[field] = stored_n
                 reverted.append(field)
+        prefer_incoming_pending = False
         for field in ("pending_flatten_close", "close_order_id"):
             current_live = self._close_field_live(current.get(field))
             incoming_live = self._close_field_live(merged.get(field))
@@ -1230,6 +1255,20 @@ class StateStore:
                 reverted.append(field)
                 continue
             if current_live and incoming_live and merged.get(field) != current.get(field):
+                if field == "pending_flatten_close" and self._prefer_incoming_close(
+                    merged.get(field), current.get(field),
+                ):
+                    prefer_incoming_pending = True
+                    continue
+                if (
+                    field == "close_order_id"
+                    and prefer_incoming_pending
+                    and incoming_live
+                ):
+                    pending = merged.get("pending_flatten_close")
+                    winner = str(pending.get("order_id") or "") if isinstance(pending, dict) else ""
+                    if winner and winner == str(merged.get(field) or ""):
+                        continue
                 merged[field] = copy.deepcopy(current.get(field))
                 reverted.append(field)
         if reverted:
@@ -1255,16 +1294,26 @@ class StateStore:
         current = await self.get_position(ticker)
         stored_rev = int((current or {}).get("_rev") or 0)
         base_rev = position.get("_rev")
+        was_stale = False
         if current is not None and base_rev is not None:
             try:
                 is_stale = int(base_rev) < stored_rev
             except (TypeError, ValueError):
                 is_stale = False
             if is_stale:
+                was_stale = True
                 position = self._reconcile_stale_write(ticker, position, current)
         position["_rev"] = stored_rev + 1
         if caller is not None:
-            caller["_rev"] = position["_rev"]
+            if was_stale:
+                # The caller still holds the pre-merge snapshot. A fresh _rev
+                # on that snapshot would make its next write authoritative and
+                # wipe the close and the entry true-up. Hand it the merged row.
+                merged = copy.deepcopy(position)
+                caller.clear()
+                caller.update(merged)
+            else:
+                caller["_rev"] = position["_rev"]
         payload = _dumps(position)
         await self._set_raw(self._pos_key(ticker), payload)
         if self.redis is None and self._durable_kv(self._pos_key(ticker), None, None):
@@ -15194,16 +15243,20 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # chain_shadow_enabled() value. enabled_default stays false. A stale
 # whole-position write cannot clear a newer pending_flatten_close or
 # close_order_id. A stale write may add a non-empty close id and cannot
-# clear one already stored. set_position copies the new _rev back onto
-# the caller's dict, so a second write of that dict is not stale.
+# clear one already stored. When both name a close, the higher
+# replacements count wins, then the newer placed_at. set_position copies
+# the new _rev back onto a fresh write. A stale write replaces the
+# caller's dict with the merged row, so the next write cannot launder
+# the old snapshot.
 # Flatten bookkeeping that placed no order waits about 2s for the
 # position lock. A save after a sell waits 30s, retries once after about
 # 2s, then logs an error that the close was sent and the order id was
 # not saved (ticker and order id only). DONE_TRADE_EXECUTED is a filled
 # terminal status for entry and stop orders. An entry reported that way
-# with no filled quantity is not cancelled or deleted. The stop is sized
-# from the broker holding, then the guard or tracked quantity, and the
-# position stays tracked for the 3:40 flatten. Whether E*TRADE puts
+# with no filled quantity is not cancelled or deleted. The stop is
+# min(broker holding, guard quantity) when both are known, otherwise the
+# broker holding, then the guard or tracked quantity. A confirmed holding
+# of 0 finishes the guard and leaves the position tracked. Whether E*TRADE puts
 # DONE_TRADE_EXECUTED on OrderDetail.status, and what filledQuantity
 # means beside it, is not in the official order-status list (the docs
 # name it only as an order event).
@@ -24994,12 +25047,21 @@ def _emergency_flatten_reuse(status: Any, filled: Any) -> bool:
     return label in _FILLED_ORDER_STATUSES
 
 
-async def _protective_qty_for_unreadable_fill(ticker: str, guard: dict) -> int:
-    """Size a stop when the order status is filled and filledQuantity is not.
+def _positive_qty(raw: Any) -> int:
+    try:
+        n = int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
 
-    The broker holding wins. A failed read falls back to the guard's
-    intended quantity, then the tracked position. A confirmed holding of
-    0 is left at 0 so a stop is not sold against an empty account.
+
+async def _unreadable_fill_size(ticker: str, guard: dict) -> Tuple[int, str]:
+    """(qty, source) for a filled order whose filledQuantity is missing.
+
+    Source is ``broker``, ``guard``, ``tracked``, ``flat``, or ``unknown``.
+    When the broker holding and the guard quantity are both known, the stop
+    is the smaller of the two. A confirmed holding of 0 is ``flat`` and is
+    not replaced with the intended quantity.
     """
     pos: dict = {}
     try:
@@ -25019,22 +25081,25 @@ async def _protective_qty_for_unreadable_fill(ticker: str, guard: dict) -> int:
         held_n = int(held) if held is not None else None
     except (TypeError, ValueError):
         held_n = None
+    guard_n = _positive_qty((guard or {}).get("qty"))
     if held_n is not None and held_n > 0:
-        return held_n
+        if guard_n > 0:
+            return min(held_n, guard_n), "broker"
+        return held_n, "broker"
     if held_n == 0:
-        return 0
-    for raw in (
-        (guard or {}).get("qty"),
-        pos.get("qty"),
-        pos.get("filled_qty"),
-    ):
-        try:
-            n = int(raw or 0)
-        except (TypeError, ValueError):
-            continue
-        if n > 0:
-            return n
-    return 0
+        return 0, "flat"
+    if guard_n > 0:
+        return guard_n, "guard"
+    tracked = _positive_qty(pos.get("qty")) or _positive_qty(pos.get("filled_qty"))
+    if tracked > 0:
+        return tracked, "tracked"
+    return 0, "unknown"
+
+
+async def _protective_qty_for_unreadable_fill(ticker: str, guard: dict) -> int:
+    """Size a stop when the order status is filled and filledQuantity is not."""
+    qty, _source = await _unreadable_fill_size(ticker, guard)
+    return qty
 
 
 def _entry_terminal_unfilled(status: Any, filled: Any) -> bool:
@@ -28222,7 +28287,17 @@ async def _stop_guard_worker(ticker: str) -> None:
             # stop from the broker holding, then the guard or tracked qty, and
             # keep the position. One alert, not one per poll.
             if filled <= 0 and _filled_order_status(status):
-                sized = await _protective_qty_for_unreadable_fill(ticker, guard)
+                sized, size_source = await _unreadable_fill_size(ticker, guard)
+                if size_source == "flat":
+                    if not guard.get("unreadable_fill_alerted"):
+                        await alerts.send(
+                            "critical", "entry_fill_qty_unreadable",
+                            f"{ticker}: entry is {status} and the broker holding is 0 "
+                            f"— no protective stop. The position stays tracked.",
+                            dedupe_key=f"unreadable_fill:{ticker}",
+                        )
+                    await _finish_guard(ticker, "filled_broker_flat")
+                    return
                 if sized > 0:
                     filled = sized
                     try:
