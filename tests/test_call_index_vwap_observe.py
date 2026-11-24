@@ -283,7 +283,14 @@ def _series():
     ]
 
 
-def test_session_sampled_vwap_drops_prior_day_and_gate_does_not_keep_full_series():
+def test_session_sampled_vwap_drops_prior_day_and_gate_does_not_keep_full_series(monkeypatch):
+    monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
+    monkeypatch.setenv("MASSIVE_ENABLED", "false")
+
+    async def fetch_bars(symbol, day):
+        raise AssertionError(f"Massive minute fetch ran for {symbol} {day}")
+
+    monkeypatch.setattr(main_bot, "_fetch_massive_minute_bars", fetch_bars)
     series = _series()
     now = datetime(2026, 11, 24, 10, 40, tzinfo=ET)
     full = main_bot.scanner_mod.sampled_vwap(series)

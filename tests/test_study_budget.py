@@ -178,6 +178,9 @@ def test_offset_past_the_cap_does_not_read_the_page():
     assert out["truncated"] is True
     assert "offset is outside" in out["truncated_reason"]
     assert out["setup_priors"] == []
+    assert out["more"] is False
+    assert out["capped"] is True
+    assert out["page"]["capped"] is True
 
 
 def test_clock_already_expired_does_not_call_the_loader():
@@ -350,7 +353,7 @@ def test_sql_page_caps_offset_at_the_file_page_window():
         assert executed == []
         for out in (blocked, at_cap):
             assert out["records"] == []
-            assert out["more"] is True
+            assert out["more"] is False
             assert out["capped"] is True
 
         shrunk = asyncio.run(study.sql_ledger_page(2000, 4000, 1.5))
@@ -528,3 +531,37 @@ def test_study_page_pool_is_size_one_and_not_the_order_engine(monkeypatch):
     assert "max_overflow" not in init_src
     assert "_open_study_page_engine(" in init_src
     assert "page_engine=_study_page_engine" in inspect.getsource(main_bot.on_startup)
+
+
+def test_file_page_at_the_offset_cap_is_not_another_page(tmp_path, monkeypatch):
+    path = tmp_path / "ledger.jsonl"
+    path.write_text(json.dumps(_close(1, "AAA", 1.0)) + "\n", encoding="utf-8")
+    monkeypatch.setattr(main_bot, "_active_ledger_path", lambda: path)
+    page = main_bot._study_file_page(10, study.STUDY_LEDGER_WINDOW_MAX)
+    assert page == {"records": [], "more": False, "capped": True}
+
+
+def test_shutdown_disposes_the_study_sql_pool():
+    disposed = []
+
+    class Engine:
+        async def dispose(self):
+            disposed.append("pool")
+
+    class State:
+        async def close(self):
+            disposed.append("state")
+
+    saved_engine = main_bot._study_page_engine
+    saved_state = main_bot.state
+    saved_stop = main_bot._worker_stop
+    main_bot._study_page_engine = Engine()
+    main_bot.state = State()
+    try:
+        asyncio.run(main_bot.on_shutdown())
+    finally:
+        main_bot._study_page_engine = saved_engine
+        main_bot.state = saved_state
+        main_bot._worker_stop = saved_stop
+    assert disposed == ["pool", "state"]
+    assert "_close_study_page_engine" in inspect.getsource(main_bot.on_shutdown)

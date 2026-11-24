@@ -63,6 +63,7 @@ daily loss limit's memory) and the kill switch.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import re
@@ -1167,6 +1168,38 @@ class StateStore:
         if self._persistence is not None:
             await self._persist_set_members(index_key)
 
+    @staticmethod
+    def _prefer_incoming_close(incoming: Any, current: Any) -> bool:
+        """True when the incoming close is the later replacement.
+
+        Higher `replacements` wins. Equal counts use a later `placed_at`.
+        Anything unreadable keeps the stored close.
+        """
+        def rank(value: Any) -> Tuple[int, str]:
+            if not isinstance(value, dict):
+                return (0, "")
+            try:
+                reps = int(value.get("replacements") or 0)
+            except (TypeError, ValueError):
+                reps = 0
+            return (reps, str(value.get("placed_at") or ""))
+
+        inc, cur = rank(incoming), rank(current)
+        if inc[0] != cur[0]:
+            return inc[0] > cur[0]
+        if inc[1] and cur[1] and inc[1] != cur[1]:
+            return inc[1] > cur[1]
+        return False
+
+    @staticmethod
+    def _close_field_live(value: Any) -> bool:
+        """True when a flatten close field names an order id."""
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, dict):
+            return bool(str(value.get("order_id") or "").strip())
+        return False
+
     def _reconcile_stale_write(self, ticker: str, incoming: dict, current: dict) -> dict:
         """Merge a write whose author never saw the newest record.
 
@@ -1185,6 +1218,14 @@ class StateStore:
         Sizes are only ever carried forward DOWNWARD here: entry partials
         legitimately grow a position, and those writes come from the guard
         worker reading fresh state, so growth is never suppressed.
+        3. A NEWER FLATTEN CLOSE. `pending_flatten_close` and `close_order_id`
+           are written when a sell is sent. A caller that read the position,
+           held the per-ticker lock through a long broker call, then wrote
+           that old copy back would erase the id. The next tick would sell
+           again. A stale write may ADD a non-empty close id the stored row
+           lacks. It must not CLEAR a non-empty id the stored row already
+           has. When both name a close, the higher `replacements` count wins,
+           then the newer `placed_at`. A tie keeps the stored id.
         """
         merged = dict(incoming)
         reverted: List[str] = []
@@ -1203,6 +1244,39 @@ class StateStore:
             if stored_n and incoming_n > stored_n:
                 merged[field] = stored_n
                 reverted.append(field)
+        prefer_incoming_pending = False
+        for field in ("pending_flatten_close", "close_order_id"):
+            current_live = self._close_field_live(current.get(field))
+            incoming_live = self._close_field_live(merged.get(field))
+            if incoming_live and not current_live:
+                continue
+            if field == "close_order_id" and prefer_incoming_pending:
+                pending = merged.get("pending_flatten_close")
+                winner = str(pending.get("order_id") or "") if isinstance(pending, dict) else ""
+                if winner:
+                    # Ghost resolution reads close_order_id. It has to name
+                    # the same order the winning pending close names.
+                    if str(merged.get(field) or "") != winner:
+                        merged[field] = winner
+                    continue
+            if current_live and not incoming_live:
+                merged[field] = copy.deepcopy(current.get(field))
+                reverted.append(field)
+                continue
+            if current_live and incoming_live and merged.get(field) != current.get(field):
+                if field == "pending_flatten_close" and self._prefer_incoming_close(
+                    merged.get(field), current.get(field),
+                ):
+                    prefer_incoming_pending = True
+                    continue
+                merged[field] = copy.deepcopy(current.get(field))
+                reverted.append(field)
+        # Sticky trail facts. A stale snapshot must not unwind a promotion
+        # the stored row already recorded. A fresh write can still set them.
+        for field in ("had_native_trail", "breakeven_locked"):
+            if current.get(field) is True and merged.get(field) is not True:
+                merged[field] = True
+                reverted.append(field)
         if reverted:
             logger.warning(
                 f"[STATE] {ticker} stale position write blocked from reverting "
@@ -1213,6 +1287,10 @@ class StateStore:
 
     async def set_position(self, ticker: str, position: dict) -> None:
         ticker = ticker.upper()
+        # The caller's dict is what the next write in the same function uses.
+        # The revision lives on the stored copy unless it is copied back, and
+        # a second write of this same dict then looks stale.
+        caller = position if isinstance(position, dict) else None
         position = dict(position)
         # LOST-UPDATE GUARD. Every record carries a monotonic `_rev`. A caller
         # that read the position, awaited a broker round-trip, then wrote back
@@ -1222,14 +1300,26 @@ class StateStore:
         current = await self.get_position(ticker)
         stored_rev = int((current or {}).get("_rev") or 0)
         base_rev = position.get("_rev")
+        was_stale = False
         if current is not None and base_rev is not None:
             try:
                 is_stale = int(base_rev) < stored_rev
             except (TypeError, ValueError):
                 is_stale = False
             if is_stale:
+                was_stale = True
                 position = self._reconcile_stale_write(ticker, position, current)
         position["_rev"] = stored_rev + 1
+        if caller is not None:
+            if was_stale:
+                # The caller still holds the pre-merge snapshot. A fresh _rev
+                # on that snapshot would make its next write authoritative and
+                # wipe the close and the entry true-up. Hand it the merged row.
+                merged = copy.deepcopy(position)
+                caller.clear()
+                caller.update(merged)
+            else:
+                caller["_rev"] = position["_rev"]
         payload = _dumps(position)
         await self._set_raw(self._pos_key(ticker), payload)
         if self.redis is None and self._durable_kv(self._pos_key(ticker), None, None):
@@ -2860,6 +2950,11 @@ GUARD_TRUST_SLACK_SECONDS = 120
 GHOST_CLOSED = "closed"
 GHOST_EXPIRED = "expired"
 GHOST_UNKNOWN = "ghost"
+# OrderDetail.status values that mean the order filled. DONE_TRADE_EXECUTED
+# sits in the same E*TRADE status enum as EXECUTED (client SDKs list it next
+# to OPEN / EXECUTED / CANCELLED) and is also an order-event name for a
+# completed trade. Entries and stops use this field with no order-type filter.
+_BROKER_FILLED_STATUSES = {"EXECUTED", "FILLED", "DONE_TRADE_EXECUTED"}
 # An option is only written off as expired once its expiration day is fully
 # over in ET. Expiration is a DATE, and the contract stays exercisable through
 # that afternoon, so treating "today is the expiry" as expired would book a
@@ -3693,7 +3788,7 @@ def plan_ghost_resolution(
     tracked_ids = [i for i in (tracked_stop_id, tracked_close_id) if i]
 
     def _fill_of(order: dict, require_closing_action: bool) -> Optional[dict]:
-        if str(order.get("status") or "").upper() != "EXECUTED":
+        if str(order.get("status") or "").upper() not in _BROKER_FILLED_STATUSES:
             return None
         action = str(order.get("order_action") or "")
         if require_closing_action:
@@ -13209,7 +13304,7 @@ async def sql_ledger_page(limit: int, offset: int, timeout_s: float) -> Dict[str
     """
     lim, off, capped = _page_bounds(limit, offset)
     if capped:
-        return {"records": [], "more": True, "capped": True}
+        return {"records": [], "more": False, "capped": True}
     page_engine = _ledger_page_engine()
     if page_engine is None:
         return {"records": [], "more": False, "offline": True}
@@ -13299,11 +13394,15 @@ async def summary(
     limit, off, offset_capped = _page_bounds(window, offset)
     page = {"limit": limit, "offset": off, "returned": 0}
     if offset_capped:
-        return _partial_study(
+        page["capped"] = True
+        body = _partial_study(
             f"offset is outside the bounded window of {STUDY_LEDGER_WINDOW_MAX} newest ledger lines",
             page,
             budget,
         )
+        body["more"] = False
+        body["capped"] = True
+        return body
     if load_page is None and _engine is None:
         return {
             "available": False,
@@ -15125,8 +15224,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # of that report, GET /trades, and GET /learning. The report reads the
 # same sign-corrected EDGE_LOOKBACK tail as learning, skips unpriced
 # closes, and collapses a repeated close identity. Recorded ledger lines
-# are not modified. A parallel change may land as 5.99.0; whichever
-# merges second rebases this version and this changelog entry.
+# are not modified.
 # 5.99.2: a flatten close reported as DONE_TRADE_EXECUTED is filled, same
 # as EXECUTED, so the path does not send a second sell. Flatten
 # bookkeeping re-reads the position and writes only the fields this pass
@@ -15147,7 +15245,38 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # A SQL fallback timeout or failure is logged at WARNING with no secrets.
 # The fallback has its own Postgres pool (size 1, no overflow) and does
 # not change the order-path pool.
-BOT_VERSION = "5.99.3-pro-day-trader"
+# 5.99.4: GET /pro-trader/report chain_shadow reports the live
+# chain_shadow_enabled() value. enabled_default stays false. A stale
+# whole-position write cannot clear a newer pending_flatten_close or
+# close_order_id. A stale write may add a non-empty close id and cannot
+# clear one already stored. When both name a close, the higher
+# replacements count wins, then the newer placed_at. set_position copies
+# the new _rev back onto a fresh write. A stale write replaces the
+# caller's dict with the merged row, so the next write cannot launder
+# the old snapshot.
+# Flatten bookkeeping that placed no order waits about 2s for the
+# position lock. A save after a sell waits 30s, retries once after about
+# 2s, then logs an error that the close was sent and the order id was
+# not saved (ticker and order id only). DONE_TRADE_EXECUTED is a filled
+# terminal status for entry and stop orders. An entry reported that way
+# with no filled quantity is not cancelled or deleted. The stop is
+# min(broker holding, guard quantity) when both are known, otherwise the
+# broker holding, then the guard or tracked quantity. A confirmed holding
+# of 0 is not a flat account until a second zero read spans about 90s
+# or the entry deadline has passed. The position stays tracked.
+# Whether E*TRADE puts
+# DONE_TRADE_EXECUTED on OrderDetail.status, and what filledQuantity
+# means beside it, is not in the official order-status list (the docs
+# name it only as an order event).
+# The CALL index VWAP gate does not seed on the read. Startup seeds once,
+# and a background task retries, so the gate never blocks on a Massive
+# fetch or the seed lock. The gate stays fail-closed while the seed is
+# missing. VWAP_CROSSCHECK_MAX_AGE_S below about 120s makes a healthy
+# minute-bar seed look stale: the minute still forming is excluded, so
+# the newest bar is already up to about two minutes old. GET /study
+# disposes its SQL pool on shutdown. An offset at the ledger cap returns
+# more=false and capped=true.
+BOT_VERSION = "5.99.4-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -16790,12 +16919,17 @@ async def ensure_index_session_vwap_seed(
 ) -> None:
     """Seed SPY/QQQ from Massive regular-session minute bars. Never raises.
 
-    Startup and the first gate read call this when the hash is empty or
-    starts after 9:30 ET. Premarket bars are not part of the seed. A
-    failed, stale, or incomplete read does not write, so the CALL gate
-    stays fail-closed. A seed that lands keeps the live volume anchor, and
-    later prints add only new volume. This does not fill the Massive RTH
-    cross-check cache and does not turn the gate fail-open.
+    Startup calls this once, then a background task retries. The CALL gate
+    does not. A gate read must not wait on this fetch or its lock. Premarket
+    bars are not part of the seed. A failed, stale, or incomplete read does
+    not write, so the gate stays fail-closed while the seed is missing. A
+    seed that lands keeps the live volume anchor, and later prints add only
+    new volume. This does not fill the Massive RTH cross-check cache and
+    does not turn the gate fail-open.
+
+    The age limit is VWAP_CROSSCHECK_MAX_AGE_S. The minute still forming is
+    excluded, so a healthy bar is already up to about 120s old. A limit
+    below that marks the seed stale and writes nothing.
     """
     try:
         if state is None or not massive.enabled():
@@ -16831,6 +16965,8 @@ async def ensure_index_session_vwap_seed(
                     continue
                 try:
                     fields = await state.hash_get(key)
+                    # Newest completed minute is already ~60–120s old.
+                    # VWAP_CROSSCHECK_MAX_AGE_S below ~120s marks it stale.
                     plan = scanner_mod.plan_session_vwap_seed(
                         fields, bars, now_et,
                         max_age_s=vwap_crosscheck_max_age_s(),
@@ -16855,6 +16991,33 @@ async def ensure_index_session_vwap_seed(
         logger.debug("index vwap seed skipped")
 
 
+async def index_session_vwap_seed_worker() -> None:
+    """Retry the session VWAP seed off the CALL gate.
+
+    The first pass is the awaited startup seed. This loop waits one retry
+    interval, then tries again until shutdown. A missing seed leaves the
+    gate fail-closed.
+    """
+    while not _worker_stop:
+        await asyncio.sleep(_VWAP_SEED_RETRY_S)
+        if _worker_stop:
+            return
+        try:
+            await ensure_index_session_vwap_seed()
+        except Exception:
+            logger.debug("index vwap seed skipped")
+
+
+def _schedule_index_session_vwap_seed() -> None:
+    """Background retries. Startup has already seeded once."""
+    try:
+        asyncio.get_running_loop().create_task(
+            index_session_vwap_seed_worker(), name="index-vwap-seed",
+        )
+    except Exception as exc:
+        logger.warning("[VWAP SEED] not scheduled: %s", type(exc).__name__)
+
+
 async def _index_vwap_quotes(
     symbols: Tuple[str, ...] = CALL_INDEX_VWAP_SYMBOLS,
     *,
@@ -16865,20 +17028,16 @@ async def _index_vwap_quotes(
     The gate value is the uncapped per-ET-date accumulator
     ``vwap:session:{symbol}:{date}``. The capped ``scanner:series`` list, a
     broker VWAP field, and Massive day.vw are not the gate input. The Massive
-    cross-check reads the today-keyed RTH cache only. A restart whose
-    accumulator is empty or starts after 9:30 ET may seed that hash from
-    Massive regular-session minute bars before the read. A failed seed
-    leaves the hash alone. Unmeasured leaves ``vwap`` empty so the gate
-    fails closed. A quote-fetch failure returns rows with no VWAP. An
-    empty cross-check cache after a restart is unmeasured; it does not raise.
+    cross-check reads the today-keyed RTH cache only. This read does not
+    seed. Startup and a background task seed the hash from Massive
+    regular-session minute bars, so a fetch or the seed lock cannot block
+    the gate. A missing seed leaves ``vwap`` empty and the gate fails
+    closed. A quote-fetch failure returns rows with no VWAP. An empty
+    cross-check cache after a restart is unmeasured; it does not raise.
     """
     syms = [s for s in symbols if s]
     if not syms:
         return []
-    try:
-        await ensure_index_session_vwap_seed(syms)
-    except Exception:
-        logger.debug("index vwap seed skipped")
     quotes: List[Dict[str, Any]] = []
     try:
         raw = await (
@@ -24866,7 +25025,139 @@ async def _etrade_call(fn, *args, source: str = "etrade", idempotent: bool = Tru
 # fills grow — never two live stops at once). Entries with zero fill by
 # ENTRY_FILL_TIMEOUT_MIN are cancelled. Guard state persists to STATE_FILE and
 # resumes after a restart.
-_TERMINAL_ORDER_STATUSES = {"EXECUTED", "CANCELLED", "REJECTED", "EXPIRED"}
+# DONE_TRADE_EXECUTED is an OrderDetail status, listed beside EXECUTED in
+# E*TRADE client enums, and an order-event name for a completed trade.
+# Flatten closes already treat it as filled. Entry, stop, and emergency
+# flatten orders read that same status field with no order-type filter,
+# so the status can appear there too. FILLED is the same completed state.
+_FILLED_ORDER_STATUSES = {"EXECUTED", "FILLED", "DONE_TRADE_EXECUTED"}
+_TERMINAL_ORDER_STATUSES = _FILLED_ORDER_STATUSES | {"CANCELLED", "REJECTED", "EXPIRED"}
+
+
+def _filled_order_status(status: Any) -> bool:
+    """True when the broker status means the order completed."""
+    return str(status or "").upper().strip() in _FILLED_ORDER_STATUSES
+
+
+def _emergency_flatten_reuse(status: Any, filled: Any) -> bool:
+    """True when a prior emergency flatten must not be replaced.
+
+    A filled status with a zero reported quantity is still a fill.
+    Replacing DONE_TRADE_EXECUTED would send a second sell.
+    """
+    label = str(status or "").upper().strip()
+    try:
+        filled_n = int(filled or 0)
+    except (TypeError, ValueError):
+        filled_n = 0
+    if filled_n > 0 or label not in _TERMINAL_ORDER_STATUSES:
+        return True
+    return label in _FILLED_ORDER_STATUSES
+
+
+def _positive_qty(raw: Any) -> int:
+    try:
+        n = int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+async def _unreadable_fill_size(ticker: str, guard: dict) -> Tuple[int, str]:
+    """(qty, source) for a filled order whose filledQuantity is missing.
+
+    Source is ``broker``, ``guard``, ``tracked``, ``zero``, or ``unknown``.
+    When the broker holding and the guard quantity are both known, the stop
+    is the smaller of the two. A holding of 0 is ``zero``, not a confirmed
+    flat: one missing portfolio row is not enough.
+    """
+    pos: dict = {}
+    try:
+        loaded = await state.get_position(ticker)
+        if isinstance(loaded, dict):
+            pos = dict(loaded)
+    except Exception:
+        pos = {}
+    if not pos.get("contract") and isinstance(guard, dict) and guard.get("contract"):
+        pos["contract"] = guard.get("contract")
+    held = None
+    try:
+        held = await _flatten_broker_held_qty(ticker, pos)
+    except Exception:
+        held = None
+    try:
+        held_n = int(held) if held is not None else None
+    except (TypeError, ValueError):
+        held_n = None
+    guard_n = _positive_qty((guard or {}).get("qty"))
+    if held_n is not None and held_n > 0:
+        if guard_n > 0:
+            return min(held_n, guard_n), "broker"
+        return held_n, "broker"
+    if held_n == 0:
+        # One empty portfolio read is lag, not a flat account. The guard
+        # decides when repeated zeros have spanned the confirm window.
+        return 0, "zero"
+    if guard_n > 0:
+        return guard_n, "guard"
+    tracked = _positive_qty(pos.get("qty")) or _positive_qty(pos.get("filled_qty"))
+    if tracked > 0:
+        return tracked, "tracked"
+    return 0, "unknown"
+
+
+# Repeated broker zeros must span this long before a missing portfolio
+# row is a flat account. Inside 60–120s. The entry deadline is the
+# other gate, and a single read is never enough on its own.
+BROKER_FLAT_CONFIRM_S = 90.0
+
+
+async def _note_broker_zero(ticker: str, guard: dict) -> Tuple[bool, dict]:
+    """Record one zero holding. True only after a second read past the window or the deadline."""
+    now = time.time()
+    try:
+        reads = int((guard or {}).get("broker_zero_reads") or 0) + 1
+    except (TypeError, ValueError):
+        reads = 1
+    since = (guard or {}).get("broker_zero_since")
+    try:
+        since_f = float(since) if since not in (None, "") else now
+    except (TypeError, ValueError):
+        since_f = now
+    updated = await state.update_guard(
+        ticker, broker_zero_reads=reads, broker_zero_since=since_f,
+    )
+    guard_out = updated if isinstance(updated, dict) else dict(guard or {})
+    try:
+        deadline = float(guard_out.get("deadline_ts") or 0)
+    except (TypeError, ValueError):
+        deadline = 0.0
+    span = now - since_f
+    confirmed = reads >= 2 and (
+        span >= BROKER_FLAT_CONFIRM_S or (deadline > 0 and now >= deadline)
+    )
+    return confirmed, guard_out
+
+
+async def _protective_qty_for_unreadable_fill(ticker: str, guard: dict) -> int:
+    """Size a stop when the order status is filled and filledQuantity is not."""
+    qty, _source = await _unreadable_fill_size(ticker, guard)
+    return qty
+
+
+def _entry_terminal_unfilled(status: Any, filled: Any) -> bool:
+    """True when the entry is terminal and nothing filled.
+
+    DONE_TRADE_EXECUTED is not this case, even when filledQuantity is 0.
+    """
+    label = str(status or "").upper().strip()
+    try:
+        filled_n = int(filled or 0)
+    except (TypeError, ValueError):
+        filled_n = 0
+    if filled_n != 0:
+        return False
+    return label in _TERMINAL_ORDER_STATUSES and label not in _FILLED_ORDER_STATUSES
 
 
 def _order_id_from_place(placed: Any) -> Optional[str]:
@@ -25303,7 +25594,7 @@ async def _resolve_exit_fill(order_id, timeout_s: float = EXIT_FILL_TIMEOUT_SECO
             for order in reconciliation.parse_open_orders(resp):
                 if str(order.get("order_id") or "") != str(order_id):
                     continue
-                if str(order.get("status") or "") == "EXECUTED":
+                if _filled_order_status(order.get("status")):
                     price = float(order.get("exec_price") or 0)
                     if price > 0:
                         return price
@@ -25778,7 +26069,7 @@ def classify_cancel_status(status: Optional[str], filled: int,
     except (TypeError, ValueError):
         ordered_n = 0
     is_partial = 0 < filled_n < ordered_n
-    if s == "EXECUTED" or (filled_n > 0 and s in _CANCEL_CONFIRMED_STATUSES):
+    if s in _FILLED_ORDER_STATUSES or (filled_n > 0 and s in _CANCEL_CONFIRMED_STATUSES):
         return "partial" if is_partial else "filled"
     if s in _CANCEL_TERMINAL_STATUSES:
         return "terminal"
@@ -26568,14 +26859,14 @@ async def _emergency_flatten(ticker: str, guard: dict, qty: int) -> Optional[str
         # broker cannot be reached we must stay blocked: an unverified retry is
         # exactly the oversell this guard is meant to prevent.
         p_status, p_filled = await _order_state(prior_id, prior_client)
-        if p_filled > 0 or p_status not in _TERMINAL_ORDER_STATUSES:
-            # Filled, partially filled, or still working — this IS the flatten.
-            logger.warning(
-                f"[FLATTEN] {ticker} reusing in-flight flatten {prior_id} "
-                f"(status={p_status}, filled={p_filled}) — not re-placing"
-            )
-            return prior_id
-        if p_status == "EXECUTED":
+        if _emergency_flatten_reuse(p_status, p_filled):
+            # Filled (including DONE_TRADE_EXECUTED with a blank quantity),
+            # partially filled, or still working — this IS the flatten.
+            if p_filled > 0 or str(p_status or "").upper() not in _TERMINAL_ORDER_STATUSES:
+                logger.warning(
+                    f"[FLATTEN] {ticker} reusing in-flight flatten {prior_id} "
+                    f"(status={p_status}, filled={p_filled}) — not re-placing"
+                )
             return prior_id
         attempts = int(guard.get("flatten_attempts") or 0)
         if attempts >= _MAX_FLATTEN_ATTEMPTS:
@@ -28035,6 +28326,64 @@ async def _stop_guard_worker(ticker: str) -> None:
             except Exception as e:
                 logger.warning(f"[STOP GUARD] {ticker} poll failed: {e}")
 
+            # A filled status with no filledQuantity is still a fill. Size the
+            # stop from the broker holding, then the guard or tracked qty, and
+            # keep the position. One alert, not one per poll.
+            if filled <= 0 and _filled_order_status(status):
+                sized, size_source = await _unreadable_fill_size(ticker, guard)
+                if size_source == "zero":
+                    confirmed, guard = await _note_broker_zero(ticker, guard)
+                    if confirmed:
+                        if not guard.get("unreadable_fill_alerted"):
+                            await alerts.send(
+                                "critical", "entry_fill_qty_unreadable",
+                                f"{ticker}: entry is {status} and the broker holding "
+                                f"stayed 0 — no protective stop. The position stays tracked.",
+                                dedupe_key=f"unreadable_fill:{ticker}",
+                            )
+                        await _finish_guard(ticker, "filled_broker_flat")
+                        return
+                elif sized > 0:
+                    if guard.get("broker_zero_reads"):
+                        guard = await state.update_guard(
+                            ticker, broker_zero_reads=0, broker_zero_since=None,
+                        ) or guard
+                    filled = sized
+                    try:
+                        async with _position_section(ticker, "unreadable fill qty"):
+                            current = await state.get_position(ticker)
+                            if isinstance(current, dict):
+                                current["filled_qty"] = sized
+                                if not int(current.get("qty") or 0):
+                                    current["qty"] = sized
+                                await state.set_position(ticker, current)
+                    except Exception as e:
+                        logger.error(
+                            f"[STOP GUARD] {ticker} could not stamp the sized fill: {e}"
+                        )
+                    if not guard.get("unreadable_fill_alerted"):
+                        await alerts.send(
+                            "critical", "entry_fill_qty_unreadable",
+                            f"{ticker}: entry is {status} but the filled quantity was "
+                            f"0 or missing — protective stop sized at {sized}. "
+                            f"The position stays tracked.",
+                            dedupe_key=f"unreadable_fill:{ticker}",
+                        )
+                        guard = await state.update_guard(
+                            ticker, unreadable_fill_alerted=True,
+                        ) or guard
+                elif not guard.get("unreadable_fill_alerted"):
+                    await alerts.send(
+                        "critical", "entry_fill_qty_unreadable",
+                        f"{ticker}: entry is {status} but the filled quantity was "
+                        f"0 or missing — no size was available for a protective stop. "
+                        f"The position stays tracked.",
+                        dedupe_key=f"unreadable_fill:{ticker}",
+                    )
+                    guard = await state.update_guard(
+                        ticker, unreadable_fill_alerted=True,
+                    ) or guard
+
             # TIMEOUT CIRCUIT BREAKER anchor — the moment the FIRST fill is
             # detected, the stop-placement clock restarts: the protective stop
             # must rest at the broker within STOP_PLACEMENT_TIMEOUT_SECONDS of
@@ -28273,7 +28622,15 @@ async def _stop_guard_worker(ticker: str) -> None:
             # fires when protection genuinely failed to stick in time.
             stop_deadline = float(guard.get("stop_deadline_ts") or 0)
             if stop_deadline and not guard.get("stop_order_id") and time.time() >= stop_deadline:
-                if filled > 0:
+                if filled <= 0 and _filled_order_status(status):
+                    # Sized above when a quantity existed. Still no cancel
+                    # and no delete. The alert already fired once.
+                    logger.error(
+                        f"[STOP GUARD] {ticker} entry is {status} but the filled "
+                        f"quantity was not readable — not cancelling and not "
+                        f"deleting the position"
+                    )
+                elif filled > 0:
                     if status not in _TERMINAL_ORDER_STATUSES:
                         await _cancel_order_safe(guard.get("entry_order_id"))
                     try:
@@ -28336,10 +28693,10 @@ async def _stop_guard_worker(ticker: str) -> None:
                         )
                         return
 
-            if status == "EXECUTED" and filled > 0 and guarded >= filled:
+            if _filled_order_status(status) and filled > 0 and guarded >= filled:
                 await _finish_guard(ticker, "filled_and_protected")
                 return
-            if status in _TERMINAL_ORDER_STATUSES and status != "EXECUTED" and filled == 0:
+            if _entry_terminal_unfilled(status, filled):
                 await _finish_guard(ticker, f"entry_{status.lower()}_unfilled")
                 await state.delete_position(ticker)
                 # Retract the optimistic open — this entry died unfilled, so no
@@ -28351,7 +28708,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                 })
                 return
             if time.time() >= float(guard.get("deadline_ts") or 0):
-                if filled == 0:
+                if filled == 0 and not _filled_order_status(status):
                     await _cancel_order_safe(guard.get("entry_order_id"))
                     await _finish_guard(ticker, "entry_timeout_cancelled")
                     await state.delete_position(ticker)
@@ -28361,17 +28718,20 @@ async def _stop_guard_worker(ticker: str) -> None:
                         "reason": "entry_timeout_cancelled",
                     })
                     return
-                if guarded >= filled:
+                if filled > 0 and guarded >= filled:
                     await _finish_guard(ticker, "partial_fill_protected")
                     return
-                # Filled but stop never stuck — keep trying rather than walk away.
-                logger.error(f"[STOP GUARD] {ticker} UNPROTECTED at deadline — extending guard")
-                await alerts.send(
-                    "critical", "position_unprotected",
-                    f"{ticker}: filled entry still has NO resting stop at the guard deadline — guard extended, retrying",
-                    dedupe_key=f"unprotected:{ticker}",
-                )
-                await state.update_guard(ticker, deadline_ts=time.time() + ENTRY_FILL_TIMEOUT_MIN * 60)
+                if filled > 0:
+                    # Filled but stop never stuck — keep trying rather than walk away.
+                    logger.error(f"[STOP GUARD] {ticker} UNPROTECTED at deadline — extending guard")
+                    await alerts.send(
+                        "critical", "position_unprotected",
+                        f"{ticker}: filled entry still has NO resting stop at the guard deadline — guard extended, retrying",
+                        dedupe_key=f"unprotected:{ticker}",
+                    )
+                    await state.update_guard(ticker, deadline_ts=time.time() + ENTRY_FILL_TIMEOUT_MIN * 60)
+                # A filled status with no size stays tracked. The next poll
+                # retries the broker quantity. Nothing is cancelled or deleted.
             # Poll faster while the stop deadline is live and unmet so the 60s
             # rule is enforced with tight granularity, not at the next 10s tick.
             # Only tighten while the deadline is still AHEAD of us: once it has
@@ -32053,6 +32413,7 @@ def chain_shadow_report(records: Any) -> Dict[str, Any]:
 
     return {
         "enabled_default": False,
+        "enabled": chain_shadow_enabled(),
         "live_flip": False,
         "n": n,
         "same_contract_pct": _rate(len(same)),
@@ -35100,7 +35461,14 @@ _FLATTEN_WORKING_STATUSES = {
 }
 # DONE_TRADE_EXECUTED is E*TRADE's filled close. Leaving it out of this set
 # made a completed sell look unknown, and the next tick sent another one.
-_FLATTEN_FILLED_STATUSES = {"EXECUTED", "FILLED", "DONE_TRADE_EXECUTED"}
+# Same set the entry and stop paths use.
+_FLATTEN_FILLED_STATUSES = _FILLED_ORDER_STATUSES
+# A save that did not send an order must not stall the serial close-10 walk.
+FLATTEN_SAVE_NO_ORDER_WAIT_S = 2.0
+# After a sell, wait out a lock held by a long order-path section.
+FLATTEN_SAVE_AFTER_SELL_WAIT_S = 30.0
+# The one retry after that wait. A second 30s wait would stall close-10.
+FLATTEN_SAVE_RETRY_WAIT_S = 2.0
 # A working close younger than this is left alone. A confirmed-dead close
 # does not wait.
 FLATTEN_REPLACE_MIN_AGE_SECONDS = 60
@@ -35459,6 +35827,55 @@ async def _flatten_merge_changed(ticker: str, delta: Dict[str, Any]) -> None:
     await state.set_position(ticker, merged)
 
 
+def _flatten_sent_order_id(pos: dict) -> str:
+    """Order id of a flatten sell this pass sent. No account fields."""
+    if not isinstance(pos, dict):
+        return ""
+    order_id = str(pos.get("close_order_id") or "").strip()
+    if order_id:
+        return order_id
+    pending = pos.get("pending_flatten_close")
+    if isinstance(pending, dict):
+        return str(pending.get("order_id") or "").strip()
+    return ""
+
+
+async def _flatten_save_attempt(
+    ticker: str, delta: Dict[str, Any], *, wait_s: float, must_persist: bool,
+) -> bool:
+    """Write ``delta``. False when a sell's id still is not on the position."""
+    lock = state.position_lock(ticker, ttl_ms=120_000, wait_timeout=wait_s)
+    try:
+        await lock.acquire()
+    except LockNotAcquired:
+        if not must_persist:
+            logger.error(
+                f"[FLATTEN REPLACE] {ticker} bookkeeping was not saved — "
+                f"position lock busy"
+            )
+            return False
+        logger.error(
+            f"[FLATTEN REPLACE] {ticker} position lock busy after a close "
+            f"was sent — writing the changed fields without the lock"
+        )
+        try:
+            await _flatten_merge_changed(ticker, delta)
+        except Exception:
+            logger.error(f"[FLATTEN REPLACE] {ticker} close bookkeeping write failed")
+            return False
+        return True
+    try:
+        await _flatten_merge_changed(ticker, delta)
+    except Exception:
+        if not must_persist:
+            raise
+        logger.error(f"[FLATTEN REPLACE] {ticker} close bookkeeping write failed")
+        return False
+    finally:
+        await lock.release()
+    return True
+
+
 async def _flatten_save(ticker: str, pos: dict) -> None:
     """Persist flatten bookkeeping onto the newest position.
 
@@ -35468,10 +35885,11 @@ async def _flatten_save(ticker: str, pos: dict) -> None:
     changed. Two saves of different fields both land. A position that has
     already closed is not recreated.
 
-    A busy lock skips a save that did not place an order. A save after this
-    pass received a broker order id waits out that same lock, then writes
-    the changed fields anyway. Dropping that write would leave the old dead
-    close on the book and the next tick could sell again.
+    A save that placed no order waits about 2s. Close-10 walks tickers
+    serially, so a 30s wait there stalls the rest of the book. A save after
+    a sell waits 30s, writes without the lock if it stays busy, and retries
+    once after about 2s. If the id is still not stored, an error names the
+    ticker and the order id. Account numbers are not included.
     """
     if not isinstance(pos, dict):
         return
@@ -35486,26 +35904,22 @@ async def _flatten_save(ticker: str, pos: dict) -> None:
     if not delta:
         return
     must_persist = bool(_FLATTEN_ORDER_PLACED.get())
-    lock = state.position_lock(ticker, ttl_ms=120_000, wait_timeout=30.0)
-    try:
-        await lock.acquire()
-    except LockNotAcquired:
-        if not must_persist:
-            logger.error(
-                f"[FLATTEN REPLACE] {ticker} bookkeeping was not saved — "
-                f"position lock busy"
-            )
-            return
-        logger.error(
-            f"[FLATTEN REPLACE] {ticker} position lock busy after a close "
-            f"was sent — writing the changed fields without the lock"
-        )
-        await _flatten_merge_changed(ticker, delta)
+    wait_s = FLATTEN_SAVE_AFTER_SELL_WAIT_S if must_persist else FLATTEN_SAVE_NO_ORDER_WAIT_S
+    if await _flatten_save_attempt(ticker, delta, wait_s=wait_s, must_persist=must_persist):
         return
-    try:
-        await _flatten_merge_changed(ticker, delta)
-    finally:
-        await lock.release()
+    if not must_persist:
+        return
+    if await _flatten_save_attempt(
+        ticker, delta, wait_s=FLATTEN_SAVE_RETRY_WAIT_S, must_persist=must_persist,
+    ):
+        return
+    order_id = _flatten_sent_order_id(pos) or "unknown"
+    message = f"{ticker}: close sent, order id not saved ({order_id})"
+    logger.error(f"[FLATTEN REPLACE] {message}")
+    await alerts.send(
+        "error", "flatten_close_unsaved", message,
+        dedupe_key=f"flatten_unsaved:{ticker}:{order_id}",
+    )
 
 
 def _flatten_alert_due(pos: dict, condition: str, now_et: datetime, *, once: bool = False) -> bool:
@@ -36853,8 +37267,10 @@ async def _start_scanner() -> None:
         f"{'' if SCANNER_ALLOW_AUTONOMOUS_ENTRY else ' — origination locked to app dispatch'}"
     )
     # A redeploy mid-session starts the hash at "now". Seed 09:30 ET onward
-    # before the first scan so live prints continue from a full session.
+    # before the first scan. The CALL gate does not seed; a later retry
+    # runs in the background so a failed seed is not stuck until restart.
     await ensure_index_session_vwap_seed()
+    _schedule_index_session_vwap_seed()
     asyncio.create_task(scanner.run())
 
 
@@ -37018,6 +37434,7 @@ async def _announce_preflight() -> None:
 async def on_shutdown():
     global _worker_stop
     _worker_stop = True
+    await _close_study_page_engine()
     await state.close()
 
 
@@ -38763,7 +39180,7 @@ def _study_file_page(limit: int, offset: int) -> Optional[Dict[str, Any]]:
     limit = max(1, min(int(limit), study.STUDY_LEDGER_WINDOW_MAX))
     offset = max(0, int(offset))
     if offset >= study.STUDY_LEDGER_WINDOW_MAX:
-        return {"records": [], "more": True, "capped": True}
+        return {"records": [], "more": False, "capped": True}
     if offset + limit > study.STUDY_LEDGER_WINDOW_MAX:
         limit = study.STUDY_LEDGER_WINDOW_MAX - offset
     probe = offset + limit + 1

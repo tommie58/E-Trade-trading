@@ -283,6 +283,7 @@ def test_gate_restart_seeds_and_a_live_print_does_not_recount_the_seed(monkeypat
         _cache("SPY", _vwap(spy))
         # QQQ's hash is empty, so the seed stops before the minute still forming.
         _cache("QQQ", _vwap(_completed(qqq)))
+        await main_bot.ensure_index_session_vwap_seed()
         quotes = await main_bot._index_vwap_quotes()
         reason = main_bot.assess_call_index_vwap_gate("CALL", quotes)
         fields = await store.hash_get(main_bot.scanner_mod.session_vwap_key("SPY", "2026-11-24"))
@@ -363,6 +364,7 @@ def test_fetch_failure_leaves_the_gate_fail_closed(monkeypatch, caplog):
     async def scenario():
         key = main_bot.scanner_mod.session_vwap_key("SPY", "2026-11-24")
         await store.hash_set(key, held, main_bot.scanner_mod.SESSION_VWAP_TTL_S)
+        await main_bot.ensure_index_session_vwap_seed()
         quotes = await main_bot._index_vwap_quotes()
         reason = main_bot.assess_call_index_vwap_gate("CALL", quotes)
         fields = await store.hash_get(key)
@@ -394,6 +396,7 @@ def test_stale_seed_bars_leave_the_gate_fail_closed(monkeypatch, caplog):
     async def scenario():
         key = main_bot.scanner_mod.session_vwap_key("SPY", "2026-11-24")
         await store.hash_set(key, held, main_bot.scanner_mod.SESSION_VWAP_TTL_S)
+        await main_bot.ensure_index_session_vwap_seed()
         quotes = await main_bot._index_vwap_quotes()
         reason = main_bot.assess_call_index_vwap_gate("CALL", quotes)
         fields = await store.hash_get(key)
@@ -405,3 +408,61 @@ def test_stale_seed_bars_leave_the_gate_fail_closed(monkeypatch, caplog):
     assert reason is not None and "fail closed" in reason
     assert "reason=stale" in caplog.text
     assert "unit-test-key" not in caplog.text
+
+
+def test_call_gate_does_not_wait_on_the_vwap_seed(monkeypatch):
+    """The gate read returns unmeasured without calling Massive or the seed lock."""
+    fetches = {"n": 0}
+    locks = {"n": 0}
+    store = main_bot.StateStore(None)
+    _arm_gate(monkeypatch, store)
+    monkeypatch.setenv("MASSIVE_API_KEY", "unit-test-key")
+    monkeypatch.setenv("MASSIVE_ENABLED", "true")
+    real_lock = store.lock
+
+    async def hang(symbol, day):
+        fetches["n"] += 1
+        await asyncio.sleep(30)
+        return None
+
+    def lock(name, ttl_ms=30_000, wait_timeout=10.0):
+        if str(name).startswith("vwap-session:"):
+            locks["n"] += 1
+        return real_lock(name, ttl_ms=ttl_ms, wait_timeout=wait_timeout)
+
+    monkeypatch.setattr(main_bot, "_fetch_massive_minute_bars", hang)
+    store.lock = lock
+    _cache("SPY", 590.0)
+    _cache("QQQ", 520.0)
+
+    async def scenario():
+        return await asyncio.wait_for(main_bot._index_vwap_quotes(), timeout=1.0)
+
+    quotes = _run(scenario())
+    assert fetches["n"] == 0
+    assert locks["n"] == 0
+    assert all(row["vwap"] is None for row in quotes)
+    assert all(row["gate_vwap_verdict"] == "unmeasured" for row in quotes)
+    reason = main_bot.assess_call_index_vwap_gate("CALL", quotes)
+    assert reason is not None and "fail closed" in reason
+
+
+def test_vwap_seed_worker_retries_after_startup(monkeypatch):
+    calls = {"n": 0}
+    saved_stop = main_bot._worker_stop
+
+    async def once(symbols=None):
+        calls["n"] += 1
+        main_bot._worker_stop = True
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(main_bot, "ensure_index_session_vwap_seed", once)
+    monkeypatch.setattr(main_bot.asyncio, "sleep", no_sleep)
+    main_bot._worker_stop = False
+    try:
+        _run(main_bot.index_session_vwap_seed_worker())
+    finally:
+        main_bot._worker_stop = saved_stop
+    assert calls["n"] == 1

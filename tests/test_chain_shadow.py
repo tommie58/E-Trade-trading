@@ -661,7 +661,20 @@ def test_pro_trader_report_includes_the_chain_shadow_block():
     assert block["live_flip"] is False
     assert block["comparison"]["min_pairs"] == 40
     assert block["comparison"]["min_pairs_is_flip_rule"] is False
-    assert report["version"] == "5.99.3-pro-day-trader"
+    assert report["version"] == "5.99.4-pro-day-trader"
+
+
+def test_chain_shadow_report_names_the_live_flag(monkeypatch):
+    monkeypatch.delenv("CHAIN_SHADOW_ENABLED", raising=False)
+    off = main_bot.chain_shadow_report([])
+    assert off["enabled_default"] is False
+    assert off["enabled"] is False
+    monkeypatch.setenv("CHAIN_SHADOW_ENABLED", "true")
+    live = main_bot.chain_shadow_report([])
+    assert live["enabled"] is True
+    assert live["enabled_default"] is False
+    monkeypatch.setenv("CHAIN_SHADOW_ENABLED", "0")
+    assert main_bot.chain_shadow_report([])["enabled"] is False
 
 
 def test_report_zero_partial_and_complete_records():
