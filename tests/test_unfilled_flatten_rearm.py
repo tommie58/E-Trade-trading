@@ -1254,3 +1254,78 @@ def test_blank_sibling_close_blocks_the_replacement(status, close_status, monkey
     assert "no cancel and no new order" in alert["message"]
     assert alert["dedupe_key"] == "unfilled_flatten:SPY:protection_unknown"
     assert rec["book"].pos["pending_flatten_close"]["order_id"] == "CLOSE-1"
+
+
+def test_done_trade_executed_is_filled_and_does_not_send_another_close(monkeypatch):
+    """E*TRADE reports a completed close as DONE_TRADE_EXECUTED. That is a fill."""
+    when = _at(FULL, 15, 50)
+    rec = _arm(monkeypatch, when, _position(when), held=4)
+    rec["scripts"]["CLOSE-1"].append(_row("DONE_TRADE_EXECUTED", 0, 4))
+    rec["state"]["fill"] = 1.40
+    booked = []
+
+    async def record_close(ticker, exit_price, payload, exit_premium=None, close_reason=None, **kwargs):
+        booked.append((ticker, exit_premium, close_reason))
+        rec["book"].pos = None
+
+    monkeypatch.setattr(main_bot, "_record_close", record_close)
+    assert main_bot._flatten_close_view(_row("DONE_TRADE_EXECUTED", 0, 4)) == "filled"
+    assert main_bot._flatten_close_view(_row("done_trade_executed", 4, 4)) == "filled"
+    _run()
+    assert rec["calls"].count("place") == 0
+    assert _no_cancel(rec["calls"])
+    assert rec["orders"] == []
+    assert booked == [("SPY", 1.40, "eod_flatten")]
+    assert "stop" not in rec["calls"]
+
+
+def test_concurrent_flatten_saves_keep_each_others_fields():
+    """Two passes write different keys. Neither snapshot replaces the other."""
+    store = main_bot.StateStore(None)
+
+    async def scenario():
+        await store.set_position("SPY", {
+            "qty": 4,
+            "note": "keep",
+            "alpha": 0,
+            "beta": 0,
+            "_rev": 1,
+        })
+        overlap = {"n": 0, "max": 0}
+        original = store.get_position
+
+        async def slow_get(ticker):
+            overlap["n"] += 1
+            overlap["max"] = max(overlap["max"], overlap["n"])
+            try:
+                await asyncio.sleep(0.05)
+                return await original(ticker)
+            finally:
+                overlap["n"] -= 1
+
+        store.get_position = slow_get
+        saved = main_bot.state
+        main_bot.state = store
+        try:
+            async def edit(key, value):
+                pos = await original("SPY")
+                token = main_bot._flatten_bind_baseline(copy.deepcopy(pos))
+                try:
+                    working = copy.deepcopy(pos)
+                    working[key] = value
+                    await main_bot._flatten_save("SPY", working)
+                finally:
+                    main_bot._FLATTEN_BASELINE.reset(token)
+
+            await asyncio.gather(edit("alpha", 1), edit("beta", 2))
+            final = await original("SPY")
+        finally:
+            main_bot.state = saved
+        return final, overlap
+
+    final, overlap = asyncio.run(scenario())
+    assert overlap["max"] == 1
+    assert final["alpha"] == 1
+    assert final["beta"] == 2
+    assert final["note"] == "keep"
+    assert final["qty"] == 4
