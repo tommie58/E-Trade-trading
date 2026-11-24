@@ -5116,6 +5116,14 @@ def apply_eyes_to_trail_position(
     return out
 
 
+def _tighten_only(override: Any, default: float, floor: float) -> float:
+    """A caller may lock sooner. It may not delay the default trigger."""
+    value = _finite(override)
+    if value is None or value >= default:
+        return default
+    return max(floor, value)
+
+
 def compute_trail_level(
     side: str,
     entry_price: float,
@@ -5125,6 +5133,10 @@ def compute_trail_level(
     atr: Optional[float] = None,
     prev_trail: Optional[float] = None,
     spread: Optional[float] = None,
+    *,
+    breakeven_trigger_r: Optional[float] = None,
+    breakeven_trigger_pct: Optional[float] = None,
+    faster_profit_lock: bool = False,
 ) -> Dict[str, Any]:
     """Compute the current trailing-stop level for a position.
 
@@ -5135,6 +5147,9 @@ def compute_trail_level(
     entry = _finite(entry_price) or 0.0
     stop = _finite(stop_loss) or 0.0
     risk = abs(entry - stop)
+    # Defaults stay 0.75R / 8%. An active pro-trader stamp may only tighten them.
+    be_r = _tighten_only(breakeven_trigger_r, BREAKEVEN_TRIGGER_R, 0.35)
+    be_pct = _tighten_only(breakeven_trigger_pct, BREAKEVEN_TRIGGER_PCT, 0.04)
 
     fallback = {
         "trail_price": _round2(stop),
@@ -5167,7 +5182,7 @@ def compute_trail_level(
     # handoff, sized at 2×spread, then replaced the ~20% hard stop with a
     # noise-width trail. Until MFE clears the breakeven trigger (R or %),
     # the resting level is the original stop and nothing else.
-    if r_multiple < BREAKEVEN_TRIGGER_R and mfe_percent < BREAKEVEN_TRIGGER_PCT:
+    if r_multiple < be_r and mfe_percent < be_pct:
         return {
             "trail_price": _round2(stop),
             "trail_distance": _round2(risk),
@@ -5182,7 +5197,7 @@ def compute_trail_level(
     rung = trail_tier_for(r_multiple)
     tier = rung["tier"]
     # A big percent run locks breakeven even when R is too wide to reach 0.75R.
-    if tier == "initial" and mfe_percent >= BREAKEVEN_TRIGGER_PCT:
+    if tier == "initial" and (mfe_percent >= be_pct or r_multiple >= be_r):
         tier = "breakeven"
 
     tier_distance = rung["frac"] * risk
@@ -5238,7 +5253,7 @@ def compute_trail_level(
 
     raw = (water_mark - distance) if is_buy else (water_mark + distance)
 
-    if r_multiple >= BREAKEVEN_TRIGGER_R or mfe_percent >= BREAKEVEN_TRIGGER_PCT:
+    if r_multiple >= be_r or mfe_percent >= be_pct:
         # Cost-aware breakeven: entry plus one spread, never inside the
         # spread floor below the water mark, never below entry.
         be_level = entry
@@ -5262,7 +5277,10 @@ def compute_trail_level(
     # +20% and then $0 again at +25%, because the rung label had changed while
     # the trail distance had not.
     r_ladder_engaged = rung["frac"] < 1.0
-    lock_fraction = None if r_ladder_engaged else profit_lock_for(mfe_percent)
+    # Two points of MFE credit starts the same ladder one rung sooner.
+    # The ladder constants themselves stay put (they match the app).
+    lock_mfe = mfe_percent + (0.02 if faster_profit_lock else 0.0)
+    lock_fraction = None if r_ladder_engaged else profit_lock_for(lock_mfe)
     if lock_fraction is not None and mfe > 0:
         spread_gap = (
             min(risk, SPREAD_FLOOR_MULT * spread_f)
@@ -5487,6 +5505,9 @@ def plan_ratchet(
         atr=position.get("atr"),
         prev_trail=current_stop,
         spread=spread,
+        breakeven_trigger_r=position.get("pro_trader_breakeven_trigger_r"),
+        breakeven_trigger_pct=position.get("pro_trader_breakeven_trigger_pct"),
+        faster_profit_lock=bool(position.get("pro_trader_faster_lock")),
     )
 
     if normalize_trail_mode(position.get("trail_mode")) == "breakeven_only":
@@ -12226,7 +12247,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # MARKET/LIMIT Good-for-Day, 24/7 session (no equity calendar gate).
 # 5.87.1: pin Individual Crypto 888103-8595 as the crypto-only routing target
 # (dash-tolerant id match, Redis crypto pin, refuse crypto as options pin).
-BOT_VERSION = "5.90.0-trade-journal"
+BOT_VERSION = "5.91.0-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -12702,6 +12723,12 @@ CALL_INDEX_VWAP_SYMBOLS = tuple(
     for s in os.getenv("CALL_INDEX_VWAP_SYMBOLS", "SPY,QQQ").split(",")
     if s.strip()
 ) or ("SPY", "QQQ")
+# Pro Day Trader realignment. Shadow classifies and records verdicts without
+# changing an order. Active may only block or scale size down.
+import pro_trader
+PRO_TRADER_MODE = pro_trader.normalize_mode(os.getenv("PRO_TRADER_MODE", "shadow"))
+MIN_TRADES_PER_DAY = pro_trader.clamp_min_trades(os.getenv("MIN_TRADES_PER_DAY", "4"))
+_PRO_TRADER = pro_trader.Desk()
 # After a handoff that cancelled the stop and failed to rest the trail, wait
 # before trying again. The failure path re-arms the fixed stop; retrying
 # every poll would open that naked window on a loop.
@@ -14029,6 +14056,12 @@ def plan_policy_sync(current: Dict[str, Any], patch: Any) -> Dict[str, Any]:
             value = None
         policy[key] = value if (value is not None and math.isfinite(value)) else None
     policy["allowed_setups"] = clean_setups(current.get("allowed_setups")) or []
+    policy["pro_trader_mode"] = pro_trader.normalize_mode(
+        current.get("pro_trader_mode"), default=PRO_TRADER_MODE,
+    )
+    policy["min_trades_per_day"] = pro_trader.clamp_min_trades(
+        current.get("min_trades_per_day") if current.get("min_trades_per_day") is not None else MIN_TRADES_PER_DAY,
+    )
 
     changes: List[str] = []
     clamped: List[str] = []
@@ -14081,7 +14114,33 @@ def plan_policy_sync(current: Dict[str, Any], patch: Any) -> Dict[str, Any]:
                 )
             policy["allowed_setups"] = names
 
-    known = set(order) | {"allowed_setups"}
+    if "pro_trader_mode" in patch:
+        requested = pro_trader.normalize_mode(patch.get("pro_trader_mode"), default="")
+        raw_mode = str(patch.get("pro_trader_mode") or "").strip().lower()
+        if raw_mode not in {"off", "shadow", "active"}:
+            ignored.append(
+                f"pro_trader_mode: {patch.get('pro_trader_mode')!r} is not off|shadow|active "
+                f"— kept {policy['pro_trader_mode']}"
+            )
+        elif requested != policy["pro_trader_mode"]:
+            changes.append(f"pro_trader_mode {policy['pro_trader_mode']} → {requested}")
+            policy["pro_trader_mode"] = requested
+
+    if "min_trades_per_day" in patch:
+        raw_trades = patch.get("min_trades_per_day")
+        try:
+            asked = int(float(raw_trades))
+        except (TypeError, ValueError):
+            ignored.append(f"min_trades_per_day: not a number ({raw_trades!r}) — kept {policy['min_trades_per_day']}")
+        else:
+            bounded = pro_trader.clamp_min_trades(asked)
+            if bounded != asked:
+                clamped.append(f"min_trades_per_day: asked {asked}, enforcing {bounded}")
+            if bounded != policy["min_trades_per_day"]:
+                changes.append(f"min_trades_per_day {policy['min_trades_per_day']} → {bounded}")
+            policy["min_trades_per_day"] = bounded
+
+    known = set(order) | {"allowed_setups", "pro_trader_mode", "min_trades_per_day"}
     for key in sorted(k for k in patch if k not in known):
         ignored.append(f"{key}: not a policy field")
 
@@ -14100,6 +14159,8 @@ _LIVE_POLICY: Dict[str, Any] = {
     "daily_loss_limit_pct": float(DAILY_LOSS_LIMIT_PCT),
     "risk_per_trade_pct": float(RISK_PER_TRADE_PCT),
     "allowed_setups": sorted(ALLOWED_SETUPS),
+    "pro_trader_mode": PRO_TRADER_MODE,
+    "min_trades_per_day": MIN_TRADES_PER_DAY,
 }
 _POLICY_META: Dict[str, Any] = {
     "source": "env",
@@ -14122,6 +14183,8 @@ def live_policy(key: str) -> Any:
             "min_mtf": float(MIN_MTF),
             "daily_loss_limit_pct": float(DAILY_LOSS_LIMIT_PCT),
             "risk_per_trade_pct": float(RISK_PER_TRADE_PCT),
+            "pro_trader_mode": PRO_TRADER_MODE,
+            "min_trades_per_day": MIN_TRADES_PER_DAY,
         }.get(key)
     return value
 
@@ -14591,6 +14654,178 @@ def _payload_vol_annual(p: dict) -> Optional[float]:
     return sigma * math.sqrt(cost_model.TRADING_DAYS * cost_model.SESSION_SECONDS) if sigma else None
 
 
+def _pro_trader_feed_health() -> Dict[str, Any]:
+    """Massive snapshot health for the regime fail-safe. A 403 is degraded
+    even when the scanner has fallen back to E*TRADE — that fallback is named,
+    not treated as a healthy primary feed."""
+    status = massive_client.status() if massive_client is not None else {}
+    err = str(status.get("last_error") or _scanner_quote_source.get("fallback_reason") or "")
+    http = 403 if "403" in err else (401 if "401" in err else None)
+    age = None
+    if isinstance(status.get("last_ok_at"), (int, float)):
+        age = max(0.0, time.time() - float(status["last_ok_at"]))
+    ok = True
+    if not status.get("key_configured"):
+        err = ""
+        http = None
+    elif http in (401, 403):
+        ok = False
+    return {
+        "provider": "massive",
+        "ok": ok,
+        "http_status": http,
+        "stale": bool(age is not None and age > 180 and not ok),
+        "age_seconds": None if age is None else round(age, 1),
+        "last_error": (err[:180] or None),
+        "endpoint": "/v2/snapshot/locale/us/markets/stocks/tickers",
+        "fallback": _scanner_quote_source.get("last"),
+    }
+
+
+def _pro_trader_candidate(p: dict) -> Dict[str, Any]:
+    feats = p.get("edge_features") if isinstance(p.get("edge_features"), dict) else {}
+    bid = p.get("option_bid") if p.get("option_bid") is not None else p.get("bid")
+    ask = p.get("option_ask") if p.get("option_ask") is not None else p.get("ask")
+    spread = snapshot_entry_spread(bid, ask)
+    expiry = str(p.get("option_expiration") or p.get("expiry") or p.get("expiration") or "")[:10]
+    dte = None
+    if len(expiry) == 10:
+        try:
+            dte = (date.fromisoformat(expiry) - _utcnow().astimezone(_ET_ZONE).date()).days
+        except ValueError:
+            dte = None
+    rvol = p.get("rvol") if p.get("rvol") is not None else feats.get("rvol")
+    return {
+        "ticker": p.get("ticker"),
+        "setup": p.get("setup"),
+        "score": p.get("score"),
+        "rvol": rvol,
+        "action": p.get("action"),
+        "option_right": p.get("option_right") or p.get("call_put"),
+        "instrument": p.get("instrument") or "option",
+        "spread_pct": spread.get("spread_pct"),
+        "bid": spread.get("bid"),
+        "ask": spread.get("ask"),
+        "underlying_vs_vwap_pct": p.get("vwap_distance_pct") if p.get("vwap_distance_pct") is not None else feats.get("vwap_distance_pct"),
+        "dte": dte,
+        "is_0dte": dte == 0,
+        "quote_age_sec": p.get("quote_age_sec"),
+    }
+
+
+async def _pro_trader_observation(p: dict) -> Dict[str, Any]:
+    now_et = _utcnow().astimezone(_ET_ZONE)
+    minute = now_et.hour * 60 + now_et.minute
+    event = False
+    try:
+        event = _macro_entry_block(True) is not None
+    except Exception:
+        event = False
+    spy = qqq = None
+    try:
+        for row in snapshot_index_vs_vwap(await _index_vwap_quotes()):
+            if row.get("symbol") == "SPY":
+                spy = row.get("vs_vwap_pct")
+            elif row.get("symbol") == "QQQ":
+                qqq = row.get("vs_vwap_pct")
+    except Exception as e:
+        logger.debug(f"pro trader index tape unavailable: {e}")
+    prices: List[float] = []
+    if scanner is not None:
+        try:
+            for sample in await scanner._series("SPY"):
+                if isinstance(sample, dict) and isinstance(sample.get("last"), (int, float)):
+                    prices.append(float(sample["last"]))
+        except Exception as e:
+            logger.debug(f"pro trader SPY series unavailable: {e}")
+    realized = None
+    if len(prices) >= 2 and min(prices) > 0:
+        realized = (max(prices) - min(prices)) / prices[0] * 100.0
+    return {
+        "minute_et": minute,
+        "spy_vs_vwap_pct": spy,
+        "qqq_vs_vwap_pct": qqq,
+        "prices": prices,
+        "realized_range_pct": realized,
+        "event_active": event,
+        "feed": _pro_trader_feed_health(),
+    }
+
+
+async def _fold_pro_trader(p: dict, blocked: List[str]) -> List[str]:
+    """Attach a pro-trader decision. Active mode may append a block. Shadow does not."""
+    mode = str(live_policy("pro_trader_mode") or "shadow")
+    if mode == "off" or _is_connectivity_test(p) or str(p.get("instrument") or "").lower() == "crypto":
+        return blocked
+    try:
+        daily = await state.get_daily()
+        decision = _PRO_TRADER.evaluate(
+            await _pro_trader_observation(p),
+            _pro_trader_candidate(p),
+            mode=mode,
+            configured_risk_pct=float(live_policy("risk_per_trade_pct") or 8),
+            daily_loss_limit_pct=float(live_policy("daily_loss_limit_pct") or 10),
+            trades_completed=int(daily.get("trades_today") or 0),
+            min_trades=int(live_policy("min_trades_per_day") or MIN_TRADES_PER_DAY),
+            realized_pnl_today_pct=daily.get("realized_pnl_today_pct"),
+        )
+    except Exception as e:
+        logger.warning(f"pro trader unavailable ({e})")
+        if mode == "active":
+            blocked.append("pro trader unavailable — active mode stands down")
+        return blocked
+    p["_pro_trader"] = decision
+    if mode == "active" and decision.get("verdict") == "BLOCK":
+        blocked.append(str(decision.get("summary") or "pro trader blocked"))
+    elif mode == "shadow":
+        logger.info(f"PRO TRADER shadow {decision.get('summary')}")
+    return blocked
+
+
+def _apply_pro_trader_size(symbol: str, qty: int, payload: dict) -> Tuple[int, Optional[str]]:
+    """Active mode applies the desk's down-only size. Shadow returns qty unchanged."""
+    decision = payload.get("_pro_trader") if isinstance(payload, dict) else None
+    if not isinstance(decision, dict) or decision.get("mode") != "active":
+        return qty, None
+    effect = pro_trader.order_effect(decision, qty)
+    if not effect["allow"]:
+        return 0, str(effect.get("reason") or decision.get("summary") or "pro trader blocked")
+    sized = int(effect["qty"])
+    if sized != qty:
+        logger.warning(
+            f"PRO TRADER {symbol}: size {qty} → {sized} "
+            f"(x{effect.get('size_multiplier')} {decision.get('playbook')})"
+        )
+        decision["applied"] = True
+        decision["sized_qty"] = sized
+    elif effect.get("floor_bound"):
+        decision["floor_bound"] = True
+    return sized, None
+
+
+def _pro_trader_position_fields(decision: Any) -> Dict[str, Any]:
+    if not isinstance(decision, dict):
+        return {}
+    fields = {"pro_trader": pro_trader.journal_metadata(decision)}
+    fields.update(pro_trader.position_exit_fields(decision))
+    return fields
+
+
+async def _note_pro_trader_decision(pd: dict, accepted: bool) -> None:
+    decision = pd.get("_pro_trader") if isinstance(pd, dict) else None
+    if not isinstance(decision, dict):
+        return
+    try:
+        _PRO_TRADER.remember(decision, accepted=accepted)
+        await trade_ledger.record("pro_trader_decision", {
+            **pro_trader.journal_metadata(decision),
+            "accepted_by_filters": bool(accepted),
+            "ticker": str(pd.get("ticker") or "").upper(),
+        })
+    except Exception as e:
+        logger.warning(f"pro trader decision was not recorded: {e}")
+
+
 async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     """Server-side re-filter mirroring the Rork app's gating, evaluated against
     the reconciled Redis state (single source of truth). Quality checks apply
@@ -14721,6 +14956,7 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
                 ))
             except Exception as e:
                 blocked.append(f"app book limits unreadable ({str(e)[:80]}) — entry refused")
+        blocked = await _fold_pro_trader(p, blocked)
         if blocked:
             logger.warning(f"📱 APP DECIDES — {ticker_m or 'entry'} refused: {' · '.join(blocked)}")
         else:
@@ -14975,6 +15211,7 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     if floor["blocked"]:
         blocked.append(floor["reason"])
 
+    blocked = await _fold_pro_trader(p, blocked)
     return len(blocked) == 0, blocked
 
 
@@ -17906,7 +18143,8 @@ def build_preflight(*,
                     killed: bool = False,
                     breaker_open: bool = False,
                     massive_status: Optional[Dict[str, Any]] = None,
-                    scanner_feed: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                    scanner_feed: Optional[Dict[str, Any]] = None,
+                    pro_trader_feed: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Can this bot actually place a real order right now — and if not, WHY?
 
     Every precondition for live trading already existed somewhere: a log line, a
@@ -18002,6 +18240,21 @@ def build_preflight(*,
                 "Check the Massive key and plan at massive.com; the bot retries Massive every scan.")
         else:
             add("scanner_feed", True, "Massive key set — waiting for the first scanner pass (market hours)")
+
+    if pro_trader_feed is not None:
+        degraded = pro_trader_feed.get("ok") is False
+        detail = str(pro_trader_feed.get("detail") or pro_trader_feed.get("last_error") or "market-data feed degraded")
+        mode = str(pro_trader_feed.get("mode") or "shadow")
+        if degraded:
+            add(
+                "pro_trader_feed", False,
+                f"Pro trader feed degraded ({detail})",
+                "Massive snapshot feed is failing (often HTTP 403). Shadow mode still trades the "
+                "existing path and records the verdict. Active mode stands down until the feed recovers.",
+                blocking=(mode == "active"),
+            )
+        else:
+            add("pro_trader_feed", True, "Pro trader market-data feed healthy")
 
     add("webhook_secret", bool(webhook_secret_set),
         "webhook authentication enabled" if webhook_secret_set else "WEBHOOK_SECRET is not set — live orders are refused",
@@ -23962,6 +24215,7 @@ def build_trade_review_fields(pos: Optional[dict]) -> Dict[str, Any]:
         "entry_bid": _finite_or_none(p.get("entry_bid")),
         "entry_ask": _finite_or_none(p.get("entry_ask")),
         "entry_index_vwap": entry_index,
+        "pro_trader": p.get("pro_trader") if isinstance(p.get("pro_trader"), dict) else None,
     }
 
 
@@ -24220,7 +24474,8 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
                        origin: Optional[str] = None,
                        signal_id: Optional[str] = None,
                        option_delta: Any = None,
-                       instrument: Optional[str] = None) -> None:
+                       instrument: Optional[str] = None,
+                       pro_trader_decision: Optional[dict] = None) -> None:
     # The setup label rides on the position and into the ledger so the trade
     # can be attributed when it settles. Without it the bot writes a history it
     # can never learn from: every close lands in an anonymous pile and the
@@ -24230,6 +24485,7 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
     signal_label = str(signal_id or "").strip() or None
     delta = _finite_or_none(option_delta)
     instrument_label = str(instrument or "").strip().lower() or None
+    pt_fields = _pro_trader_position_fields(pro_trader_decision)
     await state.set_position(ticker, {
         "qty": int(qty),
         "action": str(action or "BUY").upper(),
@@ -24251,6 +24507,7 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         "signal_id": signal_label,
         "option_delta": delta,
         "instrument": instrument_label,
+        **pt_fields,
     })
     await state.incr_trades_today()
     # 5.84.1 0DTE cap memory: count a same-day-expiry open on its ET day.
@@ -24273,6 +24530,7 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         "signal_id": signal_label,
         "option_delta": delta,
         "instrument": instrument_label,
+        **pt_fields,
     })
 
 
@@ -26544,6 +26802,13 @@ async def execute_live_order(payload: dict):
             if not is_exit:
                 quantity = _apply_learning_weight(sym_u, quantity, learning_ctx)
                 quantity = _apply_risk_weight(sym_u, quantity, risk_ctx)
+                quantity, pt_block = _apply_pro_trader_size(sym_u, quantity, payload)
+                if pt_block:
+                    await trade_ledger.record("pro_trader_blocked", {
+                        "ticker": sym_u, "reason": pt_block,
+                        "decision": pro_trader.journal_metadata(payload.get("_pro_trader")),
+                    })
+                    return {"status": "refused", "reason": pt_block, "code": "pro_trader", "paper": True}
             # The snapped contract's own book: displayed sizes, volume, OI.
             contract_liquidity: Dict[str, Any] = {}
 
@@ -26954,6 +27219,23 @@ async def execute_live_order(payload: dict):
                     )
                     return {"status": "refused", "reason": spread_gate["reason"],
                             "code": "spread_too_wide", "paper": True}
+                pt_decision = payload.get("_pro_trader") if isinstance(payload.get("_pro_trader"), dict) else None
+                if pt_decision and pt_decision.get("mode") == "active":
+                    live_guard = pro_trader.guard_live_quote(
+                        real_bid, real_ask,
+                        max_spread_pct=pt_decision.get("max_spread_pct") or 12,
+                        feed_degraded=pt_decision.get("regime") == "DEGRADED_DATA",
+                    )
+                    if live_guard["ok"] is False:
+                        logger.warning(f"⛔ {symbol} pro trader execution guard — {live_guard['reason']}")
+                        await trade_ledger.record("pro_trader_blocked", {
+                            "ticker": sym_u, "reason": live_guard["reason"],
+                            "spread_pct": live_guard.get("spread_pct"),
+                        })
+                        return {
+                            "status": "refused", "reason": live_guard["reason"],
+                            "code": "pro_trader_execution", "paper": True,
+                        }
                 if real_ask > 0:
                     # MID-PEG START off the REAL quote. The app's estimate is
                     # frequently far off the true premium, so the bot owns the
@@ -27354,6 +27636,7 @@ async def execute_live_order(payload: dict):
                     signal_id=signal_identity(payload),
                     option_delta=payload.get("option_delta"),
                     instrument="option",
+                    pro_trader_decision=payload.get("_pro_trader"),
                 )
                 # Journal: SPY/QQQ vs day VWAP + the bid/ask the ticket crossed.
                 try:
@@ -27799,6 +28082,13 @@ async def execute_live_order(payload: dict):
                     )
             quantity = _apply_learning_weight(symbol, quantity, learning_ctx)
             quantity = _apply_risk_weight(symbol, quantity, risk_ctx)
+            quantity, pt_block = _apply_pro_trader_size(symbol, quantity, payload)
+            if pt_block:
+                await trade_ledger.record("pro_trader_blocked", {
+                    "ticker": symbol, "reason": pt_block,
+                    "decision": pro_trader.journal_metadata(payload.get("_pro_trader")),
+                })
+                return {"status": "refused", "reason": pt_block, "code": "pro_trader", "paper": True}
             # CAPACITY — equities carry the sender's quote (risk_context): the
             # displayed offer and the day's volume.
             capacity = _apply_capacity(symbol, quantity, "stock", (risk_ctx or {}).get("context"), risk_ctx)
@@ -27868,7 +28158,8 @@ async def execute_live_order(payload: dict):
                                        entry_signal=_entry_signal(payload),
                                        origin=payload.get(DISPATCH_ORIGIN_FIELD),
                                        signal_id=signal_identity(payload),
-                                       instrument="equity")
+                                       instrument="equity",
+                                       pro_trader_decision=payload.get("_pro_trader"))
                     try:
                         await _stamp_entry_market_context(str(symbol).upper())
                     except Exception as e:
@@ -27899,7 +28190,8 @@ async def execute_live_order(payload: dict):
                                entry_signal=_entry_signal(payload),
                                origin=payload.get(DISPATCH_ORIGIN_FIELD),
                                signal_id=signal_identity(payload),
-                               instrument="equity")
+                               instrument="equity",
+                               pro_trader_decision=payload.get("_pro_trader"))
             try:
                 await _stamp_entry_market_context(str(symbol).upper())
             except Exception as e:
@@ -28455,9 +28747,15 @@ def _position_breakeven_locked(pos: dict, is_option: bool, mark: float) -> bool:
         return True
     mfe_pct = float(pos.get("trail_mfe_pct") or 0) or 0.0
     r_mult = float(pos.get("trail_r") or 0) or 0.0
-    if mfe_pct >= trailing_engine.BREAKEVEN_TRIGGER_PCT:
+    be_r = trailing_engine._tighten_only(
+        pos.get("pro_trader_breakeven_trigger_r"), trailing_engine.BREAKEVEN_TRIGGER_R, 0.35,
+    )
+    be_pct = trailing_engine._tighten_only(
+        pos.get("pro_trader_breakeven_trigger_pct"), trailing_engine.BREAKEVEN_TRIGGER_PCT, 0.04,
+    )
+    if mfe_pct >= be_pct:
         return True
-    if r_mult >= trailing_engine.BREAKEVEN_TRIGGER_R:
+    if r_mult >= be_r:
         return True
     entry = float(pos.get("entry_premium") if is_option else (pos.get("entry") or 0) or 0)
     initial = float(
@@ -28470,10 +28768,10 @@ def _position_breakeven_locked(pos: dict, is_option: bool, mark: float) -> bool:
     mfe = mark - entry  # long-only for options; equities use the same for longs
     if mfe < 0:
         return False
-    if (mfe / entry) >= trailing_engine.BREAKEVEN_TRIGGER_PCT:
+    if (mfe / entry) >= be_pct:
         return True
     risk = abs(entry - initial) if initial > 0 else 0.0
-    return bool(risk > 0 and (mfe / risk) >= trailing_engine.BREAKEVEN_TRIGGER_R)
+    return bool(risk > 0 and (mfe / risk) >= be_r)
 
 
 async def _maybe_hand_off_native_trail(
@@ -30376,6 +30674,7 @@ async def process_signal(pd: dict, replay: bool = False) -> dict:
             await _record_dispatch_verdict(pd, "rejected", "market_closed")
             return {"status": "rejected", "reason": "market_closed", "signal_id": sig_key}
         ok, blocked = await _passes_entry_filters(pd)
+        await _note_pro_trader_decision(pd, ok)
         if not ok:
             # A retired setup that passed EVERY other gate is the idea the core
             # book removed — paper-track it so the evidence can prove the
@@ -30505,6 +30804,8 @@ async def explain_signal(pd: dict) -> Dict[str, Any]:
         filters_ok, blocked = True, []
         base["filters_error"] = str(e)[:200]
     base["filters"] = {"passed": filters_ok, "blocked_by": blocked}
+    if isinstance(pd.get("_pro_trader"), dict):
+        base["pro_trader"] = pro_trader.journal_metadata(pd.get("_pro_trader"))
 
     if instrument != "option":
         return {**base, "verdict": "would_place" if filters_ok else "refused",
@@ -30580,6 +30881,10 @@ async def _current_preflight() -> Dict[str, Any]:
         breaker_open=await _breaker_is_open(),
         massive_status=massive_client.status(),
         scanner_feed=dict(_scanner_quote_source),
+        pro_trader_feed={
+            **_pro_trader_feed_health(),
+            "mode": str(live_policy("pro_trader_mode") or "shadow"),
+        },
     )
 
 
@@ -30656,6 +30961,7 @@ async def status():
             "interval_seconds": TRAIL_INTERVAL_SECONDS,
             "min_step_frac": TRAIL_MIN_STEP_FRAC,
         },
+        "pro_trader": _pro_trader_status_payload(daily.get("trades_today")),
         "alert_webhook_configured": alerts.webhook_configured(),
         "account_binding": _account_binding,
         "crypto_account_binding": _crypto_account_binding,
@@ -30894,6 +31200,10 @@ async def policy_get():
             # See the /status envelope above: the per-name ceiling keys were
             # removed with the rule itself on 2026-09-09.
             "option_stop_max_haircut_pct": OPTION_STOP_MAX_HAIRCUT_PCT,
+            "pro_trader_modes": ["off", "shadow", "active"],
+            "pro_trader_default": "shadow",
+            "min_trades_per_day_default": 4,
+            "min_trades_per_day_bounds": [1, 12],
         },
         "env_defaults": {
             "min_score": MIN_SCORE,
@@ -30938,6 +31248,103 @@ async def policy_set(
         "clamped": result["clamped"],
         "ignored": result["ignored"],
         "accepted": result["accepted"],
+    }
+
+
+def _pro_trader_status_payload(trades_today: Any = None) -> Dict[str, Any]:
+    now_et = _utcnow().astimezone(_ET_ZONE)
+    minute = now_et.hour * 60 + now_et.minute
+    done = _PRO_TRADER.trades_completed if trades_today is None else trades_today
+    target = int(live_policy("min_trades_per_day") or MIN_TRADES_PER_DAY)
+    pacing = pro_trader.pace_state(minute, done, target)
+    body = _PRO_TRADER.status(
+        mode=live_policy("pro_trader_mode"),
+        feed=_pro_trader_feed_health(),
+    )
+    body["mode"] = str(live_policy("pro_trader_mode") or "shadow")
+    body["min_trades_per_day"] = target
+    body["trades_completed"] = int(pacing["trades_completed"])
+    body["pacing"] = pacing
+    body["version"] = BOT_VERSION
+    return body
+
+
+async def _pro_trader_report_payload() -> Dict[str, Any]:
+    decisions: List[Dict[str, Any]] = []
+    closes: List[Dict[str, Any]] = []
+    try:
+        for rec in trade_ledger.recent(1200):
+            if not isinstance(rec, dict):
+                continue
+            data = rec.get("data") if isinstance(rec.get("data"), dict) else None
+            if not data:
+                continue
+            event = str(rec.get("event") or "")
+            if event == "pro_trader_decision":
+                decisions.append(data)
+            elif event == "position_closed":
+                closes.append(data)
+    except Exception as e:
+        logger.warning(f"pro trader report ledger unreadable: {e}")
+    if not decisions:
+        decisions = list(_PRO_TRADER.decisions)
+    try:
+        daily = await state.get_daily()
+        done = daily.get("trades_today")
+    except Exception:
+        done = _PRO_TRADER.trades_completed
+    now_et = _utcnow().astimezone(_ET_ZONE)
+    pacing = pro_trader.pace_state(
+        now_et.hour * 60 + now_et.minute,
+        done,
+        live_policy("min_trades_per_day"),
+    )
+    report = pro_trader.build_report(
+        decisions, closes,
+        pacing=pacing,
+        feed=_pro_trader_feed_health(),
+        min_trades=int(live_policy("min_trades_per_day") or MIN_TRADES_PER_DAY),
+    )
+    report["mode"] = str(live_policy("pro_trader_mode") or "shadow")
+    report["version"] = BOT_VERSION
+    return report
+
+
+@app.get("/pro-trader/status")
+async def pro_trader_status():
+    """Live regime, feed health, playbook, and pace toward MIN_TRADES_PER_DAY.
+
+    Same auth as the rest of the bot: X-Rork-Secret, except /health and /healthz.
+    """
+    try:
+        daily = await state.get_daily()
+        done = daily.get("trades_today")
+    except Exception:
+        done = None
+    return _pro_trader_status_payload(done)
+
+
+@app.get("/pro-trader/report")
+async def pro_trader_report():
+    """Daily attribution, pace, shadow counterfactual, and ranked corrective actions."""
+    return await _pro_trader_report_payload()
+
+
+@app.get("/pro-trader/corrective-actions")
+async def pro_trader_corrective_actions():
+    """Ranked, machine-readable proposals for the Pro Day Trader assistant.
+
+    Read-only. The assistant may turn a proposal into a Cursor PR. Nothing
+    here places an order or edits a safety rail.
+    """
+    report = await _pro_trader_report_payload()
+    return {
+        "mode": report.get("mode"),
+        "min_trades_per_day": report.get("min_trades_per_day"),
+        "trades_completed": report.get("trades_completed"),
+        "pacing": report.get("pacing"),
+        "corrective_actions": report.get("corrective_actions") or [],
+        "version": BOT_VERSION,
     }
 
 
