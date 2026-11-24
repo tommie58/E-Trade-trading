@@ -97,18 +97,40 @@ def _clear_seed_throttle():
     main_bot._vwap_seed_attempt_at.clear()
 
 
+def _completed(rows: list) -> list:
+    """Regular-session bars before the minute that is still forming."""
+    return [bar for bar in rows if _minute_of(bar["t"]) < LAST_MINUTE]
+
+
 def test_empty_restart_matches_the_full_regular_session_and_drops_premarket():
     rth = _rth()
+    done = _completed(rth)
     payload = _premarket() + rth
     plan = main_bot.scanner_mod.plan_session_vwap_seed(None, payload, NOW, max_age_s=300)
     assert plan["applied"] is True
     assert plan["reason"] == "seeded"
-    assert plan["bars_used"] == len(rth)
-    assert plan["vwap"] == pytest.approx(_vwap(rth))
+    assert plan["bars_used"] == len(done)
+    assert plan["vwap"] == pytest.approx(_vwap(done))
     assert plan["vwap"] != pytest.approx(_vwap(payload))
     again = main_bot.scanner_mod.plan_session_vwap_seed(plan["fields"], payload, NOW)
     assert again["applied"] is False
     assert again["reason"] == "not_needed"
+
+
+def test_empty_seed_leaves_out_the_minute_still_forming():
+    """The open minute is incomplete. Seeding it double-counts the first live print."""
+    rth = _rth()
+    done = _completed(rth)
+    forming = [bar for bar in rth if _minute_of(bar["t"]) == LAST_MINUTE]
+    assert len(forming) == 1
+    forming[0]["v"] = 9_000_000
+    forming[0]["vw"] = 1.0
+    plan = main_bot.scanner_mod.plan_session_vwap_seed(None, done + forming, NOW, max_age_s=300)
+    assert plan["applied"] is True
+    assert plan["bars_used"] == len(done)
+    assert _sum_v(plan["fields"]) == pytest.approx(sum(bar["v"] for bar in done))
+    assert plan["vwap"] == pytest.approx(_vwap(done))
+    assert plan["vwap"] != pytest.approx(_vwap(done + forming))
 
 
 def test_restart_after_the_open_seeds_only_the_missing_prefix():
@@ -259,7 +281,8 @@ def test_gate_restart_seeds_and_a_live_print_does_not_recount_the_seed(monkeypat
             main_bot.scanner_mod.SESSION_VWAP_TTL_S,
         )
         _cache("SPY", _vwap(spy))
-        _cache("QQQ", _vwap(qqq))
+        # QQQ's hash is empty, so the seed stops before the minute still forming.
+        _cache("QQQ", _vwap(_completed(qqq)))
         quotes = await main_bot._index_vwap_quotes()
         reason = main_bot.assess_call_index_vwap_gate("CALL", quotes)
         fields = await store.hash_get(main_bot.scanner_mod.session_vwap_key("SPY", "2026-11-24"))
@@ -277,7 +300,7 @@ def test_gate_restart_seeds_and_a_live_print_does_not_recount_the_seed(monkeypat
     quotes, reason, fields, after, seeded_v = _run(scenario())
     by_sym = {row["symbol"]: row for row in quotes}
     assert by_sym["SPY"]["vwap"] == pytest.approx(_vwap(spy))
-    assert by_sym["QQQ"]["vwap"] == pytest.approx(_vwap(qqq))
+    assert by_sym["QQQ"]["vwap"] == pytest.approx(_vwap(_completed(qqq)))
     assert reason is None
     assert float(fields["last_volume"]) == pytest.approx(9_000_000)
     assert seeded_v == pytest.approx(sum(bar["v"] for bar in spy))

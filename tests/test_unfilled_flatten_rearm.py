@@ -1279,6 +1279,33 @@ def test_done_trade_executed_is_filled_and_does_not_send_another_close(monkeypat
     assert "stop" not in rec["calls"]
 
 
+def test_lock_busy_after_replacement_sent_keeps_the_new_close(monkeypatch):
+    """A busy position lock after the market sell must not drop the new order id."""
+    when = _at(HALF, 12, 50)
+    rec = _arm(monkeypatch, when, _position(when), held=4)
+    rec["scripts"]["CLOSE-1"].append(_row("EXPIRED", 0, 4))
+    rec["scripts"]["CLOSE-2"] = [_row("OPEN", 0, 4)]
+
+    class _Busy:
+        async def acquire(self):
+            raise main_bot.LockNotAcquired("busy")
+
+        async def release(self):
+            return None
+
+    rec["book"].position_lock = lambda *args, **kwargs: _Busy()
+    _run()
+    pending = rec["book"].pos["pending_flatten_close"]
+    assert rec["calls"].count("place") == 1
+    assert pending["order_id"] == "CLOSE-2"
+    assert pending["replacements"] == 1
+    assert rec["book"].pos["close_order_id"] == "CLOSE-2"
+
+    _run()
+    assert rec["calls"].count("place") == 1
+    assert rec["book"].pos["pending_flatten_close"]["order_id"] == "CLOSE-2"
+
+
 def test_concurrent_flatten_saves_keep_each_others_fields():
     """Two passes write different keys. Neither snapshot replaces the other."""
     store = main_bot.StateStore(None)

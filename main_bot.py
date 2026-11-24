@@ -10624,11 +10624,12 @@ def plan_session_vwap_seed(
 ) -> Dict[str, Any]:
     """Fold regular-session minute bars into a hash that started late.
 
-    Bars before 9:30 ET are left out. Bars already covered by ``first_ts``
-    are left out, so a second call and a hash that already holds the tail
-    do not count those minutes again. A stale or gapped set is not applied.
-    The returned fields keep ``last_volume`` so the next live print adds
-    only the volume since that anchor.
+    Bars before 9:30 ET are left out, and so is the minute that is still
+    forming. Bars already covered by ``first_ts`` are left out, so a second
+    call and a hash that already holds the tail do not count those minutes
+    again. A stale or gapped set is not applied. The returned fields keep
+    ``last_volume`` so the next live print adds only the volume since that
+    anchor.
     """
     skipped = {
         "applied": False, "reason": "not_needed", "bars_used": 0,
@@ -10664,6 +10665,13 @@ def plan_session_vwap_seed(
     if not usable:
         skipped["reason"] = "no_bars"
         return skipped
+    # The current minute is still printing. Seeding it and then taking the
+    # first live delta counts that volume twice.
+    now_minute = now.hour * 60 + now.minute
+    usable = [bar for bar in usable if bar["minute"] < now_minute]
+    if not usable:
+        skipped["reason"] = "no_bars"
+        return skipped
     usable.sort(key=lambda item: item["epoch"])
     newest = usable[-1]["epoch"]
     try:
@@ -10690,7 +10698,8 @@ def plan_session_vwap_seed(
             skipped["reason"] = "incomplete"
             return skipped
     if cutoff is None:
-        tail_gap = (now.hour * 60 + now.minute) - selected[-1]["minute"]
+        # The last completed minute is the one before the minute still open.
+        tail_gap = (now_minute - 1) - selected[-1]["minute"]
     else:
         tail_gap = (cutoff - 1) - selected[-1]["minute"]
     if tail_gap > _VWAP_SEED_MAX_GAP_MINUTES:
@@ -14113,11 +14122,14 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # 5.99.2: a flatten close reported as DONE_TRADE_EXECUTED is filled, same
 # as EXECUTED, so the path does not send a second sell. Flatten
 # bookkeeping re-reads the position and writes only the fields this pass
-# changed, under the per-position lock. A mid-session restart seeds the
-# SPY/QQQ session VWAP from Massive regular-session minute bars (09:30 ET
-# onward, premarket excluded) and then keeps accumulating live prints.
-# A failed, stale, or incomplete seed does not write, and the CALL index
-# VWAP gate stays fail-closed.
+# changed, under the per-position lock. A save after a replacement close
+# was sent still writes those fields when the lock stays busy, so the new
+# order id is not lost and the next tick does not sell again. A mid-session
+# restart seeds the SPY/QQQ session VWAP from Massive regular-session
+# minute bars (09:30 ET onward, premarket excluded, the minute still
+# forming left out) and then keeps accumulating live prints. A failed,
+# stale, or incomplete seed does not write, and the CALL index VWAP gate
+# stays fail-closed.
 BOT_VERSION = "5.99.2-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
@@ -33149,6 +33161,11 @@ _FLATTEN_FIELD_DROPPED = object()
 _FLATTEN_BASELINE: contextvars.ContextVar = contextvars.ContextVar(
     "flatten_position_baseline", default=None,
 )
+# Set only after this pass has a broker order id. A busy lock may skip a
+# bookkeeping save; it may not skip the save that records that id.
+_FLATTEN_ORDER_PLACED: contextvars.ContextVar = contextvars.ContextVar(
+    "flatten_order_placed", default=False,
+)
 
 
 def _flatten_field_delta(before: dict, after: dict) -> Dict[str, Any]:
@@ -33180,6 +33197,22 @@ def _flatten_bind_baseline(pos: dict):
     return _FLATTEN_BASELINE.set(snap)
 
 
+async def _flatten_merge_changed(ticker: str, delta: Dict[str, Any]) -> None:
+    """Re-read the position and write only ``delta``. A closed position stays gone."""
+    current = await state.get_position(ticker)
+    if not isinstance(current, dict):
+        return
+    merged = dict(current)
+    for key, value in delta.items():
+        if value is _FLATTEN_FIELD_DROPPED:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    if "_rev" in current:
+        merged["_rev"] = current["_rev"]
+    await state.set_position(ticker, merged)
+
+
 async def _flatten_save(ticker: str, pos: dict) -> None:
     """Persist flatten bookkeeping onto the newest position.
 
@@ -33187,7 +33220,12 @@ async def _flatten_save(ticker: str, pos: dict) -> None:
     snapshot back would erase a fill or reconcile that landed in between.
     Re-read under the per-position lock and copy only the fields this pass
     changed. Two saves of different fields both land. A position that has
-    already closed is not recreated. A busy lock writes nothing.
+    already closed is not recreated.
+
+    A busy lock skips a save that did not place an order. A save after this
+    pass received a broker order id waits out that same lock, then writes
+    the changed fields anyway. Dropping that write would leave the old dead
+    close on the book and the next tick could sell again.
     """
     if not isinstance(pos, dict):
         return
@@ -33201,28 +33239,25 @@ async def _flatten_save(ticker: str, pos: dict) -> None:
     delta = _flatten_field_delta(baseline, pos)
     if not delta:
         return
+    must_persist = bool(_FLATTEN_ORDER_PLACED.get())
     lock = state.position_lock(ticker, ttl_ms=120_000, wait_timeout=30.0)
     try:
         await lock.acquire()
     except LockNotAcquired:
+        if not must_persist:
+            logger.error(
+                f"[FLATTEN REPLACE] {ticker} bookkeeping was not saved — "
+                f"position lock busy"
+            )
+            return
         logger.error(
-            f"[FLATTEN REPLACE] {ticker} bookkeeping was not saved — "
-            f"position lock busy"
+            f"[FLATTEN REPLACE] {ticker} position lock busy after a close "
+            f"was sent — writing the changed fields without the lock"
         )
+        await _flatten_merge_changed(ticker, delta)
         return
     try:
-        current = await state.get_position(ticker)
-        if not isinstance(current, dict):
-            return
-        merged = dict(current)
-        for key, value in delta.items():
-            if value is _FLATTEN_FIELD_DROPPED:
-                merged.pop(key, None)
-            else:
-                merged[key] = value
-        if "_rev" in current:
-            merged["_rev"] = current["_rev"]
-        await state.set_position(ticker, merged)
+        await _flatten_merge_changed(ticker, delta)
     finally:
         await lock.release()
 
@@ -33664,12 +33699,16 @@ async def _send_flatten_replacement(
             "booked_filled": 0,
         }
         pos["close_order_id"] = str(new_id)
-        await _alert_flatten(
-            pos, ticker, "replacement_sent",
-            f"{ticker}: flatten close {order_id} is dead — sent one MARKET "
-            f"SELL_CLOSE {new_id} for {sell_qty}.",
-            now_et,
-        )
+        placed = _FLATTEN_ORDER_PLACED.set(True)
+        try:
+            await _alert_flatten(
+                pos, ticker, "replacement_sent",
+                f"{ticker}: flatten close {order_id} is dead — sent one MARKET "
+                f"SELL_CLOSE {new_id} for {sell_qty}.",
+                now_et,
+            )
+        finally:
+            _FLATTEN_ORDER_PLACED.reset(placed)
     finally:
         if adopted is not None:
             _FLATTEN_BASELINE.reset(adopted)
