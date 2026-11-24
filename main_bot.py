@@ -13080,7 +13080,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # MARKET/LIMIT Good-for-Day, 24/7 session (no equity calendar gate).
 # 5.87.1: pin Individual Crypto 888103-8595 as the crypto-only routing target
 # (dash-tolerant id match, Redis crypto pin, refuse crypto as options pin).
-BOT_VERSION = "5.91.0-pro-day-trader"
+BOT_VERSION = "5.92.0-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
