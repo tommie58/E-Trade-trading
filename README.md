@@ -67,6 +67,8 @@ Every close writes a full review snapshot to the immutable ledger (`position_clo
 
 `POST /policy` accepts `pro_trader_mode` (`off`, `shadow`, `active`) and `min_trades_per_day` (1–12). `GET /pro-trader/status`, `GET /pro-trader/report`, and `GET /pro-trader/corrective-actions` use the same `X-Rork-Secret` as the other routes. The corrective-action payload is what the Pro Day Trader assistant reads before opening a follow-up PR.
 
+`CHAIN_SHADOW_ENABLED` defaults to `false`. When it is on, an option entry that has already armed its stop records a shadow strike from Massive's options chain (greeks, IV, open interest) and marks that contract while the live position is open, then at the exit and at +15 and +30 minutes. The shadow uses its own client and its own Redis list. It does not change the live strike, quantity, limit, stop, trail, size, the 8% per-trade rail, the daily loss rail, the 3:40 PM ET flatten, scanner 84-A, or the fail-closed VWAP gate. `GET /pro-trader/report` includes a read-only `chain_shadow` block. Forty paired entries is the floor for reading that comparison (same-contract rate, delta and spread gaps, exit and +30 differences with confidence intervals, and the refusal rate). It is not a switch that flips the live pick. A live flip would be a separate pull request that stays default-off until the TSIT Risk & Ops Monitor, the Chief of Staff, and Tommie sign off.
+
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /trades` | Newest closes with the full review payload (secret required) |
