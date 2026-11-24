@@ -31595,6 +31595,9 @@ FLATTEN_REPLACE_CAP = 3
 # After a reject, this many later ticks send nothing.
 FLATTEN_REJECT_BACKOFF_TICKS = 2
 _FLATTEN_ORDER_PAGE_CAP = 8
+# Tickers that already used their one replacement attempt on this pass.
+# Cleared at the start of every trail tick.
+_FLATTEN_TICK_USED: set = set()
 
 
 def _flatten_close_view(row: Any) -> str:
@@ -31805,9 +31808,9 @@ async def _flatten_open_orders() -> List[dict]:
 async def _flatten_broker_held_qty(ticker: str, pos: dict) -> Optional[int]:
     """Contracts the broker still holds for this position.
 
-    None means the portfolio could not be read (the order's own filled and
-    ordered quantities may still size a replacement). Zero means the broker
-    showed no position — a sell would be a short.
+    None means the portfolio could not be read. That is fail-closed: the
+    caller must not cancel and must not sell. Zero is a confirmed empty
+    holding, not a default for a failed read.
     """
     try:
         portfolio = await _reconcile_fetch_portfolio()
@@ -31826,31 +31829,31 @@ async def _flatten_broker_held_qty(ticker: str, pos: dict) -> Optional[int]:
 
 
 def _broker_remainder(row: dict, held: Optional[int]) -> Optional[int]:
-    """Shares or contracts still to sell, from the broker only.
+    """Sell size from a confirmed broker holding.
 
-    The order's ordered-minus-filled is the remainder of this close. The
-    portfolio holding caps it. Local position qty is not an input. None
-    means neither source could prove a number.
+    `held` is required. A missing read returns None so the caller cannot
+    size the sell from the order's remaining quantity. When the order also
+    reports a remainder, the sell is the smaller of the two. Local qty is
+    not an input.
     """
+    if held is None:
+        return None
+    try:
+        held_n = int(held)
+    except (TypeError, ValueError):
+        return None
+    if held_n < 0:
+        return None
     try:
         ordered = int(row.get("ordered") or 0)
         filled = int(row.get("filled") or 0)
     except (TypeError, ValueError):
-        return None
+        return held_n
     if filled < 0:
         filled = 0
-    order_left = max(0, ordered - filled) if ordered > 0 else None
-    if order_left is None and held is None:
-        return None
-    if held is None:
-        return order_left
-    try:
-        held_n = max(0, int(held))
-    except (TypeError, ValueError):
-        return order_left
-    if order_left is None:
-        return held_n
-    return min(order_left, held_n)
+    if ordered > 0:
+        return min(held_n, max(0, ordered - filled))
+    return held_n
 
 
 async def _flatten_save(ticker: str, pos: dict) -> None:
@@ -32012,12 +32015,12 @@ def _reject_backoff_blocks(pending: dict, order_id: str, status: str) -> bool:
 async def _protection_blocks_replace(
     ticker: str, pos: dict, close_id: str, now_et: datetime,
 ) -> bool:
-    """True when a stop or trail is still in the way, or its state is unknown.
+    """True when a stop or trail is unknown, or still live after a confirm.
 
-    Local stop and native-trail ids are checked, and so is the broker's
-    open-order list. A live one is cancelled and must read back dead
-    before a replacement sell. NOT_FOUND means it is not resting. A read
-    error or an unconfirmed cancel blocks the sell.
+    Status is read before anything is cancelled. An unreadable list or an
+    unreadable order returns immediately, so the caller does not cancel the
+    working close. A live stop is cancelled only after that read says it is
+    working, and the close is still not touched here.
     """
     try:
         open_orders = await _flatten_open_orders()
@@ -32026,21 +32029,20 @@ async def _protection_blocks_replace(
         await _alert_flatten(
             pos, ticker, "protection_unknown",
             f"{ticker}: could not read open orders before a replacement close "
-            f"for {close_id} — no new order.",
+            f"for {close_id} — no cancel and no new order.",
             now_et,
         )
         return True
-    ids: List[str] = []
-    for key in ("stop_order_id", "native_trail_order_id"):
-        oid = str(pos.get(key) or "").strip()
-        if oid and oid != close_id:
-            ids.append(oid)
+
+    live: List[str] = []
+    listed: set = set()
     for order in open_orders:
         if str(order.get("symbol") or "").upper() != str(ticker).upper():
             continue
         oid = str(order.get("order_id") or "")
         if not oid or oid == close_id:
             continue
+        listed.add(oid)
         status = str(order.get("status") or "").upper()
         price_type = str(order.get("price_type") or "").upper()
         action = str(order.get("order_action") or "").upper()
@@ -32051,12 +32053,12 @@ async def _protection_blocks_replace(
                 await _alert_flatten(
                     pos, ticker, "protection_unknown",
                     f"{ticker}: protective order {oid} is {status or 'unreadable'} "
-                    f"— no replacement close.",
+                    f"— no cancel and no new order.",
                     now_et,
                 )
                 return True
-            if oid not in ids:
-                ids.append(oid)
+            if oid not in live:
+                live.append(oid)
             continue
         if action in reconciliation._CLOSING_ACTIONS and status in _FLATTEN_WORKING_STATUSES:
             await _alert_flatten(
@@ -32065,7 +32067,39 @@ async def _protection_blocks_replace(
                 now_et,
             )
             return True
-    for oid in ids:
+
+    for key in ("stop_order_id", "native_trail_order_id"):
+        oid = str(pos.get(key) or "").strip()
+        if not oid or oid == close_id or oid in live or oid in listed:
+            continue
+        try:
+            fresh = await _flatten_read_order(oid)
+        except Exception:
+            logger.error(f"[FLATTEN REPLACE] {ticker} protective order {oid} unreadable")
+            await _alert_flatten(
+                pos, ticker, "protection_unknown",
+                f"{ticker}: protective order {oid} could not be confirmed dead "
+                f"— no cancel and no new order.",
+                now_et,
+            )
+            return True
+        if str(fresh.get("status") or "").upper() == "NOT_FOUND":
+            continue
+        view = _flatten_close_view(fresh)
+        if view == "dead":
+            continue
+        if view == "working":
+            live.append(oid)
+            continue
+        await _alert_flatten(
+            pos, ticker, "protection_unknown",
+            f"{ticker}: protective order {oid} is {fresh.get('status') or 'unreadable'} "
+            f"— no cancel and no new order.",
+            now_et,
+        )
+        return True
+
+    for oid in live:
         try:
             await _cancel_order_verified(oid)
             fresh = await _flatten_read_order(oid)
@@ -32081,64 +32115,103 @@ async def _protection_blocks_replace(
         if str(fresh.get("status") or "").upper() == "NOT_FOUND":
             continue
         view = _flatten_close_view(fresh)
-        if view == "filled":
-            await _alert_flatten(
-                pos, ticker, "protection_unknown",
-                f"{ticker}: protective order {oid} filled — no replacement close.",
-                now_et,
-            )
-            return True
-        if view != "dead":
-            await _alert_flatten(
-                pos, ticker, "protection_unknown",
-                f"{ticker}: protective order {oid} is {fresh.get('status') or 'unconfirmed'} "
-                f"— no replacement close.",
-                now_et,
-            )
-            return True
+        if view == "dead":
+            continue
+        await _alert_flatten(
+            pos, ticker, "protection_unknown",
+            f"{ticker}: protective order {oid} is {fresh.get('status') or 'unconfirmed'} "
+            f"— no replacement close.",
+            now_et,
+        )
+        return True
     pos["stop_order_id"] = None
     pos["native_trail_order_id"] = None
     await _flatten_save(ticker, pos)
     return False
 
 
-async def _send_flatten_replacement(
-    ticker: str, pos: dict, pending: dict, order_id: str, row: dict,
-    reason: str, now_et: datetime,
-) -> None:
-    """One MARKET SELL_CLOSE for the broker remainder, after the close is dead.
+async def _structural_replacement_block(
+    ticker: str, pos: dict, pending: dict, order_id: str, status: str, now_et: datetime,
+) -> bool:
+    """True when this tick must not cancel and must not sell.
 
-    At most one attempt on this call. A third rejection in the session stops
-    the sends. The qty is ordered-minus-filled from this broker row, capped
-    by the broker position. Local qty is not used.
+    Per-tick, per-session, and reject backoff. A blocked tick leaves a
+    working close where it is.
     """
+    if ticker in _FLATTEN_TICK_USED:
+        await _alert_flatten(
+            pos, ticker, "replace_tick",
+            f"{ticker}: a replacement was already attempted this tick for "
+            f"{order_id} — no cancel and no new order.",
+            now_et,
+        )
+        return True
     try:
         sent = int(pending.get("replacements") or 0)
     except (TypeError, ValueError):
-        sent = 0
+        sent = FLATTEN_REPLACE_CAP
     if sent >= FLATTEN_REPLACE_CAP:
         await _alert_flatten(
             pos, ticker, "replace_cap",
             f"{ticker}: flatten close {order_id} is still open and the "
-            f"{FLATTEN_REPLACE_CAP}-replacement cap is reached — close it manually.",
+            f"{FLATTEN_REPLACE_CAP}-replacement cap is reached — no cancel and "
+            f"no new order. Close it manually.",
             now_et,
         )
-        return
-    if await _protection_blocks_replace(ticker, pos, order_id, now_et):
-        return
+        return True
+    if _reject_backoff_blocks(pending, order_id, status):
+        pos["pending_flatten_close"] = pending
+        await _alert_flatten(
+            pos, ticker, "replace_rejected",
+            f"{ticker}: flatten close {order_id} was rejected — waiting before "
+            f"another close. No cancel and no new order.",
+            now_et,
+        )
+        return True
+    return False
+
+
+async def _read_flatten_held(ticker: str, pos: dict) -> Optional[int]:
+    """Broker holding, or None when the read failed. Never defaults to zero."""
     try:
-        held = await _flatten_broker_held_qty(ticker, pos)
+        return await _flatten_broker_held_qty(ticker, pos)
     except Exception:
-        held = None
-    sell_qty = _broker_remainder(row, held)
-    if sell_qty is None:
+        logger.error(f"[FLATTEN REPLACE] {ticker} broker position read failed")
+        return None
+
+
+async def _send_flatten_replacement(
+    ticker: str, pos: dict, pending: dict, order_id: str, row: dict,
+    reason: str, now_et: datetime, held: Optional[int],
+) -> None:
+    """One MARKET SELL_CLOSE sized only from a confirmed broker holding.
+
+    The caller has already passed the pre-cancel gates. `held is None` is
+    fail-closed: no sell, and the position is not marked flat. A confirmed
+    zero marks the flatten resolved and sends nothing.
+    """
+    if held is None:
         await _alert_flatten(
             pos, ticker, "qty_unknown",
-            f"{ticker}: flatten close {order_id} is dead but the remaining "
-            f"quantity is not on the broker read — no new order.",
+            f"{ticker}: broker holding for flatten close {order_id} could not "
+            f"be read — no new order. The position was not marked flat.",
             now_et,
         )
         return
+    try:
+        held_n = int(held)
+    except (TypeError, ValueError):
+        await _alert_flatten(
+            pos, ticker, "qty_unknown",
+            f"{ticker}: broker holding for flatten close {order_id} could not "
+            f"be read — no new order. The position was not marked flat.",
+            now_et,
+        )
+        return
+    try:
+        sent = int(pending.get("replacements") or 0)
+    except (TypeError, ValueError):
+        sent = 0
     try:
         filled = int(row.get("filled") or 0)
     except (TypeError, ValueError):
@@ -32162,10 +32235,26 @@ async def _send_flatten_replacement(
         pending["booked_filled"] = filled
         pos["pending_flatten_close"] = pending
         await _flatten_save(ticker, pos)
-    if sell_qty < 1:
+    if held_n == 0:
+        # Confirmed fresh read of an empty holding. Not a default for a
+        # failed or missing portfolio read.
         pending["resolved"] = "flat"
         pos["pending_flatten_close"] = pending
-        await _flatten_save(ticker, pos)
+        await _alert_flatten(
+            pos, ticker, "held_flat",
+            f"{ticker}: broker holding is 0 after a confirmed read of flatten "
+            f"close {order_id} — no sell.",
+            now_et,
+        )
+        return
+    sell_qty = _broker_remainder(row, held_n)
+    if sell_qty is None or sell_qty < 1:
+        await _alert_flatten(
+            pos, ticker, "qty_unknown",
+            f"{ticker}: flatten close {order_id} has no confirmed quantity to "
+            f"sell — no new order. The position was not marked flat.",
+            now_et,
+        )
         return
     contract = pos.get("contract") or {}
     try:
@@ -32257,6 +32346,7 @@ async def _replace_unfilled_flatten_one(
             logger.error(f"[FLATTEN REPLACE] {ticker} filled close could not be booked")
         return
 
+    cancelled_working = False
     if view == "working":
         age = _flatten_age_seconds(pending.get("placed_at"))
         if age is None or age < FLATTEN_REPLACE_MIN_AGE_SECONDS:
@@ -32277,6 +32367,36 @@ async def _replace_unfilled_flatten_one(
             )
             await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
             return
+        status = str(row.get("status") or "").upper()
+        if await _structural_replacement_block(
+            ticker, pos, pending, order_id, status, now_et,
+        ):
+            await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
+            return
+        held_before = await _read_flatten_held(ticker, pos)
+        if held_before is None:
+            await _alert_flatten(
+                pos, ticker, "qty_unknown",
+                f"{ticker}: broker holding for working flatten close {order_id} "
+                f"could not be read — leaving that close in place, no cancel "
+                f"and no new order.",
+                now_et,
+            )
+            await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
+            return
+        if held_before < 1:
+            await _alert_flatten(
+                pos, ticker, "qty_unknown",
+                f"{ticker}: broker holding for working flatten close {order_id} "
+                f"is 0 — leaving that close in place, no cancel and no new order.",
+                now_et,
+            )
+            await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
+            return
+        if await _protection_blocks_replace(ticker, pos, order_id, now_et):
+            await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
+            return
+        _FLATTEN_TICK_USED.add(ticker)
         try:
             await _cancel_order_verified(order_id, expected_qty=int(row.get("ordered") or 0))
         except Exception:
@@ -32317,29 +32437,53 @@ async def _replace_unfilled_flatten_one(
             )
             await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
             return
+        cancelled_working = True
 
-    if not enabled:
-        await _alert_flatten(
-            pos, ticker, "replace_disabled",
-            f"{ticker}: flatten close {order_id} is {row.get('status') or 'dead'} "
-            f"— replacement is off, no new order.",
-            now_et,
+    if not cancelled_working:
+        if not enabled:
+            await _alert_flatten(
+                pos, ticker, "replace_disabled",
+                f"{ticker}: flatten close {order_id} is {row.get('status') or 'dead'} "
+                f"— replacement is off, no new order.",
+                now_et,
+            )
+            await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
+            return
+        status = str(row.get("status") or "").upper()
+        if await _structural_replacement_block(
+            ticker, pos, pending, order_id, status, now_et,
+        ):
+            await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
+            return
+        held_now = await _read_flatten_held(ticker, pos)
+        if held_now is None:
+            await _alert_flatten(
+                pos, ticker, "qty_unknown",
+                f"{ticker}: broker holding for flatten close {order_id} could not "
+                f"be read — no cancel and no new order. The position was not marked flat.",
+                now_et,
+            )
+            return
+        if held_now < 1:
+            await _send_flatten_replacement(
+                ticker, pos, pending, order_id, row, reason, now_et, held_now,
+            )
+            return
+        if await _protection_blocks_replace(ticker, pos, order_id, now_et):
+            await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
+            return
+        _FLATTEN_TICK_USED.add(ticker)
+        await _send_flatten_replacement(
+            ticker, pos, pending, order_id, row, reason, now_et, held_now,
         )
-        await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
         return
 
-    status = str(row.get("status") or "").upper()
-    if _reject_backoff_blocks(pending, order_id, status):
-        pos["pending_flatten_close"] = pending
-        await _alert_flatten(
-            pos, ticker, "replace_rejected",
-            f"{ticker}: flatten close {order_id} was rejected — waiting before another close.",
-            now_et,
-        )
-        await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
-        return
-
-    await _send_flatten_replacement(ticker, pos, pending, order_id, row, reason, now_et)
+    # Second read, after the cancel. The pre-cancel value is not reused,
+    # and a failed read is not treated as zero.
+    held_after = await _read_flatten_held(ticker, pos)
+    await _send_flatten_replacement(
+        ticker, pos, pending, order_id, row, reason, now_et, held_after,
+    )
     fresh = await state.get_position(ticker)
     if not isinstance(fresh, dict):
         return
@@ -32373,6 +32517,7 @@ async def _replace_unfilled_flatten_closes() -> None:
     now_et = _utcnow().astimezone(_ET_ZONE)
     if not _unfilled_flatten_replace_window(now_et):
         return
+    _FLATTEN_TICK_USED.clear()
     enabled = _unfilled_flatten_replace_enabled()
     try:
         positions = await state.all_positions()

@@ -185,6 +185,10 @@ def _arm(monkeypatch, when: datetime, pos: dict, *, enabled=None, held=None):
 
     async def held_qty(ticker, pos):
         calls.append("held")
+        if isinstance(held, list):
+            if not held:
+                return None
+            return held.pop(0)
         return held
 
     async def send(severity, event, message, **kwargs):
@@ -276,7 +280,7 @@ def _assert_market_sell(order: dict, qty: int) -> None:
 )
 def test_unfilled_close_is_replaced_by_one_market_sell(when, monkeypatch):
     pos = _position(when)
-    rec = _arm(monkeypatch, when, pos)
+    rec = _arm(monkeypatch, when, pos, held=4)
     rec["scripts"]["CLOSE-1"].extend([_row("OPEN", 0, 4), _row("CANCELLED", 0, 4)])
     rec["scripts"]["CLOSE-2"] = [_row("OPEN", 0, 4)]
 
@@ -299,7 +303,7 @@ def test_unfilled_close_is_replaced_by_one_market_sell(when, monkeypatch):
 
 def test_market_order_at_the_bell_boundary_and_manual_0dte_alert(monkeypatch):
     when = _at(HALF, 12, 59)
-    rec = _arm(monkeypatch, when, _position(when, expiration="2026-11-27"))
+    rec = _arm(monkeypatch, when, _position(when, expiration="2026-11-27"), held=4)
     rec["scripts"]["CLOSE-1"].extend([_row("OPEN", 0, 4), _row("CANCELLED", 0, 4)])
     rec["scripts"]["CLOSE-2"] = [_row("OPEN", 0, 4), _row("OPEN", 0, 4)]
 
@@ -335,7 +339,7 @@ def test_manual_alert_says_when_the_contract_does_not_expire_today(monkeypatch):
 
 def test_partial_fill_replaces_the_remainder_and_books_unknown_price_as_none(monkeypatch):
     when = _at(HALF, 12, 50)
-    rec = _arm(monkeypatch, when, _position(when))
+    rec = _arm(monkeypatch, when, _position(when), held=4)
     rec["scripts"]["CLOSE-1"].extend([
         _row("OPEN", 1, 4),
         _row("CANCELLED", 1, 4),
@@ -370,6 +374,100 @@ def test_replacement_qty_is_capped_by_the_broker_position_not_local_state(monkey
     assert ("cancel", "CLOSE-1", 4) not in rec["calls"]
 
 
+def _no_cancel(calls) -> bool:
+    return not any(isinstance(c, tuple) and c[0] == "cancel" for c in calls)
+
+
+def test_session_cap_leaves_the_working_close_in_place(monkeypatch):
+    when = _at(HALF, 12, 50)
+    pos = _position(when)
+    pos["pending_flatten_close"]["replacements"] = 3
+    rec = _arm(monkeypatch, when, pos, held=4)
+    rec["scripts"]["CLOSE-1"].append(_row("OPEN", 0, 4))
+    _run()
+    assert _no_cancel(rec["calls"])
+    assert rec["calls"].count("place") == 0
+    assert rec["orders"] == []
+    assert any("cap is reached" in a["message"] and a["severity"] == "critical" for a in rec["alerts"])
+    assert rec["book"].pos["pending_flatten_close"]["order_id"] == "CLOSE-1"
+    assert rec["book"].pos["pending_flatten_close"].get("resolved") != "flat"
+
+
+def test_reject_backoff_leaves_the_working_close_in_place(monkeypatch):
+    when = _at(HALF, 12, 50)
+    pos = _position(when)
+    pos["pending_flatten_close"]["backoff_ticks"] = 2
+    pos["pending_flatten_close"]["backoff_for"] = "CLOSE-1"
+    rec = _arm(monkeypatch, when, pos, held=4)
+    rec["scripts"]["CLOSE-1"].append(_row("OPEN", 0, 4))
+    _run()
+    assert _no_cancel(rec["calls"])
+    assert rec["calls"].count("place") == 0
+    assert rec["orders"] == []
+    assert any("waiting before" in a["message"] for a in rec["alerts"])
+    assert rec["book"].pos["pending_flatten_close"]["order_id"] == "CLOSE-1"
+
+
+def test_unknown_stop_state_does_not_cancel_the_working_close(monkeypatch):
+    when = _at(HALF, 12, 50)
+    pos = _position(when)
+    pos["native_trail_order_id"] = "TRAIL-1"
+    rec = _arm(monkeypatch, when, pos, held=4)
+    rec["scripts"]["CLOSE-1"].append(_row("OPEN", 0, 4))
+    rec["state"]["open_error"] = True
+    _run()
+    assert _no_cancel(rec["calls"])
+    assert rec["calls"].count("place") == 0
+    assert rec["orders"] == []
+    assert any(
+        a["severity"] == "critical" and "no cancel and no new order" in a["message"]
+        for a in rec["alerts"]
+    )
+    assert rec["book"].pos["pending_flatten_close"]["order_id"] == "CLOSE-1"
+
+
+def test_held_none_before_cancel_sends_nothing(monkeypatch):
+    when = _at(HALF, 12, 50)
+    rec = _arm(monkeypatch, when, _position(when), held=None)
+    rec["scripts"]["CLOSE-1"].append(_row("OPEN", 0, 4))
+    _run()
+    assert _no_cancel(rec["calls"])
+    assert rec["calls"].count("place") == 0
+    assert rec["orders"] == []
+    assert any(
+        a["severity"] == "critical" and "could not be read" in a["message"]
+        for a in rec["alerts"]
+    )
+    assert rec["book"].pos["pending_flatten_close"].get("resolved") != "flat"
+
+
+def test_held_none_after_cancel_does_not_sell_or_mark_flat(monkeypatch):
+    when = _at(HALF, 12, 50)
+    rec = _arm(monkeypatch, when, _position(when), held=[4, None])
+    rec["scripts"]["CLOSE-1"].extend([_row("OPEN", 0, 4), _row("CANCELLED", 0, 4)])
+    _run()
+    assert ("cancel", "CLOSE-1", 4) in rec["calls"]
+    assert rec["calls"].count("place") == 0
+    assert rec["orders"] == []
+    pending = rec["book"].pos["pending_flatten_close"]
+    assert pending.get("resolved") != "flat"
+    assert any(
+        a["severity"] == "critical" and "not marked flat" in a["message"]
+        for a in rec["alerts"]
+    )
+
+
+def test_confirmed_zero_holding_after_cancel_is_flat_with_no_sell(monkeypatch):
+    when = _at(HALF, 12, 50)
+    rec = _arm(monkeypatch, when, _position(when), held=[4, 0])
+    rec["scripts"]["CLOSE-1"].extend([_row("OPEN", 0, 4), _row("CANCELLED", 0, 4)])
+    _run()
+    assert ("cancel", "CLOSE-1", 4) in rec["calls"]
+    assert rec["calls"].count("place") == 0
+    assert rec["orders"] == []
+    assert rec["book"].pos["pending_flatten_close"]["resolved"] == "flat"
+
+
 def test_fill_during_cancel_sends_no_replacement(monkeypatch):
     when = _at(HALF, 12, 50)
     rec = _arm(monkeypatch, when, _position(when), held=99)
@@ -395,7 +493,7 @@ def test_fill_during_cancel_sends_no_replacement(monkeypatch):
 
 def test_cancel_not_confirmed_sends_nothing_and_alerts(monkeypatch):
     when = _at(HALF, 12, 50)
-    rec = _arm(monkeypatch, when, _position(when))
+    rec = _arm(monkeypatch, when, _position(when), held=4)
     rec["scripts"]["CLOSE-1"].extend([
         _row("OPEN", 0, 4),
         _row("CANCEL_REQUESTED", 0, 4),
@@ -431,7 +529,7 @@ def test_not_found_alerts_and_sends_nothing(monkeypatch):
 
 def test_resting_stop_is_cancelled_and_confirmed_before_the_replacement(monkeypatch):
     when = _at(HALF, 12, 50)
-    rec = _arm(monkeypatch, when, _position(when))
+    rec = _arm(monkeypatch, when, _position(when), held=4)
     rec["scripts"]["CLOSE-1"].append(_row("EXPIRED", 0, 4))
     rec["scripts"]["STOP-9"] = [_row("CANCELLED", 0, 4)]
     rec["open_orders"].append({
@@ -452,7 +550,7 @@ def test_resting_stop_is_cancelled_and_confirmed_before_the_replacement(monkeypa
 
 def test_unknown_protective_order_skips_the_replacement(monkeypatch):
     when = _at(HALF, 12, 50)
-    rec = _arm(monkeypatch, when, _position(when))
+    rec = _arm(monkeypatch, when, _position(when), held=4)
     rec["scripts"]["CLOSE-1"].append(_row("EXPIRED", 0, 4))
     rec["scripts"]["TRAIL-1"] = [_row("CANCEL_REQUESTED", 0, 4)]
     rec["open_orders"].append({
@@ -473,7 +571,7 @@ def test_protective_read_error_skips_the_replacement(monkeypatch):
     when = _at(HALF, 12, 50)
     pos = _position(when)
     pos["native_trail_order_id"] = "TRAIL-1"
-    rec = _arm(monkeypatch, when, pos)
+    rec = _arm(monkeypatch, when, pos, held=4)
     rec["scripts"]["CLOSE-1"].append(_row("EXPIRED", 0, 4))
     rec["state"]["read_error"] = False
 
@@ -493,7 +591,7 @@ def test_not_found_stop_is_not_working_and_the_close_still_replaces(monkeypatch)
     when = _at(HALF, 12, 50)
     pos = _position(when)
     pos["stop_order_id"] = "STOP-OLD"
-    rec = _arm(monkeypatch, when, pos)
+    rec = _arm(monkeypatch, when, pos, held=4)
     rec["scripts"]["CLOSE-1"].append(_row("EXPIRED", 0, 4))
     rec["scripts"]["STOP-OLD"] = [_row("NOT_FOUND", 0, 0)]
     _run()
@@ -504,7 +602,7 @@ def test_not_found_stop_is_not_working_and_the_close_still_replaces(monkeypatch)
 
 def test_reject_storm_stays_inside_the_cap_and_dedupes_alerts(monkeypatch):
     when = _at(HALF, 12, 50)
-    rec = _arm(monkeypatch, when, _position(when))
+    rec = _arm(monkeypatch, when, _position(when), held=4)
     rec["state"]["place_error"] = True
     per_tick = []
 
@@ -535,7 +633,7 @@ def test_reject_storm_stays_inside_the_cap_and_dedupes_alerts(monkeypatch):
 
 def test_kill_switch_alerts_only_and_is_reread_each_tick(monkeypatch):
     when = _at(HALF, 12, 50)
-    rec = _arm(monkeypatch, when, _position(when), enabled=False)
+    rec = _arm(monkeypatch, when, _position(when), enabled=False, held=4)
     rec["scripts"]["CLOSE-1"].extend([_row("OPEN", 0, 4)] * 3)
     _run()
     _run()
@@ -753,7 +851,7 @@ def _wire_client(monkeypatch, client) -> None:
 
 def test_not_found_on_the_first_page_is_found_on_the_next_page(monkeypatch):
     when = _at(HALF, 12, 50)
-    rec = _arm(monkeypatch, when, _position(when))
+    rec = _arm(monkeypatch, when, _position(when), held=4)
     pages = {"p2": 0}
 
     class Client:
@@ -784,7 +882,7 @@ def test_not_found_on_the_first_page_is_found_on_the_next_page(monkeypatch):
 
 def test_order_missing_from_every_page_is_found_by_id(monkeypatch):
     when = _at(HALF, 12, 50)
-    rec = _arm(monkeypatch, when, _position(when))
+    rec = _arm(monkeypatch, when, _position(when), held=4)
     detail_reads = {"n": 0}
 
     class Client:
