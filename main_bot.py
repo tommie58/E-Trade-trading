@@ -6309,6 +6309,22 @@ def _epoch(value: Any) -> Optional[float]:
     return parsed.timestamp()
 
 
+def _ledger_price_unknown(data: Any) -> bool:
+    """True when a close has no broker price yet.
+
+    A missing premium is not a zero fill. Those rows stay out of P&L until
+    the reconciler trues them up. Any close_reason is accepted; the reason
+    is never a lookup key.
+    """
+    if not isinstance(data, dict):
+        return False
+    if data.get("price_unknown") is True or data.get("exit_unpriced") is True:
+        return True
+    if data.get("needs_reconcile_trueup") is True and data.get("exit") is None:
+        return True
+    return False
+
+
 def edge_trades(records: Iterable[Any], abandoned_events: Iterable[str] = ()) -> List[Dict[str, Any]]:
     """Closed LIVE trades with their thesis, holding interval, regime and
     realized percent. Records are the (sign-corrected) ledger, oldest first."""
@@ -6331,7 +6347,13 @@ def edge_trades(records: Iterable[Any], abandoned_events: Iterable[str] = ()) ->
         if event in abandoned:
             opens.pop(ticker, None)
             continue
+        if event == "flatten_partial_unpriced":
+            # Not a finished trade. The new flatten close_reason is tolerated
+            # and an unpriced slice is excluded from P&L until true-up.
+            continue
         if event != "position_closed":
+            continue
+        if _ledger_price_unknown(data):
             continue
         opened = opens.pop(ticker, None) or {}
         pct = _num(data.get("realized_pnl_pct"))
@@ -13368,10 +13390,11 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # option entries refuse once the flatten window is open (15:40 ET on a
 # full day, 12:40 on a 13:00 half day). Crypto stays exempt from that
 # block. force_execute does not bypass it.
-# 5.96.0: a flatten close that is still unfilled in the last two minutes
-# of the session is cancelled only once that cancel is confirmed, then a
-# fixed STOP is re-armed for whatever is still open. No trail is placed
-# on that path. UNFILLED_FLATTEN_REARM_ENABLED is read every trail tick.
+# 5.96.0: a flatten close that is still unfilled from close-10 until the
+# bell is cancelled only once that cancel is confirmed dead, then ONE
+# fresh MARKET SELL_CLOSE is sent for the broker-confirmed remainder.
+# This path never re-arms a stop. UNFILLED_FLATTEN_REPLACE_ENABLED is
+# read every trail tick (false = alert only).
 BOT_VERSION = "5.96.0-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
@@ -13932,9 +13955,9 @@ NATIVE_TRAIL_RETRY_SECONDS = 600
 # phone at 3:40 meant an expiring contract rode to zero — which is why the
 # bot already carries an `expired_worthless` close reason.
 SCHEDULED_EXIT_ENABLED = os.getenv("SCHEDULED_EXIT_ENABLED", "true").lower() == "true"
-# UNFILLED_FLATTEN_REARM_ENABLED is intentionally NOT cached. The trail
-# tick reads it on every pass (default true). When it is false the last
-# two minutes still raise the critical alert and do not cancel or re-arm.
+# UNFILLED_FLATTEN_REPLACE_ENABLED is intentionally NOT cached. The trail
+# tick reads it on every pass (default true). When it is false the flatten
+# window still raises the critical alert and does not cancel or replace.
 MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "8"))
 # 5.84.1 EXIT GUARDS (see exit_guards.py for the why and the thresholds).
 def _env_on(name: str, default: str = "true") -> bool:
@@ -14532,19 +14555,20 @@ def _flatten_lead_minutes() -> int:
     return int(trailing_engine.MARKET_CLOSE_MINUTE - trailing_engine.EOD_FLATTEN_MINUTE)
 
 
-def _unfilled_flatten_rearm_window(now_et: datetime) -> bool:
-    """True from two minutes before the close until the bell, and only while
+def _unfilled_flatten_replace_window(now_et: datetime) -> bool:
+    """True from ten minutes before the close until the bell, and only while
     the regular session is still open.
 
-    12:58–12:59 ET on a 13:00 half day, 15:58–15:59 ET on a full day.
+    12:50–12:59 ET on a 13:00 half day, 15:50–15:59 ET on a full day.
     13:00:00 is the close minute itself (not inside the window) and
-    13:00:01 is already after `_is_market_open_at`.
+    13:00:01 is already after `_is_market_open_at`. Nothing here runs
+    after the bell.
     """
     if not _is_market_open_at(now_et):
         return False
     minute = now_et.hour * 60 + now_et.minute
     close = _session_close_minute(now_et)
-    return (close - 2) <= minute < close
+    return (close - 10) <= minute < close
 
 
 def _flatten_window_open(now_et: datetime) -> bool:
@@ -21644,6 +21668,21 @@ def import_outcome(data: dict) -> Optional[Tuple[bool, Optional[float]]]:
     return (won, pct_val)
 
 
+def _ledger_price_unknown(data: Any) -> bool:
+    """True when a close has no broker price yet.
+
+    A missing premium is not a zero fill. Those rows stay out of P&L until
+    the reconciler trues them up. The close_reason is never a lookup key.
+    """
+    if not isinstance(data, dict):
+        return False
+    if data.get("price_unknown") is True or data.get("exit_unpriced") is True:
+        return True
+    if data.get("needs_reconcile_trueup") is True and data.get("exit") is None:
+        return True
+    return False
+
+
 def summarize_setup_performance(records: List[dict]) -> Dict[str, Dict[str, Any]]:
     """Replay the trade ledger into a settled record per setup.
 
@@ -21725,6 +21764,10 @@ def summarize_setup_performance(records: List[dict]) -> Dict[str, Dict[str, Any]
             if won:
                 bucket["wins"] += 1
             _add_pct(bucket, _basis_of(data, "pnl_basis", "basis"), pct)
+            continue
+        if event == "flatten_partial_unpriced":
+            continue
+        if event == "position_closed" and _ledger_price_unknown(data):
             continue
         if event != "position_closed":
             continue
@@ -24517,7 +24560,8 @@ async def _exit_after_limit_rejection(common: dict, tokens: dict, bid: float,
 
 
 async def _place_option_market_close(ticker: str, contract: dict, qty: int,
-                                     market_ok: bool = False) -> Optional[str]:
+                                     market_ok: bool = False,
+                                     force_market: bool = False) -> Optional[str]:
     """SELL_CLOSE for `qty` contracts of an OCC contract we hold.
 
     Name kept for its callers; the order is a CROSSING LIMIT off the live bid
@@ -24544,6 +24588,13 @@ async def _place_option_market_close(ticker: str, contract: dict, qty: int,
         strikePrice=float(contract["strike"]),
         expiryDate=str(contract["expiration"])[:10],
     )
+    # The flatten-window replacement must be a marketable sell now, not a
+    # resting limit that can still be working at the bell.
+    if force_market:
+        common["priceType"] = "MARKET"
+        common.pop("limitPrice", None)
+        placed = await _place_order_smart("option", common, tokens)
+        return _order_id_from_place(placed)
     try:
         bid, _ask = await _current_bid_ask(ticker, contract)
     except Exception:
@@ -25483,17 +25534,17 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
 
     pos["scheduled_exit_done"] = True
     pos["scheduled_exit_reason"] = reason
-    # Accepted, not filled. The last two minutes of the session read this
-    # and re-arm a fixed stop if the GOOD_FOR_DAY close is still working.
-    # scheduled_exit_done stays set so this path never sends a second close.
+    # Accepted, not filled. From close-10 the trail tick reads this and, once
+    # the close is confirmed dead, sends one fresh MARKET sell for whatever
+    # the broker still holds. scheduled_exit_done stays set so this path
+    # never sends a second close of its own. Stop prices are not captured:
+    # this window does not re-arm a stop.
     pos["pending_flatten_close"] = {
         "order_id": str(close_id) if close_id else None,
         "qty": int(qty),
         "placed_at": _utcnow().isoformat(),
-        "stop_premium": pos.get("stop_premium"),
-        "stop": pos.get("stop"),
-        "trail": pos.get("trail"),
         "reason": reason,
+        "replacements": 0,
     }
     await state.set_position(ticker, pos)
 
@@ -26069,6 +26120,7 @@ _CLOSE_REASON_LABELS = {
     # name for the same exit. Both get the label (5.84.1).
     "max_hold": "max hold reached",
     "hold_guard": "3:45 PM ET hold guard (short-dated or news before the open)",
+    "flatten_close_partial": "partial flatten close, price waiting on broker true-up",
 }
 
 
@@ -31146,6 +31198,11 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     """Mark one position, hand it to an E*TRADE trailing stop when the book
     supports one, and otherwise cancel/replace the resting stop when the
     tiered trail has improved past the min step."""
+    pending_close = pos.get("pending_flatten_close")
+    if isinstance(pending_close, dict) and str(pending_close.get("order_id") or "") \
+            and pending_close.get("resolved") != "flat":
+        # A flatten sell is the exit. Do not arm or promote a stop under it.
+        return
     contract = pos.get("contract")
     is_option = bool(contract and contract.get("right"))
     qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
@@ -31522,73 +31579,341 @@ async def _trail_ratchet_guarded(ticker: str) -> None:
 
 
 # Statuses that prove a flatten close is off the book and cannot fill.
-# CANCEL_REQUESTED is not in this set: the order can still execute.
+# CANCEL_REQUESTED is not in this set: the order can still execute, so it
+# is unknown — no cancel and no new sell.
 _FLATTEN_CLOSE_DEAD = {"CANCELLED", "CANCELED", "EXPIRED", "REJECTED"}
+_FLATTEN_WORKING_STATUSES = {
+    "OPEN", "PARTIAL", "INDIVIDUAL_FILLS", "PENDING", "OPEN_PENDING",
+}
+_FLATTEN_FILLED_STATUSES = {"EXECUTED", "FILLED"}
+# A working close younger than this is left alone. A confirmed-dead close
+# does not wait.
+FLATTEN_REPLACE_MIN_AGE_SECONDS = 60
+# One attempt per tick is structural (the position is visited once). This
+# is the session cap, counting both a send and a rejected send.
+FLATTEN_REPLACE_CAP = 3
+# After a reject, this many later ticks send nothing.
+FLATTEN_REJECT_BACKOFF_TICKS = 2
+_FLATTEN_ORDER_PAGE_CAP = 8
 
 
-def _flatten_close_view(status: Any, filled: Any, ordered: Any) -> str:
-    """Classify a flatten close as filled, partial_dead, dead, or working.
+def _flatten_close_view(row: Any) -> str:
+    """Classify a broker order row.
 
-    'working' includes OPEN, PARTIAL, CANCEL_REQUESTED and NOT_FOUND. None of
-    those prove the sell is done, so a stop must not be placed against them.
+    'working' is only a positive live status. NOT_FOUND, a blank status,
+    CANCEL_REQUESTED and anything else we cannot prove are 'unknown':
+    no cancel and no new order. A full fill is 'filled' even on a dead
+    status, so a close that fills during the cancel is not replaced.
     """
-    label = str(status or "").upper().strip()
+    if not isinstance(row, dict):
+        return "unknown"
+    label = str(row.get("status") or "").upper().strip()
     try:
-        filled_n = int(float(filled or 0))
+        filled_n = int(float(row.get("filled") or 0))
     except (TypeError, ValueError):
         filled_n = 0
     try:
-        ordered_n = int(ordered or 0)
+        ordered_n = int(float(row.get("ordered") or 0))
     except (TypeError, ValueError):
         ordered_n = 0
     if filled_n < 0:
         filled_n = 0
-    if label == "EXECUTED" or (ordered_n > 0 and filled_n >= ordered_n):
+    if label in {"", "NOT_FOUND", "UNKNOWN"}:
+        return "unknown"
+    if label in {"CANCEL_REQUESTED", "PENDING_CANCEL"}:
+        return "unknown"
+    complete = ordered_n > 0 and filled_n >= ordered_n
+    if label in _FLATTEN_FILLED_STATUSES or (complete and label not in _FLATTEN_CLOSE_DEAD):
         return "filled"
-    if label in _FLATTEN_CLOSE_DEAD and filled_n > 0:
-        return "partial_dead"
+    if label in _FLATTEN_CLOSE_DEAD and complete:
+        return "filled"
     if label in _FLATTEN_CLOSE_DEAD:
         return "dead"
-    return "working"
+    if label in _FLATTEN_WORKING_STATUSES:
+        return "working"
+    return "unknown"
 
 
-def _restore_flatten_stop_geometry(pos: dict, pending: dict) -> None:
-    """Put back the stop the position had when the flatten was sent.
-
-    Keys the snapshot recorded are restored even when the value is empty, so
-    a later trail update cannot change the price. A pending record from a
-    build that did not snapshot a key leaves that field alone — the re-arm
-    helper then applies its own fallback.
-    """
-    for key in ("stop_premium", "stop", "trail"):
-        if key in pending:
-            pos[key] = pending.get(key)
+def _flatten_age_seconds(placed_at: Any) -> Optional[float]:
+    """Seconds since placed_at, or None when the timestamp is unreadable."""
+    try:
+        placed = datetime.fromisoformat(str(placed_at))
+    except (TypeError, ValueError):
+        return None
+    if placed.tzinfo is None:
+        placed = placed.replace(tzinfo=timezone.utc)
+    return (_utcnow() - placed.astimezone(timezone.utc)).total_seconds()
 
 
-def _unfilled_flatten_rearm_enabled() -> bool:
+def _unfilled_flatten_replace_enabled() -> bool:
     """Read every trail tick. Default on. Never cached at import."""
-    return _env_on("UNFILLED_FLATTEN_REARM_ENABLED")
+    return _env_on("UNFILLED_FLATTEN_REPLACE_ENABLED")
 
 
-async def _alert_unfilled_flatten(
-    ticker: str, qty: int, order_id: Any, state: str, rearmed: bool,
-    cover_qty: Optional[int] = None,
-) -> None:
-    """Critical page for a flatten close that has not booked a full fill.
+def _flatten_is_final_minute(now_et: datetime) -> bool:
+    minute = now_et.hour * 60 + now_et.minute
+    return minute == _session_close_minute(now_et) - 1
 
-    Symbol, quantity, close order id, broker state, and whether a fixed stop
-    was re-armed. No account number and no secret.
+
+def _flatten_expires_today(pos: dict, now_et: datetime) -> bool:
+    expiry = reconciliation.contract_expiration(pos)
+    return bool(expiry) and expiry == now_et.date().isoformat()
+
+
+def _flatten_not_found(exc: BaseException) -> bool:
+    code = _http_status_of(exc)
+    if code == 404:
+        return True
+    text = str(exc).lower()
+    return "404" in text or "not found" in text
+
+
+def _orders_page(resp: Any) -> Tuple[list, Optional[str]]:
+    """(orders, next marker) from an OrdersResponse or a single order."""
+    if not isinstance(resp, dict):
+        return [], None
+    root = resp.get("OrdersResponse")
+    if isinstance(root, dict):
+        marker = root.get("marker") or root.get("next")
+        orders = root.get("Order") or []
+        if isinstance(orders, dict):
+            orders = [orders]
+        return list(orders), (str(marker) if marker else None)
+    if resp.get("orderId") or resp.get("OrderDetail"):
+        return [resp], None
+    return [], None
+
+
+def _match_order_qty(orders: Any, order_id: Any) -> Optional[dict]:
+    """Broker status plus filled and ordered quantity for one order id."""
+    want = str(order_id or "")
+    if not want:
+        return None
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("orderId") or "") != want:
+            continue
+        status = "OPEN"
+        filled = 0
+        ordered = 0
+        details = order.get("OrderDetail") or []
+        if isinstance(details, dict):
+            details = [details]
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            status = str(detail.get("status") or status).upper()
+            instruments = detail.get("Instrument") or []
+            if isinstance(instruments, dict):
+                instruments = [instruments]
+            for inst in instruments:
+                if not isinstance(inst, dict):
+                    continue
+                try:
+                    filled += int(float(inst.get("filledQuantity") or 0))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    ordered += int(float(
+                        inst.get("orderedQuantity") or inst.get("quantity") or 0
+                    ))
+                except (TypeError, ValueError):
+                    pass
+        return {"status": status, "filled": filled, "ordered": ordered}
+    return None
+
+
+async def _flatten_order_pages():
+    """Yield each list_orders page. Raises on a transport failure.
+
+    The marker is followed until it stops or repeats, bounded so a broker
+    loop cannot spin. Callers that still have not seen the id must look
+    the order up by id before calling it NOT_FOUND.
     """
-    armed = "yes" if rearmed else "no"
-    if rearmed and cover_qty is not None:
-        armed = f"yes for {int(cover_qty)}"
-    oid = str(order_id or "")
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("E*TRADE tokens not set")
+    acct_key = await _resolve_account_id_key(tokens)
+    client = _orders_client(tokens)
+    marker = None
+    seen = set()
+    for _page in range(_FLATTEN_ORDER_PAGE_CAP):
+        kwargs = {"resp_format": "json", "count": 100}
+        if marker:
+            kwargs["marker"] = marker
+        resp = await _etrade_call(
+            client.list_orders, acct_key, source="list_orders", **kwargs,
+        )
+        orders, next_marker = _orders_page(resp)
+        yield orders, resp
+        if not next_marker or next_marker in seen:
+            return
+        seen.add(next_marker)
+        marker = next_marker
+
+
+async def _flatten_read_order(order_id: str) -> dict:
+    """(status, filled, ordered) after paging list_orders, then by order id.
+
+    NOT_FOUND is returned only when both miss. A 404 on the by-id read is
+    that miss. Any other error is raised so the caller treats the state as
+    unknown and sends nothing. NOT_FOUND is not a working order.
+    """
+    async for orders, _resp in _flatten_order_pages():
+        hit = _match_order_qty(orders, order_id)
+        if hit:
+            return hit
+    tokens = load_tokens()
+    if not tokens:
+        raise Exception("E*TRADE tokens not set")
+    acct_key = await _resolve_account_id_key(tokens)
+    client = _orders_client(tokens)
+    try:
+        detail = await _etrade_call(
+            client.list_order_details, acct_key, order_id,
+            resp_format="json", source="list_order_details",
+        )
+    except Exception as exc:
+        if _flatten_not_found(exc):
+            return {"status": "NOT_FOUND", "filled": 0, "ordered": 0}
+        raise
+    orders, _marker = _orders_page(detail)
+    hit = _match_order_qty(orders, order_id)
+    if hit:
+        return hit
+    if len(orders) == 1 and isinstance(orders[0], dict) and orders[0].get("OrderDetail"):
+        stamped = dict(orders[0])
+        stamped["orderId"] = str(order_id)
+        hit = _match_order_qty([stamped], order_id)
+        if hit:
+            return hit
+    return {"status": "NOT_FOUND", "filled": 0, "ordered": 0}
+
+
+async def _flatten_open_orders() -> List[dict]:
+    """Every order on the paged list. Raises when the list cannot be read."""
+    found: List[dict] = []
+    async for orders, resp in _flatten_order_pages():
+        wrapped = resp if isinstance(resp, dict) and "OrdersResponse" in resp else {
+            "OrdersResponse": {"Order": orders},
+        }
+        found.extend(reconciliation.parse_open_orders(wrapped))
+    return found
+
+
+async def _flatten_broker_held_qty(ticker: str, pos: dict) -> Optional[int]:
+    """Contracts the broker still holds for this position.
+
+    None means the portfolio could not be read (the order's own filled and
+    ordered quantities may still size a replacement). Zero means the broker
+    showed no position — a sell would be a short.
+    """
+    try:
+        portfolio = await _reconcile_fetch_portfolio()
+    except Exception:
+        logger.error(f"[FLATTEN REPLACE] {ticker} broker position read failed")
+        return None
+    try:
+        record = reconciliation.parse_broker_positions(portfolio).get(str(ticker).upper())
+        if record is None:
+            return 0
+        option = bool((pos.get("contract") or {}).get("right"))
+        return int(reconciliation.broker_qty_for(record, option, pos))
+    except Exception:
+        logger.error(f"[FLATTEN REPLACE] {ticker} broker position was unreadable")
+        return None
+
+
+def _broker_remainder(row: dict, held: Optional[int]) -> Optional[int]:
+    """Shares or contracts still to sell, from the broker only.
+
+    The order's ordered-minus-filled is the remainder of this close. The
+    portfolio holding caps it. Local position qty is not an input. None
+    means neither source could prove a number.
+    """
+    try:
+        ordered = int(row.get("ordered") or 0)
+        filled = int(row.get("filled") or 0)
+    except (TypeError, ValueError):
+        return None
+    if filled < 0:
+        filled = 0
+    order_left = max(0, ordered - filled) if ordered > 0 else None
+    if order_left is None and held is None:
+        return None
+    if held is None:
+        return order_left
+    try:
+        held_n = max(0, int(held))
+    except (TypeError, ValueError):
+        return order_left
+    if order_left is None:
+        return held_n
+    return min(order_left, held_n)
+
+
+async def _flatten_save(ticker: str, pos: dict) -> None:
+    """Persist flatten bookkeeping. Never recreates a position that closed."""
+    if not isinstance(pos, dict):
+        return
+    current = await state.get_position(ticker)
+    if not isinstance(current, dict):
+        return
+    await state.set_position(ticker, pos)
+
+
+def _flatten_alert_due(pos: dict, condition: str, now_et: datetime, *, once: bool = False) -> bool:
+    """Same position and condition at most once per minute.
+
+    The close-1 manual alert is the exception: it fires once per position
+    even when another alert already fired in that minute, and it does not
+    fire again on a later tick.
+    """
+    if once:
+        if pos.get("flatten_manual_alerted"):
+            return False
+        pos["flatten_manual_alerted"] = True
+        return True
+    minute = now_et.strftime("%Y-%m-%d %H:%M")
+    sent = pos.get("flatten_alert_minute")
+    if not isinstance(sent, dict):
+        sent = {}
+        pos["flatten_alert_minute"] = sent
+    if sent.get(condition) == minute:
+        return False
+    sent[condition] = minute
+    return True
+
+
+async def _alert_flatten(
+    pos: dict, ticker: str, condition: str, message: str, now_et: datetime,
+    *, once: bool = False,
+) -> None:
+    if not _flatten_alert_due(pos, condition, now_et, once=once):
+        await _flatten_save(ticker, pos)
+        return
+    event = "unfilled_flatten_manual" if once else "unfilled_flatten_replace"
     await alerts.send(
-        "critical",
-        "unfilled_flatten_rearm",
-        f"{ticker}: flatten close {oid} for {qty} is {state} — "
-        f"protective stop re-armed: {armed}",
-        dedupe_key=f"unfilled_flatten:{ticker}:{oid}:{state}:{armed}",
+        "critical", event, message,
+        dedupe_key=f"unfilled_flatten:{ticker}:{condition}",
+    )
+    await _flatten_save(ticker, pos)
+
+
+async def _alert_flatten_manual(ticker: str, pos: dict, now_et: datetime, qty_text: str) -> None:
+    """The last-minute page. Says to close by hand, and whether this is 0DTE."""
+    if not _flatten_is_final_minute(now_et):
+        return
+    if _flatten_expires_today(pos, now_et):
+        expiry = "0DTE, expires today"
+    else:
+        expiry = "does not expire today"
+    await _alert_flatten(
+        pos, ticker, "manual_close",
+        f"{ticker}: {qty_text} still open at {now_et.strftime('%H:%M')} ET "
+        f"— close it manually. {expiry}.",
+        now_et, once=True,
     )
 
 
@@ -31599,183 +31924,468 @@ async def _book_filled_flatten_close(ticker: str, pos: dict, order_id: Any, reas
         await _defer_close_to_reconciler(
             ticker, order_id, "flatten close executed, price unread",
         )
+    else:
+        payload = {"ticker": ticker, "action": pos.get("action") or "BUY"}
+        await _record_close(
+            ticker, None, payload, exit_premium=float(price),
+            close_reason=reason or "eod_flatten",
+        )
+    fresh = await state.get_position(ticker)
+    if not isinstance(fresh, dict):
         return
-    payload = {"ticker": ticker, "action": pos.get("action") or "BUY"}
-    await _record_close(
-        ticker, None, payload, exit_premium=float(price),
-        close_reason=reason or "eod_flatten",
-    )
+    pending = dict(fresh.get("pending_flatten_close") or {})
+    pending["resolved"] = "filled"
+    fresh["pending_flatten_close"] = pending
+    await state.set_position(ticker, fresh)
 
 
-async def _rearm_fixed_stop_after_flatten(
-    ticker: str, pos: dict, pending: dict, qty: int,
-) -> bool:
-    """Place one fixed STOP for `qty` via the existing re-arm helper.
+async def _book_unpriced_flatten_partial(
+    ticker: str, pos: dict, sold: int, order_id: Any,
+) -> None:
+    """Book a partial whose premium is not known yet.
 
-    The flag is written on the same dict the helper persists with the new
-    stop id, so a second tick cannot place another stop. A helper that
-    returns without a resting id does not leave the flag stored.
-    Returns True only when a stop order id is on the position afterwards.
+    The exit is None, never 0.0. No realized P&L is added. The row is
+    flagged so the reconciler can true the price up later.
     """
-    _restore_flatten_stop_geometry(pos, pending)
-    pos["filled_qty"] = int(qty)
-    pos["qty"] = int(qty)
+    sold_n = int(sold)
+    if sold_n < 1:
+        return
+    try:
+        held = int(pos.get("filled_qty") or pos.get("qty") or 0)
+    except (TypeError, ValueError):
+        held = 0
+    if held > 0:
+        sold_n = min(sold_n, held)
+    remaining = max(0, held - sold_n) if held > 0 else 0
+    pos["filled_qty"] = remaining
+    pos["qty"] = remaining
+    pos["needs_reconcile_trueup"] = True
+    pos["unpriced_close_order_id"] = str(order_id)
+    pos["price_unknown"] = True
+    entry = pos.get("entry_premium")
+    try:
+        entry_px = float(entry) if entry not in (None, "") else None
+    except (TypeError, ValueError):
+        entry_px = None
+    if entry_px is not None and entry_px <= 0:
+        entry_px = None
+    await state.set_position(ticker, pos)
+    await trade_ledger.record("flatten_partial_unpriced", {
+        "ticker": ticker,
+        "entry": entry_px,
+        "exit": None,
+        "price_unknown": True,
+        "needs_reconcile_trueup": True,
+        "basis": "premium",
+        "sold_qty": sold_n,
+        "remaining_qty": remaining,
+        "realized_pnl_pct": None,
+        "realized_pnl_usd": None,
+        "reason": "flatten_close_partial",
+        "order_id": str(order_id),
+        "setup": pos.get("setup"),
+    })
+
+
+def _reject_backoff_blocks(pending: dict, order_id: str, status: str) -> bool:
+    """True when this tick must not send.
+
+    The first look at a REJECTED order starts a two-tick wait. A later
+    reject (a send that the broker refused) sets the same counter. Each
+    following tick consumes one count.
+    """
+    if status == "REJECTED" and str(pending.get("backoff_for") or "") != order_id:
+        pending["backoff_for"] = order_id
+        pending["backoff_ticks"] = FLATTEN_REJECT_BACKOFF_TICKS
+    if str(pending.get("backoff_for") or "") != order_id:
+        return False
+    try:
+        left = int(pending.get("backoff_ticks") or 0)
+    except (TypeError, ValueError):
+        left = 0
+    if left <= 0:
+        return False
+    pending["backoff_ticks"] = left - 1
+    return True
+
+
+async def _protection_blocks_replace(
+    ticker: str, pos: dict, close_id: str, now_et: datetime,
+) -> bool:
+    """True when a stop or trail is still in the way, or its state is unknown.
+
+    Local stop and native-trail ids are checked, and so is the broker's
+    open-order list. A live one is cancelled and must read back dead
+    before a replacement sell. NOT_FOUND means it is not resting. A read
+    error or an unconfirmed cancel blocks the sell.
+    """
+    try:
+        open_orders = await _flatten_open_orders()
+    except Exception:
+        logger.error(f"[FLATTEN REPLACE] {ticker} open-order read failed")
+        await _alert_flatten(
+            pos, ticker, "protection_unknown",
+            f"{ticker}: could not read open orders before a replacement close "
+            f"for {close_id} — no new order.",
+            now_et,
+        )
+        return True
+    ids: List[str] = []
+    for key in ("stop_order_id", "native_trail_order_id"):
+        oid = str(pos.get(key) or "").strip()
+        if oid and oid != close_id:
+            ids.append(oid)
+    for order in open_orders:
+        if str(order.get("symbol") or "").upper() != str(ticker).upper():
+            continue
+        oid = str(order.get("order_id") or "")
+        if not oid or oid == close_id:
+            continue
+        status = str(order.get("status") or "").upper()
+        price_type = str(order.get("price_type") or "").upper()
+        action = str(order.get("order_action") or "").upper()
+        if price_type in reconciliation._PROTECTIVE_PRICE_TYPES:
+            if status in _FLATTEN_CLOSE_DEAD or status in _FLATTEN_FILLED_STATUSES:
+                continue
+            if status not in _FLATTEN_WORKING_STATUSES:
+                await _alert_flatten(
+                    pos, ticker, "protection_unknown",
+                    f"{ticker}: protective order {oid} is {status or 'unreadable'} "
+                    f"— no replacement close.",
+                    now_et,
+                )
+                return True
+            if oid not in ids:
+                ids.append(oid)
+            continue
+        if action in reconciliation._CLOSING_ACTIONS and status in _FLATTEN_WORKING_STATUSES:
+            await _alert_flatten(
+                pos, ticker, "protection_unknown",
+                f"{ticker}: another close {oid} is still {status} — no second close.",
+                now_et,
+            )
+            return True
+    for oid in ids:
+        try:
+            await _cancel_order_verified(oid)
+            fresh = await _flatten_read_order(oid)
+        except Exception:
+            logger.error(f"[FLATTEN REPLACE] {ticker} protective order {oid} unreadable")
+            await _alert_flatten(
+                pos, ticker, "protection_unknown",
+                f"{ticker}: protective order {oid} could not be confirmed dead "
+                f"— no replacement close.",
+                now_et,
+            )
+            return True
+        if str(fresh.get("status") or "").upper() == "NOT_FOUND":
+            continue
+        view = _flatten_close_view(fresh)
+        if view == "filled":
+            await _alert_flatten(
+                pos, ticker, "protection_unknown",
+                f"{ticker}: protective order {oid} filled — no replacement close.",
+                now_et,
+            )
+            return True
+        if view != "dead":
+            await _alert_flatten(
+                pos, ticker, "protection_unknown",
+                f"{ticker}: protective order {oid} is {fresh.get('status') or 'unconfirmed'} "
+                f"— no replacement close.",
+                now_et,
+            )
+            return True
     pos["stop_order_id"] = None
     pos["native_trail_order_id"] = None
-    rec = dict(pos.get("pending_flatten_close") or pending)
-    rec["resolved"] = "rearmed"
-    pos["pending_flatten_close"] = rec
-    pos["unfilled_flatten_rearmed"] = True
-    try:
-        await _reconcile_rearm_guard(ticker, pos)
-    except Exception:
-        logger.error(f"[FLATTEN REARM] {ticker} fixed-stop re-arm failed")
-    fresh = await state.get_position(ticker) or {}
-    if fresh.get("stop_order_id"):
-        if not fresh.get("unfilled_flatten_rearmed"):
-            fresh["unfilled_flatten_rearmed"] = True
-            saved = dict(fresh.get("pending_flatten_close") or rec)
-            saved["resolved"] = "rearmed"
-            fresh["pending_flatten_close"] = saved
-            await state.set_position(ticker, fresh)
-        return True
-    if fresh.get("unfilled_flatten_rearmed") or (
-        isinstance(fresh.get("pending_flatten_close"), dict)
-        and fresh["pending_flatten_close"].get("resolved")
-    ):
-        fresh.pop("unfilled_flatten_rearmed", None)
-        saved = dict(fresh.get("pending_flatten_close") or {})
-        saved.pop("resolved", None)
-        fresh["pending_flatten_close"] = saved
-        await state.set_position(ticker, fresh)
+    await _flatten_save(ticker, pos)
     return False
 
 
-async def _settle_dead_flatten_close(
-    ticker: str, pos: dict, pending: dict, order_id: Any,
-    ordered_qty: int, filled: int, status: str,
+async def _send_flatten_replacement(
+    ticker: str, pos: dict, pending: dict, order_id: str, row: dict,
+    reason: str, now_et: datetime,
 ) -> None:
-    """The close is confirmed dead. Book any fill, then re-arm the remainder."""
-    sold = max(0, min(int(filled or 0), int(ordered_qty)))
-    protect = int(ordered_qty)
-    if sold > 0:
-        price = await _resolve_exit_fill(order_id, timeout_s=0.0)
-        remaining = await _book_partial_stop_fill(
-            ticker, sold, float(price) if price else 0.0, "unfilled_flatten_partial",
+    """One MARKET SELL_CLOSE for the broker remainder, after the close is dead.
+
+    At most one attempt on this call. A third rejection in the session stops
+    the sends. The qty is ordered-minus-filled from this broker row, capped
+    by the broker position. Local qty is not used.
+    """
+    try:
+        sent = int(pending.get("replacements") or 0)
+    except (TypeError, ValueError):
+        sent = 0
+    if sent >= FLATTEN_REPLACE_CAP:
+        await _alert_flatten(
+            pos, ticker, "replace_cap",
+            f"{ticker}: flatten close {order_id} is still open and the "
+            f"{FLATTEN_REPLACE_CAP}-replacement cap is reached — close it manually.",
+            now_et,
         )
-        if remaining <= 0:
-            return
-        pos = await state.get_position(ticker) or pos
-        protect = int(remaining)
-    if protect < 1:
         return
-    rearmed = await _rearm_fixed_stop_after_flatten(ticker, pos, pending, protect)
-    await _alert_unfilled_flatten(
-        ticker, int(ordered_qty), order_id, str(status or "dead"), rearmed,
-        cover_qty=protect if rearmed else None,
+    if await _protection_blocks_replace(ticker, pos, order_id, now_et):
+        return
+    try:
+        held = await _flatten_broker_held_qty(ticker, pos)
+    except Exception:
+        held = None
+    sell_qty = _broker_remainder(row, held)
+    if sell_qty is None:
+        await _alert_flatten(
+            pos, ticker, "qty_unknown",
+            f"{ticker}: flatten close {order_id} is dead but the remaining "
+            f"quantity is not on the broker read — no new order.",
+            now_et,
+        )
+        return
+    try:
+        filled = int(row.get("filled") or 0)
+    except (TypeError, ValueError):
+        filled = 0
+    try:
+        booked = int(pending.get("booked_filled") or 0)
+    except (TypeError, ValueError):
+        booked = 0
+    if filled > booked:
+        price = await _resolve_exit_fill(order_id, timeout_s=0.0)
+        if price and float(price) > 0:
+            await _book_partial_stop_fill(
+                ticker, filled - booked, float(price), "flatten_close_partial",
+            )
+            fresh = await state.get_position(ticker)
+            if isinstance(fresh, dict):
+                pos = fresh
+                pending = dict(pos.get("pending_flatten_close") or pending)
+        else:
+            await _book_unpriced_flatten_partial(ticker, pos, filled - booked, order_id)
+        pending["booked_filled"] = filled
+        pos["pending_flatten_close"] = pending
+        await _flatten_save(ticker, pos)
+    if sell_qty < 1:
+        pending["resolved"] = "flat"
+        pos["pending_flatten_close"] = pending
+        await _flatten_save(ticker, pos)
+        return
+    contract = pos.get("contract") or {}
+    try:
+        new_id = await _place_option_market_close(
+            ticker, contract, int(sell_qty), market_ok=True, force_market=True,
+        )
+    except Exception:
+        logger.error(f"[FLATTEN REPLACE] {ticker} replacement close failed")
+        new_id = None
+    if not new_id:
+        pending["replacements"] = sent + 1
+        pending["backoff_for"] = order_id
+        pending["backoff_ticks"] = FLATTEN_REJECT_BACKOFF_TICKS
+        pos["pending_flatten_close"] = pending
+        await _alert_flatten(
+            pos, ticker, "replacement_failed",
+            f"{ticker}: replacement MARKET close for {sell_qty} on {order_id} FAILED "
+            f"— no second order this tick.",
+            now_et,
+        )
+        return
+    pos["pending_flatten_close"] = {
+        "order_id": str(new_id),
+        "qty": int(sell_qty),
+        "placed_at": _utcnow().isoformat(),
+        "reason": reason,
+        "replacements": sent + 1,
+        "backoff_ticks": 0,
+        "backoff_for": None,
+        "booked_filled": 0,
+    }
+    pos["close_order_id"] = str(new_id)
+    await _alert_flatten(
+        pos, ticker, "replacement_sent",
+        f"{ticker}: flatten close {order_id} is dead — sent one MARKET "
+        f"SELL_CLOSE {new_id} for {sell_qty}.",
+        now_et,
     )
 
 
-async def _rearm_unfilled_flatten_one(ticker: str, pos: dict, enabled: bool) -> None:
-    """One position. At most one re-arm, and never while the close can still fill."""
-    if pos.get("unfilled_flatten_rearmed"):
-        return
+async def _replace_unfilled_flatten_one(
+    ticker: str, pos: dict, enabled: bool, now_et: datetime,
+) -> None:
+    """One position. At most one working close, and never a sell we cannot prove."""
     pending = pos.get("pending_flatten_close")
-    if not isinstance(pending, dict) or pending.get("resolved"):
+    if not isinstance(pending, dict):
         return
-    order_id = pending.get("order_id")
-    try:
-        ordered = int(pending.get("qty") or pos.get("filled_qty") or pos.get("qty") or 0)
-    except (TypeError, ValueError):
-        ordered = 0
+    if pending.get("resolved") in {"filled", "flat"}:
+        return
+    order_id = str(pending.get("order_id") or "")
     reason = str(pending.get("reason") or pos.get("scheduled_exit_reason") or "eod_flatten")
-    if not order_id or ordered < 1:
-        await _alert_unfilled_flatten(ticker, max(0, ordered), order_id, "unreadable", False)
+    if not order_id:
+        await _alert_flatten(
+            pos, ticker, "status_unknown",
+            f"{ticker}: flatten close has no order id — no new order.",
+            now_et,
+        )
+        await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
         return
 
     try:
-        status, filled = await _order_state(str(order_id), None)
+        row = await _flatten_read_order(order_id)
     except Exception:
-        logger.error(f"[FLATTEN REARM] {ticker} order status read failed")
-        await _alert_unfilled_flatten(ticker, ordered, order_id, "status_unread", False)
+        logger.error(f"[FLATTEN REPLACE] {ticker} order status read failed")
+        await _alert_flatten(
+            pos, ticker, "status_unknown",
+            f"{ticker}: flatten close {order_id} status could not be read "
+            f"— no cancel and no new order.",
+            now_et,
+        )
+        await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
         return
 
-    view = _flatten_close_view(status, filled, ordered)
+    view = _flatten_close_view(row)
+    if view == "unknown":
+        label = str(row.get("status") or "unreadable")
+        await _alert_flatten(
+            pos, ticker, "status_unknown",
+            f"{ticker}: flatten close {order_id} is {label} — no cancel and no new order.",
+            now_et,
+        )
+        await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
+        return
+
     if view == "filled":
         try:
             await _book_filled_flatten_close(ticker, pos, order_id, reason)
         except Exception:
-            logger.error(f"[FLATTEN REARM] {ticker} filled close could not be booked")
+            logger.error(f"[FLATTEN REPLACE] {ticker} filled close could not be booked")
         return
+
+    if view == "working":
+        age = _flatten_age_seconds(pending.get("placed_at"))
+        if age is None or age < FLATTEN_REPLACE_MIN_AGE_SECONDS:
+            try:
+                left = int(row.get("ordered") or 0) - int(row.get("filled") or 0)
+            except (TypeError, ValueError):
+                left = 0
+            await _alert_flatten_manual(
+                ticker, pos, now_et, f"{max(0, left)}",
+            )
+            return
+        if not enabled:
+            await _alert_flatten(
+                pos, ticker, "replace_disabled",
+                f"{ticker}: flatten close {order_id} is still working — replacement "
+                f"is off, no cancel and no new order.",
+                now_et,
+            )
+            await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
+            return
+        try:
+            await _cancel_order_verified(order_id, expected_qty=int(row.get("ordered") or 0))
+        except Exception:
+            logger.error(f"[FLATTEN REPLACE] {ticker} cancel failed")
+            await _alert_flatten(
+                pos, ticker, "cancel_unconfirmed",
+                f"{ticker}: flatten close {order_id} cancel was not confirmed "
+                f"— no new order.",
+                now_et,
+            )
+            await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
+            return
+        try:
+            row = await _flatten_read_order(order_id)
+        except Exception:
+            logger.error(f"[FLATTEN REPLACE] {ticker} status read failed after cancel")
+            await _alert_flatten(
+                pos, ticker, "cancel_unconfirmed",
+                f"{ticker}: flatten close {order_id} cancel was not confirmed "
+                f"— no new order.",
+                now_et,
+            )
+            await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
+            return
+        view = _flatten_close_view(row)
+        if view == "filled":
+            try:
+                await _book_filled_flatten_close(ticker, pos, order_id, reason)
+            except Exception:
+                logger.error(f"[FLATTEN REPLACE] {ticker} filled close could not be booked")
+            return
+        if view != "dead":
+            await _alert_flatten(
+                pos, ticker, "cancel_unconfirmed",
+                f"{ticker}: flatten close {order_id} is {row.get('status') or 'unconfirmed'} "
+                f"after cancel — no new order.",
+                now_et,
+            )
+            await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
+            return
 
     if not enabled:
-        await _alert_unfilled_flatten(ticker, ordered, order_id, str(status or "unknown"), False)
-        return
-
-    if view in ("dead", "partial_dead"):
-        await _settle_dead_flatten_close(
-            ticker, pos, pending, order_id, ordered, int(filled or 0), str(status),
+        await _alert_flatten(
+            pos, ticker, "replace_disabled",
+            f"{ticker}: flatten close {order_id} is {row.get('status') or 'dead'} "
+            f"— replacement is off, no new order.",
+            now_et,
         )
+        await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
         return
 
-    try:
-        outcome = await _cancel_order_verified(str(order_id), expected_qty=ordered)
-    except Exception:
-        logger.error(f"[FLATTEN REARM] {ticker} cancel failed")
-        await _alert_unfilled_flatten(ticker, ordered, order_id, "cancel_failed", False)
-        return
-    if outcome == CANCEL_FILLED:
-        try:
-            await _book_filled_flatten_close(ticker, pos, order_id, reason)
-        except Exception:
-            logger.error(f"[FLATTEN REARM] {ticker} filled close could not be booked")
-        return
-
-    try:
-        status, filled = await _order_state(str(order_id), None)
-    except Exception:
-        logger.error(f"[FLATTEN REARM] {ticker} order status read failed after cancel")
-        await _alert_unfilled_flatten(ticker, ordered, order_id, "status_unread", False)
-        return
-    view = _flatten_close_view(status, filled, ordered)
-    if view == "filled":
-        try:
-            await _book_filled_flatten_close(ticker, pos, order_id, reason)
-        except Exception:
-            logger.error(f"[FLATTEN REARM] {ticker} filled close could not be booked")
-        return
-    if view in ("dead", "partial_dead"):
-        await _settle_dead_flatten_close(
-            ticker, pos, pending, order_id, ordered, int(filled or 0), str(status),
+    status = str(row.get("status") or "").upper()
+    if _reject_backoff_blocks(pending, order_id, status):
+        pos["pending_flatten_close"] = pending
+        await _alert_flatten(
+            pos, ticker, "replace_rejected",
+            f"{ticker}: flatten close {order_id} was rejected — waiting before another close.",
+            now_et,
         )
+        await _alert_flatten_manual(ticker, pos, now_et, "the open quantity")
         return
-    # Still working, or the cancel helper said "confirmed" while the order
-    # is only CANCEL_REQUESTED. Do not place a stop.
-    await _alert_unfilled_flatten(ticker, ordered, order_id, str(status or outcome), False)
+
+    await _send_flatten_replacement(ticker, pos, pending, order_id, row, reason, now_et)
+    fresh = await state.get_position(ticker)
+    if not isinstance(fresh, dict):
+        return
+    if (fresh.get("pending_flatten_close") or {}).get("resolved") in {"filled", "flat"}:
+        return
+    if pos.get("flatten_manual_alerted"):
+        fresh["flatten_manual_alerted"] = True
+    if isinstance(pos.get("flatten_alert_minute"), dict):
+        merged = dict(fresh.get("flatten_alert_minute") or {})
+        merged.update(pos["flatten_alert_minute"])
+        fresh["flatten_alert_minute"] = merged
+        await state.set_position(ticker, fresh)
+    pos = fresh
+    try:
+        left = _broker_remainder(row, None)
+    except Exception:
+        left = None
+    qty_text = str(left) if isinstance(left, int) and left > 0 else "the open quantity"
+    await _alert_flatten_manual(ticker, pos, now_et, qty_text)
 
 
-async def _rearm_unfilled_flatten_closes() -> None:
+async def _replace_unfilled_flatten_closes() -> None:
     """Trail-tick check for flatten closes that are still open near the bell.
 
-    Runs only while `_is_market_open()` and only from close-2 until the
-    close. Nothing here places an order after the bell.
+    Runs only while `_is_market_open()` and only from close-10 until the
+    close. Nothing here places an order after the bell, and nothing here
+    places a stop.
     """
     if not _is_market_open():
         return
     now_et = _utcnow().astimezone(_ET_ZONE)
-    if not _unfilled_flatten_rearm_window(now_et):
+    if not _unfilled_flatten_replace_window(now_et):
         return
-    enabled = _unfilled_flatten_rearm_enabled()
+    enabled = _unfilled_flatten_replace_enabled()
     try:
         positions = await state.all_positions()
     except Exception:
-        logger.error("[FLATTEN REARM] position read failed")
+        logger.error("[FLATTEN REPLACE] position read failed")
         return
     for ticker, pos in (positions or {}).items():
         try:
-            await _rearm_unfilled_flatten_one(str(ticker), copy.deepcopy(dict(pos or {})), enabled)
+            await _replace_unfilled_flatten_one(
+                str(ticker), copy.deepcopy(dict(pos or {})), enabled, now_et,
+            )
         except Exception:
-            logger.error(f"[FLATTEN REARM] {ticker} pass failed")
+            logger.error(f"[FLATTEN REPLACE] {ticker} pass failed")
 
 
 async def _trail_pass() -> None:
@@ -31790,16 +32400,18 @@ async def _trail_pass() -> None:
     exactly the positions whose protection had already gone wrong once. The
     reconciler learned this lesson; the trailing pass had not.
     """
+    if not _is_market_open():
+        return
     positions = await state.all_positions()
     if not positions:
         return
-    # Last two minutes: an accepted flatten close that is still unfilled must
-    # not reach the bell with the protective stop already cancelled. The
-    # worker only calls this while the market is open; the helper checks again.
+    # Close-10 until the bell: replace a dead flatten close with one market
+    # sell. The worker only calls this while the market is open; the helper
+    # checks again. A position with a pending flatten close is not trailed.
     try:
-        await _rearm_unfilled_flatten_closes()
+        await _replace_unfilled_flatten_closes()
     except Exception:
-        logger.error("[FLATTEN REARM] pass failed")
+        logger.error("[FLATTEN REPLACE] pass failed")
     positions = await state.all_positions()
     if not positions:
         return
@@ -31812,7 +32424,6 @@ async def _trail_pass() -> None:
             await _trail_ratchet_guarded(ticker)
         except Exception as e:
             logger.warning(f"[TRAIL] {ticker} pass failed: {e}")
-
 
 async def trailing_worker():
     """Continuous server-side trail. Runs each pass under the distributed
