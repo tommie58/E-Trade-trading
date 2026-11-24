@@ -1,12 +1,15 @@
 """DONE_TRADE_EXECUTED is a filled terminal status for entries and stops.
 
-E*TRADE lists it beside EXECUTED on OrderDetail.status (and as an order
-event for a completed trade). Flatten closes already treat that status as
-filled. Entry, stop, and emergency-flatten orders read the same field.
+E*TRADE's official Order API lists DONE_TRADE_EXECUTED only as an order
+event name. Client enums also put it on OrderDetail.status. What
+filledQuantity means beside that status is unverified. The guard still
+treats the status as filled: it does not cancel or delete the position,
+and it sizes a protective stop from the broker holding.
 """
 from __future__ import annotations
 
 import asyncio
+import time
 
 import main_bot
 
@@ -114,3 +117,125 @@ def test_ghost_resolution_books_a_done_trade_executed_stop():
         "SPY", pos, [{**order, "status": "OPEN"}],
     )
     assert miss["kind"] != "closed"
+
+
+def test_unreadable_fill_qty_prefers_the_broker_then_the_guard(monkeypatch):
+    async def broker(_ticker, _pos):
+        return 4
+
+    async def unread(_ticker, _pos):
+        return None
+
+    async def flat(_ticker, _pos):
+        return 0
+
+    async def scenario(fetch):
+        store = main_bot.StateStore(None)
+        saved = main_bot.state
+        main_bot.state = store
+        monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", fetch)
+        try:
+            await store.set_position("QQQ", {"qty": 2, "filled_qty": 2})
+            return await main_bot._protective_qty_for_unreadable_fill(
+                "QQQ", {"qty": 9, "contract": {"right": "CALL"}},
+            )
+        finally:
+            main_bot.state = saved
+
+    assert _run(scenario(broker)) == 4
+    assert _run(scenario(unread)) == 9
+    assert _run(scenario(flat)) == 0
+
+
+def test_done_trade_executed_with_zero_qty_places_a_stop_and_stays_tracked(monkeypatch):
+    """Worker loop: filled status, filledQuantity 0, both deadlines already past."""
+    placed = []
+    alerts = []
+    cancelled = []
+    abandoned = []
+
+    async def order_state(_order_id, _client_id):
+        return "DONE_TRADE_EXECUTED", 0
+
+    async def broker(_ticker, _pos):
+        return 4
+
+    async def place_stop(ticker, contract, qty, stop_premium):
+        placed.append({"ticker": ticker, "qty": qty, "stop": stop_premium})
+        return {"order_id": "STOP-NEW", "client_id": "cid", "qty": qty, "stop": stop_premium}
+
+    async def send(severity, event, message, **_kwargs):
+        alerts.append({"severity": severity, "event": event, "message": message})
+
+    async def record(event, data=None, **_kwargs):
+        if event == "entry_abandoned":
+            abandoned.append(data)
+
+    async def cancel(_order_id):
+        cancelled.append(_order_id)
+
+    async def no_true_up(_ticker, _guard):
+        return False
+
+    async def no_flatten(*_args, **_kwargs):
+        raise AssertionError("emergency flatten ran on a filled entry")
+
+    monkeypatch.setattr(main_bot, "_order_state", order_state)
+    monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", broker)
+    monkeypatch.setattr(main_bot, "_place_option_protective_stop", place_stop)
+    monkeypatch.setattr(main_bot, "_true_up_entry_fill", no_true_up)
+    monkeypatch.setattr(main_bot, "_cancel_order_safe", cancel)
+    monkeypatch.setattr(main_bot, "_emergency_flatten", no_flatten)
+    monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.trade_ledger, "record", record)
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        saved = main_bot.state
+        main_bot.state = store
+        try:
+            past = time.time() - 30
+            await store.set_position("QQQ", {
+                "qty": 2,
+                "filled_qty": 0,
+                "action": "BUY",
+                "contract": {"right": "CALL", "strike": 480, "expiration": "2026-11-24"},
+            })
+            await store.set_guard("QQQ", {
+                "ticker": "QQQ",
+                "kind": "option",
+                "action": "BUY",
+                "stop": 1.25,
+                "contract": {"right": "CALL", "strike": 480, "expiration": "2026-11-24"},
+                "entry_order_id": "ENTRY-1",
+                "entry_client_id": "entry-cid",
+                "guarded_qty": 0,
+                "last_filled": 0,
+                "last_status": "OPEN",
+                "stop_order_id": None,
+                "qty": 9,
+                "done": False,
+                "deadline_ts": past,
+                "stop_deadline_ts": past,
+                "fill_detected_ts": None,
+                "placed_ts": past,
+                "armed_ts": past,
+            })
+            await main_bot._stop_guard_worker("QQQ")
+            return await store.get_position("QQQ"), await store.get_guard("QQQ")
+        finally:
+            main_bot.state = saved
+
+    pos, guard = _run(scenario())
+    assert placed == [{"ticker": "QQQ", "qty": 4, "stop": 1.25}]
+    assert pos is not None
+    assert pos["stop_order_id"] == "STOP-NEW"
+    assert pos["filled_qty"] == 4
+    assert guard["done"] is True
+    assert guard["result"] == "filled_and_protected"
+    critical = [a for a in alerts if a["event"] == "entry_fill_qty_unreadable"]
+    assert len(critical) == 1
+    assert critical[0]["severity"] == "critical"
+    assert "QQQ" in critical[0]["message"]
+    assert cancelled == []
+    assert abandoned == []

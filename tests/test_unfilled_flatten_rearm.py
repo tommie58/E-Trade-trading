@@ -1405,18 +1405,92 @@ def test_stale_position_write_cannot_clear_a_newer_flatten_close():
         resurrect["pending_flatten_close"] = {"order_id": "CLOSE-OLD"}
         resurrect["_rev"] = int(current["_rev"]) - 1
         await store.set_position("SPY", resurrect)
-        gone = await store.get_position("SPY")
-        return kept, still, replaced, gone
+        added = await store.get_position("SPY")
+        return kept, still, replaced, added
 
-    kept, still, replaced, gone = asyncio.run(scenario())
+    kept, still, replaced, added = asyncio.run(scenario())
     assert kept["close_order_id"] == "CLOSE-NEW"
     assert kept["pending_flatten_close"]["order_id"] == "CLOSE-NEW"
     assert kept["trail"] == 2.5
     assert still["close_order_id"] == "CLOSE-NEW"
     assert still["pending_flatten_close"]["order_id"] == "CLOSE-NEW"
     assert replaced["close_order_id"] == "CLOSE-2"
-    assert "close_order_id" not in gone
-    assert "pending_flatten_close" not in gone
+    # A stale write may add a non-empty close id. It may not clear one.
+    assert added["close_order_id"] == "CLOSE-OLD"
+    assert added["pending_flatten_close"]["order_id"] == "CLOSE-OLD"
+
+
+def test_same_dict_second_write_keeps_the_flatten_close():
+    """The caller's _rev advances, so the close recorded on the next write sticks."""
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        await store.set_position("SPY", {
+            "qty": 4, "filled_qty": 4, "stop_order_id": "STOP-1",
+        })
+        pos = await store.get_position("SPY")
+        pos["stop_order_id"] = None
+        await store.set_position("SPY", pos)
+        pos["pending_flatten_close"] = {"order_id": "CLOSE-1", "qty": 4}
+        pos["close_order_id"] = "CLOSE-1"
+        await store.set_position("SPY", pos)
+        return pos, await store.get_position("SPY")
+
+    caller, stored = asyncio.run(scenario())
+    assert caller["_rev"] == stored["_rev"]
+    assert stored["pending_flatten_close"]["order_id"] == "CLOSE-1"
+    assert stored["close_order_id"] == "CLOSE-1"
+    assert stored["stop_order_id"] is None
+
+
+def test_eod_flatten_over_a_resting_stop_keeps_the_pending_close(monkeypatch):
+    """Monitor f1e2e: EOD flatten writes the position twice. The close must stick."""
+    when = datetime(2026, 11, 24, 15, 41, tzinfo=ET)
+    monkeypatch.setattr(main_bot, "_utcnow", lambda: when.astimezone(timezone.utc))
+    monkeypatch.setattr(main_bot, "SCHEDULED_EXIT_ENABLED", True)
+    monkeypatch.setattr(main_bot, "DAY_TRADE_MODE", True)
+
+    async def cancel(*_args, **_kwargs):
+        return main_bot.CANCEL_CONFIRMED
+
+    async def place(*_args, **_kwargs):
+        return "CLOSE-1"
+
+    async def none(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel)
+    monkeypatch.setattr(main_bot, "_place_option_market_close", place)
+    monkeypatch.setattr(main_bot, "_resolve_exit_fill", none)
+    monkeypatch.setattr(main_bot.alerts, "send", none)
+    monkeypatch.setattr(main_bot.trade_ledger, "record", none)
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        saved = main_bot.state
+        main_bot.state = store
+        try:
+            await store.set_position("SPY", {
+                "qty": 2,
+                "filled_qty": 2,
+                "action": "BUY",
+                "stop_order_id": "STOP-1",
+                "ts": when.astimezone(timezone.utc).isoformat(),
+                "contract": {"right": "CALL", "strike": 500, "expiration": "2026-11-24"},
+            })
+            pos = await store.get_position("SPY")
+            closed = await main_bot._maybe_scheduled_exit("SPY", pos, 1.0)
+            stored = await store.get_position("SPY")
+            return closed, stored
+        finally:
+            main_bot.state = saved
+
+    closed, stored = asyncio.run(scenario())
+    assert closed is True
+    assert stored["pending_flatten_close"]["order_id"] == "CLOSE-1"
+    assert stored["pending_flatten_close"]["qty"] == 2
+    assert stored["scheduled_exit_done"] is True
+    assert stored["stop_order_id"] is None
 
 
 def test_flatten_save_waits_two_seconds_unless_a_sell_was_sent():
@@ -1484,6 +1558,7 @@ def test_flatten_save_waits_two_seconds_unless_a_sell_was_sent():
 def test_unsaved_close_id_retries_once_then_alerts(monkeypatch, caplog):
     calls = {"n": 0}
     sent = []
+    waits = []
 
     class _Held:
         async def acquire(self):
@@ -1509,7 +1584,11 @@ def test_unsaved_close_id_retries_once_then_alerts(monkeypatch, caplog):
             "accountId": ACCOUNT,
             "accountIdKey": ACCOUNT,
         })
-        store.position_lock = lambda *args, **kwargs: _Held()
+        def lock(*_args, **kwargs):
+            waits.append(kwargs.get("wait_timeout"))
+            return _Held()
+
+        store.position_lock = lock
         saved = main_bot.state
         main_bot.state = store
         try:
@@ -1529,6 +1608,11 @@ def test_unsaved_close_id_retries_once_then_alerts(monkeypatch, caplog):
 
     caplog.set_level(logging.ERROR, logger="etrade-bot")
     asyncio.run(scenario())
+    assert waits == [
+        main_bot.FLATTEN_SAVE_AFTER_SELL_WAIT_S,
+        main_bot.FLATTEN_SAVE_RETRY_WAIT_S,
+    ]
+    assert main_bot.FLATTEN_SAVE_RETRY_WAIT_S == 2.0
     assert calls["n"] == 2
     assert len(sent) == 1
     assert sent[0]["severity"] == "error"

@@ -1168,6 +1168,15 @@ class StateStore:
         if self._persistence is not None:
             await self._persist_set_members(index_key)
 
+    @staticmethod
+    def _close_field_live(value: Any) -> bool:
+        """True when a flatten close field names an order id."""
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, dict):
+            return bool(str(value.get("order_id") or "").strip())
+        return False
+
     def _reconcile_stale_write(self, ticker: str, incoming: dict, current: dict) -> dict:
         """Merge a write whose author never saw the newest record.
 
@@ -1190,7 +1199,9 @@ class StateStore:
            are written when a sell is sent. A caller that read the position,
            held the per-ticker lock through a long broker call, then wrote
            that old copy back would erase the id. The next tick would sell
-           again. The newer record's value wins, including a newer clear.
+           again. A stale write may ADD a non-empty close id the stored row
+           lacks. It must not CLEAR a non-empty id the stored row already
+           has. When both name a close, the stored id wins.
         """
         merged = dict(incoming)
         reverted: List[str] = []
@@ -1210,15 +1221,17 @@ class StateStore:
                 merged[field] = stored_n
                 reverted.append(field)
         for field in ("pending_flatten_close", "close_order_id"):
-            current_has = field in current
-            incoming_has = field in merged
-            if current_has == incoming_has and merged.get(field) == current.get(field):
+            current_live = self._close_field_live(current.get(field))
+            incoming_live = self._close_field_live(merged.get(field))
+            if incoming_live and not current_live:
                 continue
-            if current_has:
+            if current_live and not incoming_live:
                 merged[field] = copy.deepcopy(current.get(field))
-            else:
-                merged.pop(field, None)
-            reverted.append(field)
+                reverted.append(field)
+                continue
+            if current_live and incoming_live and merged.get(field) != current.get(field):
+                merged[field] = copy.deepcopy(current.get(field))
+                reverted.append(field)
         if reverted:
             logger.warning(
                 f"[STATE] {ticker} stale position write blocked from reverting "
@@ -1229,6 +1242,10 @@ class StateStore:
 
     async def set_position(self, ticker: str, position: dict) -> None:
         ticker = ticker.upper()
+        # The caller's dict is what the next write in the same function uses.
+        # The revision lives on the stored copy unless it is copied back, and
+        # a second write of this same dict then looks stale.
+        caller = position if isinstance(position, dict) else None
         position = dict(position)
         # LOST-UPDATE GUARD. Every record carries a monotonic `_rev`. A caller
         # that read the position, awaited a broker round-trip, then wrote back
@@ -1246,6 +1263,8 @@ class StateStore:
             if is_stale:
                 position = self._reconcile_stale_write(ticker, position, current)
         position["_rev"] = stored_rev + 1
+        if caller is not None:
+            caller["_rev"] = position["_rev"]
         payload = _dumps(position)
         await self._set_raw(self._pos_key(ticker), payload)
         if self.redis is None and self._durable_kv(self._pos_key(ticker), None, None):
@@ -15174,11 +15193,20 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # 5.99.4: GET /pro-trader/report chain_shadow reports the live
 # chain_shadow_enabled() value. enabled_default stays false. A stale
 # whole-position write cannot clear a newer pending_flatten_close or
-# close_order_id. Flatten bookkeeping that placed no order waits about
-# 2s for the position lock. A save after a sell still waits 30s, retries
-# once, then logs an error that the close was sent and the order id was
+# close_order_id. A stale write may add a non-empty close id and cannot
+# clear one already stored. set_position copies the new _rev back onto
+# the caller's dict, so a second write of that dict is not stale.
+# Flatten bookkeeping that placed no order waits about 2s for the
+# position lock. A save after a sell waits 30s, retries once after about
+# 2s, then logs an error that the close was sent and the order id was
 # not saved (ticker and order id only). DONE_TRADE_EXECUTED is a filled
-# terminal status for entry and stop orders, the same as a flatten close.
+# terminal status for entry and stop orders. An entry reported that way
+# with no filled quantity is not cancelled or deleted. The stop is sized
+# from the broker holding, then the guard or tracked quantity, and the
+# position stays tracked for the 3:40 flatten. Whether E*TRADE puts
+# DONE_TRADE_EXECUTED on OrderDetail.status, and what filledQuantity
+# means beside it, is not in the official order-status list (the docs
+# name it only as an order event).
 # The CALL index VWAP gate does not seed on the read. Startup seeds once,
 # and a background task retries, so the gate never blocks on a Massive
 # fetch or the seed lock. The gate stays fail-closed while the seed is
@@ -24966,6 +24994,49 @@ def _emergency_flatten_reuse(status: Any, filled: Any) -> bool:
     return label in _FILLED_ORDER_STATUSES
 
 
+async def _protective_qty_for_unreadable_fill(ticker: str, guard: dict) -> int:
+    """Size a stop when the order status is filled and filledQuantity is not.
+
+    The broker holding wins. A failed read falls back to the guard's
+    intended quantity, then the tracked position. A confirmed holding of
+    0 is left at 0 so a stop is not sold against an empty account.
+    """
+    pos: dict = {}
+    try:
+        loaded = await state.get_position(ticker)
+        if isinstance(loaded, dict):
+            pos = dict(loaded)
+    except Exception:
+        pos = {}
+    if not pos.get("contract") and isinstance(guard, dict) and guard.get("contract"):
+        pos["contract"] = guard.get("contract")
+    held = None
+    try:
+        held = await _flatten_broker_held_qty(ticker, pos)
+    except Exception:
+        held = None
+    try:
+        held_n = int(held) if held is not None else None
+    except (TypeError, ValueError):
+        held_n = None
+    if held_n is not None and held_n > 0:
+        return held_n
+    if held_n == 0:
+        return 0
+    for raw in (
+        (guard or {}).get("qty"),
+        pos.get("qty"),
+        pos.get("filled_qty"),
+    ):
+        try:
+            n = int(raw or 0)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return n
+    return 0
+
+
 def _entry_terminal_unfilled(status: Any, filled: Any) -> bool:
     """True when the entry is terminal and nothing filled.
 
@@ -28147,6 +28218,40 @@ async def _stop_guard_worker(ticker: str) -> None:
             except Exception as e:
                 logger.warning(f"[STOP GUARD] {ticker} poll failed: {e}")
 
+            # A filled status with no filledQuantity is still a fill. Size the
+            # stop from the broker holding, then the guard or tracked qty, and
+            # keep the position. One alert, not one per poll.
+            if filled <= 0 and _filled_order_status(status):
+                sized = await _protective_qty_for_unreadable_fill(ticker, guard)
+                if sized > 0:
+                    filled = sized
+                    try:
+                        async with _position_section(ticker, "unreadable fill qty"):
+                            current = await state.get_position(ticker)
+                            if isinstance(current, dict):
+                                current["filled_qty"] = sized
+                                if not int(current.get("qty") or 0):
+                                    current["qty"] = sized
+                                await state.set_position(ticker, current)
+                    except Exception as e:
+                        logger.error(
+                            f"[STOP GUARD] {ticker} could not stamp the sized fill: {e}"
+                        )
+                if not guard.get("unreadable_fill_alerted"):
+                    if sized > 0:
+                        detail = f"protective stop sized at {sized}"
+                    else:
+                        detail = "no size was available for a protective stop"
+                    await alerts.send(
+                        "critical", "entry_fill_qty_unreadable",
+                        f"{ticker}: entry is {status} but the filled quantity was "
+                        f"0 or missing — {detail}. The position stays tracked.",
+                        dedupe_key=f"unreadable_fill:{ticker}",
+                    )
+                    guard = await state.update_guard(
+                        ticker, unreadable_fill_alerted=True,
+                    ) or guard
+
             # TIMEOUT CIRCUIT BREAKER anchor — the moment the FIRST fill is
             # detected, the stop-placement clock restarts: the protective stop
             # must rest at the broker within STOP_PLACEMENT_TIMEOUT_SECONDS of
@@ -28386,8 +28491,8 @@ async def _stop_guard_worker(ticker: str) -> None:
             stop_deadline = float(guard.get("stop_deadline_ts") or 0)
             if stop_deadline and not guard.get("stop_order_id") and time.time() >= stop_deadline:
                 if filled <= 0 and _filled_order_status(status):
-                    # The entry completed but the fill count was not on the
-                    # row. Cancelling it, or selling qty 0, is the wrong move.
+                    # Sized above when a quantity existed. Still no cancel
+                    # and no delete. The alert already fired once.
                     logger.error(
                         f"[STOP GUARD] {ticker} entry is {status} but the filled "
                         f"quantity was not readable — not cancelling and not "
@@ -28471,7 +28576,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                 })
                 return
             if time.time() >= float(guard.get("deadline_ts") or 0):
-                if filled == 0:
+                if filled == 0 and not _filled_order_status(status):
                     await _cancel_order_safe(guard.get("entry_order_id"))
                     await _finish_guard(ticker, "entry_timeout_cancelled")
                     await state.delete_position(ticker)
@@ -28481,17 +28586,20 @@ async def _stop_guard_worker(ticker: str) -> None:
                         "reason": "entry_timeout_cancelled",
                     })
                     return
-                if guarded >= filled:
+                if filled > 0 and guarded >= filled:
                     await _finish_guard(ticker, "partial_fill_protected")
                     return
-                # Filled but stop never stuck — keep trying rather than walk away.
-                logger.error(f"[STOP GUARD] {ticker} UNPROTECTED at deadline — extending guard")
-                await alerts.send(
-                    "critical", "position_unprotected",
-                    f"{ticker}: filled entry still has NO resting stop at the guard deadline — guard extended, retrying",
-                    dedupe_key=f"unprotected:{ticker}",
-                )
-                await state.update_guard(ticker, deadline_ts=time.time() + ENTRY_FILL_TIMEOUT_MIN * 60)
+                if filled > 0:
+                    # Filled but stop never stuck — keep trying rather than walk away.
+                    logger.error(f"[STOP GUARD] {ticker} UNPROTECTED at deadline — extending guard")
+                    await alerts.send(
+                        "critical", "position_unprotected",
+                        f"{ticker}: filled entry still has NO resting stop at the guard deadline — guard extended, retrying",
+                        dedupe_key=f"unprotected:{ticker}",
+                    )
+                    await state.update_guard(ticker, deadline_ts=time.time() + ENTRY_FILL_TIMEOUT_MIN * 60)
+                # A filled status with no size stays tracked. The next poll
+                # retries the broker quantity. Nothing is cancelled or deleted.
             # Poll faster while the stop deadline is live and unmet so the 60s
             # rule is enforced with tight granularity, not at the next 10s tick.
             # Only tighten while the deadline is still AHEAD of us: once it has
@@ -35227,6 +35335,8 @@ _FLATTEN_FILLED_STATUSES = _FILLED_ORDER_STATUSES
 FLATTEN_SAVE_NO_ORDER_WAIT_S = 2.0
 # After a sell, wait out a lock held by a long order-path section.
 FLATTEN_SAVE_AFTER_SELL_WAIT_S = 30.0
+# The one retry after that wait. A second 30s wait would stall close-10.
+FLATTEN_SAVE_RETRY_WAIT_S = 2.0
 # A working close younger than this is left alone. A confirmed-dead close
 # does not wait.
 FLATTEN_REPLACE_MIN_AGE_SECONDS = 60
@@ -35645,9 +35755,9 @@ async def _flatten_save(ticker: str, pos: dict) -> None:
 
     A save that placed no order waits about 2s. Close-10 walks tickers
     serially, so a 30s wait there stalls the rest of the book. A save after
-    a sell still waits 30s, writes without the lock if it stays busy, and
-    retries that write once. If the id is still not stored, an error names
-    the ticker and the order id. Account numbers are not included.
+    a sell waits 30s, writes without the lock if it stays busy, and retries
+    once after about 2s. If the id is still not stored, an error names the
+    ticker and the order id. Account numbers are not included.
     """
     if not isinstance(pos, dict):
         return
@@ -35667,7 +35777,9 @@ async def _flatten_save(ticker: str, pos: dict) -> None:
         return
     if not must_persist:
         return
-    if await _flatten_save_attempt(ticker, delta, wait_s=wait_s, must_persist=must_persist):
+    if await _flatten_save_attempt(
+        ticker, delta, wait_s=FLATTEN_SAVE_RETRY_WAIT_S, must_persist=must_persist,
+    ):
         return
     order_id = _flatten_sent_order_id(pos) or "unknown"
     message = f"{ticker}: close sent, order id not saved ({order_id})"
