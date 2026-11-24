@@ -10539,14 +10539,34 @@ async def note_session_vwap(
     sample: Dict[str, Any],
     now_et: Optional[datetime],
 ) -> None:
-    """Update the sample's own ET-date hash. A failure is logged and swallowed."""
+    """Update the sample's own ET-date hash. A failure is logged and swallowed.
+
+    The read-modify-write holds ``vwap-session:{ticker}:{day}`` so a restart
+    seed cannot replace this sample's volume, and this sample cannot replace
+    the seed. A busy lock skips the sample. The next print still lands.
+    """
     if state is None or not ticker or not isinstance(sample, dict):
         return
     ts = _sample_clock(sample)
     if ts is None:
         return
     # The date in the key is the ET session date, not the UTC calendar date.
-    key = session_vwap_key(ticker, ts.date().isoformat())
+    day = ts.date().isoformat()
+    key = session_vwap_key(ticker, day)
+    lock = None
+    acquired = False
+    try:
+        lock = state.lock(
+            f"vwap-session:{str(ticker).upper()}:{day}",
+            ttl_ms=10_000, wait_timeout=2.0,
+        )
+        await lock.acquire()
+        acquired = True
+    except Exception as e:
+        if type(e).__name__ == "LockNotAcquired":
+            logger.warning(f"session VWAP write skipped for {ticker}: lock busy")
+            return
+        lock = None
     try:
         fields = await state.hash_get(key)
         folded = fold_session_sample(fields, sample, now_et)
@@ -10555,6 +10575,212 @@ async def note_session_vwap(
         await state.hash_set(key, _acc_to_fields(folded), SESSION_VWAP_TTL_S)
     except Exception as e:
         logger.warning(f"session VWAP write failed for {ticker}: {e}")
+    finally:
+        if acquired and lock is not None:
+            try:
+                await lock.release()
+            except Exception:
+                logger.debug("session VWAP lock release failed", exc_info=True)
+
+
+# A restart seed may skip at most this many minutes and still be the session.
+# A wider hole is an incomplete bar set, and the CALL gate stays fail-closed.
+_VWAP_SEED_MAX_GAP_MINUTES = 2
+
+
+def session_vwap_needs_seed(
+    fields: Optional[Dict[str, Any]],
+    now_et: Optional[datetime],
+) -> bool:
+    """True when today's hash is empty or its first print is after the open.
+
+    Before the open and at or after the close there is nothing to seed.
+    A hash whose first print is in the 9:30 minute already covers the open,
+    and seeding that minute again would count its volume twice.
+    """
+    if not isinstance(now_et, datetime):
+        return False
+    now = _as_et(now_et)
+    minute = now.hour * 60 + now.minute
+    if minute < _SESSION_OPEN_MIN or minute >= session_close_minute(now):
+        return False
+    acc = _acc_from_fields(fields)
+    first = acc.get("first_ts")
+    if not first:
+        return True
+    ts = _sample_clock({"ts": first})
+    if ts is None or ts.date() != now.date():
+        return True
+    return ts.hour * 60 + ts.minute > _SESSION_OPEN_MIN
+
+
+def _seed_bar_epoch(bar: Dict[str, Any]) -> Optional[float]:
+    """Epoch seconds for a minute bar. Milliseconds and nanoseconds are scaled."""
+    raw = bar.get("epoch")
+    if raw is None:
+        raw = bar.get("t")
+    if raw is None:
+        raw = bar.get("ts")
+    if isinstance(raw, str) and raw.strip():
+        clock = _sample_clock({"ts": raw})
+        return clock.timestamp() if clock is not None else None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    if value > 1e17:
+        return value / 1e9
+    if value > 1e14:
+        return value / 1e6
+    if value > 1e11:
+        return value / 1e3
+    return value
+
+
+def _seed_bar_price_volume(bar: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """``vw * v`` when the bar has them, else price times volume."""
+    def positive(raw: Any) -> Optional[float]:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or value <= 0:
+            return None
+        return value
+
+    price = positive(bar.get("vw"))
+    if price is None:
+        price = positive(bar.get("price"))
+    if price is None:
+        price = positive(bar.get("c"))
+    if price is None:
+        price = positive(bar.get("last"))
+    volume = positive(bar.get("v"))
+    if volume is None:
+        volume = positive(bar.get("volume"))
+    return price, volume
+
+
+def plan_session_vwap_seed(
+    fields: Optional[Dict[str, Any]],
+    bars: Optional[List[Dict[str, Any]]],
+    now_et: Optional[datetime],
+    *,
+    max_age_s: float = 300.0,
+) -> Dict[str, Any]:
+    """Fold regular-session minute bars into a hash that started late.
+
+    Bars before 9:30 ET are left out, and so is the minute that is still
+    forming. Bars already covered by ``first_ts`` are left out, so a second
+    call and a hash that already holds the tail do not count those minutes
+    again. A stale or gapped set is not applied. The returned fields keep
+    ``last_volume`` so the next live print adds only the volume since that
+    anchor.
+    """
+    skipped = {
+        "applied": False, "reason": "not_needed", "bars_used": 0,
+        "vwap": None, "fields": None,
+    }
+    if not isinstance(now_et, datetime) or not session_vwap_needs_seed(fields, now_et):
+        return skipped
+    now = _as_et(now_et)
+    open_m = _SESSION_OPEN_MIN
+    close_m = session_close_minute(now)
+    usable: List[Dict[str, Any]] = []
+    seen_epoch = set()
+    for bar in bars or []:
+        if not isinstance(bar, dict):
+            continue
+        epoch = _seed_bar_epoch(bar)
+        price, volume = _seed_bar_price_volume(bar)
+        if epoch is None or price is None or volume is None:
+            continue
+        bar_et = datetime.fromtimestamp(epoch, timezone.utc).astimezone(_VWAP_ET)
+        if bar_et.date() != now.date() or bar_et > now:
+            continue
+        minute = bar_et.hour * 60 + bar_et.minute
+        if minute < open_m or minute >= close_m:
+            continue
+        stamp = int(epoch)
+        if stamp in seen_epoch:
+            continue
+        seen_epoch.add(stamp)
+        usable.append({
+            "epoch": epoch, "minute": minute, "price": price, "volume": volume,
+        })
+    if not usable:
+        skipped["reason"] = "no_bars"
+        return skipped
+    # The current minute is still printing. Seeding it and then taking the
+    # first live delta counts that volume twice.
+    now_minute = now.hour * 60 + now.minute
+    usable = [bar for bar in usable if bar["minute"] < now_minute]
+    if not usable:
+        skipped["reason"] = "no_bars"
+        return skipped
+    usable.sort(key=lambda item: item["epoch"])
+    newest = usable[-1]["epoch"]
+    try:
+        age_limit = float(max_age_s)
+    except (TypeError, ValueError):
+        age_limit = 300.0
+    if not math.isfinite(age_limit) or age_limit <= 0:
+        age_limit = 300.0
+    if now.timestamp() - newest > age_limit:
+        skipped["reason"] = "stale"
+        return skipped
+
+    acc = _acc_from_fields(fields)
+    cutoff: Optional[int] = None
+    first = _sample_clock({"ts": acc.get("first_ts")}) if acc.get("first_ts") else None
+    if first is not None and first.date() == now.date():
+        cutoff = first.hour * 60 + first.minute
+    selected = [bar for bar in usable if cutoff is None or bar["minute"] < cutoff]
+    if not selected or selected[0]["minute"] != open_m:
+        skipped["reason"] = "incomplete"
+        return skipped
+    for prev, nxt in zip(selected, selected[1:]):
+        if nxt["minute"] - prev["minute"] > 1 + _VWAP_SEED_MAX_GAP_MINUTES:
+            skipped["reason"] = "incomplete"
+            return skipped
+    if cutoff is None:
+        # The last completed minute is the one before the minute still open.
+        tail_gap = (now_minute - 1) - selected[-1]["minute"]
+    else:
+        tail_gap = (cutoff - 1) - selected[-1]["minute"]
+    if tail_gap > _VWAP_SEED_MAX_GAP_MINUTES:
+        skipped["reason"] = "incomplete"
+        return skipped
+
+    for bar in selected:
+        price = float(bar["price"])
+        volume = float(bar["volume"])
+        acc["sum_pv"] = float(acc["sum_pv"]) + price * volume
+        acc["sum_v"] = float(acc["sum_v"]) + volume
+        acc["count"] = int(acc["count"]) + 1
+        acc["high"] = price if acc["high"] is None else max(float(acc["high"]), price)
+        acc["low"] = price if acc["low"] is None else min(float(acc["low"]), price)
+    first_bar = datetime.fromtimestamp(selected[0]["epoch"], timezone.utc).astimezone(_VWAP_ET)
+    prior_first = _sample_clock({"ts": acc.get("first_ts")}) if acc.get("first_ts") else None
+    if prior_first is None or prior_first > first_bar:
+        acc["first_ts"] = first_bar.isoformat()
+        acc["first_price"] = float(selected[0]["price"])
+    if not acc.get("last_ts"):
+        last_bar = datetime.fromtimestamp(selected[-1]["epoch"], timezone.utc).astimezone(_VWAP_ET)
+        acc["last_ts"] = last_bar.isoformat()
+    vwap = float(acc["sum_pv"]) / float(acc["sum_v"]) if float(acc["sum_v"]) > 0 else None
+    if vwap is None or not math.isfinite(vwap) or vwap <= 0:
+        skipped["reason"] = "incomplete"
+        return skipped
+    return {
+        "applied": True,
+        "reason": "seeded",
+        "bars_used": len(selected),
+        "vwap": round(vwap, 4),
+        "fields": _acc_to_fields(acc),
+    }
 
 
 def volume_pace(today: List[Dict[str, Any]], quote: Dict[str, Any], now_et: datetime) -> Optional[float]:
@@ -14815,7 +15041,18 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # closes, and collapses a repeated close identity. Recorded ledger lines
 # are not modified. A parallel change may land as 5.99.0; whichever
 # merges second rebases this version and this changelog entry.
-BOT_VERSION = "5.99.1-pro-day-trader"
+# 5.99.2: a flatten close reported as DONE_TRADE_EXECUTED is filled, same
+# as EXECUTED, so the path does not send a second sell. Flatten
+# bookkeeping re-reads the position and writes only the fields this pass
+# changed, under the per-position lock. A save after a replacement close
+# was sent still writes those fields when the lock stays busy, so the new
+# order id is not lost and the next tick does not sell again. A mid-session
+# restart seeds the SPY/QQQ session VWAP from Massive regular-session
+# minute bars (09:30 ET onward, premarket excluded, the minute still
+# forming left out) and then keeps accumulating live prints. A failed,
+# stale, or incomplete seed does not write, and the CALL index VWAP gate
+# stays fail-closed.
+BOT_VERSION = "5.99.2-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -16392,6 +16629,135 @@ async def _load_index_series(symbol: str) -> List[Dict[str, Any]]:
     return [row for row in loaded if isinstance(row, dict)]
 
 
+_VWAP_SEED_RETRY_S = 90.0
+_vwap_seed_attempt_at: Dict[str, float] = {}
+
+
+def _index_vwap_seed_window(now_et: datetime) -> bool:
+    """Regular session of a trading day. Weekends and full closures are not."""
+    if now_et.weekday() >= 5 or now_et.date().isoformat() in _MARKET_HOLIDAYS:
+        return False
+    minute = now_et.hour * 60 + now_et.minute
+    if minute < scanner_mod._SESSION_OPEN_MIN:
+        return False
+    return minute < _session_close_minute(now_et)
+
+
+def _log_vwap_seed(symbol: str, bars_used: int, vwap: Any, reason: str) -> None:
+    """One line. Symbol, bar count, and VWAP only — no key and no account."""
+    shown = "unmeasured"
+    try:
+        value = float(vwap)
+    except (TypeError, ValueError):
+        value = None
+    if value is not None and math.isfinite(value) and value > 0:
+        shown = f"{value:.4f}"
+    logger.info(
+        "[VWAP SEED] %s bars=%s vwap=%s reason=%s",
+        symbol, int(bars_used), shown, reason,
+    )
+
+
+async def _fetch_massive_minute_bars(symbol: str, day: str) -> Optional[List[Dict[str, Any]]]:
+    """Today's minute aggregates, or None when the read fails.
+
+    None is not an empty session. The caller leaves the accumulator alone.
+    The key is sent as a header and is not logged.
+    """
+    if not massive.enabled():
+        return None
+    headers = {"Authorization": f"Bearer {massive.api_key()}"}
+    try:
+        async with httpx.AsyncClient(timeout=_MINUTE_VWAP_TIMEOUT_S) as client:
+            resp = await asyncio.wait_for(
+                client.get(
+                    f"{massive.BASE_URL}/v2/aggs/ticker/{symbol}/range/1/minute/{day}/{day}",
+                    params={"adjusted": "true", "sort": "asc", "limit": 50000},
+                    headers=headers,
+                ),
+                timeout=_MINUTE_VWAP_TIMEOUT_S,
+            )
+        if getattr(resp, "status_code", 0) != 200:
+            return None
+        payload = resp.json()
+    except Exception:
+        return None
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, list):
+        return None
+    return [bar for bar in results if isinstance(bar, dict)]
+
+
+async def ensure_index_session_vwap_seed(
+    symbols: Optional[List[str]] = None,
+) -> None:
+    """Seed SPY/QQQ from Massive regular-session minute bars. Never raises.
+
+    Startup and the first gate read call this when the hash is empty or
+    starts after 9:30 ET. Premarket bars are not part of the seed. A
+    failed, stale, or incomplete read does not write, so the CALL gate
+    stays fail-closed. A seed that lands keeps the live volume anchor, and
+    later prints add only new volume. This does not fill the Massive RTH
+    cross-check cache and does not turn the gate fail-open.
+    """
+    try:
+        if state is None or not massive.enabled():
+            return
+        now_et = _utcnow().astimezone(_ET_ZONE)
+        if not _index_vwap_seed_window(now_et):
+            return
+        day = now_et.date().isoformat()
+        names = [str(s).upper() for s in (symbols or _index_observe_symbols()) if s]
+        for sym in names:
+            try:
+                key = scanner_mod.session_vwap_key(sym, day)
+                fields = await state.hash_get(key)
+                if not scanner_mod.session_vwap_needs_seed(fields, now_et):
+                    continue
+                attempt_key = f"{day}:{sym}"
+                last_attempt = float(_vwap_seed_attempt_at.get(attempt_key) or 0)
+                if time.time() - last_attempt < _VWAP_SEED_RETRY_S:
+                    continue
+                bars = await _fetch_massive_minute_bars(sym, day)
+                if bars is None:
+                    _vwap_seed_attempt_at[attempt_key] = time.time()
+                    _log_vwap_seed(sym, 0, None, "fetch_failed")
+                    continue
+                lock = state.lock(
+                    f"vwap-session:{sym}:{day}",
+                    ttl_ms=15_000, wait_timeout=5.0,
+                )
+                try:
+                    await lock.acquire()
+                except LockNotAcquired:
+                    _log_vwap_seed(sym, 0, None, "lock_busy")
+                    continue
+                try:
+                    fields = await state.hash_get(key)
+                    plan = scanner_mod.plan_session_vwap_seed(
+                        fields, bars, now_et,
+                        max_age_s=vwap_crosscheck_max_age_s(),
+                    )
+                    if not plan.get("applied") or not isinstance(plan.get("fields"), dict):
+                        _vwap_seed_attempt_at[attempt_key] = time.time()
+                        _log_vwap_seed(
+                            sym, 0, None, str(plan.get("reason") or "incomplete"),
+                        )
+                        continue
+                    await state.hash_set(
+                        key, plan["fields"], scanner_mod.SESSION_VWAP_TTL_S,
+                    )
+                finally:
+                    await lock.release()
+                _log_vwap_seed(
+                    sym, int(plan.get("bars_used") or 0), plan.get("vwap"), "seeded",
+                )
+            except Exception:
+                _log_vwap_seed(sym, 0, None, "fetch_failed")
+    except Exception:
+        logger.debug("index vwap seed skipped")
+
+
 async def _index_vwap_quotes(
     symbols: Tuple[str, ...] = CALL_INDEX_VWAP_SYMBOLS,
     *,
@@ -16402,14 +16768,20 @@ async def _index_vwap_quotes(
     The gate value is the uncapped per-ET-date accumulator
     ``vwap:session:{symbol}:{date}``. The capped ``scanner:series`` list, a
     broker VWAP field, and Massive day.vw are not the gate input. The Massive
-    check reads the today-keyed RTH cache only and does not call Massive.
-    Unmeasured leaves ``vwap`` empty so the gate fails closed. A quote-fetch
-    failure returns rows with no VWAP. An empty cache after a restart is
-    unmeasured; it does not raise.
+    cross-check reads the today-keyed RTH cache only. A restart whose
+    accumulator is empty or starts after 9:30 ET may seed that hash from
+    Massive regular-session minute bars before the read. A failed seed
+    leaves the hash alone. Unmeasured leaves ``vwap`` empty so the gate
+    fails closed. A quote-fetch failure returns rows with no VWAP. An
+    empty cross-check cache after a restart is unmeasured; it does not raise.
     """
     syms = [s for s in symbols if s]
     if not syms:
         return []
+    try:
+        await ensure_index_session_vwap_seed(syms)
+    except Exception:
+        logger.debug("index vwap seed skipped")
     quotes: List[Dict[str, Any]] = []
     try:
         raw = await (
@@ -16454,10 +16826,11 @@ async def _index_vwap_quotes(
 
 # Massive RTH minute VWAP, cached by ET session date. The scanner loop
 # refreshes it during the session (90s throttle, 3s timeout). /status may
-# refresh too. The CALL gate only reads the cache and does not fetch.
-# Massive day.vw and the snapshot minute `vw` stay telemetry. They are not
-# gate inputs. A restart begins with an empty cache and fails closed until
-# the first successful refresh.
+# refresh too. The CALL gate only reads this cache. It does not refresh it.
+# Seeding the session accumulator is a separate read and does not fill
+# this cache. Massive day.vw and the snapshot minute `vw` stay telemetry.
+# They are not gate inputs. A restart begins with an empty cache and fails
+# closed until the first successful refresh.
 _MINUTE_VWAP_REFRESH_S = 90.0
 _MINUTE_VWAP_TIMEOUT_S = 3.0
 _minute_vwap_cache: Dict[str, Dict[str, Any]] = {}
@@ -34581,7 +34954,9 @@ _FLATTEN_CLOSE_DEAD = {"CANCELLED", "CANCELED", "EXPIRED", "REJECTED"}
 _FLATTEN_WORKING_STATUSES = {
     "OPEN", "PARTIAL", "INDIVIDUAL_FILLS", "PENDING", "OPEN_PENDING",
 }
-_FLATTEN_FILLED_STATUSES = {"EXECUTED", "FILLED"}
+# DONE_TRADE_EXECUTED is E*TRADE's filled close. Leaving it out of this set
+# made a completed sell look unknown, and the next tick sent another one.
+_FLATTEN_FILLED_STATUSES = {"EXECUTED", "FILLED", "DONE_TRADE_EXECUTED"}
 # A working close younger than this is left alone. A confirmed-dead close
 # does not wait.
 FLATTEN_REPLACE_MIN_AGE_SECONDS = 60
@@ -34888,6 +35263,11 @@ _FLATTEN_FIELD_DROPPED = object()
 _FLATTEN_BASELINE: contextvars.ContextVar = contextvars.ContextVar(
     "flatten_position_baseline", default=None,
 )
+# Set only after this pass has a broker order id. A busy lock may skip a
+# bookkeeping save; it may not skip the save that records that id.
+_FLATTEN_ORDER_PLACED: contextvars.ContextVar = contextvars.ContextVar(
+    "flatten_order_placed", default=False,
+)
 
 
 def _flatten_field_delta(before: dict, after: dict) -> Dict[str, Any]:
@@ -34919,18 +35299,37 @@ def _flatten_bind_baseline(pos: dict):
     return _FLATTEN_BASELINE.set(snap)
 
 
+async def _flatten_merge_changed(ticker: str, delta: Dict[str, Any]) -> None:
+    """Re-read the position and write only ``delta``. A closed position stays gone."""
+    current = await state.get_position(ticker)
+    if not isinstance(current, dict):
+        return
+    merged = dict(current)
+    for key, value in delta.items():
+        if value is _FLATTEN_FIELD_DROPPED:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    if "_rev" in current:
+        merged["_rev"] = current["_rev"]
+    await state.set_position(ticker, merged)
+
+
 async def _flatten_save(ticker: str, pos: dict) -> None:
     """Persist flatten bookkeeping onto the newest position.
 
     The pass holds a snapshot taken before the broker calls. Writing that
     snapshot back would erase a fill or reconcile that landed in between.
-    Re-read immediately and copy only the fields this pass changed. A
-    position that has already closed is not recreated.
+    Re-read under the per-position lock and copy only the fields this pass
+    changed. Two saves of different fields both land. A position that has
+    already closed is not recreated.
+
+    A busy lock skips a save that did not place an order. A save after this
+    pass received a broker order id waits out that same lock, then writes
+    the changed fields anyway. Dropping that write would leave the old dead
+    close on the book and the next tick could sell again.
     """
     if not isinstance(pos, dict):
-        return
-    current = await state.get_position(ticker)
-    if not isinstance(current, dict):
         return
     baseline = _FLATTEN_BASELINE.get()
     if not isinstance(baseline, dict):
@@ -34942,15 +35341,27 @@ async def _flatten_save(ticker: str, pos: dict) -> None:
     delta = _flatten_field_delta(baseline, pos)
     if not delta:
         return
-    merged = dict(current)
-    for key, value in delta.items():
-        if value is _FLATTEN_FIELD_DROPPED:
-            merged.pop(key, None)
-        else:
-            merged[key] = value
-    if "_rev" in current:
-        merged["_rev"] = current["_rev"]
-    await state.set_position(ticker, merged)
+    must_persist = bool(_FLATTEN_ORDER_PLACED.get())
+    lock = state.position_lock(ticker, ttl_ms=120_000, wait_timeout=30.0)
+    try:
+        await lock.acquire()
+    except LockNotAcquired:
+        if not must_persist:
+            logger.error(
+                f"[FLATTEN REPLACE] {ticker} bookkeeping was not saved — "
+                f"position lock busy"
+            )
+            return
+        logger.error(
+            f"[FLATTEN REPLACE] {ticker} position lock busy after a close "
+            f"was sent — writing the changed fields without the lock"
+        )
+        await _flatten_merge_changed(ticker, delta)
+        return
+    try:
+        await _flatten_merge_changed(ticker, delta)
+    finally:
+        await lock.release()
 
 
 def _flatten_alert_due(pos: dict, condition: str, now_et: datetime, *, once: bool = False) -> bool:
@@ -35390,12 +35801,16 @@ async def _send_flatten_replacement(
             "booked_filled": 0,
         }
         pos["close_order_id"] = str(new_id)
-        await _alert_flatten(
-            pos, ticker, "replacement_sent",
-            f"{ticker}: flatten close {order_id} is dead — sent one MARKET "
-            f"SELL_CLOSE {new_id} for {sell_qty}.",
-            now_et,
-        )
+        placed = _FLATTEN_ORDER_PLACED.set(True)
+        try:
+            await _alert_flatten(
+                pos, ticker, "replacement_sent",
+                f"{ticker}: flatten close {order_id} is dead — sent one MARKET "
+                f"SELL_CLOSE {new_id} for {sell_qty}.",
+                now_et,
+            )
+        finally:
+            _FLATTEN_ORDER_PLACED.reset(placed)
     finally:
         if adopted is not None:
             _FLATTEN_BASELINE.reset(adopted)
@@ -36293,6 +36708,9 @@ async def _start_scanner() -> None:
         f"every {stored['interval_seconds']}s"
         f"{'' if SCANNER_ALLOW_AUTONOMOUS_ENTRY else ' — origination locked to app dispatch'}"
     )
+    # A redeploy mid-session starts the hash at "now". Seed 09:30 ET onward
+    # before the first scan so live prints continue from a full session.
+    await ensure_index_session_vwap_seed()
     asyncio.create_task(scanner.run())
 
 
