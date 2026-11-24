@@ -10211,15 +10211,16 @@ def today_session_vwap(
         elif minute >= close_m:
             after += 1
     today = session_series(clean, now_et)
-    if len(today) < need:
-        return _vwap_unmeasured(len(today), preopen=preopen)
+    added = _volume_delta_count(today)
+    if added < need:
+        return _vwap_unmeasured(added, preopen=preopen)
     vwap = sampled_vwap(today)
     if vwap is None or not isinstance(vwap, (int, float)) or isinstance(vwap, bool):
-        return _vwap_unmeasured(len(today), preopen=preopen)
+        return _vwap_unmeasured(added, preopen=preopen)
     if not math.isfinite(float(vwap)) or float(vwap) <= 0:
-        return _vwap_unmeasured(len(today), preopen=preopen)
+        return _vwap_unmeasured(added, preopen=preopen)
     return {
-        "vwap": float(vwap), "samples": len(today), "measured": True,
+        "vwap": float(vwap), "samples": added, "measured": True,
         "reason": None, "source": "session_sampled", "preopen_samples": preopen,
     }
 
@@ -10303,6 +10304,61 @@ def reading_from_accumulator(
     return reading
 
 
+_VWAP_ET = ZoneInfo("America/New_York")
+
+
+def _as_et(when: datetime) -> datetime:
+    """America/New_York. A naive datetime is UTC, the same clock ``_utcnow`` uses."""
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(_VWAP_ET)
+
+
+def _sample_clock(sample: Dict[str, Any]) -> Optional[datetime]:
+    """Sample time in ET. ``Z``, ``+00:00``, and naive stamps are UTC.
+
+    The open, the close, and the ``vwap:session`` date all use this clock.
+    A UTC wall time must not be compared with 9:30 or 16:00.
+    """
+    raw = sample.get("ts") if isinstance(sample, dict) else None
+    if raw is None or not str(raw).strip():
+        return None
+    text = str(raw).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        when = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    return _as_et(when)
+
+
+def _volume_delta_count(series: List[Dict[str, Any]]) -> int:
+    """How many samples added volume. The first print of a stretch does not.
+
+    The sample floor counts these, not every quote. A flat ``total_volume``
+    does not move VWAP and does not satisfy N.
+    """
+    count = 0
+    prev: Optional[float] = None
+    for sample in series or []:
+        if not isinstance(sample, dict):
+            continue
+        price = _finite_number(sample.get("last"))
+        if price is None:
+            if sample.get("last") is not None:
+                prev = None
+            continue
+        vol = _finite_number(sample.get("total_volume"))
+        if vol is None or vol < 0:
+            prev = None
+            continue
+        if prev is not None and vol > prev:
+            count += 1
+        prev = vol
+    return count
+
+
 def fold_session_sample(
     fields: Optional[Dict[str, Any]],
     sample: Dict[str, Any],
@@ -10310,19 +10366,19 @@ def fold_session_sample(
 ) -> Optional[Dict[str, Any]]:
     """Fold one regular-session sample. None when it is not today's RTH print.
 
+    The stamp is converted to America/New_York before the 9:30/close test.
     The delta matches ``sampled_vwap``: price times the volume added since the
-    previous counted sample. The first sample of a date only records volume.
-    Pre-open, after ``session_close_minute`` (half-day aware), a future stamp,
-    and a NaN or infinite price are not counted. The caller stores the result
-    under the sample's own ET date, so yesterday's key is a different hash.
+    previous counted sample. ``count`` increments only when that delta is
+    positive. Pre-open, after ``session_close_minute`` (half-day aware), a
+    future stamp, and a NaN or infinite price are not counted. The caller
+    stores the result under the sample's ET date.
     """
     if not isinstance(sample, dict):
         return None
-    tz = now_et.tzinfo if isinstance(now_et, datetime) else None
-    ts = _ts_et(sample, tz)
+    ts = _sample_clock(sample)
     if ts is None:
         return None
-    if isinstance(now_et, datetime) and ts > now_et:
+    if isinstance(now_et, datetime) and ts > _as_et(now_et):
         return None
     price = _finite_number(sample.get("last"))
     if price is None:
@@ -10331,7 +10387,6 @@ def fold_session_sample(
     if minute < _SESSION_OPEN_MIN or minute >= session_close_minute(ts):
         return None
     acc = _acc_from_fields(fields)
-    acc["count"] = int(acc["count"]) + 1
     if not acc.get("first_ts"):
         acc["first_ts"] = ts.isoformat()
         acc["first_price"] = price
@@ -10347,6 +10402,7 @@ def fold_session_sample(
             delta = vol - prev
             acc["sum_pv"] = float(acc["sum_pv"]) + price * delta
             acc["sum_v"] = float(acc["sum_v"]) + delta
+            acc["count"] = int(acc["count"]) + 1
         acc["last_volume"] = vol
     return acc
 
@@ -10355,7 +10411,7 @@ async def read_session_vwap(state: Any, ticker: str, now_et: Optional[datetime])
     """Today's hash only. A prior-day key is never requested."""
     if state is None or not isinstance(now_et, datetime):
         return _vwap_unmeasured(0)
-    key = session_vwap_key(ticker, now_et.date().isoformat())
+    key = session_vwap_key(ticker, _as_et(now_et).date().isoformat())
     try:
         fields = await state.hash_get(key)
     except Exception as e:
@@ -10373,10 +10429,10 @@ async def note_session_vwap(
     """Update the sample's own ET-date hash. A failure is logged and swallowed."""
     if state is None or not ticker or not isinstance(sample, dict):
         return
-    tz = now_et.tzinfo if isinstance(now_et, datetime) else None
-    ts = _ts_et(sample, tz)
+    ts = _sample_clock(sample)
     if ts is None:
         return
+    # The date in the key is the ET session date, not the UTC calendar date.
     key = session_vwap_key(ticker, ts.date().isoformat())
     try:
         fields = await state.hash_get(key)
@@ -15989,6 +16045,9 @@ async def _call_index_vwap_block(p: dict, *, dry_run: bool = False) -> Optional[
     return reason
 
 
+_vwap_alert_tasks: set = set()
+
+
 _VWAP_CROSSCHECK_ALERT_CODES = (
     "massive_rth_stale",
     "massive_rth_missing",
@@ -15998,11 +16057,34 @@ _VWAP_CROSSCHECK_ALERT_S = 15 * 60
 _VWAP_CROSSCHECK_ALERT_KEY = "vwap:crosscheck:alert"
 
 
+def _spawn_vwap_crosscheck_alert(reason: str) -> None:
+    """Deliver the warning off the entry path. The webhook may take 8s."""
+    async def _deliver() -> None:
+        try:
+            await alerts.send(
+                "warning",
+                "vwap_crosscheck_blocked",
+                f"CALL entries blocked by the VWAP cross-check — {reason[:400]}",
+                dedupe_key="vwap_crosscheck_blocked",
+            )
+        except Exception:
+            logger.debug("vwap crosscheck alert failed")
+
+    try:
+        task = asyncio.create_task(_deliver())
+    except RuntimeError:
+        logger.debug("vwap crosscheck alert not scheduled")
+        return
+    _vwap_alert_tasks.add(task)
+    task.add_done_callback(_vwap_alert_tasks.discard)
+
+
 async def _alert_vwap_crosscheck_block(reason: str) -> None:
     """One warning per 15 minutes while CALLs are blocked on the cross-check.
 
-    A below-VWAP block and the opening sample floor are not this alert.
-    A dedupe failure must not raise into the entry path.
+    The dedupe write stays on the caller. The webhook does not: the entry
+    path returns without waiting on it. A below-VWAP block and the opening
+    sample floor are not this alert. A dedupe failure must not raise.
     """
     if not isinstance(reason, str) or not any(code in reason for code in _VWAP_CROSSCHECK_ALERT_CODES):
         return
@@ -16014,14 +16096,10 @@ async def _alert_vwap_crosscheck_block(reason: str) -> None:
             )
         if not fresh:
             return
-        await alerts.send(
-            "warning",
-            "vwap_crosscheck_blocked",
-            f"CALL entries blocked by the VWAP cross-check — {reason[:400]}",
-            dedupe_key="vwap_crosscheck_blocked",
-        )
     except Exception:
         logger.debug("vwap crosscheck alert failed")
+        return
+    _spawn_vwap_crosscheck_alert(reason)
 
 
 def _is_market_open() -> bool:

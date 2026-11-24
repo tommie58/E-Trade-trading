@@ -267,7 +267,7 @@ def test_fewer_than_n_today_samples_fails_closed(redis_scanner):
     assert all(row["vwap"] is None for row in quotes)
     assert all(row["gate_vwap_verdict"] == "unmeasured" for row in quotes)
     assert quotes[0]["gate_vwap_reason"] == "today_samples_insufficient"
-    assert quotes[0]["gate_vwap_samples"] == 9
+    assert quotes[0]["gate_vwap_samples"] == 8
     assert reason is not None
     assert "fail closed" in reason
     assert "today_samples_insufficient" in reason
@@ -426,7 +426,7 @@ def test_half_day_session_window_excludes_the_afternoon(redis_scanner, monkeypat
     assert main_bot._session_close_minute(half_now) == 13 * 60
     assert resolved["measured"] is True
     assert resolved["vwap"] == pytest.approx(100.0)
-    assert resolved["samples"] == 12
+    assert resolved["samples"] == 11
 
     full_now = datetime(2026, 11, 24, 15, 30, tzinfo=ET)
     full_series = (
@@ -436,7 +436,7 @@ def test_half_day_session_window_excludes_the_afternoon(redis_scanner, monkeypat
     )
     full = main_bot.scanner_mod.today_session_vwap(full_series, full_now)
     assert full["vwap"] != pytest.approx(100.0)
-    assert full["samples"] == 16
+    assert full["samples"] == 15
 
     async def scenario():
         await _seed(store, "SPY", series)
@@ -590,7 +590,7 @@ def test_full_session_vwap_survives_the_120_sample_cap(redis_scanner, monkeypatc
     gap = abs(trailing - full) / full * 10000
     assert gap > 25
     assert quotes[0]["vwap"] == pytest.approx(full)
-    assert quotes[0]["gate_vwap_samples"] == 300
+    assert quotes[0]["gate_vwap_samples"] == 299
     assert reason is None
     assert cand["vwap"] == pytest.approx(full)
     assert cand["vwap"] != pytest.approx(main_bot.scanner_mod.sampled_vwap(
@@ -661,7 +661,7 @@ def test_prior_day_key_is_never_read_and_rollover_starts_fresh(redis_scanner, mo
     assert fresh["vwap"] is None
     assert nxt["measured"] is True
     assert nxt["vwap"] == pytest.approx(50.0)
-    assert nxt["samples"] == 12
+    assert nxt["samples"] == 11
     assert all("2026-11-23" not in key for key in seen)
 
 
@@ -826,7 +826,7 @@ def test_opening_ten_minutes_fail_closed(redis_scanner, monkeypatch):
 
     reading, cand, quotes, reason = _run(scenario())
     assert reading["measured"] is False
-    assert reading["samples"] == 9
+    assert reading["samples"] == 8
     assert cand["vwap"] is None
     assert cand["vwap_unmeasured_reason"] == "today_samples_insufficient"
     factor = next(item for item in cand["score_factors"] if item["key"] == "vwap")
@@ -914,6 +914,7 @@ def test_crosscheck_block_alerts_once_per_fifteen_minutes(redis_scanner, monkeyp
         payload = {"instrument": "option", "option_right": "CALL", "action": "BUY"}
         first = await main_bot._call_index_vwap_block(payload)
         second = await main_bot._call_index_vwap_block(dict(payload))
+        await asyncio.sleep(0)
         return first, second
 
     first, second = _run(scenario())
@@ -936,3 +937,168 @@ def test_sample_floor_follows_the_stored_scanner_interval(redis_scanner, monkeyp
         assert _run(scenario()) == 20
     finally:
         main_bot.scanner_mod._LIVE_INTERVAL_SECONDS = saved
+
+
+def test_append_sample_counts_a_1400_et_stamp_that_is_1900_utc(redis_scanner, monkeypatch):
+    """UTC stamps go through Scanner._append_sample. 19:00Z is 14:00 ET and counts."""
+    store, scan = redis_scanner
+    clock = {"t": datetime(2026, 11, 24, 14, 30, tzinfo=timezone.utc)}
+    monkeypatch.setattr(main_bot.scanner_mod, "_utcnow", lambda: clock["t"])
+
+    async def scenario():
+        vol = 0
+        start = datetime(2026, 11, 24, 14, 30, tzinfo=timezone.utc)
+        for i in range(180):
+            clock["t"] = start + timedelta(minutes=i)
+            vol += 1000
+            await scan._append_sample({
+                "symbol": "SPY", "last": 700.0 + i * 0.01, "total_volume": vol,
+            })
+        clock["t"] = datetime(2026, 11, 24, 19, 0, tzinfo=timezone.utc)
+        vol += 1000
+        await scan._append_sample({
+            "symbol": "SPY", "last": 720.0, "total_volume": vol,
+        })
+        fields = await store.hash_get(
+            main_bot.scanner_mod.session_vwap_key("SPY", "2026-11-24")
+        )
+        reading = await main_bot.scanner_mod.read_session_vwap(
+            store, "SPY", datetime(2026, 11, 24, 19, 0, tzinfo=timezone.utc),
+        )
+        return fields, reading
+
+    fields, reading = _run(scenario())
+    # 181 prints. The first adds no volume, so 180 deltas. A UTC close check
+    # keeps only 9:30–11:00 ET (89 deltas) and drops 19:00Z.
+    assert int(float(fields["count"])) == 180
+    assert reading["measured"] is True
+    assert reading["samples"] == 180
+    assert reading["vwap"] > 700.0
+    last = datetime.fromisoformat(fields["last_ts"])
+    assert last.astimezone(ET).hour == 14
+    assert last.astimezone(ET).minute == 0
+    assert last.date() == datetime(2026, 11, 24, tzinfo=ET).date()
+
+
+def test_append_sample_half_day_counts_until_1300_et(redis_scanner, monkeypatch):
+    """Friday 11/27 closes at 13:00 ET. 14:30Z–17:59Z count. 18:00Z does not."""
+    store, scan = redis_scanner
+    clock = {"t": datetime(2026, 11, 27, 14, 30, tzinfo=timezone.utc)}
+    monkeypatch.setattr(main_bot.scanner_mod, "_utcnow", lambda: clock["t"])
+
+    async def scenario():
+        clock["t"] = datetime(2026, 11, 27, 14, 30, tzinfo=timezone.utc)
+        await scan._append_sample({"symbol": "SPY", "last": 100.0, "total_volume": 1000})
+        clock["t"] = datetime(2026, 11, 27, 17, 59, tzinfo=timezone.utc)
+        await scan._append_sample({"symbol": "SPY", "last": 110.0, "total_volume": 2000})
+        clock["t"] = datetime(2026, 11, 27, 18, 0, tzinfo=timezone.utc)
+        await scan._append_sample({"symbol": "SPY", "last": 400.0, "total_volume": 50_000_000})
+        return await store.hash_get(
+            main_bot.scanner_mod.session_vwap_key("SPY", "2026-11-27")
+        )
+
+    fields = _run(scenario())
+    assert int(float(fields["count"])) == 1
+    assert float(fields["sum_pv"]) / float(fields["sum_v"]) == pytest.approx(110.0)
+    first = datetime.fromisoformat(fields["first_ts"])
+    last = datetime.fromisoformat(fields["last_ts"])
+    assert (first.astimezone(ET).hour, first.astimezone(ET).minute) == (9, 30)
+    assert (last.astimezone(ET).hour, last.astimezone(ET).minute) == (12, 59)
+
+
+def test_utc_just_after_midnight_does_not_open_the_next_et_day(redis_scanner, monkeypatch):
+    """2026-11-25 00:30Z is 19:30 ET on the 24th. It must not create the 25th key."""
+    store, scan = redis_scanner
+    clock = {"t": datetime(2026, 11, 25, 0, 30, tzinfo=timezone.utc)}
+    monkeypatch.setattr(main_bot.scanner_mod, "_utcnow", lambda: clock["t"])
+
+    async def scenario():
+        await scan._append_sample({"symbol": "SPY", "last": 700.0, "total_volume": 5000})
+        late = await store.hash_get(main_bot.scanner_mod.session_vwap_key("SPY", "2026-11-25"))
+        prior = await store.hash_get(main_bot.scanner_mod.session_vwap_key("SPY", "2026-11-24"))
+        return late, prior
+
+    late, prior = _run(scenario())
+    assert not late
+    assert not prior
+
+
+def test_naive_and_zulu_stamps_are_utc_before_the_et_window():
+    mod = main_bot.scanner_mod
+    anchor = mod.fold_session_sample(
+        None,
+        {"ts": "2026-11-24T18:59:00+00:00", "last": 200.0, "total_volume": 1000},
+        None,
+    )
+    naive = mod.fold_session_sample(
+        anchor,
+        {"ts": "2026-11-24T19:00:00", "last": 210.0, "total_volume": 2000},
+        None,
+    )
+    zulu = mod.fold_session_sample(
+        anchor,
+        {"ts": "2026-11-24T19:00:00Z", "last": 210.0, "total_volume": 3000},
+        None,
+    )
+    aware = mod.fold_session_sample(
+        anchor,
+        {"ts": "2026-11-24T14:00:00-05:00", "last": 210.0, "total_volume": 4000},
+        None,
+    )
+    assert anchor is not None and anchor["count"] == 0
+    for folded in (naive, zulu, aware):
+        assert folded["count"] == 1
+        assert folded["sum_pv"] / folded["sum_v"] == pytest.approx(210.0)
+        last = datetime.fromisoformat(folded["last_ts"])
+        assert last.astimezone(ET).hour == 14
+        assert last.date() == datetime(2026, 11, 24, tzinfo=ET).date()
+
+
+def test_sample_floor_counts_only_prints_that_added_volume(redis_scanner):
+    store, _scan = redis_scanner
+    day = datetime(2026, 11, 24, tzinfo=ET)
+    flat_volume = _prints(day, 9 * 60 + 30, 12, 700.0, 5000, 0)
+
+    async def scenario():
+        await _seed(store, "SPY", flat_volume)
+        await _seed(store, "QQQ", flat_volume)
+        return await main_bot._index_vwap_quotes()
+
+    quotes = _run(scenario())
+    assert quotes[0]["gate_vwap_reason"] == "today_samples_insufficient"
+    assert quotes[0]["gate_vwap_samples"] == 0
+    assert quotes[0]["vwap"] is None
+
+
+def test_crosscheck_alert_returns_before_the_webhook(redis_scanner, monkeypatch):
+    store, _scan = redis_scanner
+    spy, qqq = _live_series()
+    started = []
+
+    async def send(*_args, **_kwargs):
+        started.append(True)
+        await asyncio.sleep(8)
+
+    monkeypatch.setattr(main_bot.alerts, "send", send)
+
+    async def scenario():
+        await _seed(store, "SPY", spy)
+        await _seed(store, "QQQ", qqq)
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        reason = await main_bot._call_index_vwap_block(
+            {"instrument": "option", "option_right": "CALL", "action": "BUY"}
+        )
+        elapsed = loop.time() - t0
+        await asyncio.sleep(0)
+        pending = list(main_bot._vwap_alert_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        return reason, elapsed
+
+    reason, elapsed = _run(scenario())
+    assert reason is not None and "massive_rth_missing" in reason
+    assert elapsed < 0.5
+    assert started == [True]
