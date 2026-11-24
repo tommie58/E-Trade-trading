@@ -55,12 +55,20 @@ def _num(value: Any) -> Optional[float]:
     return out
 
 
-def session_phase(minute_et: Any) -> str:
-    """Named slice of the regular session. Outside 9:30–16:00 ET is `closed`."""
+def session_phase(minute_et: Any, close_minute: Any = None) -> str:
+    """Named slice of the regular session. Outside 9:30–close ET is `closed`.
+
+    `close_minute` defaults to 16:00, so a full day is unchanged. A 13:00
+    close reports `closed` from 13:00 on.
+    """
     minute = _num(minute_et)
     if minute is None:
         return "unknown"
-    if minute < 9 * 60 + 30 or minute >= 16 * 60:
+    close = 16 * 60
+    parsed_close = _num(close_minute)
+    if parsed_close is not None and parsed_close > 9 * 60 + 30:
+        close = parsed_close
+    if minute < 9 * 60 + 30 or minute >= close:
         return "closed"
     if minute < 10 * 60 + 30:
         return "open_drive"
@@ -176,7 +184,7 @@ def classify_raw(observation: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     or_state = opening_range_state(
         obs.get("opening_range_high"), obs.get("opening_range_low"), obs.get("last"),
     )
-    phase = session_phase(obs.get("minute_et"))
+    phase = session_phase(obs.get("minute_et"), obs.get("close_minute"))
     feed = obs.get("feed") if isinstance(obs.get("feed"), dict) else None
     degraded, feed_reasons = _feed_degraded(feed)
     event = obs.get("event_active") is True

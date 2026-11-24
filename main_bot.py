@@ -6170,6 +6170,48 @@ def side_of(action: Any) -> str:
     return "short" if a in {"SELL", "SELL_SHORT", "SHORT", "SELL_OPEN"} else "long"
 
 
+_SESSION_CLOSE_FN = None  # type: ignore
+# information_diffusion runway on a full 9:30–16:00 session (minutes since the open).
+INFORMATION_RUNWAY_FULL_DAY = 330.0
+
+
+def bind_session_close(fn) -> None:
+    """One close clock, installed by main_bot._session_close_minute."""
+    global _SESSION_CLOSE_FN
+    _SESSION_CLOSE_FN = fn
+
+
+def information_runway_limit(now_et: Any = None) -> float:
+    """session_minutes ceiling for information diffusion.
+
+    close_minute - 630. A 16:00 close is exactly 330; a 13:00 close is 150.
+    No clock → 330, the full-day condition value.
+    """
+    if now_et is None or _SESSION_CLOSE_FN is None:
+        return INFORMATION_RUNWAY_FULL_DAY
+    try:
+        close = int(_SESSION_CLOSE_FN(now_et))
+    except Exception:
+        return INFORMATION_RUNWAY_FULL_DAY
+    return float(close - 630)
+
+
+def _cond_at(cond: Dict[str, Any], now_et: Any) -> Dict[str, Any]:
+    """Scale the information-diffusion runway with today's close.
+
+    Every other condition is returned unchanged. A full day substitutes 330.0
+    for 330.0, so the comparison and the reason text stay the same.
+    """
+    if (
+        now_et is not None
+        and cond.get("feature") == "session_minutes"
+        and cond.get("op") == "<="
+        and float(cond.get("value")) == INFORMATION_RUNWAY_FULL_DAY
+    ):
+        return {**cond, "value": information_runway_limit(now_et)}
+    return cond
+
+
 def _check(cond: Dict[str, Any], features: Dict[str, Any], sign: float) -> Optional[bool]:
     """True/False when measured; None when the feature is unmeasured."""
     raw = features.get(cond["feature"])
@@ -6202,7 +6244,8 @@ def _describe(cond: Dict[str, Any], features: Dict[str, Any]) -> str:
     return f"{cond['feature']} {shown} (needs {rule}: {cond['why']})"
 
 
-def evaluate_thesis(setup: Any, side: str, features: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def evaluate_thesis(setup: Any, side: str, features: Optional[Dict[str, Any]],
+                    now_et: Any = None) -> Dict[str, Any]:
     """Does this candidate satisfy its OWN economic thesis?
 
     ok=False when: there is no thesis; a required condition is measured and
@@ -6224,6 +6267,7 @@ def evaluate_thesis(setup: Any, side: str, features: Optional[Dict[str, Any]]) -
         return out
     sign = -1.0 if side == "short" else 1.0
     for cond in thesis["conditions"]:
+        cond = _cond_at(cond, now_et)
         verdict = _check(cond, feats, sign)
         text = _describe(cond, feats)
         if cond["role"] == "required":
@@ -6670,11 +6714,12 @@ def assess_edge_gate(
     trades: List[Dict[str, Any]],
     reinstated: Optional[Dict[str, float]] = None,
     require_thesis: bool = True,
+    now_et: Any = None,
 ) -> Dict[str, Any]:
     """Every edge refusal for ONE live entry. ENTRY SIDE ONLY — an exit is
     never consulted against any of this."""
     reasons: List[str] = []
-    thesis_eval = evaluate_thesis(setup, side, features)
+    thesis_eval = evaluate_thesis(setup, side, features, now_et=now_et)
     tid = thesis_eval["thesis"]
     if require_thesis and not thesis_eval["ok"]:
         reasons.append(thesis_eval["reason"])
@@ -8507,6 +8552,55 @@ MAX_DTE = 7
 # hour where 0DTE θ and spreads blow out. An UNKNOWN clock fails closed for
 # 0DTE only (later expiries are unaffected).
 ZERO_DTE_ENTRY_CUTOFF_ET_MIN = 14 * 60 + 30
+# Full-day value and the back-compat constant. A shorter session uses
+# close-70 (zero_dte_cutoff_for). A 16:00 session stays this number so a
+# regular day does not slide from 14:30 to 14:50.
+_SESSION_CLOSE_FN = None  # type: ignore
+
+
+def bind_session_close(fn) -> None:
+    """One close clock, installed by main_bot._session_close_minute."""
+    global _SESSION_CLOSE_FN
+    _SESSION_CLOSE_FN = fn
+
+
+def _close_minute_for(now_et: Any = None, day: Any = None) -> int:
+    """Today's regular close, or 16:00 when no session was supplied."""
+    if _SESSION_CLOSE_FN is None or (now_et is None and day is None):
+        return 16 * 60
+    when = now_et
+    if when is None:
+        if isinstance(day, datetime):
+            when = day
+        elif isinstance(day, date):
+            when = datetime(day.year, day.month, day.day, 12, 0)
+        else:
+            try:
+                parsed = datetime.strptime(str(day)[:10], "%Y-%m-%d")
+            except (TypeError, ValueError):
+                return 16 * 60
+            when = parsed
+    try:
+        return int(_SESSION_CLOSE_FN(when))
+    except Exception:
+        return 16 * 60
+
+
+def zero_dte_cutoff_for(now_et: Any = None, day: Any = None) -> int:
+    """Minute-of-day after which a NEW 0DTE entry is refused.
+
+    A 16:00 session returns ZERO_DTE_ENTRY_CUTOFF_ET_MIN (14:30) unchanged.
+    A shorter session refuses 70 minutes before its own close (13:00 → 11:50).
+    No date and no clock → the full-day constant.
+    """
+    if now_et is None and day is None:
+        return ZERO_DTE_ENTRY_CUTOFF_ET_MIN
+    close = _close_minute_for(now_et, day)
+    if close >= 16 * 60:
+        return ZERO_DTE_ENTRY_CUTOFF_ET_MIN
+    return int(close) - 70
+
+
 # The fallback when no candidate could be MEASURED (no two-sided quote, no
 # published delta/theta): nearest listed near TARGET_DTE. Unmeasured is never
 # "best". Prefer same-day when the chain can be scored; the unmeasured
@@ -8907,11 +9001,17 @@ def pick_expiry(listed: Iterable[date], today: date) -> Optional[date]:
     return min(inside, key=lambda d: (abs((d - today).days - prefer), d))
 
 
-def same_day_entry_open(now_minutes_et: Any) -> bool:
-    """May a NEW 0DTE contract be bought now? False at/after
-    ZERO_DTE_ENTRY_CUTOFF_ET_MIN, and False when the clock is unknown."""
+def same_day_entry_open(now_minutes_et: Any, now_et: Any = None, day: Any = None) -> bool:
+    """May a NEW 0DTE contract be bought now? False at/after today's cutoff,
+    and False when the clock is unknown.
+
+    `day` / `now_et` select the session. Omitted, the cutoff is the full-day
+    constant (14:30). A half day is close-70 (11:50).
+    """
     m = _num(now_minutes_et)
-    return m is not None and m < ZERO_DTE_ENTRY_CUTOFF_ET_MIN
+    if m is None and isinstance(now_et, datetime):
+        m = now_et.hour * 60 + now_et.minute
+    return m is not None and m < zero_dte_cutoff_for(now_et, day)
 
 
 def weekly_candidates(listed: Iterable[date], today: date, now_minutes_et: Any = None) -> List[date]:
@@ -8927,7 +9027,7 @@ def weekly_candidates(listed: Iterable[date], today: date, now_minutes_et: Any =
         if not isinstance(d, date) or not (MIN_DTE <= (d - today).days <= MAX_DTE):
             continue
         if (d - today).days == 0:
-            if same_day_entry_open(now_minutes_et) and d not in same_day:
+            if same_day_entry_open(now_minutes_et, day=today) and d not in same_day:
                 same_day.append(d)
             continue
         key = tuple(d.isocalendar()[:2])
@@ -8973,7 +9073,7 @@ def pick_best_expiry(candidates: Iterable[Dict[str, Any]], today: date,
         dte = (exp - today).days
         if not (MIN_DTE <= dte <= MAX_DTE):
             continue
-        if dte == 0 and not same_day_entry_open(now_minutes_et):
+        if dte == 0 and not same_day_entry_open(now_minutes_et, day=today):
             continue
         cost = expiry_cost(row.get("bid"), row.get("ask"), row.get("theta"),
                            row.get("delta"), row.get("open_interest"))
@@ -9009,7 +9109,8 @@ def plan_expression(spot: Any, side: str, vol_annual: Any, today: date) -> Optio
             "dte": dte, "vol_annual": round(v, 4), "vol_basis": basis}
 
 
-def check_expression(expiry: Any, today: date, delta: Any, now_minutes_et: Any = None) -> Dict[str, Any]:
+def check_expression(expiry: Any, today: date, delta: Any, now_minutes_et: Any = None,
+                     now_et: Any = None) -> Dict[str, Any]:
     """Did the snapped contract land inside the declared expression?
     {ok, dte, delta, reason}. An unparseable expiry fails closed; a 0DTE
     contract also needs same_day_entry_open(now_minutes_et)."""
@@ -9023,11 +9124,13 @@ def check_expression(expiry: Any, today: date, delta: Any, now_minutes_et: Any =
     reasons: List[str] = []
     if not (MIN_DTE <= dte <= MAX_DTE):
         reasons.append(f"no listed expiry in {MIN_DTE}–{MAX_DTE} DTE (nearest is {dte} DTE)")
-    elif dte == 0 and not same_day_entry_open(now_minutes_et):
-        cut = f"{ZERO_DTE_ENTRY_CUTOFF_ET_MIN // 60}:{ZERO_DTE_ENTRY_CUTOFF_ET_MIN % 60:02d}"
+    elif dte == 0 and not same_day_entry_open(now_minutes_et, now_et=now_et, day=today):
+        cut_min = zero_dte_cutoff_for(now_et, day=today)
+        cut = f"{cut_min // 60}:{cut_min % 60:02d}"
         reasons.append(
             f"0DTE entry closed at/after {cut} ET (the 3:40 PM expiry flatten leaves too little runway)"
-            if _num(now_minutes_et) is not None else "0DTE entry needs a known ET clock (unknown)"
+            if _num(now_minutes_et) is not None or isinstance(now_et, datetime)
+            else "0DTE entry needs a known ET clock (unknown)"
         )
     if d is not None and not (DELTA_BAND[0] <= abs(d) <= DELTA_BAND[1]):
         reasons.append(f"snapped contract |Δ| {abs(d):.2f} outside {DELTA_BAND[0]:.2f}–{DELTA_BAND[1]:.2f}")
@@ -9035,7 +9138,8 @@ def check_expression(expiry: Any, today: date, delta: Any, now_minutes_et: Any =
             "reason": "" if not reasons else f"{REFUSAL_PREFIX} " + " · ".join(reasons)}
 
 
-def sender_contract_fits(strike: Any, expiry: Any, delta: Any, today: date, now_minutes_et: Any = None) -> bool:
+def sender_contract_fits(strike: Any, expiry: Any, delta: Any, today: date, now_minutes_et: Any = None,
+                         now_et: Any = None) -> bool:
     """Did the SENDER already choose a contract inside the expression?
 
     The app picks its strike from the real chain's exchange greeks at the
@@ -9046,7 +9150,7 @@ def sender_contract_fits(strike: Any, expiry: Any, delta: Any, today: date, now_
     k = _num(strike)
     if k is None or k <= 0 or _num(delta) is None:
         return False
-    return bool(check_expression(expiry, today, delta, now_minutes_et)["ok"])
+    return bool(check_expression(expiry, today, delta, now_minutes_et, now_et=now_et)["ok"])
 
 
 def rescale_contracts(qty: Any, planned_delta: Any, new_delta: Any) -> int:
@@ -9919,6 +10023,32 @@ TAPE_TRIGGER_VOLUME_MULT = 1.0
 TAPE_NO_NEW_ENTRY_AFTER_MIN = 15 * 60 + 30
 _SESSION_OPEN_MIN = 9 * 60 + 30
 _SESSION_CLOSE_MIN = 16 * 60
+_SESSION_CLOSE_FN = None  # type: ignore
+
+
+def bind_session_close(fn) -> None:
+    """One close clock, installed by main_bot._session_close_minute."""
+    global _SESSION_CLOSE_FN
+    _SESSION_CLOSE_FN = fn
+
+
+def session_close_minute(now_et: Any) -> int:
+    """Today's regular close. No clock → the full-day 16:00 constant."""
+    if now_et is None or _SESSION_CLOSE_FN is None:
+        return _SESSION_CLOSE_MIN
+    try:
+        return int(_SESSION_CLOSE_FN(now_et))
+    except Exception:
+        return _SESSION_CLOSE_MIN
+
+
+def tape_no_new_entry_minute(now_et: Any) -> int:
+    """No new tape entries in the last 30 minutes of today's session.
+
+    Full day: 16:00 - 30 = 15:30, the historical constant. Half day: 12:30.
+    """
+    lead = _SESSION_CLOSE_MIN - TAPE_NO_NEW_ENTRY_AFTER_MIN
+    return session_close_minute(now_et) - lead
 # Setups only the tape may name once it is readable — a snapshot-only label
 # for these is withdrawn so the bot never trades a pattern it did not see.
 TAPE_OWNED_SETUPS = ("orb", "vwap reclaim", "vwap rejection", "mean reversion")
@@ -9933,7 +10063,7 @@ def session_series(series: List[Dict[str, Any]], now_et: datetime) -> List[Dict[
         if ts is None or ts.date() != now_et.date() or s.get("last") is None:
             continue
         m = ts.hour * 60 + ts.minute
-        if _SESSION_OPEN_MIN <= m < _SESSION_CLOSE_MIN and ts <= now_et:
+        if _SESSION_OPEN_MIN <= m < session_close_minute(now_et) and ts <= now_et:
             out.append(s)
     return out
 
@@ -9989,7 +10119,7 @@ def read_tape(
         return unmeasured("no session clock")
     now_min = now_et.hour * 60 + now_et.minute
     minutes = now_min - _SESSION_OPEN_MIN
-    if minutes < 0 or now_min >= _SESSION_CLOSE_MIN:
+    if minutes < 0 or now_min >= session_close_minute(now_et):
         return unmeasured("market closed — no session to read")
     last = quote.get("last")
     if last is None:
@@ -10029,7 +10159,7 @@ def read_tape(
     def done(plan: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         return {"measured": True, "unmeasured_reason": None, "levels": levels, "plan": plan, "watching": watching}
 
-    if now_min >= TAPE_NO_NEW_ENTRY_AFTER_MIN:
+    if now_min >= tape_no_new_entry_minute(now_et):
         watching.append("Last 30 minutes — no new entries; the bot flattens at 3:55 PM")
         return done()
     floor = px * TAPE_STOP_FLOOR_PCT
@@ -10529,7 +10659,7 @@ def evaluate_quote(
         )
         features["side"] = side
         if setup is not None:
-            thesis = edge_mod.evaluate_thesis(setup, side, features)
+            thesis = edge_mod.evaluate_thesis(setup, side, features, now_et=context.get("now_et"))
             if THESIS_REQUIRED and not thesis["ok"]:
                 reasons.append(thesis["reason"])
 
@@ -13234,7 +13364,11 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # (dash-tolerant id match, Redis crypto pin, refuse crypto as options pin).
 # 5.94.0: observe-only SPY/QQQ VWAP comparison and stocks-snapshot 403
 # telemetry on /status. The gate, filters, sizing, and orders do not read it.
-BOT_VERSION = "5.94.0-pro-day-trader"
+# 5.95.0: late-session clocks follow today's real close. New equity and
+# option entries refuse once the flatten window is open (15:40 ET on a
+# full day, 12:40 on a 13:00 half day). Crypto stays exempt from that
+# block. force_execute does not bypass it.
+BOT_VERSION = "5.95.0-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -13768,6 +13902,8 @@ def call_index_vwap_gate_status() -> Dict[str, Any]:
 # Pro Day Trader realignment. Shadow classifies and records verdicts without
 # changing an order. Active may only block or scale size down.
 import pro_trader
+from pro_trader.regime import session_phase as _pro_session_phase
+from pro_trader.risk import flatten_et_label as _flatten_et_label
 
 
 def resolve_pro_trader_mode(raw: Any) -> Tuple[str, Optional[str]]:
@@ -14371,6 +14507,83 @@ def _session_close_minute(now_et: datetime) -> int:
     return 13 * 60 if now_et.date().isoformat() in _MARKET_HALF_DAYS else 16 * 60
 
 
+# One close clock. The bundled helpers call back into this function so a
+# half day and a full day cannot drift apart. Installed at import, below.
+def _install_session_clock() -> None:
+    core_book.bind_session_close(_session_close_minute)
+    edge.bind_session_close(_session_close_minute)
+    scanner_mod.bind_session_close(_session_close_minute)
+
+
+_install_session_clock()
+
+FLATTEN_WINDOW_ENTRY_REASON = "flatten window open — entry refused"
+
+
+def _flatten_lead_minutes() -> int:
+    """The same 20 minutes plan_scheduled_exit opens before the close."""
+    return int(trailing_engine.MARKET_CLOSE_MINUTE - trailing_engine.EOD_FLATTEN_MINUTE)
+
+
+def _flatten_window_open(now_et: datetime) -> bool:
+    """True from close-20 until the bell. 12:40–12:59 half day, 15:40–15:59 full day.
+
+    Weekends and full holidays have no session, so the calendar gate owns them.
+    """
+    if now_et.weekday() >= 5 or now_et.date().isoformat() in _MARKET_HOLIDAYS:
+        return False
+    minute = now_et.hour * 60 + now_et.minute
+    close = _session_close_minute(now_et)
+    return (close - _flatten_lead_minutes()) <= minute < close
+
+
+def _is_market_open_at(now_et: datetime) -> bool:
+    """Exchange-aware regular session at an explicit ET clock."""
+    if now_et.weekday() >= 5:
+        return False
+    day = now_et.date().isoformat()
+    if day in _MARKET_HOLIDAYS:
+        return False
+    close = dtime(13, 0) if day in _MARKET_HALF_DAYS else dtime(16, 0)
+    return dtime(9, 30) <= now_et.time() <= close
+
+
+def _flatten_window_blocks_entry(now_et: datetime, instrument: Any, is_close: bool) -> bool:
+    """New equity/option entry during the flatten window. Crypto and exits pass.
+
+    force_execute is not a parameter: this block cannot be bypassed.
+    """
+    if is_close or str(instrument or "").lower() == "crypto":
+        return False
+    return _flatten_window_open(now_et)
+
+
+def _entry_session_block(
+    now_et: datetime,
+    instrument: Any,
+    is_close: bool,
+    payload: Optional[dict] = None,
+) -> Optional[str]:
+    """Why a NEW entry must stop, or None.
+
+    Crypto is exempt from this clock block only — the same exemption the
+    market-closed gate already gives it. Exits, stops, trails, and the
+    flatten itself pass (`is_close`).
+
+    The flatten window is not bypassable by force_execute. The market-closed
+    gate still honors force_execute / FORCE_EXECUTE_ALLOWED exactly as before.
+    """
+    if is_close:
+        return None
+    if str(instrument or "").lower() == "crypto":
+        return None
+    if _flatten_window_open(now_et):
+        return FLATTEN_WINDOW_ENTRY_REASON
+    if not _is_market_open_at(now_et) and not _force_execute(payload or {}):
+        return "market closed — entry refused (exchange-aware calendar)"
+    return None
+
+
 # OPENING HOLD (5.83.4) — no NEW entries in the first minutes of the regular
 # session. 9:30–9:45 ET carries the day's widest option spreads and the most
 # reversal-prone bars; on 2026-11-04 the whole morning loss came from entries
@@ -14745,7 +14958,7 @@ def minute_aggs_rth_vwap(payload: Any, now_et: datetime) -> Dict[str, Any]:
         if not isinstance(results, list):
             return empty
         open_m = scanner_mod._SESSION_OPEN_MIN
-        close_m = scanner_mod._SESSION_CLOSE_MIN
+        close_m = scanner_mod.session_close_minute(now_et)
         zone = now_et.tzinfo or _ET_ZONE
         num = 0.0
         den = 0.0
@@ -15116,14 +15329,7 @@ async def _call_index_vwap_block(p: dict, *, dry_run: bool = False) -> Optional[
 def _is_market_open() -> bool:
     """Exchange-aware regular-session check: 9:30–16:00 US/Eastern (13:00 close
     on half days), weekdays only, NYSE holidays excluded. DST-safe via zoneinfo."""
-    now_et = _utcnow().astimezone(_ET_ZONE)
-    if now_et.weekday() >= 5:
-        return False
-    day = now_et.date().isoformat()
-    if day in _MARKET_HOLIDAYS:
-        return False
-    close = dtime(13, 0) if day in _MARKET_HALF_DAYS else dtime(16, 0)
-    return dtime(9, 30) <= now_et.time() <= close
+    return _is_market_open_at(_utcnow().astimezone(_ET_ZONE))
 
 
 # ==================== WEBHOOK AUTH / IDEMPOTENCY ====================
@@ -15349,6 +15555,13 @@ async def _replay_parked_signals() -> None:
                 logger.info(f"Dropping stale parked entry {ticker} (age {age:.0f}s)")
                 await trade_ledger.record("parked_signal_dropped", {
                     "ticker": ticker, "age_seconds": int(age), "reason": "stale",
+                })
+                continue
+            now_et = _utcnow().astimezone(_ET_ZONE)
+            if _flatten_window_blocks_entry(now_et, pd.get("instrument"), False):
+                logger.info(f"Dropping parked entry {ticker} — flatten window open")
+                await trade_ledger.record("parked_signal_dropped", {
+                    "ticker": ticker, "age_seconds": int(age), "reason": "flatten_window",
                 })
                 continue
             is_crypto = str(pd.get("instrument") or "").lower() == "crypto"
@@ -16016,6 +16229,7 @@ async def _assess_edge_entry(p: dict) -> Dict[str, Any]:
     feats = _payload_edge(p)
     return edge.assess_edge_gate(
         p.get("setup"), feats["side"], feats, trades, await _edge_reinstated(), EDGE_REQUIRE_THESIS,
+        now_et=_utcnow().astimezone(_ET_ZONE),
     )
 
 
@@ -16589,6 +16803,7 @@ async def _pro_trader_observation(p: dict, *, dry_run: bool = False) -> Dict[str
         realized = (max(prices) - min(prices)) / prices[0] * 100.0
     return {
         "minute_et": minute,
+        "close_minute": _session_close_minute(now_et),
         "spy_vs_vwap_pct": spy,
         "qqq_vs_vwap_pct": qqq,
         "prices": prices,
@@ -28653,7 +28868,10 @@ async def execute_live_order(payload: dict):
     if not is_close:
         if await state.is_killed():
             raise LocalRefusal("kill switch active — entry refused")
-        # E*TRADE crypto (zerohash) is 24/7 — skip the equity calendar gate.
+        # Crypto is 24/7 and skips both clocks. The flatten window is not
+        # bypassable by force_execute; the market-closed case still is.
+        if _flatten_window_blocks_entry(_utcnow().astimezone(_ET_ZONE), instrument, False):
+            raise LocalRefusal(FLATTEN_WINDOW_ENTRY_REASON)
         if instrument != "crypto" and not _is_market_open() and not _force_execute(payload):
             raise LocalRefusal("market closed — entry refused (exchange-aware calendar)")
 
@@ -32663,6 +32881,16 @@ async def process_signal(pd: dict, replay: bool = False) -> dict:
     # Server-side gates for LIVE ENTRIES. Closes always pass — a protective
     # exit must never be blocked by entry gating. Crypto is 24/7 (zerohash).
     if live_intent and not is_close:
+        now_et = _utcnow().astimezone(_ET_ZONE)
+        if _flatten_window_blocks_entry(now_et, pd.get("instrument"), False):
+            # Not bypassable by force_execute. Crypto is exempt inside the helper.
+            await state.set(sig_key, "rejected", ex=86400)
+            await _record_dispatch_verdict(pd, "rejected", "flatten_window")
+            return {
+                "status": "rejected",
+                "reason": FLATTEN_WINDOW_ENTRY_REASON,
+                "signal_id": sig_key,
+            }
         is_crypto = str(pd.get("instrument") or "").lower() == "crypto"
         if not is_crypto and not _is_market_open() and not _force_execute(pd):
             await state.set(sig_key, "rejected", ex=86400)
@@ -33257,9 +33485,10 @@ async def policy_set(
 def _pro_trader_status_payload(trades_today: Any = None) -> Dict[str, Any]:
     now_et = _utcnow().astimezone(_ET_ZONE)
     minute = now_et.hour * 60 + now_et.minute
+    close = _session_close_minute(now_et)
     done = _PRO_TRADER.trades_completed if trades_today is None else trades_today
     target = int(live_policy("min_trades_per_day") or MIN_TRADES_PER_DAY)
-    pacing = pro_trader.pace_state(minute, done, target)
+    pacing = pro_trader.pace_state(minute, done, target, close_minute=close)
     body = _PRO_TRADER.status(
         mode=live_policy("pro_trader_mode"),
         feed=_pro_trader_feed_health(),
@@ -33270,6 +33499,12 @@ def _pro_trader_status_payload(trades_today: Any = None) -> Dict[str, Any]:
     body["pacing"] = pacing
     body["loss_streak"] = _loss_streak_status_safe()
     body["version"] = BOT_VERSION
+    # Display only. The flatten order still comes from plan_scheduled_exit.
+    # A full day stays 15:40; a half day shows 12:40 and phase closed after 13:00.
+    rails = dict(body.get("hard_rails") or {})
+    rails["flatten_et"] = _flatten_et_label(close)
+    body["hard_rails"] = rails
+    body["session_phase"] = _pro_session_phase(minute, close)
     return body
 
 
@@ -33302,6 +33537,7 @@ async def _pro_trader_report_payload() -> Dict[str, Any]:
         now_et.hour * 60 + now_et.minute,
         done,
         live_policy("min_trades_per_day"),
+        close_minute=_session_close_minute(now_et),
     )
     report = pro_trader.build_report(
         decisions, closes,

@@ -59,6 +59,7 @@ def pace_state(
     minute_et: Any,
     trades_completed: Any,
     min_trades: Any = MIN_TRADES_DEFAULT,
+    close_minute: Any = None,
 ) -> Dict[str, Any]:
     """Where the session sits against the daily trade target. Pure."""
     target = clamp_min_trades(min_trades)
@@ -69,6 +70,9 @@ def pace_state(
     minute = _minute(minute_et)
     open_m = 9 * 60 + 30
     close_m = 16 * 60
+    parsed_close = _minute(close_minute)
+    if parsed_close is not None and parsed_close > open_m:
+        close_m = parsed_close
     if minute is None:
         progress = 0.0
     else:
