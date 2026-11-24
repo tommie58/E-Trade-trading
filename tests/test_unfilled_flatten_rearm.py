@@ -926,3 +926,182 @@ def test_truly_not_found_after_paging_and_by_id_alerts_only(monkeypatch):
     assert rec["calls"].count("place") == 0
     assert not any(isinstance(c, tuple) and c[0] == "cancel" for c in rec["calls"])
     assert any("NOT_FOUND" in a["message"] for a in rec["alerts"])
+
+
+_MISSING = object()
+
+
+def _order_row(order_id, status=_MISSING, *, filled=0, ordered=4, extra_details=None):
+    """One broker order. ``status`` omitted means the detail has no status key."""
+    detail = {
+        "Instrument": [{
+            "orderAction": "SELL_CLOSE",
+            "filledQuantity": filled,
+            "orderedQuantity": ordered,
+            "Product": {"symbol": "SPY", "securityType": "OPTN"},
+        }],
+    }
+    if status is not _MISSING:
+        detail["status"] = status
+    details = [detail]
+    if extra_details:
+        details.extend(extra_details)
+    return {"orderId": order_id, "OrderDetail": details}
+
+
+def test_blank_status_is_unknown_and_a_named_fill_still_matches():
+    """Missing status is not OPEN. An EXECUTED detail still reports its fill."""
+    blank = _order_row("BLANK", filled=2, ordered=4)
+    empty = _order_row("EMPTY", "", filled=1, ordered=4)
+    spaces = _order_row("SPACE", "   ", filled=3, ordered=4)
+    opened = _broker_order("OPEN-1", "OPEN", filled=0, ordered=4)
+    filled = _order_row(
+        "FILL-1", "", filled=1, ordered=2,
+        extra_details=[{
+            "status": "EXECUTED",
+            "Instrument": [{"filledQuantity": 1, "orderedQuantity": 2}],
+        }],
+    )
+    sibling = _order_row(
+        "SIB", "EXECUTED", filled=2, ordered=2,
+        extra_details=[{
+            "status": "  ",
+            "Instrument": [{"filledQuantity": 0, "orderedQuantity": 0}],
+        }],
+    )
+    no_detail = {"orderId": "NONE"}
+
+    blank_hit = main_bot._match_order_qty([blank], "BLANK")
+    assert blank_hit == {"status": "UNKNOWN", "filled": 2, "ordered": 4}
+    assert main_bot._match_order_qty([empty], "EMPTY")["status"] == "UNKNOWN"
+    assert main_bot._match_order_qty([spaces], "SPACE")["status"] == "UNKNOWN"
+    assert main_bot._match_order_qty([no_detail], "NONE")["status"] == "UNKNOWN"
+    assert main_bot._match_order_qty([opened], "OPEN-1")["status"] == "OPEN"
+    assert main_bot._flatten_close_view(blank_hit) == "unknown"
+    assert main_bot._flatten_close_view(main_bot._match_order_qty([opened], "OPEN-1")) == "working"
+
+    fill_hit = main_bot._match_order_qty([filled], "FILL-1")
+    assert fill_hit["status"] == "EXECUTED"
+    assert fill_hit["filled"] == 2
+    sib_hit = main_bot._match_order_qty([sibling], "SIB")
+    assert sib_hit["status"] == "EXECUTED"
+    assert sib_hit["filled"] == 2
+    assert main_bot.classify_cancel_status("EXECUTED", 2, 2) == "filled"
+    assert main_bot.classify_cancel_status("OPEN", 0, 4) == "working"
+
+
+def test_order_state_blank_status_is_unknown_and_executed_fill_counts(monkeypatch):
+    rows = [
+        _order_row("BLANK", filled=2, ordered=4),
+        _order_row("FILL-1", "EXECUTED", filled=2, ordered=2),
+        _broker_order("OPEN-1", "OPEN", filled=0, ordered=4),
+        _order_row("EMPTY", ""),
+    ]
+
+    class Client:
+        def list_orders(self, account_id_key, resp_format="json", count=25, marker=None, **kwargs):
+            assert marker is None
+            return {"OrdersResponse": {"Order": rows}}
+
+    _wire_client(monkeypatch, Client())
+
+    async def read():
+        return {
+            "blank": await main_bot._order_state("BLANK", None),
+            "fill": await main_bot._order_state("FILL-1", None),
+            "open": await main_bot._order_state("OPEN-1", None),
+            "empty": await main_bot._order_state("EMPTY", None),
+            "missing": await main_bot._order_state("GONE", None),
+        }
+
+    got = asyncio.run(read())
+    assert got["blank"] == ("UNKNOWN", 2)
+    assert got["fill"] == ("EXECUTED", 2)
+    assert got["open"] == ("OPEN", 0)
+    assert got["empty"] == ("UNKNOWN", 0)
+    assert got["missing"] == ("NOT_FOUND", 0)
+
+
+@pytest.mark.parametrize("status", (_MISSING, "", "   "), ids=("missing", "empty", "blank"))
+def test_statusless_flatten_close_is_not_cancelled_or_replaced(status, monkeypatch):
+    when = _at(FULL, 15, 50)
+    rec = _arm(monkeypatch, when, _position(when), held=4)
+    order = _order_row("CLOSE-1", status, ordered=4)
+
+    class Client:
+        def list_orders(self, account_id_key, resp_format="json", count=25, marker=None, **kwargs):
+            assert marker is None
+            return {"OrdersResponse": {"Order": [order]}}
+
+        def list_order_details(self, *args, **kwargs):
+            raise AssertionError("the page already returned the order")
+
+    _wire_client(monkeypatch, Client())
+    _run()
+    _run()
+
+    assert rec["calls"].count("place") == 0
+    assert not any(isinstance(c, tuple) and c[0] == "cancel" for c in rec["calls"])
+    critical = [
+        a for a in rec["alerts"]
+        if a["severity"] == "critical" and a["event"] == "unfilled_flatten_replace"
+    ]
+    assert len(critical) == 1
+    assert "UNKNOWN" in critical[0]["message"]
+    assert "no cancel and no new order" in critical[0]["message"]
+    assert critical[0]["dedupe_key"] == "unfilled_flatten:SPY:status_unknown"
+    assert rec["book"].pos["pending_flatten_close"]["order_id"] == "CLOSE-1"
+
+
+def test_explicit_open_status_is_still_cancelled_and_replaced(monkeypatch):
+    when = _at(FULL, 15, 50)
+    rec = _arm(monkeypatch, when, _position(when), held=4)
+    reads = {"n": 0}
+
+    class Client:
+        def list_orders(self, account_id_key, resp_format="json", count=25, marker=None, **kwargs):
+            assert marker is None
+            reads["n"] += 1
+            status = "OPEN" if reads["n"] == 1 else "CANCELLED"
+            return {"OrdersResponse": {"Order": [_broker_order("CLOSE-1", status)]}}
+
+        def list_order_details(self, *args, **kwargs):
+            raise AssertionError("the page already returned the order")
+
+    _wire_client(monkeypatch, Client())
+    _run()
+    assert reads["n"] >= 2
+    assert ("cancel", "CLOSE-1", 4) in rec["calls"]
+    assert rec["calls"].count("place") == 1
+    _assert_market_sell(rec["orders"][0], 4)
+    assert rec["book"].pos["pending_flatten_close"]["order_id"] == "CLOSE-2"
+
+
+def test_concurrent_fill_survives_the_flatten_replace_save(monkeypatch):
+    """A fill written after the snapshot and before the save stays on the book."""
+    when = _at(FULL, 15, 55)
+    rec = _arm(monkeypatch, when, _position(when), held=4)
+    rec["scripts"]["CLOSE-1"].append(_row("EXPIRED", 0, 4))
+
+    async def held_qty(ticker, pos):
+        rec["calls"].append("held")
+        current = await main_bot.state.get_position("SPY")
+        current["entry_premium"] = 2.75
+        current["filled_qty"] = 2
+        current["qty"] = 2
+        current["reconcile_stamp"] = "broker-fill"
+        await main_bot.state.set_position("SPY", current)
+        return 4
+
+    monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", held_qty)
+    _run()
+    saved = rec["book"].pos
+    assert saved["entry_premium"] == 2.75
+    assert saved["filled_qty"] == 2
+    assert saved["qty"] == 2
+    assert saved["reconcile_stamp"] == "broker-fill"
+    assert saved["had_native_trail"] is True
+    assert saved["pending_flatten_close"]["order_id"] == "CLOSE-2"
+    assert saved["close_order_id"] == "CLOSE-2"
+    assert rec["calls"].count("place") == 1
+    _assert_market_sell(rec["orders"][0], 4)
