@@ -3155,20 +3155,31 @@ def trail_offset_from_order_detail(detail: Any) -> Optional[float]:
     return None
 
 
-def parse_open_orders(orders_resp: Dict[str, Any]) -> List[dict]:
+def parse_open_orders(orders_resp: Dict[str, Any], *, blank_as_open: bool = True) -> List[dict]:
     """Flatten an OrdersResponse into order records (live AND terminal):
     {order_id, symbol, status, price_type, order_action, filled, ordered,
      exec_price, executed_ts, stop_price, offset_value}. `exec_price` is the
     average execution price of a filled instrument (0 when not filled);
     `executed_ts` is the epoch-seconds execution time (0 when unknown) — both
     are what fill capture books a broker-side close from. `offset_value` is
-    the resting trail distance on TRAILING_STOP_* orders (None otherwise)."""
+    the resting trail distance on TRAILING_STOP_* orders (None otherwise).
+
+    A missing or empty status defaults to OPEN. The reconciler's live-order
+    check depends on that default, so it stays unless the caller opts out.
+    `blank_as_open=False` (the flatten path) leaves a missing, empty, or
+    whitespace status as UNKNOWN so a stop that cannot be proven working is
+    not cancelled."""
     out: List[dict] = []
     root = (orders_resp or {}).get("OrdersResponse", {}) or {}
     for order in _as_list(root.get("Order")):
         order_id = str(order.get("orderId") or "")
         for detail in _as_list(order.get("OrderDetail")):
-            status = str(detail.get("status") or "OPEN").upper()
+            if blank_as_open:
+                status = str(detail.get("status") or "OPEN").upper()
+            else:
+                raw = detail.get("status")
+                text = str(raw).strip().upper() if raw is not None else ""
+                status = text or "UNKNOWN"
             try:
                 # E*TRADE stamps executedTime in epoch MILLISECONDS.
                 executed_ts = float(detail.get("executedTime") or 0) / 1000.0
@@ -10074,14 +10085,29 @@ def tape_no_new_entry_minute(now_et: Any) -> int:
     return session_close_minute(now_et) - lead
 
 
+_FLATTEN_LEAD_MINUTES = 20
+
+
+def bind_flatten_lead(minutes) -> None:
+    """Tape label lead, installed from the flatten-lead setting."""
+    global _FLATTEN_LEAD_MINUTES
+    try:
+        lead = int(minutes)
+    except (TypeError, ValueError):
+        return
+    if 1 <= lead <= 12 * 60:
+        _FLATTEN_LEAD_MINUTES = lead
+
+
 def flatten_clock_label(now_et: Any) -> str:
     """Clock the tape shows for today's flatten. A full day is 3:40 PM ET.
 
-    The flatten is twenty minutes before today's close, so a 13:00 half
-    day is 12:40 PM ET. An unknown clock stays the full-day label.
+    The lead is the flatten-lead setting (close minus the scheduled flatten),
+    twenty minutes when that setting is the 15:40 flatten. A 13:00 half day
+    is 12:40 PM ET. An unknown clock stays the full-day label.
     """
     close = session_close_minute(now_et)
-    flat = close - 20
+    flat = close - _FLATTEN_LEAD_MINUTES
     if flat < 0 or flat >= 24 * 60:
         flat = 15 * 60 + 40
     hour, minute = divmod(flat, 60)
@@ -13422,7 +13448,11 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # 5.95.0/5.96.0 and is documented here. Flatten bookkeeping is merged
 # onto the newest position instead of writing the pass's snapshot back.
 # The tape names today's flatten clock (3:40 PM ET on a full day,
-# 12:40 PM ET when the close is 13:00).
+# 12:40 PM ET when the close is 13:00) from the flatten-lead setting.
+# A blank-status protective stop or trail on the flatten open-order list
+# is UNKNOWN too: the stop is not cancelled, the close is not cancelled,
+# and nothing is sent (one deduped critical alert). The reconciler still
+# reads a blank status as OPEN.
 BOT_VERSION = "5.98.0-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
@@ -14571,6 +14601,9 @@ def _install_session_clock() -> None:
     core_book.bind_session_close(_session_close_minute)
     edge.bind_session_close(_session_close_minute)
     scanner_mod.bind_session_close(_session_close_minute)
+    scanner_mod.bind_flatten_lead(
+        int(trailing_engine.MARKET_CLOSE_MINUTE - trailing_engine.EOD_FLATTEN_MINUTE)
+    )
 
 
 _install_session_clock()
@@ -31860,13 +31893,18 @@ async def _flatten_read_order(order_id: str) -> dict:
 
 
 async def _flatten_open_orders() -> List[dict]:
-    """Every order on the paged list. Raises when the list cannot be read."""
+    """Every order on the paged list. Raises when the list cannot be read.
+
+    A missing or blank status stays UNKNOWN here. The reconciler's own parse
+    still defaults that row to OPEN; this path must not, or a blank stop is
+    cancelled before the replace can refuse it.
+    """
     found: List[dict] = []
     async for orders, resp in _flatten_order_pages():
         wrapped = resp if isinstance(resp, dict) and "OrdersResponse" in resp else {
             "OrdersResponse": {"Order": orders},
         }
-        found.extend(reconciliation.parse_open_orders(wrapped))
+        found.extend(reconciliation.parse_open_orders(wrapped, blank_as_open=False))
     return found
 
 

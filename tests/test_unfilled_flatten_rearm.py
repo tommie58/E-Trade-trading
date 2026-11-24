@@ -811,6 +811,7 @@ def test_learning_tolerates_the_flatten_close_reason_and_skips_unknown_prices():
 
 
 _REAL_FLATTEN_READ = main_bot._flatten_read_order
+_REAL_FLATTEN_OPEN = main_bot._flatten_open_orders
 
 
 class _Miss(Exception):
@@ -1105,3 +1106,106 @@ def test_concurrent_fill_survives_the_flatten_replace_save(monkeypatch):
     assert saved["close_order_id"] == "CLOSE-2"
     assert rec["calls"].count("place") == 1
     _assert_market_sell(rec["orders"][0], 4)
+
+
+def _protective_row(order_id, price_type, status):
+    row = _order_row(order_id, status)
+    row["OrderDetail"][0]["priceType"] = price_type
+    row["OrderDetail"][0]["stopPrice"] = 1.0
+    return row
+
+
+@pytest.mark.parametrize(
+    "price_type,status",
+    [
+        ("STOP", _MISSING),
+        ("STOP", ""),
+        ("STOP", "   "),
+        ("TRAILING_STOP_CNST", _MISSING),
+        ("TRAILING_STOP_CNST", ""),
+    ],
+    ids=("stop-missing", "stop-empty", "stop-blank", "trail-missing", "trail-empty"),
+)
+def test_blank_status_protective_order_is_not_cancelled(price_type, status, monkeypatch):
+    """A blank stop on the flatten list is UNKNOWN, so nothing is cancelled."""
+    when = _at(FULL, 15, 50)
+    pos = _position(when)
+    if price_type == "STOP":
+        pos["stop_order_id"] = "STOP-9"
+    else:
+        pos["native_trail_order_id"] = "STOP-9"
+    rec = _arm(monkeypatch, when, pos, held=4)
+
+    class Client:
+        def list_orders(self, account_id_key, resp_format="json", count=25, marker=None, **kwargs):
+            assert marker is None
+            return {"OrdersResponse": {"Order": [
+                _broker_order("CLOSE-1", "OPEN"),
+                _protective_row("STOP-9", price_type, status),
+            ]}}
+
+        def list_order_details(self, *args, **kwargs):
+            raise AssertionError("the page already returned both orders")
+
+    _wire_client(monkeypatch, Client())
+    monkeypatch.setattr(main_bot, "_flatten_open_orders", _REAL_FLATTEN_OPEN)
+    _run()
+    _run()
+
+    assert rec["calls"].count("place") == 0
+    assert not any(isinstance(c, tuple) and c[0] == "cancel" for c in rec["calls"])
+    critical = [
+        a for a in rec["alerts"]
+        if a["severity"] == "critical" and a["event"] == "unfilled_flatten_replace"
+    ]
+    assert len(critical) == 1
+    assert "STOP-9" in critical[0]["message"]
+    assert "UNKNOWN" in critical[0]["message"]
+    assert "no cancel and no new order" in critical[0]["message"]
+    assert critical[0]["dedupe_key"] == "unfilled_flatten:SPY:protection_unknown"
+    saved = rec["book"].pos
+    assert saved["pending_flatten_close"]["order_id"] == "CLOSE-1"
+    if price_type == "STOP":
+        assert saved["stop_order_id"] == "STOP-9"
+    else:
+        assert saved["native_trail_order_id"] == "STOP-9"
+
+
+def test_reconciler_still_treats_a_blank_order_status_as_open():
+    """The live-order check still counts a blank status as OPEN."""
+    def resp(status):
+        detail = {
+            "priceType": "STOP",
+            "stopPrice": 1.0,
+            "Instrument": {
+                "orderAction": "SELL_CLOSE",
+                "orderedQuantity": 4,
+                "filledQuantity": 0,
+                "Product": {"symbol": "SPY", "securityType": "OPTN"},
+            },
+        }
+        if status is not _MISSING:
+            detail["status"] = status
+        return {"OrdersResponse": {"Order": {"orderId": "STOP-9", "OrderDetail": detail}}}
+
+    for status in (_MISSING, ""):
+        orders = main_bot.reconciliation.parse_open_orders(resp(status))
+        assert orders[0]["status"] == "OPEN"
+        live = [
+            order for order in orders
+            if order.get("status") in main_bot.reconciliation._OPEN_ORDER_STATUSES
+        ]
+        assert [order["order_id"] for order in live] == ["STOP-9"]
+        stops = main_bot.reconciliation.protective_stops_by_leg(live)
+        assert stops[("SPY", True)][0]["order_id"] == "STOP-9"
+        flatten = main_bot.reconciliation.parse_open_orders(resp(status), blank_as_open=False)
+        assert flatten[0]["status"] == "UNKNOWN"
+        assert flatten[0]["status"] not in main_bot.reconciliation._OPEN_ORDER_STATUSES
+
+    named = main_bot.reconciliation.parse_open_orders(resp("open"), blank_as_open=False)
+    assert named[0]["status"] == "OPEN"
+    spaces = main_bot.reconciliation.parse_open_orders(resp("   "))
+    assert spaces[0]["status"] == "   "
+    assert main_bot.reconciliation.parse_open_orders(
+        resp("   "), blank_as_open=False,
+    )[0]["status"] == "UNKNOWN"
