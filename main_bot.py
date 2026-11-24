@@ -661,6 +661,29 @@ class _MemoryBackend:
                 return []
             return list(items) if isinstance(items, list) else []
 
+    async def list_all_purged(self, key: str) -> List[str]:
+        """list_all after dropping expired keys. Chain-shadow TTL lives here."""
+        async with self._lock:
+            self._purge()
+            existing = self._kv.get(key)
+            if not existing or not existing[0]:
+                return []
+            try:
+                items = json.loads(existing[0])
+            except json.JSONDecodeError:
+                return []
+            return list(items) if isinstance(items, list) else []
+
+    async def write_list_ex(self, key: str, items: List[str], ex: int) -> None:
+        """Replace one list and set its TTL. An empty list deletes the key."""
+        async with self._lock:
+            self._purge()
+            if not items:
+                self._kv.pop(key, None)
+                return
+            ttl = time.time() + float(ex) if ex else 0.0
+            self._kv[key] = (json.dumps(list(items)), ttl)
+
     async def list_drain(self, key: str) -> List[str]:
         async with self._lock:
             existing = self._kv.pop(key, None)
@@ -1028,6 +1051,31 @@ class StateStore:
         if self.redis is not None:
             return list(await self.redis.lrange(key, 0, -1))
         return await self._memory.list_all(key)
+
+    async def list_read_live(self, key: str) -> List[str]:
+        """Every list item, after Redis or memory TTL expiry. Oldest first."""
+        if self.redis is not None:
+            return list(await self.redis.lrange(key, 0, -1))
+        return await self._memory.list_all_purged(key)
+
+    async def list_write_capped_ex(self, key: str, items: List[str], max_len: int, ex: int) -> None:
+        """Replace `key` with `items` (oldest first), keep the last `max_len`, refresh TTL.
+
+        An empty list deletes the key. Used by the chain-shadow mark queue so a
+        restart reads the same list and a write pushes the 2-day TTL forward.
+        """
+        cap = max(1, int(max_len))
+        kept = [str(item) for item in list(items or [])][-cap:]
+        ttl = max(1, int(ex))
+        if self.redis is not None:
+            pipe = self.redis.pipeline()
+            pipe.delete(key)
+            if kept:
+                pipe.rpush(key, *kept)
+                pipe.expire(key, ttl)
+            await pipe.execute()
+            return
+        await self._memory.write_list_ex(key, kept, ttl)
 
     async def list_drain(self, key: str) -> List[str]:
         """Return every item and delete the list. A push between the read and
@@ -13137,6 +13185,100 @@ def pick_option_quote(quotes_verdict: Any, snapshot_verdict: Any) -> Dict[str, A
     return base
 
 
+def _optional_num(raw: Any) -> Optional[float]:
+    """A missing quote field stays missing. 0 is a measured zero, not absent."""
+    if raw is None or raw is False or raw == "":
+        return None
+    return _num(raw)
+
+
+def chain_snapshot_translate(payload: Any, now_s: float) -> Dict[str, Any]:
+    """Massive options-chain snapshot page → rows for the shadow scorer.
+
+    A leg with no usable greeks.delta (missing, zero, or not in (0, 1]) is
+    dropped and counted. DELAYED and stale quotes stay in the rows and are
+    flagged. Missing open interest stays None and is never stored as 0.
+    underlying_asset.price is not read. Pure.
+    """
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if isinstance(results, dict):
+        results = [results]
+    rows: List[Dict[str, Any]] = []
+    dropped_greeks = 0
+    now = float(now_s) if isinstance(now_s, (int, float)) and not isinstance(now_s, bool) else time.time()
+    for item in results or []:
+        if not isinstance(item, dict):
+            continue
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        greeks = item.get("greeks") if isinstance(item.get("greeks"), dict) else None
+        delta = _num(greeks.get("delta")) if greeks else None
+        if delta is None or not (0.0 < abs(delta) <= 1.0):
+            dropped_greeks += 1
+            continue
+        quote = item.get("last_quote") if isinstance(item.get("last_quote"), dict) else {}
+        tf_raw = quote.get("timeframe")
+        tf = str(tf_raw).strip().upper() if tf_raw not in (None, "") else None
+        ts = _ts_seconds(quote.get("last_updated"))
+        age = (now - ts) if ts is not None else None
+        if "open_interest" in item:
+            oi = _optional_num(item.get("open_interest"))
+        elif "openInterest" in item:
+            oi = _optional_num(item.get("openInterest"))
+        else:
+            oi = None
+        day = item.get("day") if isinstance(item.get("day"), dict) else {}
+        volume = _optional_num(day.get("volume")) if isinstance(day, dict) and "volume" in day else None
+        exp = str(details.get("expiration_date") or "")[:10]
+        strike = _num(details.get("strike_price"))
+        side_raw = str(details.get("contract_type") or "").strip().upper()
+        if side_raw.startswith("P"):
+            right = "PUT"
+        elif side_raw.startswith("C"):
+            right = "CALL"
+        else:
+            right = None
+        if len(exp) != 10 or strike is None or strike <= 0 or right is None:
+            continue
+        stale = age is None or age > REALTIME_MAX_AGE_S or age < -REALTIME_MAX_AGE_S
+        occ = str(details.get("ticker") or "").strip() or None
+        rows.append({
+            "expiry": exp,
+            "strike": float(strike),
+            "right": right,
+            "bid": _num(quote.get("bid")),
+            "ask": _num(quote.get("ask")),
+            "theta": _num(greeks.get("theta")) if greeks else None,
+            "delta": float(delta),
+            "gamma": _num(greeks.get("gamma")) if greeks else None,
+            "vega": _num(greeks.get("vega")) if greeks else None,
+            "iv": _optional_num(item.get("implied_volatility")),
+            "open_interest": oi,
+            "volume": volume,
+            "quote_age_s": round(age, 1) if age is not None else None,
+            "timeframe": tf,
+            "delayed": tf == "DELAYED",
+            "stale": bool(stale),
+            "occ": occ,
+        })
+    return {"rows": rows, "dropped_greeks": dropped_greeks}
+
+
+def chain_snapshot_to_rows(payload: Any, now_s: float) -> List[Dict[str, Any]]:
+    """Rows from chain_snapshot_translate. Greeks-missing legs are absent. Pure."""
+    return list(chain_snapshot_translate(payload, now_s)["rows"])
+
+
+def _extend_chain_results(payload: Any, into: List[Dict[str, Any]]) -> None:
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if isinstance(results, dict):
+        results = [results]
+    if not isinstance(results, list):
+        return
+    for row in results:
+        if isinstance(row, dict):
+            into.append(row)
+
+
 class MassiveClient:
     """Async quote fetcher. Holds the per-day ADV cache."""
 
@@ -13318,6 +13460,87 @@ class MassiveClient:
             self.auth_status = None
         await self._notify_health()
         return out
+
+    async def fetch_option_chain(
+        self,
+        underlying: str,
+        *,
+        contract_type: str,
+        expiration_gte: str,
+        expiration_lte: str,
+        strike_gte: float,
+        strike_lte: float,
+        limit: int = 250,
+        max_pages: int = 3,
+    ) -> Dict[str, Any]:
+        """GET /v3/snapshot/options/{UND} and follow next_url for at most 3 pages.
+
+        The strike band is the caller's. This method does not read
+        underlying_asset.price. A shadow caller uses a new MassiveClient with
+        on_health left None, so a successful options read cannot write
+        massive:feed_health or move the shared client's last_ok_at.
+        """
+        if not enabled():
+            raise RuntimeError("no Massive key configured")
+        root = str(underlying or "").strip().upper()
+        if not root:
+            raise RuntimeError("missing underlying")
+        side = str(contract_type or "").strip().lower()
+        if side not in {"call", "put"}:
+            raise RuntimeError("contract_type must be call or put")
+        page_cap = 3
+        try:
+            pages = max(1, min(int(max_pages), page_cap))
+        except (TypeError, ValueError):
+            pages = page_cap
+        try:
+            page_limit = max(1, min(int(limit), 250))
+        except (TypeError, ValueError):
+            page_limit = 250
+        params = {
+            "contract_type": side,
+            "expiration_date.gte": str(expiration_gte)[:10],
+            "expiration_date.lte": str(expiration_lte)[:10],
+            "strike_price.gte": strike_gte,
+            "strike_price.lte": strike_lte,
+            "limit": page_limit,
+            "sort": "strike_price",
+        }
+        import httpx
+
+        merged: List[Dict[str, Any]] = []
+        fetched = 0
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
+                data = await self._get(client, f"/v3/snapshot/options/{root}", params)
+                fetched = 1
+                _extend_chain_results(data, merged)
+                while fetched < pages:
+                    nxt = data.get("next_url") if isinstance(data, dict) else None
+                    if not isinstance(nxt, str) or not nxt.startswith(BASE_URL + "/"):
+                        break
+                    self.calls += 1
+                    resp = await client.get(nxt, headers=self._headers())
+                    if resp.status_code in (401, 403):
+                        self.auth_status = int(resp.status_code)
+                        raise RuntimeError(f"Massive rejected the API key (HTTP {resp.status_code})")
+                    if resp.status_code == 429:
+                        raise RuntimeError("Massive rate limit (HTTP 429)")
+                    if resp.status_code >= 400:
+                        raise RuntimeError(f"Massive HTTP {resp.status_code}")
+                    data = resp.json()
+                    fetched += 1
+                    _extend_chain_results(data, merged)
+        except Exception as e:
+            self.failures += 1
+            self.last_error = str(e)[:200]
+            await self._notify_health()
+            raise
+        self.last_ok_at = time.time()
+        self.last_error = None
+        self.auth_status = None
+        await self._notify_health()
+        return {"results": merged, "pages": fetched}
 
     async def _notify_health(self) -> None:
         hook = getattr(self, "on_health", None)
@@ -13871,6 +14094,7 @@ import os
 import copy
 import json
 import math
+import statistics
 import re
 import logging
 import random
@@ -14119,6 +14343,15 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # dead or filled blocks the same way: UNKNOWN, blank, and missing all
 # block, so the working flatten close is not cancelled and no replacement
 # is sent.
+# 5.99.0: shadow-only Massive chain-greeks strike comparison. After an
+# option stop is armed and the position stamp that follows it has run, a
+# separate task prices the same |Δ| 0.60 / 0–7 DTE rules on a Massive
+# options-chain snapshot and writes chain_shadow_pick, chain_shadow_mark,
+# and chain_shadow_error. CHAIN_SHADOW_ENABLED defaults off and the mark
+# worker re-reads it every loop. The live strike, quantity, stop, trail,
+# rails, 3:40 PM ET flatten, scanner 84-A, and the fail-closed VWAP gate
+# stay as they are. Forty paired entries is a floor for the pre-registered
+# comparison, not a flip. A live flip is a later default-off PR.
 # 5.99.2: a flatten close reported as DONE_TRADE_EXECUTED is filled, same
 # as EXECUTED, so the path does not send a second sell. Flatten
 # bookkeeping re-reads the position and writes only the fields this pass
@@ -14236,6 +14469,48 @@ CORE_BOOK_ENABLED = os.getenv("CORE_BOOK_ENABLED", os.getenv("SETUP_GATES_ENABLE
 # Option entries are re-expressed as an ITM contract (|Δ| ≈ 0.60, best expiry in 0–7 DTE)
 # before the chain snap. false = trade the contract the sender asked for.
 ITM_EXPRESSION_ENABLED = os.getenv("ITM_EXPRESSION_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+# SHADOW-ONLY chain comparison (5.99.0). Default OFF. This is the kill switch:
+# the spawn and the mark worker both re-read it, so turning it off needs no
+# redeploy and never touches an order. Nothing in this flag changes a strike.
+def chain_shadow_enabled() -> bool:
+    """True only when CHAIN_SHADOW_ENABLED is explicitly on. Default false."""
+    return os.getenv("CHAIN_SHADOW_ENABLED", "false").strip().lower() in {"true", "1", "yes"}
+
+
+CHAIN_SHADOW_TIMEOUT_S = 8.0
+CHAIN_SHADOW_WORKER_SECONDS = 60
+CHAIN_SHADOW_OPEN_KEY = "pro_trader:chain_shadow:open"
+CHAIN_SHADOW_TTL_S = 2 * 24 * 60 * 60
+CHAIN_SHADOW_MAX_OPEN = 200
+CHAIN_SHADOW_PAGE_LIMIT = 250
+CHAIN_SHADOW_MAX_PAGES = 3
+CHAIN_SHADOW_STRIKE_PAD = 0.015
+CHAIN_SHADOW_CACHE_S = 15.0
+CHAIN_SHADOW_MIN_VOLUME = 50.0
+CHAIN_SHADOW_IV_MIN = 0.05
+CHAIN_SHADOW_IV_MAX = 3.0
+# |IV − expiry median| / median. A flag only; it does not drop a scored leg.
+CHAIN_SHADOW_IV_MEDIAN_FRAC = 0.50
+# Live prices 10 strikes around the per-expiry model strike (no_of_strikes=10).
+CHAIN_SHADOW_LIVE_STRIKES = 10
+# Floor for reading the pre-registered comparison. Not a flip rule.
+CHAIN_SHADOW_MIN_PAIRS = 40
+CHAIN_SHADOW_MARK_MINUTES = (15, 30)
+CHAIN_SHADOW_EVENTS = frozenset({"chain_shadow_pick", "chain_shadow_mark", "chain_shadow_error"})
+CHAIN_SHADOW_FORBIDDEN_FIELDS = frozenset({"realized_pnl_pct", "account_pnl_pct"})
+CHAIN_SHADOW_COMPARISON_NOTE = (
+    "Pre-registered comparison for the Massive chain-greeks shadow, fixed "
+    "before any sample is read. Metrics: same-contract rate on the wide |delta| "
+    "band and on the same 10-strike window the live pick prices; mean delta gap "
+    "and mean spread gap with 95% confidence intervals; mean shadow-minus-live "
+    "premium percent at the live exit and at +30 minutes with 95% confidence "
+    "intervals; and the shadow refusal rate. Forty paired entries is a floor "
+    "for reading that record. It is not a rule that flips the live strike. A "
+    "live flip is a separate pull request, default off, and needs sign-off from "
+    "the TSIT Risk & Ops Monitor, the Chief of Staff, and Tommie. This version "
+    "does not change a live order, strike, quantity, stop, trail, rail, flatten, "
+    "scanner, or the VWAP gate."
+)
 # DAY-TRADE MODE — aggressive same-session book. When true (default):
 #   • 3:40 PM ET hard flatten closes EVERY open option (no overnight holds)
 #   • expression already prefers 0–7 DTE / same-day when cheapest to hold
@@ -29849,6 +30124,1121 @@ def _best_expression_contract(market, symbol: str, spot: Any, vol_annual: Any,
     return best
 
 
+# ==================== CHAIN SHADOW (5.99.0) ====================
+# Read-only comparison of the live E*TRADE strike against a Massive chain
+# snapshot. The task starts only after the option stop guard is armed and the
+# position stamp that follows it has run. It does not lock a live position and
+# it does not write a live position or guard. Massive I/O and the three ledger
+# events live inside the task. CHAIN_SHADOW_ENABLED defaults off.
+_CHAIN_SHADOW_CACHE: Dict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]] = {}
+_CHAIN_SHADOW_TASKS: set = set()
+_CHAIN_SHADOW_SECRET_RE = re.compile(
+    r"(?i)(api[_-]?key|access[_-]?token|oauth[_-]?token|oauth[_-]?token[_-]?secret|secret|bearer)"
+    r"(\s*[=:]\s*|\s+)(\S+)"
+)
+
+
+def _scrub_secret(value: Any) -> str:
+    text = _CHAIN_SHADOW_SECRET_RE.sub(r"\1\2redacted", str(value)[:500])
+    return text[:200]
+
+
+def _chain_shadow_right(right: Any) -> str:
+    return "PUT" if str(right or "").upper().startswith("P") else "CALL"
+
+
+def _chain_shadow_expiry(value: Any) -> Optional[date]:
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _chain_shadow_vol(vol: Any) -> float:
+    v = core_book._num(vol)
+    if v is not None and v > 3.0:
+        v = v / 100.0
+    if v is None or v <= 0:
+        return float(core_book.VOL_PRIOR_ANNUAL)
+    return float(v)
+
+
+def _chain_shadow_spread_pct(bid: Any, ask: Any) -> Optional[float]:
+    b, a = core_book._num(bid), core_book._num(ask)
+    if b is None or a is None or b <= 0 or a < b:
+        return None
+    mid = (a + b) / 2.0
+    if mid <= 0:
+        return None
+    return round((a - b) / mid, 6)
+
+
+def chain_shadow_strike_band(spot: Any, vol: Any, right: Any) -> Optional[Tuple[float, float]]:
+    """Strike window for |Δ| in DELTA_BAND at MAX_DTE, padded ±1.5%.
+
+    `spot` is the bot's live/E*TRADE underlying. This function has no
+    parameter for a Massive underlying price and does not read one.
+    """
+    s = core_book._num(spot)
+    if s is None or s <= 0:
+        return None
+    v = _chain_shadow_vol(vol)
+    side = _chain_shadow_right(right)
+    lo = core_book.strike_for_delta(s, v, core_book.MAX_DTE, side, core_book.DELTA_BAND[0])
+    hi = core_book.strike_for_delta(s, v, core_book.MAX_DTE, side, core_book.DELTA_BAND[1])
+    if lo is None or hi is None:
+        return None
+    left, right_k = (min(lo, hi), max(lo, hi))
+    pad = float(CHAIN_SHADOW_STRIKE_PAD)
+    return (left * (1.0 - pad), right_k * (1.0 + pad))
+
+
+def chain_shadow_query_params(live_pick: Dict[str, Any], today: date) -> Optional[Dict[str, Any]]:
+    """Chain-snapshot query centered on live_pick['spot'] only."""
+    if not isinstance(live_pick, dict):
+        return None
+    band = chain_shadow_strike_band(
+        live_pick.get("spot"), live_pick.get("vol_annual"), live_pick.get("right"),
+    )
+    if band is None:
+        return None
+    side = "put" if _chain_shadow_right(live_pick.get("right")) == "PUT" else "call"
+    return {
+        "contract_type": side,
+        "expiration_date.gte": today.isoformat(),
+        "expiration_date.lte": (today + timedelta(days=int(core_book.MAX_DTE))).isoformat(),
+        "strike_price.gte": band[0],
+        "strike_price.lte": band[1],
+        "limit": CHAIN_SHADOW_PAGE_LIMIT,
+        "sort": "strike_price",
+    }
+
+
+def _chain_shadow_unscored_reason(row: Dict[str, Any]) -> Optional[str]:
+    """Why expiry_cost would refuse this leg, or None when it can score.
+
+    Missing open interest is allowed. A measured OI under the minimum is not.
+    The caller still scores with core_book.expiry_cost.
+    """
+    delta = core_book._num(row.get("delta"))
+    if delta is None or not (0 < abs(delta) <= 1):
+        return "greeks_missing"
+    if not (core_book.DELTA_BAND[0] <= abs(delta) <= core_book.DELTA_BAND[1]):
+        return "delta_outside"
+    bid, ask = core_book._num(row.get("bid")), core_book._num(row.get("ask"))
+    if bid is None or ask is None or bid <= 0 or ask < bid:
+        return "no_two_sided"
+    if core_book._num(row.get("theta")) is None:
+        return "no_theta"
+    oi = row.get("open_interest")
+    oi_n = None if oi is None else core_book._num(oi)
+    if oi is not None and oi_n is None:
+        return "oi_unreadable"
+    if oi_n is not None and oi_n < core_book.MIN_EXPIRY_OI:
+        return "oi_low"
+    spread = _chain_shadow_spread_pct(bid, ask)
+    if spread is None:
+        return "no_two_sided"
+    if spread > core_book.MAX_EXPIRY_SPREAD_PCT:
+        return "spread_wide"
+    return None
+
+
+def _chain_shadow_nearest(legs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    measured = []
+    for leg in legs:
+        delta = core_book._num(leg.get("delta"))
+        if delta is not None and 0 < abs(delta) <= 1:
+            measured.append(leg)
+    if not measured:
+        return None
+    return min(
+        measured,
+        key=lambda leg: (
+            abs(abs(float(leg["delta"])) - core_book.EXPRESSION_DELTA),
+            core_book._num(leg.get("strike")) or 0.0,
+        ),
+    )
+
+
+def _chain_shadow_window(legs: List[Dict[str, Any]], model_strike: Optional[float]) -> List[Dict[str, Any]]:
+    """The same 10-strike window live prices around the per-expiry model strike."""
+    if model_strike is None:
+        return []
+    strikes = sorted({
+        round(float(k), 4)
+        for k in (core_book._num(leg.get("strike")) for leg in legs)
+        if k is not None
+    })
+    nearest = sorted(strikes, key=lambda k: (abs(k - model_strike), k))[:CHAIN_SHADOW_LIVE_STRIKES]
+    keep = set(nearest)
+    return [
+        leg for leg in legs
+        if core_book._num(leg.get("strike")) is not None
+        and round(float(leg["strike"]), 4) in keep
+    ]
+
+
+def _chain_shadow_flags(row: Dict[str, Any], expiry_rows: List[Dict[str, Any]]) -> Dict[str, bool]:
+    """Volume, IV, DELAYED and stale are flags. They do not change the score."""
+    volume = core_book._num(row.get("volume"))
+    volume_ok = volume is not None and volume >= CHAIN_SHADOW_MIN_VOLUME
+    tf = str(row.get("timeframe") or "").strip().upper()
+    timeframe_ok = bool(tf) and tf != "DELAYED"
+    age = core_book._num(row.get("quote_age_s"))
+    fresh = (
+        age is not None
+        and -float(massive.REALTIME_MAX_AGE_S) <= age <= float(massive.REALTIME_MAX_AGE_S)
+    )
+    ivs = []
+    for item in expiry_rows:
+        iv = core_book._num(item.get("iv"))
+        if iv is not None and iv > 0:
+            ivs.append(iv)
+    median = statistics.median(ivs) if ivs else None
+    iv = core_book._num(row.get("iv"))
+    iv_ok = False
+    if (
+        iv is not None
+        and CHAIN_SHADOW_IV_MIN <= iv <= CHAIN_SHADOW_IV_MAX
+        and median is not None
+        and median > 0
+        and abs(iv - median) <= CHAIN_SHADOW_IV_MEDIAN_FRAC * median
+    ):
+        iv_ok = True
+    delayed = bool(row.get("delayed")) or tf == "DELAYED"
+    return {
+        "volume_ok": bool(volume_ok),
+        "timeframe_ok": bool(timeframe_ok),
+        "quote_fresh": bool(fresh),
+        "iv_ok": bool(iv_ok),
+        "delayed": bool(delayed),
+        "stale": bool(row.get("stale")) or not fresh,
+    }
+
+
+def _chain_shadow_public(
+    row: Dict[str, Any],
+    today: date,
+    expiry_rows: List[Dict[str, Any]],
+    right: str,
+) -> Dict[str, Any]:
+    exp = str(row.get("expiry") or "")[:10]
+    exp_d = _chain_shadow_expiry(exp)
+    dte = (exp_d - today).days if exp_d is not None else row.get("dte")
+    oi = row.get("open_interest")
+    oi_out = None if oi is None else core_book._num(oi)
+    flags = _chain_shadow_flags(row, expiry_rows)
+    return {
+        "strike": core_book._num(row.get("strike")),
+        "expiry": exp or None,
+        "dte": dte,
+        "right": right,
+        "delta": core_book._num(row.get("delta")),
+        "theta": core_book._num(row.get("theta")),
+        "gamma": core_book._num(row.get("gamma")),
+        "vega": core_book._num(row.get("vega")),
+        "iv": core_book._num(row.get("iv")),
+        "open_interest": oi_out,
+        "volume": None if row.get("volume") is None else core_book._num(row.get("volume")),
+        "bid": core_book._num(row.get("bid")),
+        "ask": core_book._num(row.get("ask")),
+        "spread_pct": _chain_shadow_spread_pct(row.get("bid"), row.get("ask")),
+        "cost": core_book._num(row.get("cost")),
+        "quote_age_s": core_book._num(row.get("quote_age_s")),
+        "timeframe": row.get("timeframe"),
+        "occ": row.get("occ"),
+        **flags,
+    }
+
+
+def _chain_shadow_score_leg(leg: Dict[str, Any], reasons: Dict[str, int]) -> Optional[Dict[str, Any]]:
+    why = _chain_shadow_unscored_reason(leg)
+    cost = core_book.expiry_cost(
+        leg.get("bid"), leg.get("ask"), leg.get("theta"), leg.get("delta"), leg.get("open_interest"),
+    )
+    if cost is None:
+        reasons[why or "unscored"] = reasons.get(why or "unscored", 0) + 1
+        return None
+    return {**leg, "cost": cost}
+
+
+def select_chain_shadow(
+    rows: List[Dict[str, Any]],
+    *,
+    spot: Any,
+    vol_annual: Any,
+    right: Any,
+    today: date,
+    now_minutes_et: Any = None,
+    dropped_greeks: int = 0,
+) -> Dict[str, Any]:
+    """Wide |Δ| pick and the same 10-strike window, using only the pure helpers.
+
+    Broker chain, snap, and sync helpers are not used. A missing greek is not
+    replaced with a model delta.
+    """
+    side = _chain_shadow_right(right)
+    vol = _chain_shadow_vol(vol_annual)
+    reasons: Dict[str, int] = {}
+    if dropped_greeks:
+        reasons["greeks_missing"] = int(dropped_greeks)
+    by_exp: Dict[date, List[Dict[str, Any]]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        exp = _chain_shadow_expiry(row.get("expiry"))
+        if exp is None:
+            continue
+        by_exp.setdefault(exp, []).append(row)
+    for exp in list(by_exp):
+        if (exp - today).days == 0 and not core_book.same_day_entry_open(now_minutes_et, day=today):
+            reasons["zero_dte_cutoff"] = reasons.get("zero_dte_cutoff", 0) + 1
+    candidates = core_book.weekly_candidates(list(by_exp), today, now_minutes_et)
+    wide_rows: List[Dict[str, Any]] = []
+    window_rows: List[Dict[str, Any]] = []
+    model_missing = False
+    for exp in candidates:
+        legs = by_exp.get(exp) or []
+        dte = max(1, (exp - today).days)
+        model = core_book.strike_for_delta(core_book._num(spot) or 0.0, vol, dte, side)
+        if core_book._num(spot) is None or core_book._num(spot) <= 0:
+            model = None
+        if model is None:
+            model_missing = True
+        nearest = _chain_shadow_nearest(legs)
+        if nearest is None:
+            reasons["greeks_missing"] = reasons.get("greeks_missing", 0) + 1
+        else:
+            scored = _chain_shadow_score_leg({**nearest, "expiry": exp.isoformat()}, reasons)
+            if scored is not None:
+                wide_rows.append(scored)
+        window_legs = _chain_shadow_window(legs, model)
+        window_nearest = _chain_shadow_nearest(window_legs)
+        if window_nearest is None:
+            if model is None:
+                pass
+            elif legs:
+                reasons["same_window_unscored"] = reasons.get("same_window_unscored", 0) + 1
+        else:
+            # Score the window leg on its own counter so a window refusal does
+            # not look like the wide pick failed.
+            window_reasons: Dict[str, int] = {}
+            scored_w = _chain_shadow_score_leg(
+                {**window_nearest, "expiry": exp.isoformat()}, window_reasons,
+            )
+            if scored_w is not None:
+                window_rows.append(scored_w)
+            else:
+                for key, count in window_reasons.items():
+                    bucket = f"same_window_{key}"
+                    reasons[bucket] = reasons.get(bucket, 0) + count
+    if model_missing:
+        reasons["no_model_strike"] = reasons.get("no_model_strike", 0) + 1
+    wide = core_book.pick_best_expiry(wide_rows, today, now_minutes_et)
+    window = core_book.pick_best_expiry(window_rows, today, now_minutes_et)
+    if not rows and not dropped_greeks and not reasons:
+        reasons["no_contracts"] = 1
+
+    def _pub(picked: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not picked:
+            return None
+        exp = _chain_shadow_expiry(picked.get("expiry"))
+        expiry_rows = by_exp.get(exp, []) if exp is not None else []
+        return _chain_shadow_public(picked, today, expiry_rows, side)
+
+    return {
+        "shadow": _pub(wide),
+        "shadow_same_window": _pub(window),
+        "reasons": {k: v for k, v in reasons.items() if v},
+        "expiries_considered": len(candidates),
+        "expiries_scored": 0 if wide is None else int(wide.get("scored") or 0),
+        "same_window_scored": 0 if window is None else int(window.get("scored") or 0),
+    }
+
+
+def _chain_shadow_same_contract(live: Optional[Dict[str, Any]], shadow: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(live, dict) or not isinstance(shadow, dict):
+        return False
+    if _chain_shadow_right(live.get("right")) != _chain_shadow_right(shadow.get("right")):
+        return False
+    if str(live.get("expiry") or "")[:10] != str(shadow.get("expiry") or "")[:10]:
+        return False
+    left, right_k = core_book._num(live.get("strike")), core_book._num(shadow.get("strike"))
+    return left is not None and right_k is not None and abs(left - right_k) < 1e-6
+
+
+def _chain_shadow_delta_gap(live: Dict[str, Any], shadow: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not isinstance(shadow, dict):
+        return None
+    ld, sd = core_book._num(live.get("delta")), core_book._num(shadow.get("delta"))
+    if ld is None or sd is None:
+        return None
+    return round(abs(sd) - abs(ld), 6)
+
+
+def _chain_shadow_spread_gap(live: Dict[str, Any], shadow: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not isinstance(shadow, dict):
+        return None
+    live_spread = live.get("spread_pct")
+    if live_spread is None:
+        live_spread = _chain_shadow_spread_pct(live.get("bid"), live.get("ask"))
+    shadow_spread = shadow.get("spread_pct")
+    if shadow_spread is None:
+        shadow_spread = _chain_shadow_spread_pct(shadow.get("bid"), shadow.get("ask"))
+    left, right_k = core_book._num(live_spread), core_book._num(shadow_spread)
+    if left is None or right_k is None:
+        return None
+    return round(right_k - left, 6)
+
+
+def chain_shadow_compare(live: Dict[str, Any], selected: Dict[str, Any]) -> Dict[str, Any]:
+    shadow = selected.get("shadow") if isinstance(selected, dict) else None
+    window = selected.get("shadow_same_window") if isinstance(selected, dict) else None
+    return {
+        "same_contract": _chain_shadow_same_contract(live, shadow if isinstance(shadow, dict) else None),
+        "same_contract_same_window": _chain_shadow_same_contract(
+            live, window if isinstance(window, dict) else None,
+        ),
+        "delta_gap": _chain_shadow_delta_gap(live, shadow if isinstance(shadow, dict) else None),
+        "delta_gap_same_window": _chain_shadow_delta_gap(live, window if isinstance(window, dict) else None),
+        "spread_gap": _chain_shadow_spread_gap(live, shadow if isinstance(shadow, dict) else None),
+        "spread_gap_same_window": _chain_shadow_spread_gap(live, window if isinstance(window, dict) else None),
+    }
+
+
+def _chain_shadow_live_view(live_pick: Dict[str, Any], today: date) -> Dict[str, Any]:
+    exp = str(live_pick.get("expiry") or "")[:10]
+    exp_d = _chain_shadow_expiry(exp)
+    oi = live_pick.get("open_interest")
+    volume = live_pick.get("volume")
+    return {
+        "strike": core_book._num(live_pick.get("strike")),
+        "expiry": exp or None,
+        "dte": (exp_d - today).days if exp_d is not None else None,
+        "right": _chain_shadow_right(live_pick.get("right")),
+        "basis": live_pick.get("basis"),
+        "delta": core_book._num(live_pick.get("delta")),
+        "theta": core_book._num(live_pick.get("theta")),
+        "open_interest": None if oi is None else core_book._num(oi),
+        "volume": None if volume is None else core_book._num(volume),
+        "bid": core_book._num(live_pick.get("bid")),
+        "ask": core_book._num(live_pick.get("ask")),
+        "spread_pct": _chain_shadow_spread_pct(live_pick.get("bid"), live_pick.get("ask")),
+        "cost": core_book._num(live_pick.get("cost")),
+    }
+
+
+def build_chain_shadow_live_pick(
+    *,
+    ticker: str,
+    strike: Any,
+    expiry: Any,
+    right: Any,
+    expression: Optional[Dict[str, Any]],
+    sender_honored: bool,
+    app_decides: bool,
+    payload: Optional[Dict[str, Any]],
+    contract_liquidity: Optional[Dict[str, Any]],
+    real_bid: Any,
+    real_ask: Any,
+    vol_annual: Any,
+    signal_id: Optional[str],
+) -> Dict[str, Any]:
+    """In-memory snapshot of the live pick. No Massive I/O and no ledger write."""
+    liq = contract_liquidity if isinstance(contract_liquidity, dict) else {}
+    expr = expression if isinstance(expression, dict) else {}
+    body = payload if isinstance(payload, dict) else {}
+    if app_decides:
+        basis = "app_decides"
+    elif sender_honored:
+        basis = "sender"
+    elif expr:
+        basis = str(expr.get("expiry_basis") or "target")
+        if basis not in {"best", "target", "sender"}:
+            basis = "target"
+    else:
+        basis = "sender"
+    oi = liq.get("open_interest") if "open_interest" in liq else None
+    if oi is not None:
+        oi = core_book._num(oi)
+    volume = liq.get("volume") if "volume" in liq else None
+    if volume is not None:
+        volume = core_book._num(volume)
+    delta = liq.get("delta") if "delta" in liq else None
+    if delta is not None:
+        delta = core_book._num(delta)
+    bid = core_book._num(real_bid)
+    ask = core_book._num(real_ask)
+    if bid is not None and bid <= 0:
+        bid = None
+    if ask is not None and ask <= 0:
+        ask = None
+    theta = expr.get("theta") if "theta" in expr else None
+    cost = expr.get("expiry_cost") if "expiry_cost" in expr else None
+    return {
+        "ticker": str(ticker or "").upper(),
+        "strike": core_book._num(strike),
+        "expiry": str(expiry or "")[:10],
+        "right": _chain_shadow_right(right),
+        "basis": basis,
+        "delta": delta,
+        "theta": None if theta is None else core_book._num(theta),
+        "open_interest": oi,
+        "volume": volume,
+        "bid": bid,
+        "ask": ask,
+        "cost": None if cost is None else core_book._num(cost),
+        "spot": body.get("entry"),
+        "vol_annual": vol_annual if vol_annual is not None else body.get("vol_annual"),
+        "signal_id": signal_id,
+        "placed_at": _utcnow().isoformat(),
+    }
+
+
+def _scrub_shadow_payload(data: Any) -> Any:
+    if isinstance(data, dict):
+        return {
+            str(k): _scrub_shadow_payload(v)
+            for k, v in data.items()
+            if k not in CHAIN_SHADOW_FORBIDDEN_FIELDS
+        }
+    if isinstance(data, list):
+        return [_scrub_shadow_payload(v) for v in data]
+    return data
+
+
+async def _chain_shadow_record(event: str, data: Dict[str, Any]) -> bool:
+    if event not in CHAIN_SHADOW_EVENTS:
+        return False
+    try:
+        seq = await trade_ledger.record(event, _scrub_shadow_payload(data))
+    except Exception as e:
+        logger.debug(f"[CHAIN SHADOW] ledger {event} failed: {type(e).__name__}")
+        return False
+    return seq is not None
+
+
+def _chain_shadow_cache_get(key: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
+    hit = _CHAIN_SHADOW_CACHE.get(key)
+    if not hit:
+        return None
+    stamped, payload = hit
+    if time.monotonic() - stamped > CHAIN_SHADOW_CACHE_S:
+        _CHAIN_SHADOW_CACHE.pop(key, None)
+        return None
+    return payload
+
+
+def _chain_shadow_cache_put(key: Tuple[Any, ...], payload: Dict[str, Any]) -> None:
+    if len(_CHAIN_SHADOW_CACHE) > 64:
+        _CHAIN_SHADOW_CACHE.clear()
+    _CHAIN_SHADOW_CACHE[key] = (time.monotonic(), payload)
+
+
+def _chain_shadow_pick_event(
+    ticker: str,
+    live_pick: Dict[str, Any],
+    today: date,
+    selected: Optional[Dict[str, Any]],
+    reasons: Dict[str, int],
+    pages: Any,
+    params: Optional[Dict[str, Any]],
+    started: float,
+    queued: bool = False,
+) -> Dict[str, Any]:
+    selected = selected or {}
+    live = _chain_shadow_live_view(live_pick, today)
+    compared = chain_shadow_compare(live, selected)
+    band = None
+    if isinstance(params, dict):
+        band = [params.get("strike_price.gte"), params.get("strike_price.lte")]
+    return {
+        "ticker": str(ticker or "").upper(),
+        "signal_id": live_pick.get("signal_id"),
+        "placed_at": live_pick.get("placed_at"),
+        "spot": core_book._num(live_pick.get("spot")),
+        "live": live,
+        "shadow": selected.get("shadow"),
+        "shadow_same_window": selected.get("shadow_same_window"),
+        "reasons": {k: int(v) for k, v in (reasons or {}).items() if v},
+        "expiries_considered": selected.get("expiries_considered"),
+        "expiries_scored": selected.get("expiries_scored"),
+        "same_window_scored": selected.get("same_window_scored"),
+        "pages": pages,
+        "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        "strike_band": band,
+        "queued": bool(queued),
+        "refused": selected.get("shadow") is None,
+        **compared,
+    }
+
+
+async def _chain_shadow_enqueue(job: Dict[str, Any]) -> bool:
+    try:
+        current = await state.list_read_live(CHAIN_SHADOW_OPEN_KEY)
+    except Exception as e:
+        logger.debug(f"[CHAIN SHADOW] queue unreadable: {type(e).__name__}")
+        return False
+    if len(current) >= int(CHAIN_SHADOW_MAX_OPEN):
+        return False
+    current.append(json.dumps(job, sort_keys=True, default=str))
+    try:
+        await state.list_write_capped_ex(
+            CHAIN_SHADOW_OPEN_KEY, current, CHAIN_SHADOW_MAX_OPEN, CHAIN_SHADOW_TTL_S,
+        )
+    except Exception as e:
+        logger.debug(f"[CHAIN SHADOW] queue write failed: {type(e).__name__}")
+        return False
+    return True
+
+
+async def _chain_shadow_record_error(ticker: str, live_pick: Any, kind: str, detail: Any) -> None:
+    body = live_pick if isinstance(live_pick, dict) else {}
+    await _chain_shadow_record("chain_shadow_error", {
+        "ticker": str(ticker or "").upper(),
+        "signal_id": body.get("signal_id"),
+        "error": str(kind or "error")[:80],
+        "detail": _scrub_secret(detail),
+    })
+
+
+async def _chain_shadow_body(ticker: str, live_pick: Dict[str, Any]) -> None:
+    # First await is inside the 8s budget so the entry path has already returned.
+    await asyncio.sleep(0)
+    if not chain_shadow_enabled():
+        return
+    try:
+        if not massive.enabled():
+            return
+    except Exception:
+        return
+    started = time.perf_counter()
+    client = massive.MassiveClient()
+    client.on_health = None
+    today = _utcnow().astimezone(_ET_ZONE).date()
+    params = chain_shadow_query_params(live_pick, today)
+    if params is None:
+        await _chain_shadow_record("chain_shadow_pick", _chain_shadow_pick_event(
+            ticker, live_pick, today, {"reasons": {"no_live_spot": 1}, "shadow": None,
+                                       "shadow_same_window": None, "expiries_considered": 0,
+                                       "expiries_scored": 0, "same_window_scored": 0},
+            {"no_live_spot": 1}, None, None, started,
+        ))
+        return
+    cache_key = (
+        str(ticker).upper(),
+        params["contract_type"],
+        params["expiration_date.gte"],
+        params["expiration_date.lte"],
+        round(float(params["strike_price.gte"]), 4),
+        round(float(params["strike_price.lte"]), 4),
+    )
+    data = _chain_shadow_cache_get(cache_key)
+    if data is None:
+        data = await client.fetch_option_chain(
+            ticker,
+            contract_type=params["contract_type"],
+            expiration_gte=params["expiration_date.gte"],
+            expiration_lte=params["expiration_date.lte"],
+            strike_gte=float(params["strike_price.gte"]),
+            strike_lte=float(params["strike_price.lte"]),
+            limit=CHAIN_SHADOW_PAGE_LIMIT,
+            max_pages=CHAIN_SHADOW_MAX_PAGES,
+        )
+        if isinstance(data, dict):
+            _chain_shadow_cache_put(cache_key, data)
+    if not isinstance(data, dict):
+        data = {"results": [], "pages": 0}
+    translated = massive.chain_snapshot_translate(data, time.time())
+    selected = select_chain_shadow(
+        translated["rows"],
+        spot=live_pick.get("spot"),
+        vol_annual=live_pick.get("vol_annual"),
+        right=live_pick.get("right"),
+        today=today,
+        now_minutes_et=_et_minutes_now(),
+        dropped_greeks=int(translated.get("dropped_greeks") or 0),
+    )
+    queued = False
+    shadow = selected.get("shadow")
+    if isinstance(shadow, dict):
+        ask = core_book._num(shadow.get("ask"))
+        occ = shadow.get("occ") or massive.occ_option_ticker(
+            ticker, shadow.get("expiry"), shadow.get("right") or live_pick.get("right"), shadow.get("strike"),
+        )
+        if occ and ask is not None and ask > 0 and shadow.get("expiry") and shadow.get("strike"):
+            shadow = {**shadow, "occ": occ}
+            selected = {**selected, "shadow": shadow}
+            queued = await _chain_shadow_enqueue({
+                "id": f"{live_pick.get('signal_id') or ticker}:{occ}",
+                "ticker": str(ticker).upper(),
+                "signal_id": live_pick.get("signal_id"),
+                "occ": occ,
+                "right": shadow.get("right"),
+                "expiry": shadow.get("expiry"),
+                "strike": shadow.get("strike"),
+                "entry_ask": ask,
+                "entry_delta": shadow.get("delta"),
+                "opened_at": live_pick.get("placed_at") or _utcnow().isoformat(),
+                "closed_at": None,
+                "exit_done": False,
+                "plus15_done": False,
+                "plus30_done": False,
+                "mfe_mid": None,
+                "mae_mid": None,
+            })
+    await _chain_shadow_record("chain_shadow_pick", _chain_shadow_pick_event(
+        ticker, live_pick, today, selected, selected.get("reasons") or {},
+        data.get("pages"), params, started, queued=queued,
+    ))
+
+
+async def _run_chain_shadow(ticker: str, live_pick: Dict[str, Any]) -> None:
+    try:
+        await asyncio.wait_for(
+            _chain_shadow_body(ticker, live_pick),
+            timeout=float(CHAIN_SHADOW_TIMEOUT_S),
+        )
+    except asyncio.TimeoutError:
+        logger.debug(f"[CHAIN SHADOW] {ticker} timed out")
+        await _chain_shadow_record_error(
+            ticker, live_pick, "timeout", "chain shadow exceeded the time budget",
+        )
+    except Exception as e:
+        logger.debug(f"[CHAIN SHADOW] {ticker} failed: {type(e).__name__}")
+        await _chain_shadow_record_error(ticker, live_pick, type(e).__name__, e)
+
+
+def _spawn_chain_shadow(ticker: str, live_pick: Optional[Dict[str, Any]]) -> None:
+    """Fire-and-forget. Never raises into the entry path. No Massive I/O here."""
+    try:
+        if not chain_shadow_enabled():
+            return
+        try:
+            if not massive.enabled():
+                return
+        except Exception:
+            return
+        snap = dict(live_pick or {})
+        coro = _run_chain_shadow(str(ticker or "").upper(), snap)
+        try:
+            task = asyncio.create_task(coro)
+        except Exception:
+            coro.close()
+            raise
+        _CHAIN_SHADOW_TASKS.add(task)
+        task.add_done_callback(_CHAIN_SHADOW_TASKS.discard)
+    except Exception as e:
+        logger.debug(f"[CHAIN SHADOW] spawn skipped: {type(e).__name__}")
+
+
+def _chain_shadow_job_id(raw: str) -> Optional[str]:
+    try:
+        job = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(job, dict) or not job.get("id"):
+        return None
+    return str(job.get("id"))
+
+
+async def _chain_shadow_commit(previous: List[str], kept: List[str]) -> None:
+    """Rewrite the shadow queue and refresh its TTL. Keep jobs enqueued mid-pass."""
+    try:
+        current = await state.list_read_live(CHAIN_SHADOW_OPEN_KEY)
+    except Exception:
+        current = list(previous)
+    prev_ids = {i for i in (_chain_shadow_job_id(raw) for raw in previous) if i}
+    kept_ids = {i for i in (_chain_shadow_job_id(raw) for raw in kept) if i}
+    extras = []
+    for raw in current:
+        ident = _chain_shadow_job_id(raw)
+        if ident and ident not in prev_ids and ident not in kept_ids:
+            extras.append(raw)
+    room = max(0, int(CHAIN_SHADOW_MAX_OPEN) - len(kept))
+    merged = list(kept) + extras[:room]
+    await state.list_write_capped_ex(
+        CHAIN_SHADOW_OPEN_KEY, merged, CHAIN_SHADOW_MAX_OPEN, CHAIN_SHADOW_TTL_S,
+    )
+
+
+def _chain_shadow_premium_views(entry_ask: Any, mid: Any, delta: Any) -> Dict[str, Any]:
+    ask = core_book._num(entry_ask)
+    mark = core_book._num(mid)
+    if ask is None or mark is None or ask <= 0 or mark <= 0:
+        return {
+            "premium_change": None, "premium_pct": None,
+            "per_dollar": None, "delta_normalized_pct": None,
+        }
+    change = mark - ask
+    pct = change / ask * 100.0
+    d = core_book._num(delta)
+    norm = None if d is None or abs(d) <= 0 else pct / abs(d)
+    return {
+        "premium_change": round(change, 6),
+        "premium_pct": round(pct, 6),
+        "per_dollar": round(change / ask, 6),
+        "delta_normalized_pct": None if norm is None else round(norm, 6),
+    }
+
+
+def _chain_shadow_pct(entry_ask: Any, mid: Any) -> Optional[float]:
+    return _chain_shadow_premium_views(entry_ask, mid, None).get("premium_pct")
+
+
+async def _chain_shadow_quote_mid(client: Any, job: Dict[str, Any]) -> Dict[str, Any]:
+    """One isolated-client NBBO. A non-live quote is unmeasured and never raises."""
+    try:
+        quote = await client.fetch_option_quote(
+            job.get("ticker"), job.get("expiry"), job.get("right"), float(job.get("strike")),
+        )
+    except Exception as e:
+        return {"measured": False, "detail": _scrub_secret(e)}
+    if not isinstance(quote, dict) or quote.get("live") is not True:
+        return {
+            "measured": False,
+            "bid": (quote or {}).get("bid") if isinstance(quote, dict) else None,
+            "ask": (quote or {}).get("ask") if isinstance(quote, dict) else None,
+            "timeframe": (quote or {}).get("timeframe") if isinstance(quote, dict) else None,
+            "quote_age_s": (quote or {}).get("age_s") if isinstance(quote, dict) else None,
+        }
+    bid, ask = core_book._num(quote.get("bid")), core_book._num(quote.get("ask"))
+    if bid is None or ask is None or bid <= 0 or ask < bid:
+        return {"measured": False, "bid": bid, "ask": ask, "timeframe": quote.get("timeframe")}
+    return {
+        "measured": True,
+        "bid": bid,
+        "ask": ask,
+        "mid": (bid + ask) / 2.0,
+        "timeframe": quote.get("timeframe"),
+        "quote_age_s": quote.get("age_s"),
+    }
+
+
+async def _chain_shadow_emit_mark(
+    job: Dict[str, Any],
+    horizon: str,
+    quote: Dict[str, Any],
+    now_dt: datetime,
+) -> bool:
+    views = _chain_shadow_premium_views(
+        job.get("entry_ask"), quote.get("mid"), job.get("entry_delta"),
+    )
+    payload = {
+        "ticker": job.get("ticker"),
+        "signal_id": job.get("signal_id"),
+        "occ": job.get("occ"),
+        "horizon": horizon,
+        "marked_at": now_dt.isoformat(),
+        "entry_ask": job.get("entry_ask"),
+        "entry_delta": job.get("entry_delta"),
+        "measured": bool(quote.get("measured")),
+        "bid": quote.get("bid"),
+        "ask": quote.get("ask"),
+        "mid": quote.get("mid"),
+        "timeframe": quote.get("timeframe"),
+        "quote_age_s": quote.get("quote_age_s"),
+        "mfe_pct": _chain_shadow_pct(job.get("entry_ask"), job.get("mfe_mid")),
+        "mae_pct": _chain_shadow_pct(job.get("entry_ask"), job.get("mae_mid")),
+        **views,
+    }
+    return await _chain_shadow_record("chain_shadow_mark", payload)
+
+
+def _chain_shadow_parse_ts(value: Any) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+async def _run_chain_shadow_marks(now: Optional[datetime] = None) -> int:
+    """Mark open shadows and the exit / +15 / +30 points. Own queue key only.
+
+    Re-reads CHAIN_SHADOW_ENABLED. Reads a position by its ticker key and
+    writes neither positions nor guards nor trades:exit_followups.
+    """
+    if not chain_shadow_enabled():
+        return 0
+    now_dt = now or _utcnow()
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    try:
+        raws = await state.list_read_live(CHAIN_SHADOW_OPEN_KEY)
+    except Exception as e:
+        logger.debug(f"[CHAIN SHADOW] queue unreadable: {type(e).__name__}")
+        return 0
+    if not raws:
+        return 0
+    client = massive.MassiveClient()
+    client.on_health = None
+    kept: List[str] = []
+    recorded = 0
+    for raw in list(raws):
+        try:
+            job = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(job, dict) or not job.get("ticker"):
+            continue
+        try:
+            pos = await state.get_position(str(job.get("ticker") or ""))
+        except Exception as e:
+            logger.debug(f"[CHAIN SHADOW] position read failed: {type(e).__name__}")
+            kept.append(json.dumps(job, sort_keys=True, default=str))
+            continue
+        if pos:
+            quote = await _chain_shadow_quote_mid(client, job)
+            mid = core_book._num(quote.get("mid")) if quote.get("measured") else None
+            if mid is not None:
+                prev_hi = core_book._num(job.get("mfe_mid"))
+                prev_lo = core_book._num(job.get("mae_mid"))
+                job["mfe_mid"] = mid if prev_hi is None else max(prev_hi, mid)
+                job["mae_mid"] = mid if prev_lo is None else min(prev_lo, mid)
+            kept.append(json.dumps(job, sort_keys=True, default=str))
+            continue
+        if not job.get("closed_at"):
+            job["closed_at"] = now_dt.isoformat()
+        closed = _chain_shadow_parse_ts(job.get("closed_at")) or now_dt
+        quote = await _chain_shadow_quote_mid(client, job)
+        if not job.get("exit_done"):
+            if not await _chain_shadow_emit_mark(job, "exit", quote, now_dt):
+                kept.append(json.dumps(job, sort_keys=True, default=str))
+                continue
+            job["exit_done"] = True
+            recorded += 1
+        if not job.get("plus15_done") and now_dt >= closed + timedelta(minutes=15):
+            if not await _chain_shadow_emit_mark(job, "15", quote, now_dt):
+                kept.append(json.dumps(job, sort_keys=True, default=str))
+                continue
+            job["plus15_done"] = True
+            recorded += 1
+        if not job.get("plus30_done") and now_dt >= closed + timedelta(minutes=30):
+            if not await _chain_shadow_emit_mark(job, "30", quote, now_dt):
+                kept.append(json.dumps(job, sort_keys=True, default=str))
+                continue
+            job["plus30_done"] = True
+            recorded += 1
+            continue
+        kept.append(json.dumps(job, sort_keys=True, default=str))
+    try:
+        await _chain_shadow_commit(list(raws), kept)
+    except Exception as e:
+        logger.debug(f"[CHAIN SHADOW] queue commit failed: {type(e).__name__}")
+    return recorded
+
+
+async def chain_shadow_worker() -> None:
+    """Mark worker. The kill switch is read on every loop, including while off."""
+    logger.info(
+        f"[CHAIN SHADOW] mark worker started — every {CHAIN_SHADOW_WORKER_SECONDS}s, "
+        f"enabled={chain_shadow_enabled()}"
+    )
+    while not _worker_stop:
+        try:
+            if chain_shadow_enabled():
+                await _run_chain_shadow_marks()
+        except Exception as e:
+            logger.error(f"[CHAIN SHADOW] loop error: {type(e).__name__}")
+        await asyncio.sleep(max(15, int(CHAIN_SHADOW_WORKER_SECONDS)))
+
+
+_CHAIN_SHADOW_T95 = (
+    (1, 12.706), (2, 4.303), (3, 3.182), (4, 2.776), (5, 2.571),
+    (6, 2.447), (7, 2.365), (8, 2.306), (9, 2.262), (10, 2.228),
+    (12, 2.179), (15, 2.131), (20, 2.086), (24, 2.064), (30, 2.042),
+    (40, 2.021), (60, 2.000), (120, 1.980),
+)
+
+
+def _chain_shadow_t95(df: int) -> float:
+    if df <= 0:
+        return 0.0
+    for limit, value in _CHAIN_SHADOW_T95:
+        if df <= limit:
+            return value
+    return 1.96
+
+
+def chain_shadow_mean_ci(values: Any) -> Dict[str, Any]:
+    """Mean and 95% Student-t interval. None bounds until there are two points."""
+    xs: List[float] = []
+    for value in values or []:
+        num = core_book._num(value)
+        if num is not None:
+            xs.append(float(num))
+    n = len(xs)
+    if n == 0:
+        return {"n": 0, "mean": None, "low": None, "high": None}
+    mean = statistics.mean(xs)
+    if n < 2:
+        return {"n": n, "mean": round(mean, 6), "low": None, "high": None}
+    half = _chain_shadow_t95(n - 1) * statistics.stdev(xs) / math.sqrt(n)
+    return {
+        "n": n,
+        "mean": round(mean, 6),
+        "low": round(mean - half, 6),
+        "high": round(mean + half, 6),
+    }
+
+
+def _chain_shadow_percentile(values: List[float], p: float) -> Optional[float]:
+    xs = [float(v) for v in values if core_book._num(v) is not None]
+    if not xs:
+        return None
+    xs.sort()
+    if len(xs) == 1:
+        return round(xs[0], 4)
+    k = (len(xs) - 1) * float(p)
+    lo = math.floor(k)
+    hi = math.ceil(k)
+    if lo == hi:
+        return round(xs[lo], 4)
+    weight = k - lo
+    return round(xs[lo] * (1.0 - weight) + xs[hi] * weight, 4)
+
+
+def chain_shadow_comparison_spec() -> Dict[str, Any]:
+    """The comparison that was fixed before any shadow sample is read."""
+    return {
+        "name": "massive_chain_greeks_vs_etrade_strike",
+        "registered_before_sample": True,
+        "min_pairs": CHAIN_SHADOW_MIN_PAIRS,
+        "min_pairs_is_flip_rule": False,
+        "live_flip_permitted": False,
+        "metrics": [
+            "same_contract_rate",
+            "same_window_same_contract_rate",
+            "delta_gap_mean_ci95",
+            "spread_gap_mean_ci95",
+            "exit_premium_pct_minus_live_ci95",
+            "plus30_premium_pct_minus_live_ci95",
+            "refusal_rate",
+        ],
+        "signoff_required": [
+            "TSIT Risk & Ops Monitor",
+            "Chief of Staff",
+            "Tommie",
+        ],
+        "note": CHAIN_SHADOW_COMPARISON_NOTE,
+    }
+
+
+def _chain_shadow_close_pct(data: Dict[str, Any]) -> Optional[float]:
+    """Live booked percent from a position_closed row. Not copied onto shadow events."""
+    raw = data.get("realized_pnl_pct")
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        raw = data.get("account_pnl_pct")
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return None
+    if not math.isfinite(float(raw)):
+        return None
+    return float(raw)
+
+
+def chain_shadow_report(records: Any) -> Dict[str, Any]:
+    """Read-only block for /pro-trader/report. Zero, partial, and complete samples."""
+    picks: List[Dict[str, Any]] = []
+    marks: List[Dict[str, Any]] = []
+    closes: Dict[str, float] = {}
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        event = str(rec.get("event") or "")
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else None
+        if data is None and event in CHAIN_SHADOW_EVENTS | {"position_closed"}:
+            data = rec
+        if not isinstance(data, dict):
+            continue
+        if event == "chain_shadow_pick":
+            picks.append(data)
+        elif event == "chain_shadow_mark":
+            marks.append(data)
+        elif event == "position_closed":
+            sid = str(data.get("signal_id") or "").strip()
+            pct = _chain_shadow_close_pct(data)
+            if sid and pct is not None:
+                closes[sid] = pct
+    n = len(picks)
+    same = [p for p in picks if p.get("same_contract") is True]
+    same_window = [p for p in picks if p.get("same_contract_same_window") is True]
+    refused = [p for p in picks if p.get("shadow") is None or p.get("refused") is True]
+    reasons: Dict[str, int] = {}
+    for pick in picks:
+        block = pick.get("reasons") if isinstance(pick.get("reasons"), dict) else {}
+        for key, count in block.items():
+            try:
+                reasons[str(key)] = reasons.get(str(key), 0) + int(count)
+            except (TypeError, ValueError):
+                continue
+    delta_gaps = [p.get("delta_gap") for p in picks if p.get("delta_gap") is not None]
+    spread_gaps = [p.get("spread_gap") for p in picks if p.get("spread_gap") is not None]
+    latencies = [p.get("latency_ms") for p in picks if p.get("latency_ms") is not None]
+
+    def _diff(horizon: str) -> List[float]:
+        out: List[float] = []
+        for mark in marks:
+            if str(mark.get("horizon")) != horizon:
+                continue
+            sid = str(mark.get("signal_id") or "").strip()
+            shadow_pct = core_book._num(mark.get("premium_pct"))
+            live_pct = closes.get(sid)
+            if shadow_pct is None or live_pct is None:
+                continue
+            out.append(float(shadow_pct) - float(live_pct))
+        return out
+
+    exit_diff = _diff("exit")
+    plus15_diff = _diff("15")
+    plus30_diff = _diff("30")
+    exit_ci = chain_shadow_mean_ci(exit_diff)
+    plus30_ci = chain_shadow_mean_ci(plus30_diff)
+    spec = chain_shadow_comparison_spec()
+    spec["measured"] = {
+        "picks": n,
+        "exit_pairs": len(exit_diff),
+        "plus30_pairs": len(plus30_diff),
+        "floor_met": len(exit_diff) >= CHAIN_SHADOW_MIN_PAIRS and len(plus30_diff) >= CHAIN_SHADOW_MIN_PAIRS,
+        "same_contract_rate": None if n == 0 else round(len(same) / n, 6),
+        "same_window_same_contract_rate": None if n == 0 else round(len(same_window) / n, 6),
+        "delta_gap_mean_ci95": chain_shadow_mean_ci(delta_gaps),
+        "spread_gap_mean_ci95": chain_shadow_mean_ci(spread_gaps),
+        "exit_premium_pct_minus_live_ci95": exit_ci,
+        "plus30_premium_pct_minus_live_ci95": plus30_ci,
+        "plus15_premium_pct_minus_live_ci95": chain_shadow_mean_ci(plus15_diff),
+        "refusal_rate": None if n == 0 else round(len(refused) / n, 6),
+        "action": "report_only",
+    }
+    def _rate(count: int) -> Optional[float]:
+        if n == 0:
+            return None
+        return round(100.0 * count / n, 1)
+
+    return {
+        "enabled_default": False,
+        "live_flip": False,
+        "n": n,
+        "same_contract_pct": _rate(len(same)),
+        "same_window_same_contract_pct": _rate(len(same_window)),
+        "mean_delta_gap": chain_shadow_mean_ci(delta_gaps)["mean"],
+        "mean_spread_gap": chain_shadow_mean_ci(spread_gaps)["mean"],
+        "exit_minus_live_pct": exit_ci["mean"],
+        "plus15_minus_live_pct": chain_shadow_mean_ci(plus15_diff)["mean"],
+        "plus30_minus_live_pct": plus30_ci["mean"],
+        "refusal_counts": reasons,
+        "refusal_rate": None if n == 0 else round(len(refused) / n, 6),
+        "latency_ms": {
+            "p50": _chain_shadow_percentile(latencies, 0.50),
+            "p95": _chain_shadow_percentile(latencies, 0.95),
+        },
+        "comparison": spec,
+    }
+
+
 # ==================== HARD SIZE CAP (5.80) ====================
 # The last word on size, for EVERY entry including app-decided ones. It never
 # resizes — a ticket that breaks it is refused outright, because a size this far
@@ -31335,6 +32725,29 @@ async def execute_live_order(payload: dict):
                         logger.info(
                             f"[EXIT AUTHORITY] {symbol} — {placement['reason']}; "
                             f"app tactical level {stop_premium:.2f} is NOT resting at the broker"
+                        )
+                    # Shadow only, after the stop is armed and the position stamp
+                    # above has run. The helper never raises; Massive I/O and the
+                    # ledger write happen inside the task.
+                    try:
+                        _spawn_chain_shadow(sym_u, build_chain_shadow_live_pick(
+                            ticker=sym_u,
+                            strike=strike,
+                            expiry=expiry,
+                            right=call_put,
+                            expression=expression,
+                            sender_honored=sender_honored,
+                            app_decides=app_decides,
+                            payload=payload,
+                            contract_liquidity=contract_liquidity,
+                            real_bid=real_bid,
+                            real_ask=real_ask,
+                            vol_annual=expression_vol,
+                            signal_id=signal_identity(payload),
+                        ))
+                    except Exception as e:
+                        logger.debug(
+                            f"[CHAIN SHADOW] {sym_u} spawn did not start: {type(e).__name__}"
                         )
                 else:
                     logger.warning(f"⚠️ {symbol} option entry has no derivable stop premium — no broker-side stop armed")
@@ -34622,6 +36035,7 @@ async def start_worker():
     asyncio.create_task(app_eyes_worker())
     asyncio.create_task(entry_paths_worker())
     asyncio.create_task(exit_followup_worker())
+    asyncio.create_task(chain_shadow_worker())
     await _start_scanner()
 
 
@@ -36051,6 +37465,11 @@ async def _pro_trader_report_payload() -> Dict[str, Any]:
     )
     report["mode"] = str(live_policy("pro_trader_mode") or "shadow")
     report["version"] = BOT_VERSION
+    try:
+        report["chain_shadow"] = chain_shadow_report(trade_ledger.recent(4000))
+    except Exception as e:
+        logger.warning(f"chain shadow report unreadable: {type(e).__name__}")
+        report["chain_shadow"] = chain_shadow_report([])
     return report
 
 
