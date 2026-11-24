@@ -13452,7 +13452,10 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # A blank-status protective stop or trail on the flatten open-order list
 # is UNKNOWN too: the stop is not cancelled, the close is not cancelled,
 # and nothing is sent (one deduped critical alert). The reconciler still
-# reads a blank status as OPEN.
+# reads a blank status as OPEN. A sibling close that is not confirmed
+# dead or filled blocks the same way: UNKNOWN, blank, and missing all
+# block, so the working flatten close is not cancelled and no replacement
+# is sent.
 BOT_VERSION = "5.98.0-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
@@ -32188,6 +32191,10 @@ async def _protection_blocks_replace(
     unreadable order returns immediately, so the caller does not cancel the
     working close. A live stop is cancelled only after that read says it is
     working, and the close is still not touched here.
+
+    Another close on the same symbol blocks unless it is confirmed dead
+    (cancelled, rejected, expired) or filled. UNKNOWN, blank, and missing
+    all block: nothing is cancelled and nothing is sent.
     """
     try:
         open_orders = await _flatten_open_orders()
@@ -32227,10 +32234,13 @@ async def _protection_blocks_replace(
             if oid not in live:
                 live.append(oid)
             continue
-        if action in reconciliation._CLOSING_ACTIONS and status in _FLATTEN_WORKING_STATUSES:
+        if action in reconciliation._CLOSING_ACTIONS:
+            if status in _FLATTEN_CLOSE_DEAD or status in _FLATTEN_FILLED_STATUSES:
+                continue
             await _alert_flatten(
                 pos, ticker, "protection_unknown",
-                f"{ticker}: another close {oid} is still {status} — no second close.",
+                f"{ticker}: another close {oid} is {status or 'unreadable'} "
+                f"— no cancel and no new order.",
                 now_et,
             )
             return True

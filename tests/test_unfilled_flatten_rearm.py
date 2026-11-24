@@ -1209,3 +1209,48 @@ def test_reconciler_still_treats_a_blank_order_status_as_open():
     assert main_bot.reconciliation.parse_open_orders(
         resp("   "), blank_as_open=False,
     )[0]["status"] == "UNKNOWN"
+
+
+def _sibling_close(status):
+    """A MARKET SELL_CLOSE whose status key may be missing or blank."""
+    row = _order_row("CLOSE-2", status)
+    row["OrderDetail"][0]["priceType"] = "MARKET"
+    return row
+
+
+@pytest.mark.parametrize("status", (_MISSING, ""), ids=("missing", "blank"))
+@pytest.mark.parametrize(
+    "close_status", ("OPEN", "EXPIRED"), ids=("replace", "dead"),
+)
+def test_blank_sibling_close_blocks_the_replacement(status, close_status, monkeypatch):
+    """An unconfirmed sibling close blocks both the replace and the dead path."""
+    when = _at(FULL, 15, 50)
+    rec = _arm(monkeypatch, when, _position(when), held=4)
+
+    class Client:
+        def list_orders(self, account_id_key, resp_format="json", count=25, marker=None, **kwargs):
+            assert marker is None
+            return {"OrdersResponse": {"Order": [
+                _broker_order("CLOSE-1", close_status),
+                _sibling_close(status),
+            ]}}
+
+        def list_order_details(self, *args, **kwargs):
+            raise AssertionError("the page already returned both closes")
+
+    _wire_client(monkeypatch, Client())
+    monkeypatch.setattr(main_bot, "_flatten_open_orders", _REAL_FLATTEN_OPEN)
+    _run()
+    _run()
+
+    assert rec["calls"].count("place") == 0
+    assert not any(isinstance(c, tuple) and c[0] == "cancel" for c in rec["calls"])
+    assert len(rec["alerts"]) == 1
+    alert = rec["alerts"][0]
+    assert alert["severity"] == "critical"
+    assert alert["event"] == "unfilled_flatten_replace"
+    assert "CLOSE-2" in alert["message"]
+    assert "UNKNOWN" in alert["message"]
+    assert "no cancel and no new order" in alert["message"]
+    assert alert["dedupe_key"] == "unfilled_flatten:SPY:protection_unknown"
+    assert rec["book"].pos["pending_flatten_close"]["order_id"] == "CLOSE-1"
