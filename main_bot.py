@@ -11910,6 +11910,7 @@ Pure translators (no I/O) are unit-tested in test_bot_fixes.py.
 """
 from __future__ import annotations
 
+import copy
 import math
 import os
 import time
@@ -12246,9 +12247,18 @@ class MassiveClient:
             if adv is not None:
                 self._adv[sym] = adv
 
-    async def fetch_quote_response(self, symbols: List[str]) -> Dict[str, Any]:
+    async def fetch_quote_response(self, symbols: List[str], *, dry_run: bool = False) -> Dict[str, Any]:
         """Massive snapshot for `symbols`, returned in E*TRADE QuoteResponse shape.
-        Raises on transport/auth failure so the caller can fall back."""
+        Raises on transport/auth failure so the caller can fall back.
+
+        `dry_run` (keyword-only, default False) runs the same read on a copy of
+        this client. Live counters, the ADV cache, last-ok/error, and the
+        on_health hook are not touched. The live call does not pass it.
+        """
+        if dry_run:
+            shadow = copy.deepcopy(self)
+            shadow.on_health = None
+            return await MassiveClient.fetch_quote_response(shadow, symbols)
         import httpx  # local: keeps the pure translators importable without httpx
 
         syms = [s.strip().upper() for s in symbols if s and s.strip()]
@@ -12861,6 +12871,7 @@ from typing import Optional, Dict, Any, List, Tuple
 import httpx
 import pyetrade
 import os
+import copy
 import json
 import math
 import re
@@ -13080,7 +13091,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # MARKET/LIMIT Good-for-Day, 24/7 session (no equity calendar gate).
 # 5.87.1: pin Individual Crypto 888103-8595 as the crypto-only routing target
 # (dash-tolerant id match, Redis crypto pin, refuse crypto as options pin).
-BOT_VERSION = "5.92.0-pro-day-trader"
+BOT_VERSION = "5.93.0-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -13594,6 +13605,23 @@ CALL_INDEX_VWAP_SYMBOLS = tuple(
     for s in os.getenv("CALL_INDEX_VWAP_SYMBOLS", "SPY,QQQ").split(",")
     if s.strip()
 ) or ("SPY", "QQQ")
+
+
+def call_index_vwap_gate_status() -> Dict[str, Any]:
+    """Read-only /status view. Re-reads the env at call time.
+
+    The gate itself keeps the import-time `CALL_INDEX_VWAP_GATE` value and
+    its fail-closed behavior. This does not change either. `enabled` is the
+    effective boolean (`true` only), and `symbols` is the same list the gate
+    was given, uppercased, with the SPY,QQQ default when the env is blank.
+    """
+    enabled = os.getenv("CALL_INDEX_VWAP_GATE", "true").lower() == "true"
+    symbols = [
+        s.strip().upper()
+        for s in os.getenv("CALL_INDEX_VWAP_SYMBOLS", "SPY,QQQ").split(",")
+        if s.strip()
+    ] or ["SPY", "QQQ"]
+    return {"enabled": enabled, "symbols": symbols, "mode": "fail_closed"}
 # Pro Day Trader realignment. Shadow classifies and records verdicts without
 # changing an order. Active may only block or scale size down.
 import pro_trader
@@ -14440,7 +14468,11 @@ def _payload_option_right(p: dict) -> str:
     return ""
 
 
-async def _index_vwap_quotes(symbols: Tuple[str, ...] = CALL_INDEX_VWAP_SYMBOLS) -> List[Dict[str, Any]]:
+async def _index_vwap_quotes(
+    symbols: Tuple[str, ...] = CALL_INDEX_VWAP_SYMBOLS,
+    *,
+    dry_run: bool = False,
+) -> List[Dict[str, Any]]:
     """SPY/QQQ last + day VWAP for the call gate. Prefers the broker VWAP
     field; falls back to the scanner's sampled session VWAP when the quote
     omits it. A total fetch failure returns rows with no VWAP; the gate
@@ -14450,7 +14482,9 @@ async def _index_vwap_quotes(symbols: Tuple[str, ...] = CALL_INDEX_VWAP_SYMBOLS)
         return []
     quotes: List[Dict[str, Any]] = []
     try:
-        raw = await _scanner_fetch_quotes(syms)
+        raw = await (
+            _scanner_fetch_quotes(syms, dry_run=True) if dry_run else _scanner_fetch_quotes(syms)
+        )
         quotes = scanner_mod.parse_quotes(raw)
     except Exception as e:
         logger.warning(f"call-index VWAP quote fetch failed ({e})")
@@ -14476,7 +14510,7 @@ async def _index_vwap_quotes(symbols: Tuple[str, ...] = CALL_INDEX_VWAP_SYMBOLS)
     return out
 
 
-async def _call_index_vwap_block(p: dict) -> Optional[str]:
+async def _call_index_vwap_block(p: dict, *, dry_run: bool = False) -> Optional[str]:
     """Live CALL-vs-index-VWAP check. Fail-closed when VWAP is unmeasured."""
     if not CALL_INDEX_VWAP_GATE:
         return None
@@ -14484,7 +14518,7 @@ async def _call_index_vwap_block(p: dict) -> Optional[str]:
     if right != "CALL":
         return None
     try:
-        quotes = await _index_vwap_quotes()
+        quotes = await _index_vwap_quotes(dry_run=True) if dry_run else await _index_vwap_quotes()
         return assess_call_index_vwap_gate(right, quotes, enabled=True)
     except Exception as e:
         logger.warning(f"call-index VWAP gate unavailable (CALL entry blocked): {e}")
@@ -15490,6 +15524,8 @@ async def _assess_portfolio_risk(
     p: dict,
     edge_verdict: Optional[Dict[str, Any]] = None,
     learning_snapshot: Optional[Dict[str, Any]] = None,
+    *,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Book-, regime- and evidence-level verdict for ONE entry (capacity is
     judged later, at the real quote). Returns allowed/reasons/weight plus every
@@ -15512,7 +15548,9 @@ async def _assess_portfolio_risk(
     corr: Optional[Dict[str, Any]] = None
     try:
         positions = await state.all_positions()
-        account_ref = await _risk_account_reference()
+        account_ref = await (
+            _risk_account_reference(dry_run=True) if dry_run else _risk_account_reference()
+        )
         risk_pct = live_policy("risk_per_trade_pct")
         nominal = account_ref * (risk_pct / 100.0)
         new_risk = max(nominal, estimate_entry_risk_usd(p) or 0.0)
@@ -15934,7 +15972,7 @@ def _pro_trader_candidate(p: dict) -> Dict[str, Any]:
     }
 
 
-async def _pro_trader_observation(p: dict) -> Dict[str, Any]:
+async def _pro_trader_observation(p: dict, *, dry_run: bool = False) -> Dict[str, Any]:
     now_et = _utcnow().astimezone(_ET_ZONE)
     minute = now_et.hour * 60 + now_et.minute
     event = False
@@ -15944,7 +15982,8 @@ async def _pro_trader_observation(p: dict) -> Dict[str, Any]:
         event = False
     spy = qqq = None
     try:
-        for row in snapshot_index_vs_vwap(await _index_vwap_quotes()):
+        index_quotes = await _index_vwap_quotes(dry_run=True) if dry_run else await _index_vwap_quotes()
+        for row in snapshot_index_vs_vwap(index_quotes):
             if row.get("symbol") == "SPY":
                 spy = row.get("vs_vwap_pct")
             elif row.get("symbol") == "QQQ":
@@ -15973,15 +16012,22 @@ async def _pro_trader_observation(p: dict) -> Dict[str, Any]:
     }
 
 
-async def _fold_pro_trader(p: dict, blocked: List[str]) -> List[str]:
-    """Attach a pro-trader decision. Active mode may append a block. Shadow does not."""
+async def _fold_pro_trader(p: dict, blocked: List[str], *, dry_run: bool = False) -> List[str]:
+    """Attach a pro-trader decision. Active mode may append a block. Shadow does not.
+
+    `dry_run` is keyword-only and defaults False. Only /explain passes True.
+    The live call evaluates `_PRO_TRADER` and persists it, unchanged. A dry run
+    evaluates `copy.deepcopy` of that desk and does not persist.
+    """
     mode = str(live_policy("pro_trader_mode") or "shadow")
     if mode == "off" or _is_connectivity_test(p) or str(p.get("instrument") or "").lower() == "crypto":
         return blocked
+    desk = copy.deepcopy(_PRO_TRADER) if dry_run else _PRO_TRADER
     try:
         daily = await state.get_trading_day()
-        decision = _PRO_TRADER.evaluate(
-            await _pro_trader_observation(p),
+        observation = await _pro_trader_observation(p, dry_run=True) if dry_run else await _pro_trader_observation(p)
+        decision = desk.evaluate(
+            observation,
             _pro_trader_candidate(p),
             mode=mode,
             configured_risk_pct=float(live_policy("risk_per_trade_pct") or 8),
@@ -15996,7 +16042,8 @@ async def _fold_pro_trader(p: dict, blocked: List[str]) -> List[str]:
             blocked.append("pro trader unavailable — active mode stands down")
         return blocked
     p["_pro_trader"] = decision
-    await _persist_desk()
+    if not dry_run:
+        await _persist_desk()
     if mode == "active" and decision.get("verdict") == "BLOCK":
         blocked.append(str(decision.get("summary") or "pro trader blocked"))
     elif mode == "shadow":
@@ -16049,7 +16096,7 @@ async def _note_pro_trader_decision(pd: dict, accepted: bool) -> None:
         logger.warning(f"pro trader decision was not recorded: {e}")
 
 
-async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
+async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool, List[str]]:
     """Server-side re-filter mirroring the Rork app's gating, evaluated against
     the reconciled Redis state (single source of truth). Quality checks apply
     only when the payload carries the field (score/rvol/mtf/setup); risk
@@ -16062,7 +16109,20 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     `REJECTED - rvol 1 < 1.5; setup 'Connectivity Test' not allowlisted`,
     leaving the user with no way to prove the real-money path works. Every
     RISK gate below still applies to a probe — kill switch, daily loss, trade
-    count, position cap, portfolio heat and duplicate ticker are absolute."""
+    count, position cap, portfolio heat and duplicate ticker are absolute.
+
+    `dry_run` is keyword-only and defaults False. Only /explain passes True.
+    The live path calls the same helpers with no extra arguments."""
+    async def _risk_ref() -> float:
+        if dry_run:
+            return await _risk_account_reference(dry_run=True)
+        return await _risk_account_reference()
+
+    async def _fold(reasons: List[str]) -> List[str]:
+        if dry_run:
+            return await _fold_pro_trader(p, reasons, dry_run=True)
+        return await _fold_pro_trader(p, reasons)
+
     blocked: List[str] = []
     if await state.is_killed():
         blocked.append("kill switch active")
@@ -16075,7 +16135,7 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     # falling tape is not a quality opinion, it is a regime the book already
     # lost money on. Probes skip it so connectivity tests still prove the path.
     if not is_probe and not is_crypto:
-        vwap_block = await _call_index_vwap_block(p)
+        vwap_block = await _call_index_vwap_block(p, dry_run=True) if dry_run else await _call_index_vwap_block(p)
         if vwap_block:
             blocked.append(vwap_block)
             logger.warning(f"📉 INDEX VWAP — {vwap_block}")
@@ -16112,7 +16172,7 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
                 live_policy("daily_loss_limit_pct"),
                 sum(position_risk_usd(x) for x in positions_a.values()),
                 estimate_entry_risk_usd(p),
-                await _risk_account_reference(),
+                await _risk_ref(),
                 MAX_CONCURRENT_POSITIONS,
                 APP_MAX_OPEN_RISK_PCT,
             ))
@@ -16177,13 +16237,13 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
                     live_policy("daily_loss_limit_pct"),
                     sum(position_risk_usd(x) for x in positions_a.values()),
                     estimate_entry_risk_usd(p),
-                    await _risk_account_reference(),
+                    await _risk_ref(),
                     MAX_CONCURRENT_POSITIONS,
                     APP_MAX_OPEN_RISK_PCT,
                 ))
             except Exception as e:
                 blocked.append(f"app book limits unreadable ({str(e)[:80]}) — entry refused")
-        blocked = await _fold_pro_trader(p, blocked)
+        blocked = await _fold(blocked)
         if blocked:
             logger.warning(f"📱 APP DECIDES — {ticker_m or 'entry'} refused: {' · '.join(blocked)}")
         else:
@@ -16285,7 +16345,11 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
         # gap pause, and (with REQUIRE_PROVEN_EV) the evidence class. Sizing
         # weights and order-book capacity are applied at placement.
         try:
-            book_risk = await _assess_portfolio_risk(p, edge_verdict=edge_verdict)
+            book_risk = await (
+                _assess_portfolio_risk(p, edge_verdict=edge_verdict, dry_run=True)
+                if dry_run else
+                _assess_portfolio_risk(p, edge_verdict=edge_verdict)
+            )
             if not book_risk["allowed"]:
                 blocked.extend(book_risk["reasons"])
                 logger.warning(f"🧩 PORTFOLIO RISK — {'; '.join(book_risk['reasons'])}")
@@ -16376,7 +16440,7 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
 
     # The account every dollar gate below is measured against — REAL broker
     # equity, not a static env default. See _risk_account_reference.
-    account_ref = await _risk_account_reference()
+    account_ref = await _risk_ref()
     # What THIS entry actually risks, read from the contract in the payload.
     # None when unmeasurable; the nominal figure is the floor either way.
     actual_risk = estimate_entry_risk_usd(p)
@@ -16442,11 +16506,11 @@ async def _passes_entry_filters(p: dict) -> Tuple[bool, List[str]]:
     if floor["blocked"]:
         blocked.append(floor["reason"])
 
-    blocked = await _fold_pro_trader(p, blocked)
+    blocked = await _fold(blocked)
     return len(blocked) == 0, blocked
 
 
-async def _risk_account_reference() -> float:
+async def _risk_account_reference(*, dry_run: bool = False) -> float:
     """The account size every risk gate is measured against, in REAL dollars.
 
     This used to be `os.getenv("ACCOUNT_SIZE", "50000")` — a static default that
@@ -16475,7 +16539,7 @@ async def _risk_account_reference() -> float:
         env_ref = 50000.0
 
     try:
-        live = await _live_equity()
+        live = await _live_equity(dry_run=True) if dry_run else await _live_equity()
         if live is not None and math.isfinite(live) and live > 0:
             return float(live)
     except Exception as e:
@@ -27153,7 +27217,7 @@ async def _get_balance_compat(accounts: "pyetrade.ETradeAccounts", acct: Dict[st
     raise last_error or TypeError("get_account_balance: no compatible signature found")
 
 
-async def _fetch_broker_balance() -> Optional[Dict[str, Optional[float]]]:
+async def _fetch_broker_balance(*, dry_run: bool = False) -> Optional[Dict[str, Optional[float]]]:
     """ONE E*TRADE balance call → {'total': totalAccountValue, 'available':
     cash available for new orders}. Returns None on any failure — callers
     decide whether to fail closed or fall back to the tracked snapshot."""
@@ -27187,7 +27251,7 @@ async def _fetch_broker_balance() -> Optional[Dict[str, Optional[float]]]:
         # daily loss limit falls back to when the token later expires — written
         # here, at the single point where equity is actually observed, so no
         # future call site can forget to record it.
-        if total is not None:
+        if total is not None and not dry_run:
             try:
                 await state.set_equity_snapshot(total)
             except Exception as e:
@@ -27207,11 +27271,11 @@ async def _fetch_broker_balance() -> Optional[Dict[str, Optional[float]]]:
         return None
 
 
-async def _live_equity() -> Optional[float]:
+async def _live_equity(*, dry_run: bool = False) -> Optional[float]:
     """Fetch real account equity from E*TRADE. Returns None on any failure —
     live sizing must FAIL CLOSED (reject the trade) rather than silently size
     off a default."""
-    bal = await _fetch_broker_balance()
+    bal = await _fetch_broker_balance(dry_run=True) if dry_run else await _fetch_broker_balance()
     return (bal or {}).get("total")
 
 
@@ -27483,14 +27547,14 @@ def _clamp_option_stop_premium(candidate: float, fill_ref: float) -> tuple:
     return round(stop, 2), ""
 
 
-async def _day_risk_budget() -> Dict[str, Any]:
+async def _day_risk_budget(*, dry_run: bool = False) -> Dict[str, Any]:
     """The day's dollar risk budget for a PRICED entry — read only.
 
     One assembly shared by the priced-risk gate and the /explain dry run, so
     the budget a dry run reports is the budget placement would enforce.
     Raises on failure; each caller decides what an unavailable budget means.
     """
-    account_ref = await _risk_account_reference()
+    account_ref = await _risk_account_reference(dry_run=True) if dry_run else await _risk_account_reference()
     daily = await state.get_daily()
     open_positions = await state.all_positions()
     open_risk_usd = sum(position_risk_usd(pos) for pos in open_positions.values())
@@ -31061,8 +31125,25 @@ def _massive_adv_cache() -> Dict[str, Any]:
     }
 
 
-async def _scanner_fetch_quotes(symbols: List[str]) -> Dict[str, Any]:
-    """Batched quote read for the scanner: Massive first, E*TRADE fallback."""
+async def _scanner_fetch_quotes_readonly(symbols: List[str]) -> Dict[str, Any]:
+    """The /explain quote read. Same sources, no counter, source, or Redis writes."""
+    if massive.enabled():
+        try:
+            return await massive_client.fetch_quote_response(list(symbols), dry_run=True)
+        except Exception as e:
+            logger.warning(f"Massive quote fetch failed ({e}) — falling back to E*TRADE")
+    return await _scanner_fetch_etrade_quotes(symbols)
+
+
+async def _scanner_fetch_quotes(symbols: List[str], *, dry_run: bool = False) -> Dict[str, Any]:
+    """Batched quote read for the scanner: Massive first, E*TRADE fallback.
+
+    `dry_run` is keyword-only and defaults False. The live body below is the
+    original path. Only /explain passes True, and that returns before any
+    persist or counter update on the live client.
+    """
+    if dry_run:
+        return await _scanner_fetch_quotes_readonly(symbols)
     if massive.enabled():
         try:
             resp = await massive_client.fetch_quote_response(list(symbols))
@@ -32067,8 +32148,10 @@ async def process_signal(pd: dict, replay: bool = False) -> dict:
 # the entry filters, the reprice/resize, the filled-shape gate, the armed-stop
 # clamp and the priced-risk recheck, and returns the basis and the dollars at
 # risk. It takes no idempotency key, sets no cooldown, queues nothing, records
-# no ledger event, arms no guard and writes no position. The only broker call
-# is the read-only chain lookup the real placement also makes.
+# no ledger event, arms no guard and writes no position. Filters run with
+# dry_run=True: the pro desk is evaluated on a copy, and quote reads do not
+# persist feed health or bump feed counters. The only broker call is the
+# read-only chain lookup the real placement also makes.
 @app.post("/explain")
 async def explain(
     request: Request,
@@ -32095,7 +32178,7 @@ async def explain(
 async def _explain_budget() -> Optional[Dict[str, Any]]:
     """The same day budget `_priced_option_risk_gate` enforces — read only."""
     try:
-        budget = await _day_risk_budget()
+        budget = await _day_risk_budget(dry_run=True)
         return {"remaining_usd": budget["remaining_usd"], "base_budget_usd": budget["base_budget_usd"]}
     except Exception as e:
         logger.warning(f"explain: risk budget unavailable (reported as unmeasured): {e}")
@@ -32118,9 +32201,9 @@ async def explain_signal(pd: dict) -> Dict[str, Any]:
                 "reason": "explain covers entries — a close always passes entry gating"}
 
     try:
-        filters_ok, blocked = await _passes_entry_filters(pd)
+        filters_ok, blocked = await _passes_entry_filters(pd, dry_run=True)
     except Exception as e:
-        filters_ok, blocked = True, []
+        filters_ok, blocked = False, [f"filters_error: {type(e).__name__}"]
         base["filters_error"] = str(e)[:200]
     base["filters"] = {"passed": filters_ok, "blocked_by": blocked}
     if isinstance(pd.get("_pro_trader"), dict):
@@ -32319,6 +32402,9 @@ async def status():
             "core_book_enabled": CORE_BOOK_ENABLED,
             "itm_expression_enabled": ITM_EXPRESSION_ENABLED,
             "day_trade_mode": DAY_TRADE_MODE,
+            # Read-only. Effective env value at request time; the gate still
+            # uses the import-time constant and fails closed when VWAP is missing.
+            "call_index_vwap_gate": call_index_vwap_gate_status(),
             "require_proven_ev": REQUIRE_PROVEN_EV,
             "risk_per_trade_pct": live_policy("risk_per_trade_pct"),
             "daily_loss_limit_pct": live_policy("daily_loss_limit_pct"),
