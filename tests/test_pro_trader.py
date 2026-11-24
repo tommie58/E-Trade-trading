@@ -349,6 +349,11 @@ def test_policy_accepts_mode_and_trade_target():
 
 
 def test_pro_trader_endpoints_use_the_webhook_secret(monkeypatch):
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    # Full session, so the displayed flatten stays 15:40 even if CI runs on a half day.
+    frozen = datetime(2026, 11, 24, 14, 0, tzinfo=ZoneInfo("America/New_York"))
+    monkeypatch.setattr(main_bot, "_utcnow", lambda: frozen.astimezone(timezone.utc))
     monkeypatch.setattr(main_bot, "WEBHOOK_SECRET", "s3cret")
     with TestClient(main_bot.app) as client:
         denied = client.get("/pro-trader/status")

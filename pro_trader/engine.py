@@ -149,12 +149,14 @@ def evaluate(
         decision["pacing"] = pace_state(
             (observation or {}).get("minute_et") if isinstance(observation, dict) else None,
             trades_completed, min_trades,
+            (observation or {}).get("close_minute") if isinstance(observation, dict) else None,
         )
         return decision
     classification, memory_out = classify(observation, memory)
     pace = pace_state(
         (observation or {}).get("minute_et") if isinstance(observation, dict) else None,
         trades_completed, min_trades,
+        (observation or {}).get("close_minute") if isinstance(observation, dict) else None,
     )
     cand = dict(candidate or {})
     if realized_pnl_today_pct is not None and cand.get("realized_pnl_today_pct") is None:

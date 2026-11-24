@@ -31,6 +31,27 @@ FASTER_BREAKEVEN_TRIGGER_PCT = 0.05
 TRAIL_SEQUENCE = ("STOP", "breakeven_locked", "TRAILING_STOP_CNST")
 FLATTEN_ET = "15:40"
 
+
+def flatten_et_label(close_minute: Any = None) -> str:
+    """Display clock for today's flatten. A 16:00 close stays ``15:40``.
+
+    A shorter session shows 20 minutes before that close (13:00 → ``12:40``).
+    Unknown stays the full-day label. This does not move the flatten itself.
+    """
+    if isinstance(close_minute, bool) or close_minute is None:
+        return FLATTEN_ET
+    try:
+        close = int(close_minute)
+    except (TypeError, ValueError):
+        return FLATTEN_ET
+    if close >= 16 * 60:
+        return FLATTEN_ET
+    flat = close - 20
+    if flat < 0:
+        return FLATTEN_ET
+    hour, minute = divmod(flat, 60)
+    return f"{hour:02d}:{minute:02d}"
+
 HARD_RAILS = {
     "max_size_multiplier": MAX_SIZE_MULTIPLIER,
     "min_size_multiplier": MIN_SIZE_MULTIPLIER,
