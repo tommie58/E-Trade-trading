@@ -15417,7 +15417,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # still fail-closes when the two disagree or the Massive side is missing
 # or stale. GET /pro-trader/report includes the gap in basis points.
 # /status positions_open is the open book with status, side, and qty.
-BOT_VERSION = "5.99.6-pro-day-trader"
+BOT_VERSION = "5.99.10-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -16455,6 +16455,9 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 logging.basicConfig(level=logging.INFO)
+# httpx logs every request URL at INFO. Those URLs contain the accountIdKey.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("etrade-bot")
 
 app = FastAPI(title="E*TRADE Trading Bot")
