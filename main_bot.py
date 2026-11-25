@@ -1344,6 +1344,11 @@ class StateStore:
             if current.get(field) is True and merged.get(field) is not True:
                 merged[field] = True
                 reverted.append(field)
+        stored_heat = str(current.get("_heat_reservation_id") or "").strip()
+        incoming_heat = str(merged.get("_heat_reservation_id") or "").strip()
+        if stored_heat and incoming_heat != stored_heat:
+            merged["_heat_reservation_id"] = current.get("_heat_reservation_id")
+            reverted.append("_heat_reservation_id")
         if reverted:
             logger.warning(
                 f"[STATE] {ticker} stale position write blocked from reverting "
@@ -7448,6 +7453,7 @@ DESIGN RULES (same as edge.py / learning.py)
 """
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -7656,12 +7662,12 @@ def assess_correlation(
 VIX_PAUSE = 35.0
 SPY_RANGE_PAUSE = 3.0
 SPY_GAP_PAUSE = 2.0
-# Cash open through the opening range. A verified index gap at or above
-# SPY_GAP_PAUSE is still price discovery here, so new entries stay paused.
-# After this, a settled tape (real range, healthy feed, healthy spread) may
-# take a structure setup at SPY_GAP_SETTLED_WEIGHT instead of sitting out
-# the rest of the session. 2026-11-23 was a genuine +5.004% SPY gap
-# (724.33 vs 689.81) and the old rule paused all 268 scans.
+# Cash open through the whole session. A verified index gap at or above
+# SPY_GAP_PAUSE is price discovery for the day: no new entries from either
+# scanner or the app. 5.99.7 restores that full-day sit-out. The stabilize
+# window and the half-size weight stay defined (PR #16) and no longer
+# release the book. 2026-11-23 was a genuine +5.004% SPY gap (724.33 vs
+# 689.81). 2026-11-25 was −2.17% and the half-size release traded it.
 SPY_GAP_STABILIZE_MINUTES = 30.0
 SPY_GAP_SETTLED_WEIGHT = 0.5
 # Wider than any modern SPY cash gap, including the 2020 limit days. Above
@@ -7886,8 +7892,85 @@ def index_gap_context(
     }
 
 
+_SPY_GAP_SIT_OUT: Dict[str, Any] = {
+    "day": None,
+    "active": False,
+    "gap_pct": None,
+    "reason": None,
+    "logged": False,
+    "alerted": False,
+}
+
+
+def spy_gap_sit_out_reason(spy_gap: Any, verified: Any) -> Optional[str]:
+    """Full-day sit-out text for a verified opening gap at or above 2%.
+
+    `verified is False` is a bad reference and does not sit the book out.
+    A missing flag (legacy context that only carried the number) still
+    sits out. Pure.
+    """
+    gap = _finite(spy_gap)
+    if gap is None or abs(gap) + 1e-12 < SPY_GAP_PAUSE:
+        return None
+    if verified is False:
+        return None
+    return (
+        f"regime pause: SPY opened {gap:+.2f}% — index gap ≥ {SPY_GAP_PAUSE:g}% "
+        "(full-day sit-out, no new entries)"
+    )
+
+
+def remember_spy_gap_sit_out(spy_gap: Any, verified: Any, day: str) -> Optional[str]:
+    """Record today's sit-out. Logs once. Returns the reason when active."""
+    reason = spy_gap_sit_out_reason(spy_gap, verified)
+    if not reason:
+        return None
+    day_s = str(day or "")
+    if _SPY_GAP_SIT_OUT.get("day") == day_s and _SPY_GAP_SIT_OUT.get("active"):
+        return str(_SPY_GAP_SIT_OUT.get("reason") or reason)
+    gap = _finite(spy_gap)
+    _SPY_GAP_SIT_OUT.update({
+        "day": day_s,
+        "active": True,
+        "gap_pct": None if gap is None else round(float(gap), 3),
+        "reason": reason,
+        "logged": True,
+        "alerted": False,
+    })
+    logging.getLogger("etrade-bot").warning(f"SPY GAP SIT-OUT — {reason}")
+    return reason
+
+
+def spy_gap_sit_out_view(day: str) -> Dict[str, Any]:
+    """Today's sit-out, or inactive when the stored day is not `day`."""
+    day_s = str(day or "")
+    if _SPY_GAP_SIT_OUT.get("day") != day_s or not _SPY_GAP_SIT_OUT.get("active"):
+        return {
+            "active": False, "gap_pct": None, "reason": None,
+            "day": day_s, "alerted": False,
+        }
+    return {
+        "active": True,
+        "gap_pct": _SPY_GAP_SIT_OUT.get("gap_pct"),
+        "reason": _SPY_GAP_SIT_OUT.get("reason"),
+        "day": day_s,
+        "alerted": bool(_SPY_GAP_SIT_OUT.get("alerted")),
+    }
+
+
+def mark_spy_gap_sit_out_alerted() -> None:
+    _SPY_GAP_SIT_OUT["alerted"] = True
+
+
+def clear_spy_gap_sit_out() -> None:
+    _SPY_GAP_SIT_OUT.update({
+        "day": None, "active": False, "gap_pct": None,
+        "reason": None, "logged": False, "alerted": False,
+    })
+
+
 def _spy_gap_settled(tape: Dict[str, Any]) -> bool:
-    """True when a verified gap day may take a reduced-size structure setup."""
+    """Legacy tape check from PR #16. The full-day sit-out does not call it."""
     minutes = _finite(tape.get("minutes_since_open"))
     stabilize = _finite(tape.get("stabilize_minutes"))
     if stabilize is None:
@@ -7911,9 +7994,8 @@ def assess_regime_sizing(
 ) -> Dict[str, Any]:
     """{pause, weight, reasons (pause), notes (trims)} for one entry.
 
-    A verified SPY gap at or above SPY_GAP_PAUSE pauses through the open
-    stabilization window. Once `tape` shows a settled session it sizes a
-    structure setup down instead of pausing. An unverified gap
+    A verified SPY gap at or above SPY_GAP_PAUSE pauses for the whole
+    session. `tape` does not release it. An unverified gap
     (`spy_gap_verified is False`) is ignored — a bad reference is not a
     crisis. A legacy context that carries only the number still pauses,
     which is the safe direction when nobody has checked the bar.
@@ -7933,20 +8015,10 @@ def assess_regime_sizing(
             notes.append(
                 f"SPY gap {spy_gap:+.2f}% unverified — pause not applied"
             )
-        elif _spy_gap_settled(tape or {}):
-            settled = _finite((tape or {}).get("settled_weight"))
-            if settled is None:
-                settled = SPY_GAP_SETTLED_WEIGHT
-            settled = min(1.0, max(0.05, float(settled)))
-            weights.append(settled)
-            notes.append(
-                f"SPY gap {spy_gap:+.2f}% ≥ {SPY_GAP_PAUSE:g}% — open stabilization passed "
-                f"with structure and healthy feeds/spreads → ×{settled:g}"
-            )
         else:
-            reasons.append(
-                f"regime pause: SPY opened {spy_gap:+.2f}% — index gap ≥ {SPY_GAP_PAUSE:g}%"
-            )
+            reason = spy_gap_sit_out_reason(spy_gap, verified)
+            if reason:
+                reasons.append(reason)
     if earnings is True:
         reasons.append("gap risk: earnings inside the holding window — the print gaps through any stop")
     if name_gap is not None and abs(name_gap) >= NAME_GAP_PAUSE:
@@ -8168,7 +8240,8 @@ def book_report(book: List[Dict[str, Any]], account_usd: float, regime: Any = No
 def thresholds() -> Dict[str, Any]:
     return {
         "correlated_risk_mult": CORRELATED_RISK_MULT, "max_cluster_same_side": MAX_CLUSTER_SAME_SIDE,
-        "vix_pause": VIX_PAUSE, "spy_range_pause": SPY_RANGE_PAUSE, "spy_gap_pause": SPY_GAP_PAUSE,
+        "vix_pause": VIX_PAUSE, "spy_range_pause": SPY_RANGE_PAUSE,         "spy_gap_pause": SPY_GAP_PAUSE,
+        "spy_gap_full_day_sit_out": True,
         "spy_gap_stabilize_minutes": SPY_GAP_STABILIZE_MINUTES,
         "spy_gap_settled_weight": SPY_GAP_SETTLED_WEIGHT,
         "spy_gap_max_trust_pct": SPY_GAP_MAX_TRUST_PCT,
@@ -11442,6 +11515,13 @@ def build_risk_context(quote: Dict[str, Any], quotes_by_symbol: Dict[str, Any]) 
         vendor_change=quote.get("change_close"),
         vendor_change_pct=quote.get("change_close_pct"),
     )
+    try:
+        sit_day = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+        risk_mod.remember_spy_gap_sit_out(
+            index.get("spy_gap_pct"), index.get("spy_gap_verified"), sit_day,
+        )
+    except Exception as exc:
+        logger.warning(f"SPY gap sit-out note failed: {exc}")
     return risk_mod.sanitize_risk_context({
         "gap_pct": name_gap["gap_pct"] if name_gap["verified"] else None,
         "spy_range_pct": round(spy_range, 3) if spy_range is not None else None,
@@ -12062,6 +12142,18 @@ class Scanner:
                     )
                 except Exception:
                     logger.debug("scanner alert failed", exc_info=True)
+
+        try:
+            sit_day = now_et.date().isoformat()
+            sit = risk_mod.spy_gap_sit_out_view(sit_day)
+            if sit.get("active") and not sit.get("alerted") and self.alert is not None:
+                await self.alert(
+                    "warning", "spy_gap_sit_out", str(sit.get("reason") or ""),
+                    dedupe_key=f"spy_gap_sit_out:{sit_day}",
+                )
+                risk_mod.mark_spy_gap_sit_out_alerted()
+        except Exception as exc:
+            logger.warning(f"SPY gap sit-out alert failed: {exc}")
 
         report = {
             "ts": _utcnow().isoformat(),
@@ -15407,6 +15499,11 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # and never frees every row on the ticker. The settle after a stop is
 # armed does not wait on that lock.
 # 5.99.6 keeps those rules and closes the follow-ups above.
+# 5.99.7: a verified SPY gap at or above 2% sits out new entries for the
+# whole session. Risk weight × quantity under 1 contract is skipped.
+# App entries use the same remaining budget and priced-risk cap, and an
+# unreadable budget or realized P&L refuses the entry. The code defaults
+# and the policy ceilings are 5% per trade and 10% per day.
 # HEAT_RESERVATION_ENABLED defaults on. Setting it false is the rollback:
 # heat is judged at fill time again.
 # The session VWAP stays the scanner's own samples. Each volume delta is
@@ -15417,7 +15514,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # still fail-closes when the two disagree or the Massive side is missing
 # or stale. GET /pro-trader/report includes the gap in basis points.
 # /status positions_open is the open book with status, side, and qty.
-BOT_VERSION = "5.99.6-pro-day-trader"
+BOT_VERSION = "5.99.7-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -15830,7 +15927,11 @@ _ENTRY_ABANDONED_EVENTS = frozenset({
 # $84 — below the stop distance of almost every liquid 0.60-delta contract, so
 # nothing dispatched. 8% (~$340) funds one real contract; the 10% ceilings
 # below sit just above it so an 8% plan plus a stop gap still fits.
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "8.0"))
+# 5.99.7: code default and ceiling are 5%. An env value above 5 is capped
+# at 5. 0.5 × the 10% day (MAX_TRADE_RISK_FRACTION_OF_DAILY) is the same 5%.
+RISK_PER_TRADE_PCT = min(5.0, _env_float("RISK_PER_TRADE_PCT", 5.0))
+if RISK_PER_TRADE_PCT <= 0:
+    RISK_PER_TRADE_PCT = 5.0
 # The day-halt rule is FIXED at 10% of capital (mirrors services/dayHalt.ts in
 # the app — operator-set shared policy, 2026-09, was 20): a day down 10% of
 # capital halts, six losing trades halts, nothing else does. For scale, the
@@ -15844,7 +15945,12 @@ RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "8.0"))
 # MAX_TRADE_RISK_FRACTION_OF_DAILY (0.5) × this, so a 10% day could never fund
 # an 8% trade, and one loss must not end the day: 20% absorbs two full-risk
 # losses before the halt. Mirrors MAX_DAY_LOSS_PCT in the app.
-DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "20.0"))
+# 5.99.7: the code default is 10 again. An env value above 10 is capped at
+# 10 so a stale host setting cannot reopen the old day halt. A stored
+# policy above the ceiling is clamped on restore, not discarded.
+DAILY_LOSS_LIMIT_PCT = min(10.0, _env_float("DAILY_LOSS_LIMIT_PCT", 10.0))
+if DAILY_LOSS_LIMIT_PCT <= 0:
+    DAILY_LOSS_LIMIT_PCT = 10.0
 # A daily TRADE COUNT is not a risk control and no longer gates entries. It let
 # 6 trades at 1% risk (6% of the account) through while refusing 20 at 0.25%
 # (5%) — exactly backwards — and it killed the 7th good setup on a day the first
@@ -15934,8 +16040,15 @@ TICKER_COOLDOWN_MINUTES = int(os.getenv("TICKER_COOLDOWN_MINUTES", "15"))
 # kill, so a rejected value never disappears quietly.
 POLICY_HARD_MIN_SCORE = float(os.getenv("POLICY_HARD_MIN_SCORE", "40"))
 # 5.82: 5 → 10 — the operator's stated 8-10% per-trade range, never higher.
-POLICY_HARD_MAX_RISK_PCT = float(os.getenv("POLICY_HARD_MAX_RISK_PCT", "10.0"))
-POLICY_HARD_MAX_DAILY_LOSS_PCT = float(os.getenv("POLICY_HARD_MAX_DAILY_LOSS_PCT", "25.0"))
+# 5.99.7: the hard per-trade ceiling and the day-halt ceiling are 5 and 10.
+# An env value above either cap is pulled down to the cap. It cannot reopen
+# 6.1, 8, 20, or 25 through POST /policy or a stored policy restore.
+POLICY_HARD_MAX_RISK_PCT = min(5.0, _env_float("POLICY_HARD_MAX_RISK_PCT", 5.0))
+if POLICY_HARD_MAX_RISK_PCT <= 0:
+    POLICY_HARD_MAX_RISK_PCT = 5.0
+POLICY_HARD_MAX_DAILY_LOSS_PCT = min(10.0, _env_float("POLICY_HARD_MAX_DAILY_LOSS_PCT", 10.0))
+if POLICY_HARD_MAX_DAILY_LOSS_PCT <= 0:
+    POLICY_HARD_MAX_DAILY_LOSS_PCT = 10.0
 # Where the adopted policy is persisted. A restart that silently reverted to
 # env defaults would re-open the same invisible gap the sync just closed.
 POLICY_STATE_KEY = "policy:app"
@@ -19245,10 +19358,13 @@ def assess_app_risk_gates(open_count: Any, realized_pnl_today_pct: Any, daily_lo
     try:
         limit = abs(float(daily_loss_limit_pct))
         pnl = float(realized_pnl_today_pct)
-        if math.isfinite(limit) and math.isfinite(pnl) and limit > 0 and pnl <= -limit:
-            reasons.append(f"daily loss limit ({pnl:.2f}% ≤ -{limit:g}%)")
     except (TypeError, ValueError):
-        pass
+        reasons.append("realized P&L unreadable — entry refused")
+    else:
+        if not math.isfinite(limit) or not math.isfinite(pnl):
+            reasons.append("realized P&L unreadable — entry refused")
+        elif limit > 0 and pnl <= -limit:
+            reasons.append(f"daily loss limit ({pnl:.2f}% ≤ -{limit:g}%)")
     try:
         n, cap = int(open_count), int(max_positions)
         if cap > 0 and n >= cap:
@@ -19269,6 +19385,34 @@ def assess_app_risk_gates(open_count: Any, realized_pnl_today_pct: Any, daily_lo
     if heat:
         reasons.append(heat)
     return reasons
+
+
+def assess_remaining_daily_budget(budget: Any, requested_risk_usd: Any) -> Optional[str]:
+    """The scanner's remaining-budget check, shared with app entries.
+
+    Blocks when what is left is under 25% of the requested risk. An
+    unreadable budget refuses the entry. Pure.
+    """
+    if not isinstance(budget, dict):
+        return "daily risk budget unreadable — entry refused"
+    try:
+        remaining = float(budget.get("remaining_usd"))
+        used = float(budget.get("used_usd"))
+        total = float(budget.get("budget_usd"))
+        requested = float(requested_risk_usd)
+    except (TypeError, ValueError):
+        return "daily risk budget unreadable — entry refused"
+    if not all(math.isfinite(v) for v in (remaining, used, total, requested)):
+        return "daily risk budget unreadable — entry refused"
+    if requested < 0:
+        requested = 0.0
+    if remaining < requested * 0.25:
+        return (
+            f"daily risk budget spent: ${used:,.0f} of "
+            f"${total:,.0f} committed (realized losses + open risk) — "
+            f"${remaining:,.0f} left against a ${requested:,.0f} entry"
+        )
+    return None
 
 
 def snapshot_index_vs_vwap(index_quotes: Any) -> List[Dict[str, Any]]:
@@ -19670,6 +19814,36 @@ def plan_policy_sync(current: Dict[str, Any], patch: Any) -> Dict[str, Any]:
     for key in sorted(k for k in patch if k not in known):
         ignored.append(f"{key}: not a policy field")
 
+    def _enforce_ceiling(key: str) -> None:
+        """Pull a field that was not in this patch down to the ceiling.
+
+        A clamp replaces the number. It does not keep the previous looser
+        value, and it does not reject the rest of the policy.
+        """
+        try:
+            value_f = float(policy.get(key))
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(value_f):
+            return
+        low, high = bounds[key]
+        if key == "risk_per_trade_pct":
+            try:
+                day_f = float(policy.get("daily_loss_limit_pct"))
+            except (TypeError, ValueError):
+                day_f = None
+            if day_f is not None and math.isfinite(day_f) and day_f > 0:
+                high = min(high, day_f * MAX_TRADE_RISK_FRACTION_OF_DAILY)
+        bounded = min(max(value_f, low), high)
+        if abs(bounded - value_f) <= 1e-9:
+            return
+        clamped.append(f"{key}: asked {value_f:g}, enforcing {bounded:g}")
+        changes.append(f"{key} {value_f:g} → {bounded:g}")
+        policy[key] = bounded
+
+    _enforce_ceiling("daily_loss_limit_pct")
+    _enforce_ceiling("risk_per_trade_pct")
+
     return {"policy": policy, "changes": changes, "clamped": clamped,
             "ignored": ignored, "accepted": True}
 
@@ -19733,6 +19907,12 @@ async def apply_policy_patch(patch: Any, source: str) -> Dict[str, Any]:
     taken and what was refused."""
     global _LIVE_POLICY, _POLICY_META
     result = plan_policy_sync(_LIVE_POLICY, patch)
+    if result.get("clamped"):
+        logger.warning(
+            "policy clamped (%s): %s",
+            source,
+            "; ".join(str(item) for item in result["clamped"]),
+        )
     _LIVE_POLICY = result["policy"]
     _POLICY_META = {
         "source": source if result["accepted"] else _POLICY_META.get("source", "env"),
@@ -19992,20 +20172,77 @@ async def _assess_portfolio_risk(
     return out
 
 
+def contract_qty_for_risk_weight(qty: Any, weight: Any) -> Dict[str, Any]:
+    """Size by risk weight. A product under 1 contract is a skip, not a round-up.
+
+    Weight >= 1 leaves the quantity. Otherwise floor(qty × weight). A floor
+    of at least 1 is that integer. Under 1 skips. Scanner and app both use
+    this. Pure.
+    """
+    try:
+        base = int(qty)
+    except (TypeError, ValueError):
+        base = 0
+    try:
+        w = float(weight)
+    except (TypeError, ValueError):
+        w = 1.0
+    if not math.isfinite(w):
+        w = 1.0
+    if base < 1:
+        return {
+            "qty": 0, "skipped": True, "weight": w, "product": 0.0,
+            "reason": "quantity under 1 contract — skipped",
+        }
+    if w >= 1.0:
+        return {"qty": base, "skipped": False, "weight": w, "product": float(base), "reason": ""}
+    w = max(0.0, w)
+    product = base * w
+    want = math.floor(product + 1e-12)
+    if want < 1:
+        return {
+            "qty": 0,
+            "skipped": True,
+            "weight": w,
+            "product": product,
+            "reason": (
+                f"risk weight {w:g} × {base} = {product:g} < 1 contract — "
+                "skipped, not rounded up to 1"
+            ),
+        }
+    return {"qty": want, "skipped": False, "weight": w, "product": product, "reason": ""}
+
+
 def _apply_risk_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]]) -> int:
     """Shrink an ENTRY by the regime × evidence weight (after the learning
-    weight). Same one-unit floor and `floor_bound` honesty as learning."""
+    weight). Under 1 contract sets `skip_reason` and returns 0."""
     if not ctx or not PORTFOLIO_RISK_ENABLED:
         return qty
-    sized, floor_bound = learning.apply_weight(qty, float(ctx.get("weight") or 1.0))
-    ctx.update({"requested_qty": int(qty), "sized_qty": int(sized), "floor_bound": floor_bound})
-    if sized != qty or floor_bound:
+    decision = contract_qty_for_risk_weight(qty, ctx.get("weight") if ctx.get("weight") is not None else 1.0)
+    ctx.update({
+        "requested_qty": int(qty) if isinstance(qty, int) else qty,
+        "sized_qty": int(decision["qty"]),
+        "floor_bound": False,
+    })
+    if decision["skipped"]:
+        ctx["skip_reason"] = decision["reason"]
+        logger.warning(f"🧩 RISK {symbol}: {decision['reason']}")
+        return 0
+    sized = int(decision["qty"])
+    ctx.pop("skip_reason", None)
+    if sized != qty:
         logger.warning(
             f"🧩 RISK {symbol}: size {qty} → {sized} (weight {ctx.get('weight')}) "
-            f"{'— one-unit floor, cut did not fully bite ' if floor_bound else ''}"
             f"— {'; '.join(ctx.get('notes') or [])}"
         )
     return sized
+
+
+def _risk_weight_skip(ctx: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(ctx, dict):
+        return None
+    reason = ctx.get("skip_reason")
+    return str(reason) if reason else None
 
 
 def _apply_capacity(symbol: str, qty: int, instrument: str, liquidity: Optional[Dict[str, Any]],
@@ -20449,7 +20686,7 @@ async def _fold_pro_trader(p: dict, blocked: List[str], *, dry_run: bool = False
             observation,
             _pro_trader_candidate(p),
             mode=mode,
-            configured_risk_pct=float(live_policy("risk_per_trade_pct") or 8),
+            configured_risk_pct=float(live_policy("risk_per_trade_pct") or 5),
             daily_loss_limit_pct=float(live_policy("daily_loss_limit_pct") or 10),
             trades_completed=int(daily.get("trades_today") or 0),
             min_trades=int(live_policy("min_trades_per_day") or MIN_TRADES_PER_DAY),
@@ -20515,6 +20752,53 @@ async def _note_pro_trader_decision(pd: dict, accepted: bool) -> None:
         logger.warning(f"pro trader decision was not recorded: {e}")
 
 
+def _session_day_et() -> str:
+    """ET cash-session date. The sit-out lasts this whole date."""
+    return _utcnow().astimezone(_ET_ZONE).date().isoformat()
+
+
+def entry_gap_sit_out_reason(payload: Any, *, is_close: bool = False) -> Optional[str]:
+    """Why this entry sits out, or None.
+
+    Closes, stops, and crypto are not entries. A verified gap on the
+    payload records the day. A gap the scanner already recorded blocks an
+    app payload that does not repeat it.
+    """
+    if is_close or not isinstance(payload, dict):
+        return None
+    if str(payload.get("instrument") or "").lower() == "crypto":
+        return None
+    if _is_close_payload(payload):
+        return None
+    ctx = portfolio_risk.sanitize_risk_context(payload.get("risk_context"))
+    noted = portfolio_risk.remember_spy_gap_sit_out(
+        ctx.get("spy_gap_pct"), ctx.get("spy_gap_verified"), _session_day_et(),
+    )
+    if noted:
+        return noted
+    view = portfolio_risk.spy_gap_sit_out_view(_session_day_et())
+    if view.get("active") and view.get("reason"):
+        return str(view["reason"])
+    return None
+
+
+async def _alert_spy_gap_sit_out_once(reason: str) -> None:
+    """One warning for today's sit-out. A repeat is a no-op."""
+    day = _session_day_et()
+    view = portfolio_risk.spy_gap_sit_out_view(day)
+    if view.get("alerted"):
+        return
+    try:
+        await alerts.send(
+            "warning", "spy_gap_sit_out", reason,
+            dedupe_key=f"spy_gap_sit_out:{day}",
+        )
+    except Exception as e:
+        logger.warning(f"SPY gap sit-out alert failed: {e}")
+        return
+    portfolio_risk.mark_spy_gap_sit_out_alerted()
+
+
 async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool, List[str]]:
     """Server-side re-filter mirroring the Rork app's gating, evaluated against
     the reconciled Redis state (single source of truth). Quality checks apply
@@ -20548,6 +20832,11 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
 
     is_probe = _is_connectivity_test(p)
     is_crypto = str(p.get("instrument") or "").lower() == "crypto"
+    sit = entry_gap_sit_out_reason(p)
+    if sit:
+        blocked.append(sit)
+        await _alert_spy_gap_sit_out_once(sit)
+        return False, blocked
 
     # CALL INDEX VWAP — bullish premium only when SPY or QQQ holds above the
     # session VWAP. Applies to app-decided and bot-decided entries alike: a
@@ -20683,6 +20972,31 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
                     APP_MAX_OPEN_RISK_PCT,
                     reserved_a,
                 ))
+                try:
+                    lock_a = plan_profit_lock(daily_a.get("realized_pnl_today_usd"))
+                    budget_a = plan_risk_budget(
+                        account_size=account_a,
+                        realized_usd=daily_a.get("realized_pnl_today_usd"),
+                        open_risk_usd=sum(position_risk_usd(x) for x in positions_a.values()),
+                        profit_lock_max_risk=(
+                            lock_a["max_risk_usd"] if lock_a["cushion_usd"] > 0 else None
+                        ),
+                        loss_limit_pct=live_policy("daily_loss_limit_pct"),
+                    )
+                except Exception as budget_err:
+                    logger.warning(
+                        f"app daily budget unreadable — entry refused: {budget_err}"
+                    )
+                    blocked.append(
+                        f"daily risk budget unreadable ({str(budget_err)[:80]}) — entry refused"
+                    )
+                else:
+                    nominal_a = account_a * (float(live_policy("risk_per_trade_pct")) / 100.0)
+                    requested_a = max(nominal_a, float(new_risk_a or 0.0))
+                    budget_block = assess_remaining_daily_budget(budget_a, requested_a)
+                    if budget_block:
+                        logger.warning(f"📱 APP DECIDES — {budget_block}")
+                        blocked.append(budget_block)
                 if not blocked and not dry_run and heat_reservation_enabled() and not is_probe:
                     admission = await admit_heat_reservation(
                         p, new_risk_a, account_a, positions=positions_a,
@@ -32392,11 +32706,9 @@ async def _priced_option_risk_gate(symbol: str, premium: Any, qty: Any,
 
     Thin async wrapper: it reassembles exactly the budget the dispatch gate uses
     (broker equity, realized P&L, committed open risk, profit lock) and hands the
-    arithmetic to `plan_priced_option_risk`. Failure here never blocks a trade —
-    an unavailable budget is not evidence of an oversized one.
+    arithmetic to `plan_priced_option_risk`. An unreadable budget refuses the
+    entry. It is not treated as permission to place.
     """
-    fallback = {"action": "allow", "qty": qty, "risk_usd": None,
-                "per_contract_usd": None, "ceiling_usd": None, "reason": ""}
     try:
         budget = await _day_risk_budget()
         return plan_priced_option_risk(
@@ -32405,8 +32717,12 @@ async def _priced_option_risk_gate(symbol: str, premium: Any, qty: Any,
             base_budget_usd=budget["base_budget_usd"],
         )
     except Exception as e:
-        logger.warning(f"priced-risk recheck unavailable for {symbol} (non-fatal, entry not blocked): {e}")
-        return fallback
+        logger.warning(f"priced-risk recheck unavailable for {symbol} — entry refused: {e}")
+        return {
+            "action": "reject", "qty": 0, "risk_usd": None,
+            "per_contract_usd": None, "ceiling_usd": None,
+            "reason": f"daily risk budget unreadable ({str(e)[:80]}) — entry refused",
+        }
 
 
 # ==================== CONTRACT SNAP ====================
@@ -33990,6 +34306,10 @@ async def execute_live_order(payload: dict):
     app_decides = app_decides_entry(payload.get(DISPATCH_ORIGIN_FIELD), is_close, APP_DECIDES)
 
     if not is_close:
+        sit = entry_gap_sit_out_reason(payload)
+        if sit:
+            await _alert_spy_gap_sit_out_once(sit)
+            raise LocalRefusal(sit)
         if await state.is_killed():
             raise LocalRefusal("kill switch active — entry refused")
         # Crypto is 24/7 and skips both clocks. The flatten window is not
@@ -34022,11 +34342,20 @@ async def execute_live_order(payload: dict):
     # _assess_portfolio_risk — never a silent full-size pass on a refusal.
     risk_ctx: Optional[Dict[str, Any]] = None
     if not is_close and not _is_connectivity_test(payload):
-        if not app_decides:
-            try:
-                risk_ctx = await _assess_portfolio_risk(payload)
-            except Exception as e:
-                logger.warning(f"portfolio risk unavailable for {ticker} (unweighted): {e}")
+        try:
+            weighed = await _assess_portfolio_risk(payload)
+        except Exception as e:
+            logger.warning(f"portfolio risk unavailable for {ticker} (unweighted): {e}")
+            weighed = None
+        if weighed is not None:
+            # App entries take the weight when the book allows the trade.
+            # Other portfolio pauses stay on the scanner path. The gap
+            # sit-out already refused above.
+            if app_decides:
+                if weighed.get("allowed"):
+                    risk_ctx = weighed
+            else:
+                risk_ctx = weighed
         if risk_ctx is not None:
             if not risk_ctx["allowed"]:
                 raise LocalRefusal("; ".join(risk_ctx["reasons"]) or "portfolio risk: entry refused")
@@ -34105,6 +34434,12 @@ async def execute_live_order(payload: dict):
             if not is_exit:
                 quantity = _apply_learning_weight(sym_u, quantity, learning_ctx)
                 quantity = _apply_risk_weight(sym_u, quantity, risk_ctx)
+                weight_skip = _risk_weight_skip(risk_ctx)
+                if weight_skip:
+                    return {
+                        "status": "refused", "reason": weight_skip,
+                        "code": "risk_weight_under_one", "paper": True,
+                    }
                 quantity, pt_block = _apply_pro_trader_size(sym_u, quantity, payload)
                 if pt_block:
                     await trade_ledger.record("pro_trader_blocked", {
@@ -34727,13 +35062,11 @@ async def execute_live_order(payload: dict):
                 logger.info(f"✅ {symbol} {shape['reason']} [{pq['source']}]")
                 shape_stop = shape["stop"]
 
-            if not is_exit and not app_decides:
-                # POST-PRICING RISK RECHECK — the last gate that sees the REAL
-                # contract. Every gate before this one judged an option payload
-                # that had no premium in it yet, so they measured a nominal
-                # percentage instead of the trade. Now the premium and the stop
-                # that will rest behind it are both known, so the day's budget
-                # question gets asked once more in broker dollars.
+            if not is_exit:
+                # POST-PRICING RISK RECHECK — scanner and app. The premium and
+                # the stop that will rest behind it are both known, so the
+                # day's budget is asked again in broker dollars. An unreadable
+                # budget refuses the entry.
                 entry_premium_ref = float(common.get("limitPrice") or 0) or float(real_ask or 0)
                 # The app's ESTIMATE is passed as the planned entry so a stop
                 # designed against 0.13 is not measured against a 0.57 fill.
@@ -34741,7 +35074,8 @@ async def execute_live_order(payload: dict):
                     payload.get("option_stop_price"), entry_premium_ref,
                     payload.get("option_limit_price"),
                 )
-                armed_stop = tighten_to_shape_stop(armed_stop, shape_stop)
+                if not app_decides:
+                    armed_stop = tighten_to_shape_stop(armed_stop, shape_stop)
                 risk_check = await _priced_option_risk_gate(
                     sym_u, entry_premium_ref, quantity, armed_stop,
                 )
@@ -34786,6 +35120,7 @@ async def execute_live_order(payload: dict):
                     quantity = int(risk_check["qty"])
                     common["quantity"] = quantity
 
+            if not is_exit and not app_decides:
                 # CAPACITY — the last size decision, on the snapped contract's
                 # REAL book: never lift more of the offer, or more of the day's
                 # flow, than the contract can absorb. A refusal is a policy
@@ -35151,7 +35486,7 @@ async def execute_live_order(payload: dict):
             try:
                 risk_pct = float(live_policy("risk_per_trade_pct"))
             except Exception:
-                risk_pct = float(os.getenv("RISK_PER_TRADE_PCT", "8") or 8)
+                risk_pct = float(RISK_PER_TRADE_PCT)
             plan = plan_crypto_order(payload, available_usd=available, risk_pct=risk_pct)
             if not plan.get("ok"):
                 raise LocalRefusal(plan.get("reason") or "crypto order refused")
@@ -35412,6 +35747,12 @@ async def execute_live_order(payload: dict):
                     )
             quantity = _apply_learning_weight(symbol, quantity, learning_ctx)
             quantity = _apply_risk_weight(symbol, quantity, risk_ctx)
+            weight_skip = _risk_weight_skip(risk_ctx)
+            if weight_skip:
+                return {
+                    "status": "refused", "reason": weight_skip,
+                    "code": "risk_weight_under_one", "paper": True,
+                }
             quantity, pt_block = _apply_pro_trader_size(symbol, quantity, payload)
             if pt_block:
                 await trade_ledger.record("pro_trader_blocked", {
@@ -39973,6 +40314,7 @@ def _pro_trader_status_payload(trades_today: Any = None) -> Dict[str, Any]:
     body["trades_completed"] = int(pacing["trades_completed"])
     body["pacing"] = pacing
     body["loss_streak"] = _loss_streak_status_safe()
+    body["spy_gap_sit_out"] = portfolio_risk.spy_gap_sit_out_view(_session_day_et())
     body["version"] = BOT_VERSION
     # Display only. The flatten order still comes from plan_scheduled_exit.
     # A full day stays 15:40; a half day shows 12:40 and phase closed after 13:00.

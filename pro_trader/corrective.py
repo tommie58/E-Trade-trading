@@ -19,7 +19,7 @@ DISPATCH = {
 _SEVERITY = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 DO_NOT_TOUCH = [
-    "RISK_PER_TRADE_PCT above 8",
+    "RISK_PER_TRADE_PCT above 5",
     "DAILY_LOSS_LIMIT_PCT (do not raise)",
     "APP_MAX_OPEN_RISK_PCT 10",
     "STOP until breakeven_locked",
