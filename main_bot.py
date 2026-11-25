@@ -1877,7 +1877,10 @@ import json
 import logging
 import os
 import random
-from typing import Any, Dict, List, Optional
+import re
+import threading
+import time
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 from oauthlib.oauth1 import Client as OAuth1Client
@@ -1893,6 +1896,190 @@ RETRY_BASE_SECONDS = float(os.getenv("ETRADE_RETRY_BASE_SECONDS", "2"))
 RETRY_MAX_SECONDS = float(os.getenv("ETRADE_RETRY_MAX_SECONDS", "8"))
 # Statuses worth retrying: throttle, timeout, and server-side failures.
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
+
+# One alert per endpoint per 15 minutes. Not an env knob: the global
+# ALERT_DEDUPE_SECONDS default stays 300s for every other alert.
+ETRADE_ERROR_ALERT_SECONDS = 15 * 60
+_ETRADE_ALERT_AT: Dict[str, float] = {}
+_OAUTH_LOG_LOCK = threading.Lock()
+
+# Portfolio "no positions" is HTTP 204, not HTTP 404.
+# https://apisb.etrade.com/docs/api/account/api-portfolio-v1.html
+#   204 + code 1007  success with no data
+#   204 + code 53    data not found for the given input
+#   204 + code 153   position lots not found — NOT an empty portfolio
+#   400 + code 404   resource not found — a failure
+# List Orders documents no empty-book 204 and no 404:
+# https://apisb.etrade.com/docs/api/order/api-order-v1.html
+_PORTFOLIO_EMPTY_CODES = frozenset({"1007", "53"})
+_ACCT_IN_PATH = re.compile(r"(/accounts/)([^/?#]+)")
+_LONG_DIGITS = re.compile(r"\d{8,}")
+_AUTH_HEADER = re.compile(r"(?i)authorization\s*[:=]\s*\S+")
+_OAUTH_PARAM = re.compile(
+    r"(?i)\b(oauth_[a-z0-9_]+|access_token|token_secret|consumer_secret)\s*[=:]\s*\"?[^\s\",}]+"
+)
+
+
+def redact_etrade_path(path: str) -> str:
+    """Drop the query and replace the account-id path segment with {acct}."""
+    base = str(path or "").split("?", 1)[0]
+    return _ACCT_IN_PATH.sub(
+        lambda m: m.group(0) if m.group(2) == "{acct}" else m.group(1) + "{acct}",
+        base,
+    )
+
+
+def _account_ids_in_path(path: str) -> List[str]:
+    found: List[str] = []
+    for match in _ACCT_IN_PATH.finditer(str(path or "").split("?", 1)[0]):
+        segment = match.group(2)
+        if segment and segment != "{acct}":
+            found.append(segment)
+    return found
+
+
+def scrub_etrade_text(text: str, secrets: Optional[Sequence[str]] = None) -> str:
+    """Strip account ids, long digit runs, and OAuth material from a log line."""
+    cleaned = str(text or "")
+    for secret in secrets or ():
+        if secret and len(secret) >= 4:
+            cleaned = cleaned.replace(secret, "{acct}")
+    cleaned = _ACCT_IN_PATH.sub(
+        lambda m: m.group(0) if m.group(2) == "{acct}" else m.group(1) + "{acct}",
+        cleaned,
+    )
+    cleaned = _AUTH_HEADER.sub("Authorization: [redacted]", cleaned)
+    cleaned = _OAUTH_PARAM.sub(lambda m: m.group(1) + "=[redacted]", cleaned)
+    cleaned = _LONG_DIGITS.sub("{redacted}", cleaned)
+    return cleaned
+
+
+def _endpoint_family(path: str) -> str:
+    redacted = redact_etrade_path(path)
+    if redacted.endswith("/portfolio.json"):
+        return "portfolio"
+    if redacted.endswith("/orders.json"):
+        return "orders"
+    return ""
+
+
+def portfolio_no_data(family: str, status: int, code: str, body_empty: bool) -> bool:
+    """True only for the documented empty-portfolio signature (HTTP 204).
+
+    A 404 is never this signature, including a 404 whose body repeats code
+    1007 or the words "no positions". Error code 404 is "Resource not found"
+    (HTTP 400) and is a failure. Error code 153 is missing position lots.
+    """
+    if family != "portfolio" or int(status) != 204:
+        return False
+    if body_empty:
+        return True
+    return str(code or "").strip() in _PORTFOLIO_EMPTY_CODES
+
+
+def empty_portfolio_response() -> Dict[str, Any]:
+    return {"PortfolioResponse": {"AccountPortfolio": []}}
+
+
+def claim_etrade_alert(key: str, now: Optional[float] = None) -> bool:
+    """True when this endpoint may alert. At most one claim per 15 minutes."""
+    now = time.monotonic() if now is None else now
+    last = _ETRADE_ALERT_AT.get(key)
+    if last is not None and (now - last) < ETRADE_ERROR_ALERT_SECONDS:
+        return False
+    _ETRADE_ALERT_AT[key] = now
+    return True
+
+
+def _extract_error_parts(body: str) -> Tuple[str, str]:
+    """(code, short message) from an E*TRADE JSON or XML error body."""
+    code = ""
+    msg = ""
+    text = body or ""
+    data: Any = None
+    try:
+        data = json.loads(text) if text.strip() else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        err = data.get("Error") if data.get("Error") is not None else data.get("error")
+        if isinstance(err, dict):
+            raw_code = err.get("code") if err.get("code") is not None else err.get("Code")
+            raw_msg = err.get("message") if err.get("message") is not None else err.get("Message")
+            code = str(raw_code).strip() if raw_code is not None else ""
+            msg = str(raw_msg or "").strip()
+    if not code and not msg:
+        code_match = re.search(r"<(?:[A-Za-z0-9]+:)?(?:code|Code)>\s*([^<]{1,32})\s*</", text)
+        msg_match = re.search(r"<(?:[A-Za-z0-9]+:)?(?:message|Message)>\s*([^<]{1,300})\s*</", text)
+        if code_match:
+            code = code_match.group(1).strip()
+        if msg_match:
+            msg = msg_match.group(1).strip()
+    if not msg and text.strip() and data is None:
+        msg = text.strip()[:180]
+    return code, msg
+
+
+def _extract_error_message(body: str) -> str:
+    code, msg = _extract_error_parts(body)
+    secrets_msg = scrub_etrade_text(msg)
+    if code and secrets_msg:
+        return f"[{scrub_etrade_text(code)}] {secrets_msg}"[:300]
+    if secrets_msg:
+        return secrets_msg[:300]
+    return "no error body"
+
+
+async def emit_etrade_error(
+    method: str,
+    path: str,
+    status: int,
+    code: str,
+    message: str,
+    alert: Optional[Callable[..., Awaitable[None]]] = None,
+) -> str:
+    """Log one E*TRADE failure. Alert at most once per endpoint per 15 min.
+
+    The line carries the method, the redacted path, the status, and a short
+    code/message. Account ids, tokens, and the OAuth header never appear.
+    """
+    secrets = _account_ids_in_path(path)
+    red_path = redact_etrade_path(path) or str(path or "")
+    method_u = str(method or "GET").upper()
+    code_s = scrub_etrade_text(str(code or ""), secrets)[:40]
+    msg_s = scrub_etrade_text(str(message or ""), secrets)[:180]
+    status_s = str(status) if status else "network"
+    line = f"E*TRADE {method_u} {red_path} -> {status_s}"
+    if code_s or msg_s:
+        line += f" [{code_s}] {msg_s}".rstrip()
+    logger.error(line)
+    key = f"{method_u} {red_path}"
+    if not claim_etrade_alert(key):
+        return line
+
+    async def _default_alert(severity: str, event: str, text: str,
+                             dedupe_key: Optional[str] = None,
+                             dedupe_seconds: Optional[int] = None) -> None:
+        import alerts
+        await alerts.send(
+            severity, event, text,
+            dedupe_key=dedupe_key, dedupe_seconds=dedupe_seconds,
+        )
+
+    sender = alert or _default_alert
+    try:
+        try:
+            await sender(
+                "error", "etrade_http_error", line,
+                dedupe_key=f"etrade:{key}",
+                dedupe_seconds=ETRADE_ERROR_ALERT_SECONDS,
+            )
+        except TypeError:
+            await sender("error", "etrade_http_error", line, dedupe_key=f"etrade:{key}")
+    except Exception:
+        _ETRADE_ALERT_AT.pop(key, None)
+        logger.debug("etrade error alert failed", exc_info=True)
+    return line
 
 # ---- Broker-native trailing stops ----
 # E*TRADE trails these server-side, off the BID for a sell (the ask for a buy),
@@ -1915,13 +2102,25 @@ def backoff_delay(attempt: int, exact: bool = False) -> float:
 
 
 class ETradeAPIError(Exception):
-    """Non-2xx response from E*TRADE. Carries status + parsed error message."""
+    """Non-2xx response from E*TRADE. Carries status + a scrubbed message.
 
-    def __init__(self, status_code: int, message: str, body: str = "") -> None:
-        super().__init__(f"E*TRADE {status_code}: {message}")
-        self.status_code = status_code
-        self.message = message
-        self.body = body
+    `path` is stored redacted (`/v1/accounts/{acct}/...`). `message` and `body`
+    never keep an account id, a token, or an Authorization header.
+    """
+
+    def __init__(self, status_code: int, message: str, body: str = "",
+                 method: str = "", path: str = "", code: str = "") -> None:
+        secrets = _account_ids_in_path(path)
+        self.method = str(method or "").upper()
+        self.path = redact_etrade_path(path) if path else ""
+        self.code = scrub_etrade_text(str(code or ""), secrets)[:32]
+        self.message = scrub_etrade_text(str(message or ""), secrets)[:300]
+        self.body = scrub_etrade_text(str(body or ""), secrets)[:500]
+        self.status_code = int(status_code)
+        self.reported = False
+        where = f"{self.method} {self.path} ".strip()
+        detail = f"[{self.code}] {self.message}".strip() if self.code else self.message
+        super().__init__(f"E*TRADE {where} {self.status_code}: {detail}".strip())
 
 
 class OTOCOUnsupported(ETradeAPIError):
@@ -1932,19 +2131,6 @@ class OTOCOUnsupported(ETradeAPIError):
 # 4xx statuses that say nothing about whether the broker accepts multi-leg
 # orders: the session, the permissions, or the rate budget failed instead.
 _NOT_AN_OTOCO_VERDICT = {401, 403, 429}
-
-
-def _extract_error_message(body: str) -> str:
-    try:
-        data = json.loads(body)
-        err = (data.get("Error") or {}) if isinstance(data, dict) else {}
-        msg = err.get("message") or err.get("Message")
-        if msg:
-            code = err.get("code") or err.get("Code")
-            return f"[{code}] {msg}" if code else str(msg)
-    except (json.JSONDecodeError, AttributeError):
-        pass
-    return body[:300] if body else "no error body"
 
 
 class ETradeAsyncClient:
@@ -1989,7 +2175,19 @@ class ETradeAsyncClient:
             # (For non-form bodies OAuth1 signs only the URL + oauth params —
             # the JSON body is intentionally NOT part of the signature base,
             # matching how requests_oauthlib/pyetrade sign JSON requests.)
-            signed_url, signed_headers, _ = self._signer.sign(url, http_method=method.upper())
+            # oauthlib logs the signature base string at DEBUG, and that
+            # string contains the account id and the oauth token. Silence it
+            # for the sign call, then put the logger level back.
+            with _OAUTH_LOG_LOCK:
+                oauth_log = logging.getLogger("oauthlib")
+                previous_level = oauth_log.level
+                oauth_log.setLevel(logging.WARNING)
+                try:
+                    signed_url, signed_headers, _ = self._signer.sign(
+                        url, http_method=method.upper(),
+                    )
+                finally:
+                    oauth_log.setLevel(previous_level)
             headers["Authorization"] = signed_headers["Authorization"]
             try:
                 async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -1997,17 +2195,59 @@ class ETradeAsyncClient:
             except (httpx.TimeoutException, httpx.TransportError) as e:
                 # Network-level failure. Non-idempotent requests retry only on
                 # connect errors — a timeout AFTER sending may have landed.
+                # Log the exception TYPE only: str(e) can carry the full URL,
+                # and that URL contains the account id.
                 last_exc = e
                 can_retry = idempotent or isinstance(e, httpx.ConnectError)
                 if can_retry and attempt < RETRY_MAX_ATTEMPTS - 1:
                     delay = backoff_delay(attempt)
                     logger.warning(
-                        f"E*TRADE network error on {method} {path} "
-                        f"(attempt {attempt + 1}/{RETRY_MAX_ATTEMPTS}): {e} — retrying in {delay:.1f}s"
+                        "E*TRADE %s %s -> network [%s] (attempt %s/%s) — retrying in %.1fs",
+                        method.upper(), redact_etrade_path(path), type(e).__name__,
+                        attempt + 1, RETRY_MAX_ATTEMPTS, delay,
                     )
                     await asyncio.sleep(delay)
                     continue
+                await emit_etrade_error(method, path, 0, "", type(e).__name__)
                 raise
+            family = _endpoint_family(path)
+            code, msg = _extract_error_parts(resp.text)
+            body_empty = not (resp.text or "").strip()
+            secrets = _account_ids_in_path(path)
+            safe_msg = scrub_etrade_text(msg, secrets)
+            safe_body = scrub_etrade_text(resp.text or "", secrets)
+            if portfolio_no_data(family, resp.status_code, code, body_empty):
+                # Documented empty portfolio (HTTP 204). Not an error, and
+                # not a 404: a 404 never reaches this branch.
+                logger.info(
+                    "E*TRADE %s %s -> %s [%s] %s — documented no-data, empty list",
+                    method.upper(), redact_etrade_path(path), resp.status_code,
+                    scrub_etrade_text(code, secrets), safe_msg[:180],
+                )
+                return empty_portfolio_response()
+            if family == "portfolio" and resp.status_code == 204:
+                await emit_etrade_error(
+                    method, path, resp.status_code, code, safe_msg or "undocumented portfolio 204",
+                )
+                err = ETradeAPIError(
+                    resp.status_code, safe_msg or "undocumented portfolio 204", safe_body,
+                    method=method, path=path, code=code,
+                )
+                err.reported = True
+                raise err
+            # List Orders has no documented 204 no-orders signature. A 204
+            # that still carries a body is a failure, not an empty book.
+            # An empty 204 body keeps the historical `{}` return below.
+            if family == "orders" and resp.status_code == 204 and not body_empty:
+                await emit_etrade_error(
+                    method, path, resp.status_code, code, safe_msg or "undocumented orders 204",
+                )
+                err = ETradeAPIError(
+                    resp.status_code, safe_msg or "undocumented orders 204", safe_body,
+                    method=method, path=path, code=code,
+                )
+                err.reported = True
+                raise err
             if resp.status_code >= 400:
                 # 429 never processed the request — always safe to retry.
                 # Other retryable statuses (408/5xx) retry only when the call
@@ -2020,19 +2260,35 @@ class ETradeAsyncClient:
                     # other statuses keep jitter to spread retries.
                     delay = backoff_delay(attempt, exact=(resp.status_code == 429))
                     logger.warning(
-                        f"E*TRADE {resp.status_code} on {method} {path} "
-                        f"(attempt {attempt + 1}/{RETRY_MAX_ATTEMPTS}) — retrying in {delay:.1f}s"
+                        "E*TRADE %s %s -> %s (attempt %s/%s) — retrying in %.1fs",
+                        method.upper(), redact_etrade_path(path), resp.status_code,
+                        attempt + 1, RETRY_MAX_ATTEMPTS, delay,
                     )
                     await asyncio.sleep(delay)
                     continue
-                raise ETradeAPIError(resp.status_code, _extract_error_message(resp.text), resp.text)
-            if not resp.text.strip():
+                await emit_etrade_error(method, path, resp.status_code, code, safe_msg)
+                err = ETradeAPIError(
+                    resp.status_code, safe_msg or "no error body", safe_body,
+                    method=method, path=path, code=code,
+                )
+                err.reported = True
+                raise err
+            if body_empty:
                 return {}
             try:
                 return resp.json()
             except json.JSONDecodeError:
-                raise ETradeAPIError(resp.status_code, f"non-JSON response: {resp.text[:200]}")
-        raise last_exc if last_exc else ETradeAPIError(0, "E*TRADE request retries exhausted")
+                await emit_etrade_error(method, path, resp.status_code, "", "non-JSON response")
+                err = ETradeAPIError(
+                    resp.status_code, "non-JSON response", safe_body[:200],
+                    method=method, path=path,
+                )
+                err.reported = True
+                raise err
+        if last_exc is not None:
+            await emit_etrade_error(method, path, 0, "", type(last_exc).__name__)
+            raise last_exc
+        raise ETradeAPIError(0, "E*TRADE request retries exhausted", method=method, path=path)
 
     # ------------------------------------------------------------------
     # Read endpoints
@@ -2503,7 +2759,8 @@ class AlertManager:
                    dedupe_key: Optional[str] = None,
                    data: Optional[Dict[str, Any]] = None,
                    force_deliver: bool = False,
-                   webhook_text: Optional[str] = None) -> None:
+                   webhook_text: Optional[str] = None,
+                   dedupe_seconds: Optional[int] = None) -> None:
         severity = severity.lower() if severity.lower() in _VALID_SEVERITIES else "warning"
         record: Dict[str, Any] = {
             "ts": _utcnow_iso(),
@@ -2522,9 +2779,12 @@ class AlertManager:
         # re-polled fill must never double-post.
         if dedupe_key:
             try:
+                # Per-call window for E*TRADE endpoint alerts (15 min). Every
+                # other alert keeps ALERT_DEDUPE_SECONDS.
+                ttl = self._dedupe_seconds if dedupe_seconds is None else max(10, int(dedupe_seconds))
                 fresh = await self._state.set(
                     f"alert:dedupe:{dedupe_key}", "1",
-                    ex=self._dedupe_seconds, nx=True,
+                    ex=ttl, nx=True,
                 )
                 if not fresh:
                     logger.debug(f"[ALERT][dup suppressed] {event}")
@@ -2653,7 +2913,8 @@ async def send(severity: str, event: str, message: str,
                dedupe_key: Optional[str] = None,
                data: Optional[Dict[str, Any]] = None,
                force_deliver: bool = False,
-               webhook_text: Optional[str] = None) -> None:
+               webhook_text: Optional[str] = None,
+               dedupe_seconds: Optional[int] = None) -> None:
     """Fire an alert. Safe to call before init (logs only) and never raises.
 
     `force_deliver` delivers regardless of the configured min-severity floor —
@@ -2666,7 +2927,8 @@ async def send(severity: str, event: str, message: str,
             logger.warning(f"[ALERT][{severity.upper()}] {event} — {message} (alerting not initialised)")
             return
         await _manager.send(severity, event, message, dedupe_key=dedupe_key, data=data,
-                            force_deliver=force_deliver, webhook_text=webhook_text)
+                            force_deliver=force_deliver, webhook_text=webhook_text,
+                            dedupe_seconds=dedupe_seconds)
     except Exception as e:
         logger.error(f"alert send failed ({event}): {e}")
 
@@ -2976,8 +3238,10 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 try:  # package-style import (python -m bot...) or flat (uvicorn main_bot:app)
     from .state_store import StateStore
+    from . import etrade_async
 except ImportError:
     from state_store import StateStore
+    import etrade_async
 
 logger = logging.getLogger("etrade-bot.reconcile")
 
@@ -3959,16 +4223,63 @@ async def reconcile_once(
 ) -> Dict[str, Any]:
     """One reconciliation pass. Caller must already hold the reconcile lock.
     `alert(severity, event, message, dedupe_key=...)` is an optional async
-    callback for real-time alerting — failures in it are swallowed."""
+    callback for real-time alerting — failures in it are swallowed.
+
+    portfolio.json and orders.json are fetched independently. A failure of one
+    does not discard the other. Fill booking, cancels, and re-arms run only
+    when the read they depend on succeeded. A failed read is unknown, not an
+    empty book."""
 
     async def _alert(severity: str, event: str, message: str,
-                     dedupe_key: Optional[str] = None) -> None:
+                     dedupe_key: Optional[str] = None,
+                     dedupe_seconds: Optional[int] = None) -> None:
         if alert is None:
             return
         try:
-            await alert(severity, event, message, dedupe_key=dedupe_key)
+            kwargs: Dict[str, Any] = {}
+            if dedupe_key is not None:
+                kwargs["dedupe_key"] = dedupe_key
+            if dedupe_seconds is not None:
+                kwargs["dedupe_seconds"] = dedupe_seconds
+            try:
+                await alert(severity, event, message, **kwargs)
+            except TypeError:
+                kwargs.pop("dedupe_seconds", None)
+                await alert(severity, event, message, **kwargs)
         except Exception:
             logger.debug("reconcile alert delivery failed", exc_info=True)
+
+    async def _note_broker_error(err: BaseException, fallback_method: str,
+                                 fallback_path: str) -> None:
+        """Log and alert one failed read. The path is the redacted endpoint."""
+        if isinstance(err, etrade_async.ETradeAPIError):
+            method = err.method or fallback_method
+            path = err.path or fallback_path
+            status = err.status_code
+            code = err.code
+            message = err.message
+            already = bool(err.reported)
+        else:
+            method = fallback_method
+            path = fallback_path
+            status = int(getattr(err, "status_code", 0) or 0)
+            code = str(getattr(err, "code", "") or "")
+            message = str(err)
+            already = False
+        if already:
+            # The shared request helper already logged and alerted this
+            # response. Reconcile records the same scrubbed line under its
+            # own logger and does not send a second alert.
+            status_s = str(status) if status else "network"
+            line = f"E*TRADE {method} {path} -> {status_s}"
+            if code or message:
+                line += f" [{code}] {message}".rstrip()
+        else:
+            line = await etrade_async.emit_etrade_error(
+                method, path, status, code, message, alert=_alert,
+            )
+        logger.error("[RECONCILE] %s", line)
+        report["warnings"].append(line)
 
     report: Dict[str, Any] = {
         "ts": _utcnow_iso(),
@@ -3979,33 +4290,78 @@ async def reconcile_once(
         "broker_positions": 0,
         "live_orders": 0,
     }
-    try:
-        portfolio_resp, orders_resp = await asyncio.gather(fetch_portfolio(), fetch_orders())
-    except BrokerSessionExpired as e:
+    async def _capture(fn: Callable[[], Awaitable[Dict[str, Any]]]):
+        try:
+            return await fn(), None
+        except Exception as exc:
+            return None, exc
+
+    # One read failing must not cancel the other. gather used to abort the
+    # whole pass on the first exception, which skipped stop-fill booking and
+    # re-arming even when the sibling call had succeeded.
+    (portfolio_resp, portfolio_err), (orders_resp, orders_err) = await asyncio.gather(
+        _capture(fetch_portfolio),
+        _capture(fetch_orders),
+    )
+    if isinstance(portfolio_err, BrokerSessionExpired) or isinstance(orders_err, BrokerSessionExpired):
         # Known-dead session — not a new failure. The transition was already
-        # alerted once; repeating an ERROR per cycle is pure noise.
-        report["warnings"].append(f"skipped — broker session expired, awaiting relink: {e}")
+        # alerted once; repeating an ERROR per cycle is pure noise. Do not
+        # act on the sibling payload either: a dead session is not an empty book.
+        reason = portfolio_err or orders_err
+        report["warnings"].append(f"skipped — broker session expired, awaiting relink: {reason}")
         await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
-        logger.info(f"[RECONCILE] skipped — session expired, awaiting relink ({e})")
-        return report
-    except Exception as e:
-        report["warnings"].append(f"broker fetch failed: {e}")
-        await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
-        logger.warning(f"[RECONCILE] broker fetch failed: {e}")
-        await _alert("error", "reconcile_fetch_failed",
-                     f"Reconciliation could not read broker state: {e}",
-                     dedupe_key="reconcile_fetch")
+        logger.info(f"[RECONCILE] skipped — session expired, awaiting relink ({reason})")
         return report
 
-    broker_positions = parse_broker_positions(portfolio_resp)
-    all_orders = parse_open_orders(orders_resp)
-    live_orders = [o for o in all_orders if o["status"] in _OPEN_ORDER_STATUSES]
+    if portfolio_err is None and not isinstance(portfolio_resp, dict):
+        portfolio_err = etrade_async.ETradeAPIError(
+            0, "portfolio response was not an object",
+            method="GET", path="/v1/accounts/{acct}/portfolio.json",
+        )
+        portfolio_resp = None
+    if orders_err is None and not isinstance(orders_resp, dict):
+        orders_err = etrade_async.ETradeAPIError(
+            0, "orders response was not an object",
+            method="GET", path="/v1/accounts/{acct}/orders.json",
+        )
+        orders_resp = None
+
+    portfolio_ok = portfolio_err is None
+    orders_ok = orders_err is None
+    if portfolio_err is not None:
+        await _note_broker_error(
+            portfolio_err, "GET", "/v1/accounts/{acct}/portfolio.json",
+        )
+    if orders_err is not None:
+        await _note_broker_error(
+            orders_err, "GET", "/v1/accounts/{acct}/orders.json",
+        )
+
+    # A failed read is unknown, not empty. Empty would ghost the book, cancel
+    # live stops, and re-arm a second stop on top of one we failed to see.
+    broker_positions = parse_broker_positions(portfolio_resp) if portfolio_ok else {}
+    if orders_ok:
+        all_orders = parse_open_orders(orders_resp)
+        live_orders = [o for o in all_orders if o["status"] in _OPEN_ORDER_STATUSES]
+    else:
+        all_orders = []
+        live_orders = []
     tracked = await state.all_positions()
     guards = await state.all_guards()
 
     report["tracked_positions"] = len(tracked)
-    report["broker_positions"] = len(broker_positions)
-    report["live_orders"] = len(live_orders)
+    report["broker_positions"] = len(broker_positions) if portfolio_ok else None
+    report["live_orders"] = len(live_orders) if orders_ok else None
+    report["portfolio_ok"] = portfolio_ok
+    report["orders_ok"] = orders_ok
+    # Stop-fill booking needs BOTH reads: the portfolio says the position is
+    # gone, and the orders list has the fill. Either failure defers it.
+    report["fill_booking"] = "ran" if (portfolio_ok and orders_ok) else "deferred"
+
+    if not portfolio_ok and not orders_ok:
+        report["ok"] = False
+        await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
+        return report
 
     now = time.time()
     # PROTECTION means a resting stop that CLOSES the position. A stop-entry
@@ -4016,10 +4372,15 @@ async def reconcile_once(
     # as protection for a tracked CALL on the same underlying (false green on
     # naked risk), and the invariant audit below summed a share stop and a
     # contract stop together and cancelled real protection as "over-committed".
-    stops_by_leg = protective_stops_by_leg(live_orders)
+    stops_by_leg = protective_stops_by_leg(live_orders) if orders_ok else {}
 
     # --- 1) tracked positions vs broker ---
     for ticker, pos in tracked.items():
+        if not portfolio_ok:
+            report["warnings"].append(
+                f"{ticker}: portfolio.json failed — not booking a fill, ghost, or re-arm"
+            )
+            continue
         broker = broker_positions.get(ticker)
         is_opt_pos = position_is_option(pos)
         basis_qty = abs(broker_qty_for(broker, is_opt_pos, pos))
@@ -4033,6 +4394,14 @@ async def reconcile_once(
         # "Present" means present ON THE SAME BASIS: a tracked option with
         # only equity shares at the broker is a ghost of the option position.
         if broker is None or basis_qty == 0:
+            # Orders failed: the position may be a filled stop, a ghost, or
+            # still opening. Do not book any of those from the portfolio alone.
+            if not orders_ok:
+                report["warnings"].append(
+                    f"{ticker}: stop-fill booking deferred — orders.json failed; "
+                    f"not booked as a fill, a ghost, or a close"
+                )
+                continue
             # Not at the broker. In-flight entries get a grace period; a live
             # unfilled entry order also keeps the position tracked.
             has_live_entry = any(
@@ -4132,6 +4501,17 @@ async def reconcile_once(
             report["healed"].append(f"{ticker}: filled_qty {tracked_qty} → {broker_qty}")
             logger.info(f"[RECONCILE] {ticker} filled_qty synced {tracked_qty} → {broker_qty}")
 
+        # Re-arm, native-trail adoption, and "no live stop" all read the order
+        # book. An empty book from a failed orders.json call is not "no stop":
+        # re-arming here would stack a second stop on one we failed to see.
+        # The re-arm callback itself is unchanged: fixed STOP until
+        # breakeven_locked, then one TRAILING_STOP_CNST with a fixed-STOP fallback.
+        if not orders_ok:
+            report["warnings"].append(
+                f"{ticker}: orders.json failed — re-arm deferred, no stop cancelled"
+            )
+            continue
+
         # NATIVE TRAIL ADOPTION. A broker-native trailing stop covering the
         # whole leg IS this position's protection: E*TRADE ratchets it
         # server-side, so the engine-side trail must stand down rather than
@@ -4196,6 +4576,8 @@ async def reconcile_once(
     #         position. Runs after the filled_qty sync above so the audit
     #         compares against the broker's real position size.
     for ticker, pos in tracked.items():
+        if not (portfolio_ok and orders_ok):
+            continue
         broker = broker_positions.get(ticker)
         if broker is None:
             continue
@@ -4285,7 +4667,7 @@ async def reconcile_once(
     #         Real paths here: process death between placement and recording,
     #         a guard timeout that deleted the position before the entry
     #         filled, a partial close remainder, or a manual trade.
-    for exposure in plan_untracked_exposure(broker_positions, tracked):
+    for exposure in (plan_untracked_exposure(broker_positions, tracked) if portfolio_ok else []):
         symbol = exposure["symbol"]
         qty_untracked = exposure["qty"]
         unit = f"{exposure['unit']}(s)"
@@ -4310,7 +4692,7 @@ async def reconcile_once(
 
     # --- 2) orphaned protective stops (stop order live, no tracked position,
     #        no broker position) ---
-    for order in live_orders:
+    for order in (live_orders if portfolio_ok and orders_ok else []):
         if order["price_type"] not in {"STOP", "STOP_LIMIT"}:
             continue
         # Only CLOSING stops can be orphaned. A BUY_STOP entry order legitimately
@@ -4337,8 +4719,12 @@ async def reconcile_once(
             report["warnings"].append(f"{symbol}: orphaned stop order {order['order_id']}")
 
     # --- 3) finished guards referencing dead entry orders (stale cleanup) ---
-    live_order_ids = {o["order_id"] for o in live_orders}
+    live_order_ids = {o["order_id"] for o in live_orders} if orders_ok else set()
     for ticker, guard in guards.items():
+        # "entry gone" plus "no broker position" are both unknown when a read
+        # failed. Closing the guard from that would drop a live entry.
+        if not (portfolio_ok and orders_ok):
+            break
         if guard.get("done"):
             continue
         entry_id = str(guard.get("entry_order_id") or "")
@@ -4352,22 +4738,30 @@ async def reconcile_once(
     # The portfolio and order data above was already paid for; throwing it away
     # after the heal pass is what forced every other consumer (the app, the risk
     # math, the operator) to fall back to the bot's own memory.
-    balances: Optional[Dict[str, Optional[float]]] = None
-    if fetch_balance is not None:
+    # A partial book must not be published as broker truth: missing orders
+    # would mark every position unprotected, and a missing portfolio would
+    # mark every tracked position a ghost.
+    if portfolio_ok and orders_ok:
+        balances: Optional[Dict[str, Optional[float]]] = None
+        if fetch_balance is not None:
+            try:
+                balances = await fetch_balance()
+            except Exception as e:
+                logger.debug(f"[RECONCILE] balance fetch failed (snapshot still published): {e}")
         try:
-            balances = await fetch_balance()
+            snapshot = build_account_snapshot(
+                broker_positions, all_orders, tracked, guards, balances=balances, now=now,
+            )
+            await state.set(ACCOUNT_SNAPSHOT_KEY, json.dumps(snapshot))
+            report["account_snapshot_ts"] = snapshot["ts"]
         except Exception as e:
-            logger.debug(f"[RECONCILE] balance fetch failed (snapshot still published): {e}")
-    try:
-        snapshot = build_account_snapshot(
-            broker_positions, all_orders, tracked, guards, balances=balances, now=now,
+            logger.warning(f"[RECONCILE] account snapshot publish failed: {e}")
+    else:
+        report["warnings"].append(
+            "account snapshot not updated — a broker read failed, so the last snapshot stands"
         )
-        await state.set(ACCOUNT_SNAPSHOT_KEY, json.dumps(snapshot))
-        report["account_snapshot_ts"] = snapshot["ts"]
-    except Exception as e:
-        logger.warning(f"[RECONCILE] account snapshot publish failed: {e}")
 
-    report["ok"] = True
+    report["ok"] = bool(portfolio_ok and orders_ok)
     await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
     if report["healed"] or report["warnings"]:
         logger.info(f"[RECONCILE] pass done — healed={len(report['healed'])} warnings={len(report['warnings'])}")
@@ -15417,7 +15811,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # still fail-closes when the two disagree or the Massive side is missing
 # or stale. GET /pro-trader/report includes the gap in basis points.
 # /status positions_open is the open book with status, side, and qty.
-BOT_VERSION = "5.99.6-pro-day-trader"
+BOT_VERSION = "5.99.9-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against

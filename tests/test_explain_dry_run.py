@@ -165,8 +165,8 @@ async def _seed_store(store):
     await store.queue_push("seed:list", "delta")
 
 
-def test_bot_version_is_pro_day_trader_5996():
-    assert main_bot.BOT_VERSION == "5.99.6-pro-day-trader"
+def test_bot_version_is_pro_day_trader_5999():
+    assert main_bot.BOT_VERSION == "5.99.9-pro-day-trader"
 
 
 def test_dry_run_is_keyword_only_and_defaults_false():
@@ -229,7 +229,7 @@ def test_explain_leaves_memory_desk_and_ledger_unchanged(monkeypatch):
 
             result = await main_bot.explain_signal(_payload())
 
-            assert result["bot_version"] == "5.99.6-pro-day-trader"
+            assert result["bot_version"] == "5.99.9-pro-day-trader"
             assert result["dry_run"] is True
             assert result["placed"] is False
             assert isinstance(result.get("pro_trader"), dict)
