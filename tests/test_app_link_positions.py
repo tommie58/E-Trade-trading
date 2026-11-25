@@ -88,5 +88,7 @@ def test_positions_open_view_marks_puts_short_and_open():
     assert len(rows) == 4
     assert {row["symbol"] for row in rows} == {"AVGO", "INTC", "PLTR", "TSLA"}
     assert all(row["status"] == "open" for row in rows)
-    assert all(row["side"] == "short" for row in rows)
+    assert all(row["side"] == "long" for row in rows)
+    assert all(row["right"] == "put" for row in rows)
+    assert all(row["direction"] == "bearish" for row in rows)
     assert all(row["qty"] == 1 for row in rows)

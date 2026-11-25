@@ -56,26 +56,24 @@ def _end_weighted(samples):
     return num / den
 
 
-def _path_vwap():
-    """Uniform volume between two samples prints at their average."""
-    num = den = 0.0
-    for i, delta in enumerate(DELTAS):
-        weight = (PRICES[i] + PRICES[i + 1]) / 2.0
-        num += weight * delta
-        den += delta
-    return num / den
+# Independently computed from PRICES and DELTAS. Not derived by calling
+# sampled_vwap. End-price weighting of this series is 700.3354. The bracket
+# average is 703.9994. Switching the accumulator back to the later price
+# alone fails the 703.9994 assertion.
+EXPECTED_END_WEIGHTED = 700.3354
+EXPECTED_BRACKET = 703.9994
 
 
 def test_bracketed_samples_stay_inside_the_ceiling_on_todays_shape():
     samples = _samples()
-    path = _path_vwap()
     end_weighted = _end_weighted(samples)
     bracketed = main_bot.scanner_mod.sampled_vwap(samples)
-    end_gap = abs(path - end_weighted) / path * 10000.0
-    bracket_gap = abs(path - bracketed) / path * 10000.0
+    assert end_weighted == pytest.approx(EXPECTED_END_WEIGHTED, abs=0.001)
+    assert bracketed == pytest.approx(EXPECTED_BRACKET, abs=0.001)
+    end_gap = abs(EXPECTED_BRACKET - end_weighted) / EXPECTED_BRACKET * 10000.0
+    bracket_gap = abs(EXPECTED_BRACKET - bracketed) / EXPECTED_BRACKET * 10000.0
     assert end_gap > 25
     assert bracket_gap <= 25
-    assert bracketed == pytest.approx(path, abs=0.02)
     # The published 10:26 ET pair was 700.38 vs 703.44, about 44 bps.
     published = main_bot._vwap_diff_bps(703.4367, 700.3759)
     assert abs(published) > 25

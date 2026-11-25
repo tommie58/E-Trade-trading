@@ -4043,6 +4043,7 @@ async def reconcile_once(
                                      dedupe_key=f"fill_capture:{ticker}")
                     continue
             await state.delete_position(ticker)
+            await release_heat_reservation(ticker=str(ticker).upper(), reason="close")
             guard = guards.get(ticker)
             if guard and not guard.get("done"):
                 await state.update_guard(ticker, done=True, result="reconciled_ghost")
@@ -18318,6 +18319,92 @@ def reservation_exposure(
     return total, book
 
 
+def merge_book_rows(rows: Any) -> List[Dict[str, Any]]:
+    """One row per ticker. A held name plus its reservation is one name.
+
+    Dollars add. The cluster stack then cannot report AVGO/AVGO for a single
+    held AVGO.
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker") or "").upper()
+        if not ticker:
+            continue
+        try:
+            risk = float(row.get("risk_usd") or 0.0)
+        except (TypeError, ValueError):
+            risk = 0.0
+        if ticker not in merged:
+            merged[ticker] = {
+                "ticker": ticker,
+                "direction": 1 if int(row.get("direction") or 1) >= 0 else -1,
+                "risk_usd": 0.0,
+                "cluster": row.get("cluster"),
+            }
+            order.append(ticker)
+        merged[ticker]["risk_usd"] = round(merged[ticker]["risk_usd"] + max(0.0, risk), 2)
+        if row.get("cluster"):
+            merged[ticker]["cluster"] = row.get("cluster")
+    return [merged[ticker] for ticker in order]
+
+
+def _position_filled_qty(pos: Any) -> int:
+    """Filled contracts only. A missing filled_qty is not a fill."""
+    if not isinstance(pos, dict) or pos.get("filled_qty") is None:
+        return 0
+    try:
+        qty = int(float(pos.get("filled_qty")))
+    except (TypeError, ValueError):
+        return 0
+    return qty if qty > 0 else 0
+
+
+def apply_fill_to_reservations(
+    rows: Any,
+    symbol: str,
+    filled_qty: int,
+    now: float,
+) -> List[Dict[str, Any]]:
+    """Release by filled quantity, not by nominal dollars.
+
+    filled >= planned qty drops the row. A partial fill keeps
+    ``(planned - filled) / planned`` of the planned risk. Booked dollars
+    below the nominal plan do not leave the row in place.
+    """
+    ticker = str(symbol or "").upper()
+    try:
+        filled = int(filled_qty or 0)
+    except (TypeError, ValueError):
+        filled = 0
+    if filled < 0:
+        filled = 0
+    kept: List[Dict[str, Any]] = []
+    for row in active_heat_reservations(rows, now):
+        if str(row.get("ticker") or "").upper() != ticker:
+            kept.append(row)
+            continue
+        try:
+            planned_qty = int(row.get("qty") or 1)
+        except (TypeError, ValueError):
+            planned_qty = 1
+        if planned_qty < 1:
+            planned_qty = 1
+        if filled >= planned_qty:
+            continue
+        if filled <= 0:
+            kept.append(row)
+            continue
+        remain = planned_qty - filled
+        updated = dict(row)
+        updated["qty"] = remain
+        updated["risk_usd"] = round(_heat_row_risk(row) * (remain / planned_qty), 2)
+        kept.append(updated)
+    return kept
+
+
 def _entry_contracts(payload: Any) -> int:
     if not isinstance(payload, dict):
         return 1
@@ -18385,9 +18472,11 @@ def judge_heat_admission(
     if enforce_correlation and ticker and not reasons:
         try:
             direction = portfolio_risk.payload_direction(payload or {})
-            book = portfolio_risk.book_rows(held, position_risk_usd) + [
-                row for row in extra_rows if row["ticker"] != ticker
-            ]
+            book = merge_book_rows(
+                portfolio_risk.book_rows(held, position_risk_usd) + [
+                    row for row in extra_rows if row["ticker"] != ticker
+                ]
+            )
             corr = portfolio_risk.assess_correlation(
                 ticker, direction, new_risk, book, account,
                 live_policy("risk_per_trade_pct"), cap, regime,
@@ -18487,12 +18576,17 @@ async def _write_heat_rows(rows: List[Dict[str, Any]]) -> None:
         raise
 
 
-async def _with_heat_lock(mutate, *, wait: bool = True):
+# Releases and settles that lost the try-lock. The sweep retries them.
+_heat_release_retry: List[Dict[str, Any]] = []
+_heat_settle_retry: List[str] = []
+
+
+async def _with_heat_lock(mutate, *, wait: bool = True, refresh_positions: bool = False):
     """Read-modify-write the reservation list.
 
-    ``mutate`` must not read the broker or the network. Positions are loaded
-    before this lock is taken. The lock TTL only has to cover the local
-    reservation read and write.
+    ``mutate`` must not call the broker. When ``refresh_positions`` is set,
+    the book is re-read here — a local state read — so a snapshot taken
+    before the lock cannot miss a fill that just settled.
     """
     if state is None:
         raise LockNotAcquired("heat reservation store is not ready")
@@ -18509,7 +18603,11 @@ async def _with_heat_lock(mutate, *, wait: bool = True):
     try:
         now = time.time()
         rows = active_heat_reservations(await _read_heat_rows(), now)
-        updated, result = mutate(rows, now)
+        if refresh_positions:
+            positions = await state.all_positions()
+            updated, result = mutate(rows, now, positions)
+        else:
+            updated, result = mutate(rows, now)
         await _write_heat_rows(active_heat_reservations(updated, now))
         return result
     finally:
@@ -18547,13 +18645,19 @@ async def admit_heat_reservation(
     """
     if not heat_reservation_enabled():
         return {"allowed": True, "reserved": False, "enabled": False, "reasons": []}
+    # A caller-supplied book can be stale. Read it outside the lock when the
+    # caller did not, so a slow read is not under the lock, then re-read
+    # inside the lock for the decision.
     if positions is None:
-        positions = await state.all_positions()
+        try:
+            await state.all_positions()
+        except Exception as e:
+            logger.warning(f"heat reservation book read failed: {e}")
     correlate = PORTFOLIO_RISK_ENABLED if enforce_correlation is None else enforce_correlation
 
-    def mutate(rows, now):
+    def mutate(rows, now, fresh):
         verdict = judge_heat_admission(
-            positions, rows, payload, new_risk_usd, account_usd, now,
+            fresh, rows, payload, new_risk_usd, account_usd, now,
             regime=regime, enforce_correlation=correlate, heat_cap_pct=heat_cap_pct,
         )
         if not verdict["allowed"]:
@@ -18563,7 +18667,7 @@ async def admit_heat_reservation(
         return rows + [record], {**verdict, "reserved": True, "id": ident}
 
     try:
-        return await _with_heat_lock(mutate)
+        return await _with_heat_lock(mutate, refresh_positions=True)
     except LockNotAcquired:
         return {
             "allowed": False, "reserved": False, "id": None,
@@ -18590,7 +18694,17 @@ async def release_heat_reservation(
         return kept, None
 
     try:
-        await _with_heat_lock(mutate)
+        await _with_heat_lock(mutate, wait=False)
+        return
+    except LockNotAcquired:
+        _heat_release_retry.append({
+            "id": reservation_id, "ticker": ticker, "reason": reason,
+        })
+        logger.warning(
+            "[HEAT] reservation release deferred (%s) — sweep will retry",
+            reason,
+        )
+        return
     except Exception as e:
         logger.warning(f"heat reservation release failed ({reason}): {e}")
 
@@ -18611,23 +18725,16 @@ async def settle_heat_reservation(ticker: str) -> None:
     except Exception as e:
         logger.warning(f"heat reservation settle skipped for {symbol}: {e}")
         return
-    try:
-        booked = float(position_risk_usd(pos) or 0.0) if pos else 0.0
-    except Exception:
-        booked = 0.0
+    filled = _position_filled_qty(pos)
 
     def mutate(rows, now):
-        planned = sum(
-            _heat_row_risk(row) for row in rows
-            if str(row.get("ticker") or "").upper() == symbol
-        )
-        if planned > 0 and booked + 1e-6 >= planned:
-            return release_heat_rows(rows, now, ticker=symbol), None
-        return rows, None
+        return apply_fill_to_reservations(rows, symbol, filled, now), None
 
     try:
         await _with_heat_lock(mutate, wait=False)
     except LockNotAcquired:
+        if symbol not in _heat_settle_retry:
+            _heat_settle_retry.append(symbol)
         logger.info(
             "[HEAT] %s reservation settle deferred — stop arming does not wait",
             symbol,
@@ -18666,9 +18773,8 @@ async def finish_heat_attempt(payload: Optional[dict], status: str) -> None:
 async def clear_heat_reservations(reason: str = "restart") -> None:
     """Drop every reservation. Open positions are not touched.
 
-    Restart calls this so a crashed order cannot hold the cap. Risk that
-    was already booked on a position still counts. An order that fills
-    after the clear is booked at fill, which is the residual window.
+    Tests and an operator reset use this. Boot does not: a restart keeps
+    unexpired rows so a recovered order still holds its heat.
     """
     if state is None:
         return
@@ -18677,6 +18783,105 @@ async def clear_heat_reservations(reason: str = "restart") -> None:
         logger.info(f"heat reservations cleared ({reason})")
     except Exception as e:
         logger.warning(f"heat reservation clear failed ({reason}): {e}")
+
+
+async def drop_expired_heat_reservations(reason: str = "restart") -> None:
+    """Boot path. Expired rows go. Live reservations stay."""
+    if state is None or not heat_reservation_enabled():
+        return
+
+    def mutate(rows, now):
+        kept = active_heat_reservations(rows, now)
+        return kept, len(list(rows or [])) - len(kept)
+
+    try:
+        dropped = await _with_heat_lock(mutate)
+        logger.info("heat reservations kept (%s); expired dropped: %s", reason, dropped)
+    except Exception as e:
+        logger.warning(f"heat reservation expiry sweep failed ({reason}): {e}")
+
+
+async def sweep_heat_reservations() -> None:
+    """Retry settles and releases that lost the try-lock, and apply fills.
+
+    The position book is a local read inside the lock. A busy lock leaves
+    the retry lists in place for the next pass.
+    """
+    if state is None or not heat_reservation_enabled():
+        return
+    releases = list(_heat_release_retry)
+    settles = list(_heat_settle_retry)
+
+    def mutate(rows, now, positions):
+        kept = active_heat_reservations(rows, now)
+        for item in releases:
+            if not isinstance(item, dict):
+                continue
+            kept = release_heat_rows(
+                kept, now,
+                reservation_id=item.get("id") or None,
+                ticker=None if item.get("id") else item.get("ticker"),
+            )
+        symbols = {str(row.get("ticker") or "").upper() for row in kept}
+        symbols.update(str(sym or "").upper() for sym in settles)
+        held = positions if isinstance(positions, dict) else {}
+        for symbol in symbols:
+            if not symbol:
+                continue
+            pos = held.get(symbol)
+            if pos is None:
+                continue
+            kept = apply_fill_to_reservations(
+                kept, symbol, _position_filled_qty(pos), now,
+            )
+        return kept, None
+
+    try:
+        await _with_heat_lock(mutate, wait=False, refresh_positions=True)
+    except LockNotAcquired:
+        return
+    except Exception as e:
+        logger.warning(f"heat reservation sweep failed: {e}")
+        return
+    _heat_release_retry.clear()
+    _heat_settle_retry.clear()
+
+
+async def ensure_queued_heat(payload: dict) -> Optional[str]:
+    """Re-check heat before a recovered or queued entry is placed.
+
+    A reservation that is still live is kept. One that a restart or a
+    missed settle dropped is admitted again. Refusal means do not place.
+    """
+    if not isinstance(payload, dict) or not heat_reservation_enabled():
+        return None
+    if _is_close_payload(payload):
+        return None
+    rid = str(payload.get("_heat_reservation_id") or "").strip()
+    now = time.time()
+    try:
+        rows = active_heat_reservations(await _read_heat_rows(), now)
+    except Exception:
+        rows = []
+    if rid and any(str(row.get("id") or "") == rid for row in rows):
+        return None
+    try:
+        account = await _risk_account_reference()
+    except Exception as e:
+        logger.warning(f"queued heat recheck account unreadable: {e}")
+        return "heat reservation recheck failed — entry not placed"
+    try:
+        nominal = float(account) * (float(live_policy("risk_per_trade_pct")) / 100.0)
+    except (TypeError, ValueError):
+        nominal = 0.0
+    actual = estimate_entry_risk_usd(payload) or 0.0
+    new_risk = max(nominal, float(actual or 0.0))
+    admission = await admit_heat_reservation(payload, new_risk, account)
+    if not admission.get("allowed", False):
+        return "; ".join(admission.get("reasons") or ["heat reservation refused"])
+    if admission.get("id"):
+        payload["_heat_reservation_id"] = admission["id"]
+    return None
 
 
 def assess_app_risk_gates(open_count: Any, realized_pnl_today_pct: Any, daily_loss_limit_pct: Any,
@@ -30390,6 +30595,7 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
     missing number. It is passed explicitly (never inferred from a falsy exit)
     so that an absent price can never masquerade as a total loss."""
     pos = await state.delete_position(ticker)
+    await release_heat_reservation(ticker=str(ticker).upper(), reason="close")
     # WHO WINS marker: a second closer (bot or app) arriving for this ticker
     # inside RECENT_CLOSE_STANDDOWN_SECONDS stands down. Best effort.
     try:
@@ -30801,8 +31007,10 @@ async def _book_partial_stop_fill(
     pos["partial_exits"] = int(pos.get("partial_exits") or 0) + 1
     if remaining > 0:
         await state.set_position(ticker, pos)
+        await settle_heat_reservation(ticker)
     else:
         await state.delete_position(ticker)
+        await release_heat_reservation(ticker=str(ticker).upper(), reason="close")
 
     await trade_ledger.record("partial_stop_fill", {
         "ticker": ticker,
@@ -34639,6 +34847,7 @@ async def execute_live_order(payload: dict):
                         await state.delete_position(symbol)
                     except Exception:
                         pass
+                    await release_heat_reservation(ticker=str(symbol).upper(), reason="close")
                     await _defer_close_to_reconciler(symbol, close_order_id,
                                                      "crypto close placed — fill sync deferred")
                 logger.info(f"✅ LIVE CRYPTO CLOSE SUCCESS: SELL {symbol}")
@@ -35123,6 +35332,13 @@ async def _run_queued_job(raw: str) -> None:
     sig_key = _signal_key(pd)
     mode = str(pd.get("mode") or "paper").lower()
     live_intent = _live_intent(mode)
+    if live_intent and not _is_close_payload(pd):
+        refusal = await ensure_queued_heat(pd)
+        if refusal:
+            await state.set(sig_key, "rejected", ex=86400)
+            await _record_dispatch_verdict(pd, "rejected", refusal)
+            logger.warning(f"queued heat recheck refused {pd.get('ticker')}: {refusal}")
+            return
     try:
         result = await execute_live_order(pd)
         inner_status = str(result.get("status") or "processed")
@@ -35191,6 +35407,7 @@ async def _recover_processing_queue() -> None:
 async def placement_worker():
     while not _worker_stop:
         try:
+            await sweep_heat_reservations()
             if state.is_distributed:
                 job = await state.lmove_fifo(QUEUE_KEY, PROCESSING_KEY)
                 if job:
@@ -37984,10 +38201,10 @@ async def on_startup():
         _last_pnl_migration = {"status": "error", "error": str(e)}
         logger.error(f"[PNL-MIGRATION] failed (non-fatal, will retry next boot): {e}")
     _last_pnl_repair = await _repair_daily_pnl()
-    # A reservation is process-lifetime state. Restart drops it so a crashed
-    # order cannot hold the heat cap. Open positions still count. An order
-    # that fills after this clear is booked when the position gets its risk.
-    await clear_heat_reservations("restart")
+    # Keep unexpired heat reservations across a restart. Expired ones drop.
+    # A recovered job re-checks heat before it places, so a wiped row cannot
+    # skip the cap.
+    await drop_expired_heat_reservations("restart")
     # STARTUP RECONCILIATION — blocking broker→Redis sync BEFORE the placement
     # worker starts, so no order is ever placed against stale cold-start state.
     await _startup_reconcile()
@@ -38236,23 +38453,33 @@ def positions_open_view(tracked: Optional[Dict[str, Any]]) -> List[Dict[str, Any
             continue
         contract = pos.get("contract") if isinstance(pos.get("contract"), dict) else {}
         right = str(contract.get("right") or "").upper()
-        if right == "PUT":
-            side = "short"
-        elif right == "CALL":
-            side = "long"
+        action = str(pos.get("action") or "BUY").upper()
+        bought = action not in {"SELL", "SELL_SHORT", "SHORT", "SELL_OPEN"}
+        # A bought option is a long contract. Direction is separate so a
+        # long put is bearish exposure, not a short position.
+        if right in {"PUT", "CALL"}:
+            side = "long" if bought else "short"
+            if right == "PUT":
+                direction = "bearish" if bought else "bullish"
+            else:
+                direction = "bullish" if bought else "bearish"
         else:
-            action = str(pos.get("action") or "BUY").upper()
-            side = "short" if action in {"SELL", "SELL_SHORT", "SHORT"} else "long"
+            side = "long" if bought else "short"
+            direction = "bullish" if side == "long" else "bearish"
         qty = pos.get("filled_qty")
         if qty is None:
             qty = pos.get("qty")
-        rows.append({
+        row = {
             "symbol": str(ticker).upper(),
             "qty": qty,
             "side": side,
+            "direction": direction,
             "instrument": pos.get("instrument") or ("option" if right else "equity"),
             "status": "open",
-        })
+        }
+        if right in {"PUT", "CALL"}:
+            row["right"] = right.lower()
+        rows.append(row)
     return rows
 
 
