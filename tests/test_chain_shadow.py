@@ -894,6 +894,9 @@ def test_process_signal_hook_order_and_identical_orders(monkeypatch):
     monkeypatch.setattr(main_bot, "_place_order_smart", place_order)
 
     async def drive(signal_id, enabled):
+        main_bot.portfolio_risk.note_spy_gap_session(
+            0.4, True, main_bot._session_day_et(),
+        )
         monkeypatch.setenv("CHAIN_SHADOW_ENABLED", "true" if enabled else "false")
         store = main_bot.StateStore(None)
         main_bot.state = store
@@ -935,6 +938,7 @@ def test_process_signal_hook_order_and_identical_orders(monkeypatch):
         main_bot.massive_client = saved["client"]
         main_bot.trade_ledger._ledger = saved["ledger"]
         main_bot._CHAIN_SHADOW_CACHE.clear()
+        main_bot.portfolio_risk.clear_spy_gap_sit_out()
 
     assert off["status"] == "processed_directly", off
     assert off["result"]["status"] == "success", off
