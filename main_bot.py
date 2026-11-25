@@ -17493,7 +17493,6 @@ def _note_data_quality_vwap(row: Dict[str, Any], resolved: Dict[str, Any], now_e
 # this cache. Massive day.vw and the snapshot minute `vw` stay telemetry.
 # They are not gate inputs. A restart begins with an empty cache and fails
 # closed until the first successful refresh.
-_MINUTE_VWAP_REFRESH_S = 90.0
 _MINUTE_VWAP_TIMEOUT_S = 3.0
 _minute_vwap_cache: Dict[str, Dict[str, Any]] = {}
 _minute_vwap_attempt_at: Dict[str, float] = {}

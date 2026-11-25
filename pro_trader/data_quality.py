@@ -1007,10 +1007,13 @@ def research_status(
 
 
 def bars_allowed_for_gate(symbol: str, *, bar_vwap: Any, bar_age_s: Any, bar_count: int) -> bool:
-    """Opt-in bar gate input only when this symbol's Massive bars are fresh.
+    """True when enforcement may copy this symbol's bar VWAP onto the gate.
 
-    IV does not move the CALL gate. A 401/403, a missing bar, or a stale
-    bar leaves the gate on the sampled path it already computed.
+    Needs an ok bars feed, an ok symbol reading, and a completed-bar VWAP
+    no older than 150s. IV is not an input. False does not select a gate
+    value: ``choose_vwap`` fail-closes a stale or missing bar, and a 401
+    or 403 that leaves a fresh cache is still open (the caller does not
+    enter this branch).
     """
     if bars_feed().get("status") != SHADOW_OK:
         return False

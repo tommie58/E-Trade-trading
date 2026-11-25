@@ -559,44 +559,46 @@ def test_running_sum_mismatch_keeps_the_full_recompute(monkeypatch):
     assert adopted["vwap"] != pytest.approx(1.0)
 
 
-def _pulls_in_window(due, start, seconds, step):
-    """How many times one symbol pulls if the caller wakes every ``step`` seconds."""
+def _pull_timestamps(due, start, seconds, step):
+    """Epochs where one symbol pulls. ``last`` begins at 0, as on a fresh process."""
     last = 0.0
-    count = 0
+    stamps = []
     t = float(start)
     end = float(start) + float(seconds)
     while t <= end + 1e-9:
         if due(t, last):
-            count += 1
+            stamps.append(t)
             last = t
         t += float(step)
-    return count
+    return stamps
 
 
 def test_default_pull_matches_main_over_a_simulated_rth_hour(monkeypatch):
-    """Flag off: 90s elapsed, full-day URL, and no more GETs than main."""
+    """Flag off: full-day URL, and the same pull times as main's 90s rule.
+
+    The clock is 09:30 ET on 24 Nov 2026, not zero. A zero clock makes
+    ``last <= 0`` stay true after the first pull and insert a second one.
+    """
     monkeypatch.delenv("BAR_PULL_ALIGNED_60S", raising=False)
     monkeypatch.delenv("AGGS_INCREMENTAL_MERGE", raising=False)
     monkeypatch.delenv("AGGS_PULL_INTERVAL_S", raising=False)
-    assert dq.agg_request_range("2026-11-24", 1_700_000_000.0) == ("2026-11-24", "2026-11-24")
-    clock = datetime(2026, 11, 24, 9, 30, tzinfo=ET)
+    assert dq.agg_request_range("2026-11-24", 1_764_000_000.0) == ("2026-11-24", "2026-11-24")
+    open_et = datetime(2026, 11, 24, 9, 30, tzinfo=ET)
+    start = open_et.timestamp()
 
     def main_due(now, last):
-        return last <= 0 or now - last >= 90.0
+        return now - last >= 90.0
 
     def our_due(now, last):
-        when = clock + timedelta(seconds=now)
+        when = datetime.fromtimestamp(now, tz=ET)
         return dq.agg_pull_due(
             now, last, dq.aggs_pull_interval_s(), dq.aggs_alignment_active(), when,
         )
 
-    # Scanner wakes every 60s. One regular-session hour, two symbols.
-    main_gets = 2 * _pulls_in_window(main_due, 0, 3600, 60)
-    our_gets = 2 * _pulls_in_window(our_due, 0, 3600, 60)
-    assert our_gets == main_gets
-    assert our_gets <= main_gets
-    # A one-second caller still cannot beat main's 90s ceiling.
-    assert _pulls_in_window(our_due, 0, 3600, 1) == _pulls_in_window(main_due, 0, 3600, 1)
+    # Scanner wakes every 60s for one regular-session hour, and a 1s caller
+    # covers the same hour. Both symbols share one throttle.
+    for step in (60, 1):
+        assert _pull_timestamps(our_due, start, 3600, step) == _pull_timestamps(main_due, start, 3600, step)
 
 
 def test_admitted_open_survives_a_shadow_verdict_failure(monkeypatch, caplog, tmp_path):
