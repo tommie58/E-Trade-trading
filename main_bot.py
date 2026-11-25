@@ -16862,7 +16862,18 @@ _shadow_writer: Optional[asyncio.Task] = None
 _shadow_loop: Optional[asyncio.AbstractEventLoop] = None
 _shadow_accepting = True
 _shadow_mirror: Optional[Any] = None
+_shadow_line_loader: Optional[Any] = None
 _shadow_inflight = 0
+_shadow_writer_restarted = False
+_shadow_restore_failed = False
+_shadow_restore_attempts = 0
+_shadow_restore_delays: Tuple[float, ...] = (0.0, 2.0, 3.0)
+_shadow_boot_nonce = "b" + uuid.uuid4().hex[:8]
+_shadow_mirrored_hashes: set = set()
+_shadow_backfill_task: Optional[asyncio.Task] = None
+_shadow_restore_task: Optional[asyncio.Task] = None
+_SHADOW_MIRROR_TIMEOUT_S = 2.0
+_SHADOW_BACKFILL_INTERVAL_S = 60.0
 _shadow_ledger_counts: Dict[str, int] = {
     "written": 0, "dropped": 0, "on_disk": 0, "durable": 0, "mirror_failed": 0,
     "partial_truncated": 0,
@@ -16959,9 +16970,23 @@ def setup_disable_signal_parts(payload: Any) -> Tuple[str, str, str]:
     return symbol, setup, signal_id
 
 
+def _shadow_key_tail() -> str:
+    """Boot-unique suffix while restore is degraded, so core keys cannot collide."""
+    if _shadow_restore_failed and _shadow_boot_nonce:
+        return f"|{_shadow_boot_nonce}"
+    return ""
+
+
 def setup_disable_signal_key(payload: Any, attempt: int = 1) -> str:
     symbol, setup, signal_id = setup_disable_signal_parts(payload)
-    return f"{symbol}|{setup}|{signal_id}|{int(attempt)}"
+    return f"{symbol}|{setup}|{signal_id}|{int(attempt)}{_shadow_key_tail()}"
+
+
+def _attempt_from_signal_key(key: str) -> int:
+    for part in reversed(str(key).split("|")):
+        if part.isdigit():
+            return int(part)
+    return 0
 
 
 def _claim_setup_disable_attempt(payload: Dict[str, Any], *, fresh_order: bool) -> Optional[Tuple[int, str]]:
@@ -16984,7 +17009,7 @@ def _claim_setup_disable_attempt(payload: Dict[str, Any], *, fresh_order: bool) 
         return attempt, current
     n = int(_setup_disable_attempt_n.get((symbol, setup, day)) or 0) + 1
     _setup_disable_attempt_n[(symbol, setup, day)] = n
-    key = f"{symbol}|{setup}|{signal_id}|{n}"
+    key = f"{symbol}|{setup}|{signal_id}|{n}{_shadow_key_tail()}"
     _setup_disable_inflight[ident] = key
     if fresh_order:
         _setup_disable_closed_attempt.add(key)
@@ -17095,10 +17120,7 @@ def seed_setup_disable_from_ledger() -> None:
                 _setup_disable_closed_attempt.add(key)
             parts = key.split("|")
             if len(parts) >= 4 and parts[0] and parts[1]:
-                try:
-                    attempt = int(parts[-1])
-                except ValueError:
-                    attempt = 0
+                attempt = _attempt_from_signal_key(key)
                 day = str(data.get("et_timestamp") or "")[:10]
                 if day:
                     bucket = (parts[0], parts[1], day)
@@ -17431,30 +17453,33 @@ class SetupDisableShadowLog:
         self._seq, self._prev_hash = self._load_tail()
 
     def _repair_partial_tail(self) -> int:
-        """Drop a torn last line so verify() can start from a complete chain."""
+        """Truncate a torn last line. The bytes before it stay where they are."""
         try:
             if not self.path.exists() or self.path.stat().st_size == 0:
                 return 0
-            raw = self.path.read_text(encoding="utf-8")
+            raw = self.path.read_bytes()
         except OSError:
             return 0
+        keep = raw
         removed = 0
-        if raw and not raw.endswith("\n"):
-            cut = raw.rfind("\n")
-            raw = raw[: cut + 1] if cut >= 0 else ""
+        if keep and not keep.endswith(b"\n"):
+            cut = keep.rfind(b"\n")
+            keep = keep[: cut + 1] if cut >= 0 else b""
             removed += 1
-        lines = [ln for ln in raw.splitlines() if ln.strip()]
-        while lines:
+        while keep:
+            body = keep[:-1] if keep.endswith(b"\n") else keep
+            split = body.rfind(b"\n")
+            last = body[split + 1:]
             try:
-                json.loads(lines[-1])
+                json.loads(last.decode("utf-8"))
                 break
-            except json.JSONDecodeError:
-                lines.pop()
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                keep = keep[: split + 1] if split >= 0 else b""
                 removed += 1
-        if removed:
-            payload = ("\n".join(lines) + "\n") if lines else ""
+        if removed and len(keep) != len(raw):
             try:
-                self.path.write_text(payload, encoding="utf-8")
+                with open(self.path, "rb+") as handle:
+                    handle.truncate(len(keep))
             except OSError:
                 return 0
         return removed
@@ -17509,10 +17534,11 @@ class SetupDisableShadowLog:
                     handle.flush()
                     os.fsync(handle.fileno())
             except Exception:
-                if not advanced:
-                    self._seq -= 1
                 self._reload_tail()
-                raise
+                if not advanced:
+                    raise
+                # write() returned, so the line is on disk. fsync can fail
+                # without dropping the row. The head now matches the file.
             _shadow_ledger_counts["on_disk"] = self._seq
             return rec
 
@@ -17528,7 +17554,10 @@ class SetupDisableShadowLog:
                         continue
                     rec = json.loads(line)
                     claimed = str(rec.pop("hash", ""))
-                    if str(rec.get("prev_hash")) != prev:
+                    prev_link = str(rec.get("prev_hash"))
+                    # A second chain may start at genesis. Each segment is checked
+                    # on its own instead of failing the whole file.
+                    if prev_link != prev and prev_link != ("0" * 64):
                         return False, checked, f"line {line_no}: prev_hash broken"
                     body = json.dumps(rec, sort_keys=True, default=str)
                     if hashlib.sha256((str(rec.get("prev_hash")) + body).encode("utf-8")).hexdigest() != claimed:
@@ -17601,37 +17630,165 @@ async def _shadow_postgres_mirror(seq: int, rec_hash: str, line: str) -> None:
         )
 
 
+async def _load_durable_shadow_lines() -> List[str]:
+    loader = _shadow_line_loader
+    if loader is not None:
+        return list(await loader())
+    if engine is None:
+        return []
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            sql_text(f"SELECT line FROM {_bt('bot_shadow_ledger')} ORDER BY seq"))
+        return [row[0] for row in result.fetchall()]
+
+
 async def _mirror_shadow_line(seq: int, rec_hash: str, line: str) -> None:
     mirror = _shadow_mirror
     if mirror is None:
         return
+    digest = str(rec_hash)
+    if digest in _shadow_mirrored_hashes:
+        return
     try:
-        await mirror(int(seq), str(rec_hash), line)
+        await asyncio.wait_for(mirror(int(seq), digest, line), timeout=_SHADOW_MIRROR_TIMEOUT_S)
+        _shadow_mirrored_hashes.add(digest)
         _shadow_ledger_counts["durable"] = int(_shadow_ledger_counts.get("durable") or 0) + 1
     except Exception as exc:
         _shadow_ledger_counts["mirror_failed"] = int(_shadow_ledger_counts.get("mirror_failed") or 0) + 1
+        _shadow_ledger_counts["mirror_failures"] = int(_shadow_ledger_counts.get("mirror_failures") or 0) + 1
         _log_setup_disable_observer_error(exc)
 
 
-async def _restore_shadow_log_from_db(path: Path) -> int:
-    """Rebuild the side log from Postgres when the file was wiped. Before seeding."""
-    if engine is None:
-        return 0
+def _shadow_file_lines() -> List[str]:
+    log = _shadow_log
+    if log is None or not log.path.exists():
+        return []
     try:
-        async with engine.connect() as conn:
-            result = await conn.execute(
-                sql_text(f"SELECT line FROM {_bt('bot_shadow_ledger')} ORDER BY seq"))
-            lines = [row[0] for row in result.fetchall()]
-    except Exception as exc:
+        with log._lock:
+            raw = log.path.read_text(encoding="utf-8")
+    except OSError as exc:
         _log_setup_disable_observer_error(exc)
-        return 0
+        return []
+    return [ln for ln in raw.splitlines() if ln.strip()]
+
+
+async def backfill_shadow_mirror() -> int:
+    """Push on-disk lines that Postgres does not have yet. Off the order path."""
+    pushed = 0
+    for line in _shadow_file_lines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        digest = str(rec.get("hash") or "")
+        if not digest or digest in _shadow_mirrored_hashes:
+            continue
+        before = int(_shadow_ledger_counts.get("durable") or 0)
+        await _mirror_shadow_line(int(rec.get("seq") or 0), digest, line)
+        if int(_shadow_ledger_counts.get("durable") or 0) > before:
+            pushed += 1
+    return pushed
+
+
+async def _shadow_backfill_loop() -> None:
+    while _shadow_accepting:
+        await asyncio.sleep(_SHADOW_BACKFILL_INTERVAL_S)
+        if not _shadow_accepting:
+            return
+        try:
+            await backfill_shadow_mirror()
+        except Exception as exc:
+            _log_setup_disable_observer_error(exc)
+
+
+def _start_shadow_backfill_loop() -> None:
+    global _shadow_backfill_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _shadow_backfill_task is not None and not _shadow_backfill_task.done():
+        return
+    _shadow_backfill_task = loop.create_task(_shadow_backfill_loop(), name="setup-disable-shadow-backfill")
+
+
+async def _restore_shadow_once(path: Path) -> None:
+    lines = await _load_durable_shadow_lines()
     if not lines:
-        return 0
+        return
     written = restore_shadow_lines(path, lines)
-    _shadow_ledger_counts["durable"] = len(lines)
+    _shadow_ledger_counts["durable"] = max(int(_shadow_ledger_counts.get("durable") or 0), len(lines))
     if written:
         _shadow_ledger_counts["on_disk"] = written
-    return written
+
+
+async def _shadow_restore_retry(path: Path) -> None:
+    """Keep trying after boot. A later success clears the degraded flag."""
+    global _shadow_restore_failed, _shadow_restore_attempts, _setup_disable_seeded
+    delay = 5.0
+    while _shadow_restore_failed and _shadow_accepting:
+        await asyncio.sleep(delay)
+        if not _shadow_restore_failed or not _shadow_accepting:
+            return
+        _shadow_restore_attempts += 1
+        try:
+            await _restore_shadow_once(path)
+        except Exception as exc:
+            _log_setup_disable_observer_error(exc)
+            delay = min(delay * 2.0, 60.0)
+            continue
+        _shadow_restore_failed = False
+        init_setup_disable_shadow_log(path)
+        try:
+            await backfill_shadow_mirror()
+        except Exception as exc:
+            _log_setup_disable_observer_error(exc)
+        _setup_disable_seeded = False
+        seed_setup_disable_from_ledger()
+        return
+
+
+def _start_shadow_restore_retry(path: Path) -> None:
+    global _shadow_restore_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _shadow_restore_task is not None and not _shadow_restore_task.done():
+        return
+    _shadow_restore_task = loop.create_task(_shadow_restore_retry(path), name="setup-disable-shadow-restore")
+
+
+async def prepare_setup_disable_shadow(path: Path) -> None:
+    """Restore, backfill, then leave seeding to the caller.
+
+    Three tries span about five seconds. They do not run on the order path.
+    A failure stays visible and keeps retrying. Keys minted while degraded
+    carry this boot's nonce.
+    """
+    global _shadow_restore_failed, _shadow_restore_attempts
+    ok = False
+    for delay in _shadow_restore_delays:
+        if delay:
+            await asyncio.sleep(delay)
+        _shadow_restore_attempts += 1
+        try:
+            await _restore_shadow_once(path)
+            ok = True
+            break
+        except Exception as exc:
+            _log_setup_disable_observer_error(exc)
+    _shadow_restore_failed = not ok
+    init_setup_disable_shadow_log(path)
+    if engine is not None and _shadow_mirror is None:
+        set_shadow_mirror(_shadow_postgres_mirror)
+    try:
+        await backfill_shadow_mirror()
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+    if _shadow_restore_failed:
+        _start_shadow_restore_retry(path)
+    _start_shadow_backfill_loop()
 
 
 def read_setup_disable_shadow(count: int = 100) -> List[Dict[str, Any]]:
@@ -17668,6 +17825,8 @@ def _on_shadow_writer_done(task: asyncio.Task) -> None:
     if exc is None:
         return
     logger.error("setup disable shadow writer died (%s)", type(exc).__name__)
+    global _shadow_writer_restarted
+    _shadow_writer_restarted = True
     try:
         task.get_loop().call_soon(_start_shadow_writer)
     except Exception as restart_exc:
@@ -17764,7 +17923,9 @@ async def drain_shadow_queue(timeout: float = _SHADOW_SHUTDOWN_DRAIN_S) -> int:
     writer = _shadow_writer
     if queue is None:
         return 0
-    wait = 0.0 if writer is None or writer.done() else max(0.0, float(timeout))
+    # A writer that died and was replaced is not a live drain. Don't sit out the budget.
+    dead = writer is None or writer.done() or _shadow_writer_restarted
+    wait = 0.0 if dead else max(0.0, float(timeout))
     if wait:
         try:
             await asyncio.wait_for(queue.join(), timeout=wait)
@@ -17830,7 +17991,10 @@ def setup_disable_status() -> Dict[str, Any]:
             "on_disk": int(_shadow_ledger_counts.get("on_disk") or 0),
             "durable": int(_shadow_ledger_counts.get("durable") or 0),
             "mirror_failed": int(_shadow_ledger_counts.get("mirror_failed") or 0),
+            "mirror_failures": int(_shadow_ledger_counts.get("mirror_failures") or _shadow_ledger_counts.get("mirror_failed") or 0),
             "partial_truncated": int(_shadow_ledger_counts.get("partial_truncated") or 0),
+            "restore_failed": bool(_shadow_restore_failed),
+            "restore_attempts": int(_shadow_restore_attempts),
         },
         "read_only": True,
         "env_read": "each_entry",
@@ -17859,8 +18023,11 @@ def reset_setup_disable_state() -> None:
     _shadow_ledger_counts["durable"] = 0
     _shadow_ledger_counts["mirror_failed"] = 0
     _shadow_ledger_counts["partial_truncated"] = 0
-    global _shadow_accepting
+    global _shadow_accepting, _shadow_restore_failed, _shadow_restore_attempts, _shadow_writer_restarted
     _shadow_accepting = True
+    _shadow_restore_failed = False
+    _shadow_restore_attempts = 0
+    _shadow_writer_restarted = False
     _opened_seq_by_signal.clear()
     _opened_seq_order.clear()
 
@@ -24604,7 +24771,11 @@ async def _init_durable_state() -> Optional[PgStatePersistence]:
         async with engine.begin() as conn:
             await conn.execute(sql_text(_state_table_sql()))
             await conn.execute(sql_text(_ledger_table_sql()))
-            await conn.execute(sql_text(_shadow_ledger_table_sql()))
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(sql_text(_shadow_ledger_table_sql()))
+        except Exception as shadow_err:
+            logger.error("shadow ledger table init failed (%s)", type(shadow_err).__name__)
         _state_persistence = PgStatePersistence(engine)
         return _state_persistence
     except Exception as e:
@@ -40073,10 +40244,9 @@ async def on_startup():
         "SETUP_DISABLE_SHADOW_FILE",
         str(TRADE_LEDGER_FILE.with_name("setup_disable_shadow.jsonl")),
     ))
-    await _restore_shadow_log_from_db(shadow_path)
-    init_setup_disable_shadow_log(shadow_path)
     if engine is not None:
         set_shadow_mirror(_shadow_postgres_mirror)
+    await prepare_setup_disable_shadow(shadow_path)
     seed_setup_disable_from_ledger()
     # Say out loud whether this process actually remembers anything. A ledger
     # that comes up empty is indistinguishable from a healthy one in the logs,
