@@ -1,16 +1,18 @@
-"""Shadow data-quality measurements. Decisions stay on the current inputs.
+"""Shadow data-quality measurements. Defaults do not change a live decision.
 
-Four switches, each read from the environment on every use (not at import):
+Switches, each read from the environment on every use (not at import):
 
-- ``VWAP_SOURCE`` ``sampled`` (default) or ``bars``
-- ``AGGS_PULL_INTERVAL_S`` unset (default) keeps the 90s elapsed throttle
+- ``VWAP_SOURCE`` ``sampled`` (default) or ``bars`` (enforcement, default off)
+- ``AGGS_PULL_INTERVAL_S`` unset means 60s, aligned to the minute boundary
+- ``AGGS_INCREMENTAL_MERGE`` ``false`` (default). Off keeps the full-day pull
 - ``BAD_TICK_FILTER_ENABLED`` ``false`` (default)
 - ``GAP_SOURCE`` ``current`` (default) or ``snapshot``
 
-The CALL index gate stays fail-closed. A missing or stale bar VWAP falls
-back to the sampled gate input. It does not allow the CALL. Official gap
-math uses the snapshot day open and previous close only. The first 1-minute
-bar open is not an input. Nothing here places an order or reads a secret.
+Shadow rows fail closed: a missing or stale bar VWAP is ``no_data`` and is
+not replaced with the sampled VWAP. Enforcement (``VWAP_SOURCE=bars``) also
+fails closed, with no sampled fallback. A missing snapshot gap leaves the
+current gap verdict in place. A bad IV check nulls only the IV field.
+Nothing here places an order or reads a secret.
 """
 from __future__ import annotations
 
@@ -22,20 +24,19 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("etrade-bot.data-quality")
 
-# Shadow research fails closed. A row is ``no_data`` when Massive 1-minute
-# bars or IV (where the research depends on it) are missing, stale, or
-# rejected with 401/403. The sampled VWAP and Yahoo volume are not substitutes.
+# A bar-VWAP row is ``no_data`` when its own bars are missing, stale, or
+# rejected. That does not borrow the sampled VWAP. IV is its own field.
 SHADOW_OK = "ok"
 SHADOW_NO_DATA = "no_data"
 _IV_STALE_S = 90.0
 _AUTH_REASONS = frozenset({"unauthorized", "forbidden", "not_configured"})
 
-# Current refresh throttle in main_bot (_MINUTE_VWAP_REFRESH_S).
-DEFAULT_AGGS_PULL_INTERVAL_S = 90.0
-# Proposal cadence. Not the default.
-PROPOSAL_AGGS_PULL_INTERVAL_S = 60.0
-# Pulls that track the minute wait until this many seconds after it closes.
-AGGS_ALIGN_AFTER_CLOSE_S = 5
+# Quant Lab: a 90s pull was stale 16.2% of the time. 60s on the minute was 0%.
+DEFAULT_AGGS_PULL_INTERVAL_S = 60.0
+# Previous elapsed throttle. Set AGGS_PULL_INTERVAL_S=90 to restore it.
+LEGACY_AGGS_PULL_INTERVAL_S = 90.0
+# Minute boundary. Second 0, not five seconds after the close.
+AGGS_ALIGN_AFTER_CLOSE_S = 0
 # Newest completed bar older than this is not fresh enough to drive the gate.
 BAR_VWAP_STALE_S = 150.0
 # Bad-tick: wick beyond the body, versus the median true range of the prior bars.
@@ -71,6 +72,9 @@ def _fresh_state() -> Dict[str, Any]:
         "gaps": {},
         "bad_tick_ids": {},
         "bad_tick_details": [],
+        "bad_tick_confirmed_ids": {},
+        "bad_tick_confirmed_details": [],
+        "symbol_iv": {},
         "agg_requests": {},
         "bars_feed": _feed("unmeasured"),
         "iv_feed": _feed("unmeasured"),
@@ -132,8 +136,22 @@ def bad_tick_k() -> float:
     return value
 
 
+def aggs_incremental_merge_enabled() -> bool:
+    """Incremental ``from`` merge. Read on each agg pull. Default off.
+
+    Off, every pull is the session date and the VWAP is recomputed from
+    that full-day response. On, bars are merged by minute and a running
+    sum is checked against that recompute. A relative gap above 1e-9
+    discards the running sum. A correction to a minute older than ``from``
+    is not in the incremental response, which is why this stays off until
+    someone turns it on.
+    """
+    raw = os.getenv("AGGS_INCREMENTAL_MERGE", "false")
+    return str(raw if raw is not None else "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def aggs_pull_interval_s() -> float:
-    """Seconds between agg pulls. Unset keeps the 90s throttle. Read each check."""
+    """Seconds between agg pulls. Unset is 60. Read each check."""
     raw = os.getenv("AGGS_PULL_INTERVAL_S", "")
     text = str(raw if raw is not None else "").strip()
     if not text:
@@ -148,15 +166,13 @@ def aggs_pull_interval_s() -> float:
 
 
 def aggs_alignment_active(interval_s: Optional[float] = None) -> bool:
-    """Phase-lock only when the operator sets an interval of 60s or less.
+    """Phase-lock to the minute boundary when the interval is 60s or less.
 
-    The unset default stays an elapsed 90s throttle, with no clock phase.
+    The default 60s pull is aligned. An explicit 90s interval stays an
+    elapsed throttle with no phase.
     """
-    raw = os.getenv("AGGS_PULL_INTERVAL_S", "")
-    if not str(raw if raw is not None else "").strip():
-        return False
     interval = aggs_pull_interval_s() if interval_s is None else float(interval_s)
-    return interval <= PROPOSAL_AGGS_PULL_INTERVAL_S
+    return interval <= DEFAULT_AGGS_PULL_INTERVAL_S
 
 
 def _fmt(value: Any) -> str:
@@ -256,11 +272,15 @@ def agg_pull_due(
     return last < anchor.timestamp() - 1e-6
 
 
-def agg_path_range(day: str, last_bar_epoch: Optional[float]) -> Tuple[str, str]:
-    """One request per symbol. The first pull of the session is the day.
+# Running sum versus a full recompute of the same minutes. Wider than this
+# and the pull keeps the recompute.
+VWAP_RECOMPUTE_REL_TOL = 1e-9
 
-    Later pulls set ``from`` to the last bar's millisecond timestamp so the
-    response is that bar plus anything newer. ``to`` stays the session date.
+
+def agg_path_range(day: str, last_bar_epoch: Optional[float]) -> Tuple[str, str]:
+    """Incremental window. ``from`` is the last bar's millisecond timestamp.
+
+    Used only when ``AGGS_INCREMENTAL_MERGE`` is on. ``to`` stays the session date.
     """
     session = str(day or "").strip()
     epoch = _finite(last_bar_epoch)
@@ -269,6 +289,165 @@ def agg_path_range(day: str, last_bar_epoch: Optional[float]) -> Tuple[str, str]
     if epoch is None or epoch <= 0:
         return session, session
     return str(int(round(epoch * 1000.0))), session
+
+
+def agg_request_range(
+    day: str,
+    last_bar_epoch: Optional[float] = None,
+    *,
+    incremental: Optional[bool] = None,
+) -> Tuple[str, str]:
+    """Request window for one symbol. Default is the full session day."""
+    session = str(day or "").strip()
+    use_incremental = aggs_incremental_merge_enabled() if incremental is None else bool(incremental)
+    if not use_incremental:
+        return session, session
+    return agg_path_range(session, last_bar_epoch)
+
+
+def _bar_weight(bar: Any) -> Optional[Tuple[float, float, float]]:
+    """``(timestamp, vw*v, v)`` for one bar. None when vw or v is not a price."""
+    if not isinstance(bar, dict):
+        return None
+    epoch = ts_seconds(bar.get("t"))
+    price = _price(bar.get("vw"))
+    volume = _price(bar.get("v"))
+    if epoch is None or price is None or volume is None:
+        return None
+    return epoch, price * volume, volume
+
+
+def full_day_vwap(bars: Optional[Sequence[Any]]) -> Optional[float]:
+    """VWAP of the latest bar at each minute. ``sum(vw*v) / sum(v)`` via fsum.
+
+    Duplicate minutes keep the last copy in ``bars``. This is the full-day
+    recompute. It does not read a sampled VWAP or a Yahoo volume.
+    """
+    latest: Dict[float, Tuple[float, float]] = {}
+    order: List[float] = []
+    for bar in bars or []:
+        weight = _bar_weight(bar)
+        if weight is None:
+            continue
+        epoch, numerator, volume = weight
+        if epoch not in latest:
+            order.append(epoch)
+        latest[epoch] = (numerator, volume)
+    if not latest:
+        return None
+    numerator = math.fsum(latest[epoch][0] for epoch in order)
+    volume = math.fsum(latest[epoch][1] for epoch in order)
+    if volume <= 0 or not math.isfinite(numerator) or not math.isfinite(volume):
+        return None
+    ratio = numerator / volume
+    if not math.isfinite(ratio) or ratio <= 0:
+        return None
+    return ratio
+
+
+def relative_delta(left: Optional[float], right: Optional[float]) -> Optional[float]:
+    """``|a-b| / max(|a|, |b|)``. None when either side is missing."""
+    if left is None or right is None:
+        return None
+    if not math.isfinite(left) or not math.isfinite(right):
+        return None
+    scale = max(abs(left), abs(right))
+    if scale <= 0:
+        return 0.0
+    return abs(left - right) / scale
+
+
+def _running_vwap(prior: Optional[Sequence[Any]], incoming: Optional[Sequence[Any]]) -> Optional[float]:
+    """Add and replace minute contributions in arrival order. Independent of fsum.
+
+    The prior cache is applied first. Each incoming bar replaces that minute's
+    previous contribution. This is the incremental sum the full recompute checks.
+    """
+    held: Dict[float, Tuple[float, float]] = {}
+    numerator = 0.0
+    volume = 0.0
+    for group in (prior or [], incoming or []):
+        for bar in group:
+            weight = _bar_weight(bar)
+            if weight is None:
+                continue
+            epoch, bar_numerator, bar_volume = weight
+            previous = held.get(epoch)
+            if previous is not None:
+                numerator -= previous[0]
+                volume -= previous[1]
+            held[epoch] = (bar_numerator, bar_volume)
+            numerator += bar_numerator
+            volume += bar_volume
+    if volume <= 0 or not math.isfinite(numerator) or not math.isfinite(volume):
+        return None
+    ratio = numerator / volume
+    if not math.isfinite(ratio) or ratio <= 0:
+        return None
+    return ratio
+
+
+def adopt_session_bars(
+    prior: Optional[Sequence[Any]],
+    incoming: Optional[Sequence[Any]],
+    *,
+    incremental: bool,
+) -> Dict[str, Any]:
+    """Bars used for one pull, plus the VWAP of those bars.
+
+    ``incremental`` false replaces the cache with the response. That response
+    is the full day. ``incremental`` true merges by minute, checks the
+    running sum against a full recompute of the merged minutes, and on a
+    relative gap above 1e-9 keeps the recompute (``mismatch`` true).
+    """
+    arrived = [bar for bar in (incoming or []) if isinstance(bar, dict)]
+    if not incremental:
+        bars = merge_bars(None, arrived)
+        return {
+            "bars": bars,
+            "vwap": full_day_vwap(bars),
+            "mode": "full_day",
+            "mismatch": False,
+        }
+    merged = merge_bars(prior, arrived)
+    full = full_day_vwap(merged)
+    running = _running_vwap(prior, arrived)
+    gap = relative_delta(running, full)
+    mismatch = full is None or gap is None or gap > VWAP_RECOMPUTE_REL_TOL
+    return {
+        "bars": merged,
+        "vwap": full,
+        "running_vwap": running,
+        "mode": "full_recompute_fallback" if mismatch else "incremental",
+        "mismatch": mismatch,
+    }
+
+
+def fold_session_batches(
+    batches: Sequence[Sequence[Any]],
+    *,
+    incremental: bool,
+    restart_at: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Fold pull batches the way the cache does. ``restart_at`` clears the cache.
+
+    After a restart the next batch is applied to an empty cache, which is the
+    full-day request a process makes when it has no last bar.
+    """
+    prior: List[Dict[str, Any]] = []
+    last: Dict[str, Any] = {
+        "bars": [],
+        "vwap": None,
+        "mode": "full_day",
+        "mismatch": False,
+    }
+    for index, batch in enumerate(batches):
+        use_incremental = bool(incremental) and not (restart_at is not None and index == restart_at)
+        if restart_at is not None and index == restart_at:
+            prior = []
+        last = adopt_session_bars(prior, batch, incremental=use_incremental and bool(prior))
+        prior = list(last["bars"])
+    return last
 
 
 def merge_bars(existing: Optional[Sequence[Any]], incoming: Optional[Sequence[Any]]) -> List[Dict[str, Any]]:
@@ -389,10 +568,9 @@ def choose_vwap(
 ) -> Dict[str, Any]:
     """Pick the gate input. Default ``sampled`` does not replace it.
 
-    ``bars`` replaces the gate input only when the completed-bar VWAP exists
-    and the newest completed bar is not older than ``stale_after_s`` (150s).
-    Stale or missing falls back to the sampled input and says so. The caller
-    still fail-closes when that input is unmeasured.
+    ``bars`` (enforcement, default off) uses the completed-bar VWAP when it
+    is fresh. Stale or missing fails closed: the gate input becomes
+    unmeasured and the sampled VWAP is not a fallback.
     """
     selected_flag = source if source in {"sampled", "bars"} else vwap_source_flag()
     sampled = _price(sampled_vwap)
@@ -412,16 +590,20 @@ def choose_vwap(
         "bar_age_s": None if age is None else round(age, 1),
         "bar_count": int(bar_count or 0),
         "applied_gate_vwap": gate,
+        "fail_closed": False,
+        "enforcement_reason": None,
     }
     if selected_flag != "bars":
         return choice
     missing = bar is None or int(bar_count or 0) <= 0
     stale = (not missing) and (age is None or age < 0 or age > float(stale_after_s))
     if missing or stale:
-        choice["fallback"] = "missing" if missing else "stale"
-        choice["selected"] = "sampled"
+        choice["fail_closed"] = True
+        choice["fallback"] = None
+        choice["selected"] = None
         choice["replace_gate"] = False
-        choice["applied_gate_vwap"] = gate
+        choice["applied_gate_vwap"] = None
+        choice["enforcement_reason"] = "bar_vwap_missing" if missing else "bar_vwap_stale"
         return choice
     choice["selected"] = "bars"
     choice["replace_gate"] = True
@@ -539,6 +721,45 @@ def filter_bad_ticks(
         logger.debug("bad tick filter skipped", exc_info=True)
         return {"bars": [dict(b) for b in bars or [] if isinstance(b, dict)], "flagged": [], "flagged_count": 0}
     return {"bars": clean, "flagged": flagged, "flagged_count": len(flagged)}
+
+
+def confirmed_bad_ticks(bars: Optional[Sequence[Any]], symbol: Any = "") -> Dict[str, Any]:
+    """Shadow-only two-bar confirm. A bar counts only if the next bar also deviates.
+
+    This does not clamp, drop, or replace a bar. Callers log the count and
+    leave the series alone.
+    """
+    report = filter_bad_ticks(bars, symbol)
+    deviant = set()
+    by_ts: Dict[float, Dict[str, Any]] = {}
+    for item in report.get("flagged") or []:
+        if not isinstance(item, dict):
+            continue
+        stamp = item.get("t_seconds")
+        if stamp is None:
+            stamp = ts_seconds(item.get("t"))
+        if stamp is None:
+            continue
+        key = round(float(stamp), 3)
+        deviant.add(key)
+        by_ts[key] = item
+    ordered: List[Tuple[float, Dict[str, Any]]] = []
+    for bar in bars or []:
+        if not isinstance(bar, dict):
+            continue
+        stamp = ts_seconds(bar.get("t"))
+        if stamp is None:
+            continue
+        ordered.append((round(float(stamp), 3), bar))
+    ordered.sort(key=lambda item: item[0])
+    confirmed: List[Dict[str, Any]] = []
+    for index, (stamp, _bar) in enumerate(ordered[:-1]):
+        nxt = ordered[index + 1][0]
+        if stamp in deviant and nxt in deviant:
+            item = dict(by_ts[stamp])
+            item["confirmed_by_next"] = True
+            confirmed.append(item)
+    return {"confirmed": confirmed, "confirmed_count": len(confirmed)}
 
 
 def series_for_extremes(bars: Optional[Sequence[Any]], symbol: Any = "") -> Dict[str, Any]:
@@ -728,17 +949,41 @@ def symbol_bars(symbol: str) -> Dict[str, Any]:
     return dict(row) if isinstance(row, dict) else _feed("missing")
 
 
+def iv_field(symbol: Optional[str] = None) -> Dict[str, Any]:
+    """The IV check alone. A failure nulls ``iv`` and does not name other rows."""
+    specific = None
+    if symbol:
+        specific = (_state().get("symbol_iv") or {}).get(str(symbol).upper())
+    feed = specific if isinstance(specific, dict) else iv_feed()
+    ok = feed.get("status") == SHADOW_OK
+    return {
+        "status": SHADOW_OK if ok else SHADOW_NO_DATA,
+        "reason": None if ok else feed.get("reason"),
+        "iv": feed.get("value") if ok else None,
+    }
+
+
+def note_symbol_iv(symbol: str, result: Dict[str, Any]) -> None:
+    """One IV check. Other symbols and other shadow fields stay as they are."""
+    sym = str(symbol or "").upper().strip() or "?"
+    ok = result.get("status") == SHADOW_OK
+    _state().setdefault("symbol_iv", {})[sym] = {
+        "status": SHADOW_OK if ok else SHADOW_NO_DATA,
+        "reason": None if ok else (result.get("reason") or "iv_missing"),
+        "value": result.get("value") if ok else None,
+    }
+
+
 def research_status(
     *,
     symbol: Optional[str] = None,
     needs_symbol_bars: bool = True,
-    needs_iv: bool = True,
+    needs_iv: bool = False,
 ) -> Dict[str, Any]:
-    """Every shadow metric fails closed unless its Massive dependencies are ok.
+    """Bar dependency for one shadow metric. IV is not included.
 
-    Bars are always required at the feed. A symbol metric also requires that
-    symbol's own completed bars. IV is required for the shadow research
-    (``needs_iv``). Neither sampled VWAP nor Yahoo volume is consulted.
+    A bad IV check nulls the IV field only. It does not blank bar VWAP, gap,
+    or bad-tick rows. ``needs_iv`` remains for a caller that asks explicitly.
     """
     parts = [bars_feed()]
     if needs_symbol_bars and symbol:
@@ -857,16 +1102,23 @@ def publish_vwap_row(symbol: str, choice: Dict[str, Any]) -> Dict[str, Any]:
     """
     sym = str(symbol or "").upper().strip() or "?"
     local = _local_bar_part(choice if isinstance(choice, dict) else {})
-    gate = dependency_row(bars_feed(), local, iv_feed())
+    gate = dependency_row(bars_feed(), local)
     measured = gate["status"] == SHADOW_OK
     bar = _price((choice or {}).get("bar_vwap")) if measured else None
     sampled = _price((choice or {}).get("sampled_vwap")) if measured else None
     diff = diff_bps(bar, sampled) if measured else None
+    last = _price((choice or {}).get("last"))
+    if measured and last is not None and bar is not None:
+        bar_verdict = "above" if last + 1e-9 >= bar else "below"
+    else:
+        bar_verdict = "unmeasured"
+    iv = iv_field(sym)
     return {
         "symbol": sym,
         "status": gate["status"],
         "reason": gate["reason"],
         "bar_vwap": bar,
+        "bar_verdict": bar_verdict,
         "sampled_vwap": sampled,
         "diff_bps": diff,
         "live_gate_vwap": _price((choice or {}).get("gate_vwap")),
@@ -874,6 +1126,9 @@ def publish_vwap_row(symbol: str, choice: Dict[str, Any]) -> Dict[str, Any]:
         "bar_count": 0 if not measured else int((choice or {}).get("bar_count") or 0),
         "configured_source": (choice or {}).get("configured_source"),
         "selected": "bars" if measured else None,
+        "iv_status": iv["status"],
+        "iv_reason": iv["reason"],
+        "iv": iv["iv"],
     }
 
 
@@ -915,10 +1170,9 @@ def note_gap(
     selected: str,
     fallback: Optional[str],
 ) -> None:
-    """Shadow gap row. A bad bars or IV dependency blanks the snapshot gap.
+    """Shadow gap row. A missing snapshot nulls that field only.
 
-    The current gap is the live verdict's number. It is not copied into
-    ``snapshot_gap_pct`` when the research dependency fails.
+    The live gap verdict is kept. A bad IV check does not blank it.
     """
     sym = "?"
     if isinstance(quote, dict):
@@ -927,21 +1181,12 @@ def note_gap(
     state["gap_pairs"] = int(state["gap_pairs"]) + 1
     if fallback == "missing":
         state["gap_fallback_missing"] = int(state["gap_fallback_missing"]) + 1
-    # Gap does not read 1-minute bars for the formula, but the research
-    # bundle is fail-closed when the bars feed or IV feed is not ok.
-    gate = research_status(needs_symbol_bars=False, needs_iv=True)
-    if gate["status"] != SHADOW_OK:
+    if snapshot_pct is None:
         state["no_data"] = int(state.get("no_data") or 0) + 1
         published_snapshot = None
-        published_selected = None
-        reason = gate["reason"]
-        status = SHADOW_NO_DATA
-    elif snapshot_pct is None:
-        state["no_data"] = int(state.get("no_data") or 0) + 1
-        published_snapshot = None
-        published_selected = None
         reason = "missing"
         status = SHADOW_NO_DATA
+        published_selected = "current"
     else:
         published_snapshot = snapshot_pct
         published_selected = selected
@@ -950,10 +1195,10 @@ def note_gap(
     state["gaps"][sym] = {
         "status": status,
         "reason": reason,
-        "current_gap_pct": current_pct if status == SHADOW_OK else None,
+        "current_gap_pct": current_pct,
         "snapshot_gap_pct": published_snapshot,
         "selected": published_selected,
-        "fallback": None if status == SHADOW_NO_DATA else fallback,
+        "fallback": fallback,
         "live_gap_pct": current_pct,
     }
     logger.info(
@@ -961,7 +1206,7 @@ def note_gap(
         sym,
         status,
         reason,
-        current_pct if status == SHADOW_OK else None,
+        current_pct,
         published_snapshot,
         published_selected,
     )
@@ -1002,6 +1247,43 @@ def note_bad_ticks(symbol: str, flagged: Sequence[Dict[str, Any]]) -> None:
     state["bad_tick_details"] = details[-20:]
 
 
+def note_bad_tick_confirmed(symbol: str, confirmed: Sequence[Dict[str, Any]]) -> None:
+    """Record two-bar confirmations. Logging only. Nothing here changes a bar."""
+    sym = str(symbol or "").upper().strip() or "?"
+    state = _state()
+    seen = set(state["bad_tick_confirmed_ids"].get(sym) or [])
+    details: List[Dict[str, Any]] = list(state.get("bad_tick_confirmed_details") or [])
+    added = 0
+    for item in confirmed or []:
+        if not isinstance(item, dict):
+            continue
+        stamp = item.get("t_seconds")
+        if stamp is None:
+            stamp = ts_seconds(item.get("t"))
+        if stamp is None:
+            continue
+        key = round(float(stamp), 3)
+        if key in seen:
+            continue
+        seen.add(key)
+        added += 1
+        details.append({
+            "symbol": sym,
+            "t_seconds": key,
+            "field": item.get("field"),
+            "high": item.get("high"),
+            "low": item.get("low"),
+            "confirmed_by_next": True,
+        })
+    state["bad_tick_confirmed_ids"][sym] = sorted(seen)
+    state["bad_tick_confirmed_details"] = details[-20:]
+    if added:
+        logger.info(
+            "[DATA QUALITY] bad tick confirmed symbol=%s count=%s",
+            sym, len(seen),
+        )
+
+
 def note_agg_request(symbol: str, from_token: str, to_token: str) -> None:
     """Count one GET. The tokens are a date or a bar time, never a key."""
     sym = str(symbol or "").upper().strip() or "?"
@@ -1020,61 +1302,74 @@ def requests_per_hour(spacing_s: float) -> float:
 
 
 def call_budget(symbols: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-    """Agg GET budget. One request per symbol per pull, both cadences.
+    """Agg GET budget. One request per symbol per pull.
 
-    Today the code throttle is 90s (40/hour/symbol if the loop hits it
-    exactly). Quant Lab measured pulls every ~90–150s, which is 24–40
-    requests/hour/symbol. SPY and QQQ together are 48–80/hour. At the
-    proposal 60s cadence that is 60/hour/symbol and 120/hour for the two
-    index names. The incremental ``from`` does not add a second request; it
-    shortens the payload after the first full-session pull.
+    The default is 60s on the minute boundary: 60/hour/symbol and 120/hour
+    for SPY and QQQ. The old 90s elapsed throttle is the 24–40/hour band.
+    Incremental merge is off, so each pull is the full session day.
     """
     names = [str(s).upper() for s in (symbols or ("SPY", "QQQ")) if s]
     count = len(names) or 2
     slow = requests_per_hour(OBSERVED_PULL_SPACING_S[1])
     fast = requests_per_hour(OBSERVED_PULL_SPACING_S[0])
-    ceiling = requests_per_hour(DEFAULT_AGGS_PULL_INTERVAL_S)
-    proposal = requests_per_hour(PROPOSAL_AGGS_PULL_INTERVAL_S)
+    legacy_ceiling = requests_per_hour(LEGACY_AGGS_PULL_INTERVAL_S)
+    aligned = requests_per_hour(DEFAULT_AGGS_PULL_INTERVAL_S)
     return {
         "symbols": names,
         "requests_per_pull_per_symbol": 1,
         "current_interval_s": DEFAULT_AGGS_PULL_INTERVAL_S,
-        "current_observed_spacing_s": "90-150",
-        "current_requests_per_hour_per_symbol": "24-40",
-        "current_requests_per_hour": f"{int(round(slow * count))}-{int(round(fast * count))}",
-        "current_throttle_ceiling_per_hour_per_symbol": int(round(ceiling)),
-        "proposal_interval_s": PROPOSAL_AGGS_PULL_INTERVAL_S,
+        "current_observed_spacing_s": "60",
+        "current_requests_per_hour_per_symbol": int(round(aligned)),
+        "current_requests_per_hour": int(round(aligned * count)),
+        "legacy_90s_requests_per_hour_per_symbol": "24-40",
+        "legacy_90s_requests_per_hour": f"{int(round(slow * count))}-{int(round(fast * count))}",
+        "current_throttle_ceiling_per_hour_per_symbol": int(round(legacy_ceiling)),
+        "proposal_interval_s": DEFAULT_AGGS_PULL_INTERVAL_S,
         "proposal_align_after_close_s": AGGS_ALIGN_AFTER_CLOSE_S,
-        "proposal_requests_per_hour_per_symbol": int(round(proposal)),
-        "proposal_requests_per_hour": int(round(proposal * count)),
+        "proposal_requests_per_hour_per_symbol": int(round(aligned)),
+        "proposal_requests_per_hour": int(round(aligned * count)),
+        "incremental_merge": aggs_incremental_merge_enabled(),
         "note": (
-            "One GET per symbol per pull. Unset AGGS_PULL_INTERVAL_S keeps the "
-            "90s elapsed throttle (no :05 phase). Setting 60 aligns the next "
-            "pull to about 5s after the minute closes and still sends one "
-            "request per symbol. The first pull of a session is the session "
-            "date; later pulls set from to the last bar timestamp. The session "
-            "VWAP seed is a separate fetch and stops once the open is stored."
+            "One GET per symbol per pull. Unset AGGS_PULL_INTERVAL_S is 60s, "
+            "aligned to the minute boundary (60/hour/symbol, 120/hour for "
+            "SPY+QQQ). AGGS_PULL_INTERVAL_S=90 restores the old elapsed "
+            "throttle. AGGS_INCREMENTAL_MERGE defaults off: every pull is the "
+            "full session day and the live cross-check recomputes from that "
+            "response. The session VWAP seed is a separate fetch and stops "
+            "once the open is stored."
         ),
     }
 
 
 def _publish_bad_ticks(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Hide the filtered count while bars or IV are no_data. Do not invent 0."""
-    gate = research_status(needs_symbol_bars=False, needs_iv=True)
-    if gate["status"] != SHADOW_OK:
-        return {
-            "status": SHADOW_NO_DATA,
-            "reason": gate["reason"],
-            "bad_ticks_flagged": None,
-            "bad_tick_details": [],
-        }
+    """Single-bar count and the two-bar confirm count. IV does not clear them."""
     flagged = sum(len(ids) for ids in (state.get("bad_tick_ids") or {}).values())
+    confirmed = sum(len(ids) for ids in (state.get("bad_tick_confirmed_ids") or {}).values())
     return {
-        "status": SHADOW_OK,
-        "reason": None,
         "bad_ticks_flagged": int(flagged),
         "bad_tick_details": list(state.get("bad_tick_details") or []),
+        "bad_tick_confirmed": int(confirmed),
+        "bad_tick_confirmed_details": list(state.get("bad_tick_confirmed_details") or []),
     }
+
+
+def bar_vwap_verdict() -> Dict[str, Any]:
+    """Latest per-symbol bar-VWAP rows for an admitted entry. Read-only."""
+    symbols = _state().get("symbols") or {}
+    out: Dict[str, Any] = {}
+    for sym, row in symbols.items():
+        if not isinstance(row, dict):
+            continue
+        out[sym] = {
+            "status": row.get("status"),
+            "reason": row.get("reason"),
+            "bar_vwap": row.get("bar_vwap"),
+            "bar_verdict": row.get("bar_verdict"),
+            "diff_bps": row.get("diff_bps"),
+            "iv": row.get("iv"),
+            "iv_status": row.get("iv_status"),
+        }
+    return out
 
 
 def shadow_status() -> Dict[str, Any]:
@@ -1085,7 +1380,8 @@ def shadow_status() -> Dict[str, Any]:
         for sym, row in (state.get("agg_requests") or {}).items()
     }
     ticks = _publish_bad_ticks(state)
-    feed = research_status(needs_symbol_bars=False, needs_iv=True)
+    feed = bars_feed()
+    iv = iv_field()
     return {
         "read_only": True,
         "available": True,
@@ -1106,6 +1402,8 @@ def shadow_status() -> Dict[str, Any]:
         "aggs_pull_interval_read": "runtime",
         "aggs_alignment": aggs_alignment_active(),
         "aggs_align_after_close_s": AGGS_ALIGN_AFTER_CLOSE_S,
+        "aggs_incremental_merge": aggs_incremental_merge_enabled(),
+        "aggs_incremental_merge_read": "runtime",
         "evaluations": int(state.get("evaluations") or 0),
         "no_data": int(state.get("no_data") or 0),
         "fallback_stale": int(state.get("fallback_stale") or 0),
@@ -1114,9 +1412,10 @@ def shadow_status() -> Dict[str, Any]:
         "gap_pairs": int(state.get("gap_pairs") or 0),
         "gap_fallback_missing": int(state.get("gap_fallback_missing") or 0),
         "bad_ticks_flagged": ticks["bad_ticks_flagged"],
-        "bad_tick_status": ticks["status"],
-        "bad_tick_reason": ticks["reason"],
         "bad_tick_details": ticks["bad_tick_details"],
+        "bad_tick_confirmed": ticks["bad_tick_confirmed"],
+        "bad_tick_confirmed_details": ticks["bad_tick_confirmed_details"],
+        "iv_check": iv,
         "agg_requests": per_symbol,
         "entitlement": {
             "session": entitlement_session(),

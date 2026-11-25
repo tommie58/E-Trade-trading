@@ -138,17 +138,32 @@ def test_http_401_and_403_fail_closed_for_bars_and_iv():
     assert row["bar_vwap"] is None
     assert row["diff_bps"] is None
     dq.note_bars_feed({"status": dq.SHADOW_OK, "reason": None})
-    dq.note_iv_feed(dq.classify_http_dependency(401, has_data=False, kind="iv"))
-    denied = dq.publish_vwap_row("SPY", {
+    dq.note_symbol_iv("QQQ", dq.classify_http_dependency(401, has_data=False, kind="iv"))
+    spy = dq.publish_vwap_row("SPY", {
         "sampled_vwap": 715.0,
         "gate_vwap": 715.0,
         "bar_vwap": 710.0,
         "bar_age_s": 60,
         "bar_count": 8,
+        "last": 716.0,
     })
-    assert denied["status"] == "no_data"
-    assert denied["reason"] == "iv_unauthorized"
-    assert denied["bar_vwap"] is None
+    qqq = dq.publish_vwap_row("QQQ", {
+        "sampled_vwap": 634.0,
+        "gate_vwap": 634.0,
+        "bar_vwap": 633.0,
+        "bar_age_s": 60,
+        "bar_count": 8,
+        "last": 635.0,
+    })
+    assert spy["status"] == "ok"
+    assert spy["bar_vwap"] == pytest.approx(710.0)
+    assert spy["bar_verdict"] == "above"
+    assert spy["iv"] is None
+    assert qqq["status"] == "ok"
+    assert qqq["bar_vwap"] == pytest.approx(633.0)
+    assert qqq["iv"] is None
+    assert qqq["iv_status"] == "no_data"
+    assert qqq["iv_reason"] == "iv_unauthorized"
     assert not hasattr(dq, "yahoo_vwap")
     source = open(dq.__file__, encoding="utf-8").read().lower()
     assert "yfinance" not in source
@@ -233,20 +248,24 @@ def test_snapshot_gap_uses_official_open_not_the_first_bar():
     logged = dq.shadow_status()["gaps"]["QQQ"]
     assert logged["status"] == "ok"
     assert logged["snapshot_gap_pct"] == pytest.approx(-1.688, abs=1e-3)
-    dq.note_bars_feed(dq.classify_http_dependency(401, has_data=False))
-    dq.apply_gap_source(quote, verdict, lambda o, c: {"gap_pct": 0, "verified": True})
-    blocked = dq.shadow_status()["gaps"]["QQQ"]
-    assert blocked["status"] == "no_data"
-    assert "unauthorized" in blocked["reason"]
-    assert blocked["snapshot_gap_pct"] is None
-    assert blocked["snapshot_gap_pct"] != verdict["gap_pct"]
-    assert out["gap_pct"] == pytest.approx(-1.763)
+    kept = dq.apply_gap_source(
+        {"symbol": "QQQ", "open": 639.55, "previous_close": 651.03},
+        verdict,
+        lambda o, c: {"gap_pct": 0, "verified": True},
+    )
+    assert kept is verdict
+    assert kept["gap_pct"] == pytest.approx(-1.763)
+    missing = dq.shadow_status()["gaps"]["QQQ"]
+    assert missing["status"] == "no_data"
+    assert missing["reason"] == "missing"
+    assert missing["snapshot_gap_pct"] is None
+    assert missing["current_gap_pct"] == pytest.approx(-1.763)
 
 
-def test_cadence_default_is_90s_and_60s_aligns_after_the_close(monkeypatch):
+def test_cadence_default_is_60s_on_the_minute(monkeypatch):
     monkeypatch.delenv("AGGS_PULL_INTERVAL_S", raising=False)
-    assert dq.aggs_pull_interval_s() == 90
-    assert dq.aggs_alignment_active() is False
+    assert dq.aggs_pull_interval_s() == 60
+    assert dq.aggs_alignment_active() is True
     now = datetime(2026, 11, 24, 12, 2, 40, tzinfo=ET)
     assert dq.agg_pull_due(0, 0, 90, False, now) is True
     assert dq.agg_pull_due(now.timestamp(), now.timestamp() - 89, 90, False, now) is False
@@ -261,10 +280,16 @@ def test_cadence_default_is_90s_and_60s_aligns_after_the_close(monkeypatch):
     assert dq.agg_pull_due(early.timestamp(), last_early, 60, True, early) is False
     budget = dq.call_budget()
     assert budget["requests_per_pull_per_symbol"] == 1
-    assert budget["current_requests_per_hour"] == "48-80"
+    assert budget["current_requests_per_hour"] == 120
     assert budget["proposal_requests_per_hour"] == 120
+    assert budget["legacy_90s_requests_per_hour"] == "48-80"
+    monkeypatch.setenv("AGGS_PULL_INTERVAL_S", "90")
+    assert dq.aggs_pull_interval_s() == 90
+    assert dq.aggs_alignment_active() is False
     assert dq.agg_path_range("2026-11-24", None) == ("2026-11-24", "2026-11-24")
     assert dq.agg_path_range("2026-11-24", 1_700_000_000.0)[0] == "1700000000000"
+    assert dq.aggs_incremental_merge_enabled() is False
+    assert dq.agg_request_range("2026-11-24", 1_700_000_000.0) == ("2026-11-24", "2026-11-24")
     merged = dq.merge_bars(
         [{"t": 1_700_000_000_000, "vw": 10, "v": 1}],
         [{"t": 1_700_000_060_000, "vw": 12, "v": 1}, {"t": 1_700_000_000_000, "vw": 11, "v": 2}],
@@ -455,6 +480,163 @@ def test_refresh_403_records_no_data_and_does_not_log_the_target(monkeypatch, ca
     assert "probe.invalid" not in caplog.text
 
 
+def _session_bar(minute: int, vw: float, vol: float) -> dict:
+    return {"t": int((1_700_000_000 + minute * 60) * 1000), "vw": vw, "v": vol, "c": vw}
+
+
+def test_full_day_recompute_ignores_a_stale_cache(monkeypatch):
+    """Default path. The response is the whole day, prior bars are not merged."""
+    monkeypatch.delenv("AGGS_INCREMENTAL_MERGE", raising=False)
+    truth = [
+        _session_bar(0, 100.0, 10.0),
+        _session_bar(1, 130.0, 30.0),
+        _session_bar(2, 110.0, 20.0),
+    ]
+    payload = [truth[2], dict(truth[0]), truth[1], dict(truth[2]), truth[0]]
+    stale = [_session_bar(0, 999.0, 1.0), _session_bar(4, 50.0, 10.0)]
+    adopted = dq.adopt_session_bars(stale, payload, incremental=False)
+    assert adopted["mode"] == "full_day"
+    assert adopted["mismatch"] is False
+    assert dq.relative_delta(adopted["vwap"], dq.full_day_vwap(truth)) <= 1e-9
+    assert all(bar["vw"] != 999.0 for bar in adopted["bars"])
+
+
+def test_incremental_fold_matches_full_day_within_1e_9():
+    """Random batches: out of order, duplicates, late corrections, one restart.
+
+    The restart's next payload is the full book, because an empty cache asks
+    for the session day. The kept VWAP matches that full-day recompute.
+    """
+    rng = __import__("random").Random(20261127)
+    worst = 0.0
+    for _trial in range(40):
+        book = {}
+        prior = []
+        steps = rng.randint(12, 50)
+        restart_at = rng.randrange(4, steps)
+        for step in range(steps):
+            if step == restart_at:
+                prior = []
+                batch = [dict(bar) for bar in book.values()]
+            else:
+                changed = set()
+                for _ in range(rng.randint(1, 5)):
+                    minute = rng.randrange(0, 390)
+                    book[minute] = _session_bar(
+                        minute, rng.uniform(20.0, 900.0), rng.uniform(1.0, 4_000_000.0),
+                    )
+                    changed.add(minute)
+                if book and rng.random() < 0.8:
+                    minute = rng.choice(tuple(book))
+                    book[minute] = _session_bar(
+                        minute, rng.uniform(20.0, 900.0), rng.uniform(1.0, 4_000_000.0),
+                    )
+                    changed.add(minute)
+                batch = [dict(book[minute]) for minute in changed]
+            if batch:
+                batch.append(dict(rng.choice(batch)))
+            rng.shuffle(batch)
+            adopted = dq.adopt_session_bars(prior, batch, incremental=bool(prior))
+            prior = list(adopted["bars"])
+            truth = dq.full_day_vwap(list(book.values()))
+            gap = dq.relative_delta(adopted["vwap"], truth)
+            assert gap is not None and gap <= dq.VWAP_RECOMPUTE_REL_TOL
+            worst = max(worst, gap)
+            if adopted["mode"] == "incremental":
+                running_gap = dq.relative_delta(adopted["running_vwap"], truth)
+                assert running_gap is not None and running_gap <= dq.VWAP_RECOMPUTE_REL_TOL
+            else:
+                assert adopted["vwap"] == pytest.approx(truth, rel=dq.VWAP_RECOMPUTE_REL_TOL)
+    assert worst <= dq.VWAP_RECOMPUTE_REL_TOL
+
+
+def test_running_sum_mismatch_keeps_the_full_recompute(monkeypatch):
+    monkeypatch.setattr(dq, "_running_vwap", lambda prior, incoming: 1.0)
+    bars = [_session_bar(0, 100.0, 10.0), _session_bar(1, 200.0, 10.0)]
+    adopted = dq.adopt_session_bars(bars[:1], bars[1:], incremental=True)
+    assert adopted["mismatch"] is True
+    assert adopted["mode"] == "full_recompute_fallback"
+    assert dq.relative_delta(adopted["vwap"], dq.full_day_vwap(bars)) <= 1e-9
+    assert adopted["vwap"] != pytest.approx(1.0)
+
+
+def test_enforcement_stale_bar_vwap_fails_closed_without_sampled(monkeypatch):
+    monkeypatch.setenv("VWAP_SOURCE", "bars")
+    _ok_feeds()
+    row = {
+        "symbol": "SPY",
+        "last": 716.25,
+        "vwap": 714.64,
+        "vwap_source": "session_sampled",
+        "gate_vwap_source": "session_sampled",
+        "gate_vwap_verdict": "above",
+        "gate_vwap_reason": None,
+    }
+    main_bot._note_data_quality_vwap(
+        row, {"measured": True, "vwap": 714.64}, NOW,
+    )
+    assert row["vwap"] is None
+    assert row["gate_vwap_verdict"] == "unmeasured"
+    assert row["gate_vwap_reason"] == "bar_vwap_missing"
+    assert row["vwap"] != pytest.approx(714.64)
+    reason = main_bot.assess_call_index_vwap_gate("CALL", [row])
+    assert reason is not None and "fail closed" in reason
+
+
+def test_two_bar_confirm_ignores_a_single_spike_and_does_not_clamp():
+    bars = []
+    for minute in range(40, 60):
+        bars.append(_bar(11, minute, vw=633.95, vol=10000, open_=633.90, high=634.10, low=633.80, close=634.00))
+    bars.append(_bar(12, 1, vw=634.05, vol=12000, open_=633.90, high=648.00, low=633.80, close=634.00))
+    bars.append(_bar(12, 2, vw=634.00, vol=10000, open_=634.00, high=634.10, low=633.80, close=634.00))
+    alone = dq.confirmed_bad_ticks(bars, "QQQ")
+    assert alone["confirmed_count"] == 0
+    assert bars[-2]["h"] == pytest.approx(648.0)
+    bars[-1]["h"] = 648.0
+    pair = dq.confirmed_bad_ticks(bars, "QQQ")
+    assert pair["confirmed_count"] == 1
+    assert pair["confirmed"][0]["high"] == pytest.approx(648.0)
+    assert bars[-2]["h"] == pytest.approx(648.0)
+
+
+def test_refresh_mismatch_warns_and_does_not_log_the_key(monkeypatch, caplog):
+    monkeypatch.setenv("MASSIVE_API_KEY", KEY)
+    monkeypatch.setenv("MASSIVE_ENABLED", "true")
+    monkeypatch.setenv("AGGS_INCREMENTAL_MERGE", "true")
+    monkeypatch.setattr(main_bot, "_utcnow", lambda: NOW.astimezone(timezone.utc))
+    monkeypatch.setattr(dq, "_running_vwap", lambda prior, incoming: 1.0)
+    caplog.set_level(logging.WARNING, logger="etrade-bot")
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, params=None, headers=None):
+            return httpx.Response(
+                200,
+                json={"results": [
+                    {"t": _ms(12, 0), "vw": 200, "v": 100, "c": 200},
+                    {"t": _ms(12, 1), "vw": 210, "v": 100, "c": 210},
+                ]},
+                request=httpx.Request("GET", "https://probe.invalid/aggs"),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    _run(main_bot.refresh_massive_minute_vwap(["SPY"]))
+    view = main_bot._cached_minute_vwap_view("SPY", NOW)
+    assert view["vwap"] == pytest.approx(205.0)
+    assert "full recompute" in caplog.text
+    assert KEY not in caplog.text
+    assert "probe.invalid" not in caplog.text
+    assert "http" not in caplog.text.lower()
+
+
 def test_status_exposes_the_shadow_block(monkeypatch):
     monkeypatch.setattr(main_bot, "WEBHOOK_SECRET", "s3cret")
     monkeypatch.setattr(main_bot, "_utcnow", lambda: NOW.astimezone(timezone.utc))
@@ -468,7 +650,10 @@ def test_status_exposes_the_shadow_block(monkeypatch):
     assert shadow["vwap_source"] == "sampled"
     assert shadow["gap_source"] == "current"
     assert shadow["bad_tick_filter_enabled"] is False
-    assert shadow["aggs_pull_interval_s"] == 90
+    assert shadow["aggs_pull_interval_s"] == 60
+    assert shadow["aggs_incremental_merge"] is False
     assert shadow["call_budget"]["proposal_requests_per_hour"] == 120
     assert shadow["entitlement"]["bars"]["status"] == "no_data"
-    assert shadow["bad_ticks_flagged"] is None
+    assert shadow["bad_ticks_flagged"] == 0
+    assert shadow["bad_tick_confirmed"] == 0
+    assert shadow["iv_check"]["iv"] is None

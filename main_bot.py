@@ -17451,10 +17451,17 @@ def _note_data_quality_vwap(row: Dict[str, Any], resolved: Dict[str, Any], now_e
         bar_count=int(view.get("bar_count") or 0),
         source=data_quality.vwap_source_flag(),
     )
-    # The shadow row fail-closes on its own. The gate input moves only when
-    # the operator selected bars AND this symbol's Massive bars are fresh
-    # and the bars feed is not 401/403/missing. IV does not move the gate.
-    if choice.get("replace_gate") and data_quality.bars_allowed_for_gate(
+    choice["last"] = row.get("last")
+    # Enforcement (VWAP_SOURCE=bars) fail-closes when the bar VWAP is stale
+    # or missing. The sampled value stays off the gate. Default sampled
+    # does not enter this branch.
+    if choice.get("fail_closed"):
+        row["vwap"] = None
+        row["vwap_source"] = None
+        row["gate_vwap_source"] = None
+        row["gate_vwap_verdict"] = "unmeasured"
+        row["gate_vwap_reason"] = choice.get("enforcement_reason")
+    elif choice.get("replace_gate") and data_quality.bars_allowed_for_gate(
         symbol,
         bar_vwap=choice.get("bar_vwap"),
         bar_age_s=choice.get("bar_age_s"),
@@ -17874,14 +17881,19 @@ async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> No
         async with httpx.AsyncClient(timeout=_MINUTE_VWAP_TIMEOUT_S) as client:
             for sym in due:
                 try:
-                    # One GET per symbol. from is the session date until we
-                    # have a bar, then the last bar's millisecond timestamp.
-                    # The header carries the key and is not logged.
+                    # One GET per symbol. The key is a header and is not logged.
+                    # Default: the session day, and the VWAP is recomputed from
+                    # that full response. AGGS_INCREMENTAL_MERGE=true merges
+                    # from the last bar and falls back to the recompute when
+                    # the running sum disagrees.
                     cache_key = _minute_vwap_cache_key(sym, day)
                     prior = _minute_vwap_cache.get(cache_key)
                     prior_bars = prior.get("bars") if isinstance(prior, dict) else None
-                    frm, to = data_quality.agg_path_range(
-                        day, data_quality.last_bar_epoch(prior_bars if isinstance(prior_bars, list) else None),
+                    incremental = data_quality.aggs_incremental_merge_enabled()
+                    frm, to = data_quality.agg_request_range(
+                        day,
+                        data_quality.last_bar_epoch(prior_bars if isinstance(prior_bars, list) else None),
+                        incremental=incremental,
                     )
                     data_quality.note_agg_request(sym, frm, to)
                     resp = await asyncio.wait_for(
@@ -17909,10 +17921,23 @@ async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> No
                         continue
                     payload = resp.json()
                     incoming = payload.get("results") if isinstance(payload, dict) else None
-                    merged = data_quality.merge_bars(
-                        prior_bars if isinstance(prior_bars, list) else None,
-                        incoming if isinstance(incoming, list) else None,
-                    )
+                    raw_bars = [bar for bar in incoming if isinstance(bar, dict)] if isinstance(incoming, list) else []
+                    if incremental:
+                        adopted = data_quality.adopt_session_bars(
+                            prior_bars if isinstance(prior_bars, list) else None,
+                            raw_bars,
+                            incremental=True,
+                        )
+                        if adopted.get("mismatch"):
+                            logger.warning(
+                                "[DATA QUALITY] incremental VWAP mismatch symbol=%s — full recompute",
+                                sym,
+                            )
+                        merged = adopted["bars"]
+                    else:
+                        # Same list the cross-check used before this proposal.
+                        # No merge and no reorder.
+                        merged = raw_bars
                     parsed = minute_aggs_rth_vwap({"results": merged}, now_et)
                     bar_state = data_quality.classify_aggs_payload(
                         {"results": merged}, now_et, status_code=200,
@@ -17929,6 +17954,8 @@ async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> No
                     try:
                         extremes = data_quality.series_for_extremes(merged, sym)
                         data_quality.note_bad_ticks(sym, extremes.get("flagged") or [])
+                        confirmed = data_quality.confirmed_bad_ticks(merged, sym)
+                        data_quality.note_bad_tick_confirmed(sym, confirmed.get("confirmed") or [])
                     except Exception:
                         extremes = {"flagged_count": 0}
                         logger.debug("bad tick shadow skipped for %s", sym)
@@ -30960,6 +30987,11 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
     delta = _finite_or_none(option_delta)
     instrument_label = str(instrument or "").strip().lower() or None
     pt_fields = _pro_trader_position_fields(pro_trader_decision)
+    bar_vwap_verdict = data_quality.bar_vwap_verdict()
+    logger.info(
+        "[DATA QUALITY] bar vwap admitted ticker=%s verdict=%s",
+        ticker, bar_vwap_verdict,
+    )
     position = {
         "qty": int(qty),
         "action": str(action or "BUY").upper(),
@@ -31008,6 +31040,7 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         "signal_id": signal_label,
         "option_delta": delta,
         "instrument": instrument_label,
+        "bar_vwap_verdict": bar_vwap_verdict,
         **pt_fields,
     })
 
