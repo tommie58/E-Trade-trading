@@ -15445,7 +15445,8 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # /status positions_open is the open book with status, side, and qty.
 # Logs, alerts, and HTTP responses mask accountIdKey (**** + last 4).
 # Order routing still uses the real key.
-BOT_VERSION = "5.99.11-pro-day-trader"
+# 5.99.14 pages GET /ledger. No paging params still returns today's tail.
+BOT_VERSION = "5.99.14-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -40507,19 +40508,702 @@ async def scanner_scan_now(
     return await scanner.scan_once()
 
 
-@app.get("/ledger")
-async def ledger_tail(count: int = Query(100, ge=1, le=500), verify: bool = Query(False)):
-    """Tail of the immutable trade ledger (newest first). Pass ?verify=true to
-    walk the FULL hash chain and prove no record was altered or removed."""
-    out: Dict[str, Any] = {"records": trade_ledger.tail(count)}
+# GET /ledger paging. The ledger is the append-only JSONL file
+# (TRADE_LEDGER_FILE), not a Redis list, stream, or sorted set. Reads seek
+# to the window and stop after LEDGER_PAGE_SCAN_CAP lines. Nothing here
+# appends, trims, or rewrites that file.
+LEDGER_PAGE_DEFAULT_LIMIT = 500
+LEDGER_PAGE_MAX_LIMIT = 1000
+LEDGER_PAGE_SCAN_CAP = 8000
+LEDGER_PAGE_MAX_LINE = 1024 * 1024
+LEDGER_RATE_LIMIT = 30
+LEDGER_RATE_WINDOW_SECONDS = 60.0
+_LEDGER_CT = ZoneInfo("America/Chicago")
+_LEDGER_STRIP_FIELDS = frozenset({"accountId", "accountIdKey"})
+_LEDGER_EVENT_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_ledger_rate_hits: Dict[str, List[float]] = {}
+
+
+def _reset_ledger_rate_limit() -> None:
+    _ledger_rate_hits.clear()
+
+
+def _ledger_scrub_secrets() -> List[str]:
+    """Resolved routing keys. Used only as scrub needles, never logged."""
+    found: List[str] = []
+    for value in (_resolved_account_id_key, _resolved_crypto_account_id_key):
+        if isinstance(value, str) and len(value) >= 4 and value not in found:
+            found.append(value)
+    return found
+
+
+def _ledger_log_failure(where: str, exc: BaseException) -> None:
+    """Log a ledger read failure without an unscrubbed str(exc)."""
+    detail = scrub_etrade_text(str(exc), secrets=_ledger_scrub_secrets())
+    logger.warning("ledger %s failed: %s", where, detail)
+
+
+def _collect_ledger_secrets(value: Any, found: List[str]) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in _LEDGER_STRIP_FIELDS and isinstance(item, str) and len(item) >= 4:
+                if item not in found:
+                    found.append(item)
+            _collect_ledger_secrets(item, found)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_ledger_secrets(item, found)
+
+
+def _redact_ledger_value(value: Any, secrets: Sequence[str]) -> Any:
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _LEDGER_STRIP_FIELDS:
+                continue
+            out[key] = _redact_ledger_value(item, secrets)
+        return out
+    if isinstance(value, list):
+        return [_redact_ledger_value(item, secrets) for item in value]
+    if isinstance(value, str):
+        return scrub_etrade_text(value, secrets=secrets)
+    return value
+
+
+def _redact_ledger_payload(value: Any) -> Any:
+    secrets = _ledger_scrub_secrets()
+    _collect_ledger_secrets(value, secrets)
+    return _redact_ledger_value(value, secrets)
+
+
+def _enforce_ledger_rate_limit(request: Request) -> None:
+    """30 reads a minute per client host. Auth has already fail-closed."""
+    now = time.monotonic()
+    client = request.client
+    key = client.host if client is not None and client.host else "unknown"
+    window = LEDGER_RATE_WINDOW_SECONDS
+    hits = [stamp for stamp in _ledger_rate_hits.get(key, ()) if now - stamp < window]
+    if len(hits) >= LEDGER_RATE_LIMIT:
+        _ledger_rate_hits[key] = hits
+        raise HTTPException(status_code=429, detail="ledger rate limit exceeded")
+    hits.append(now)
+    _ledger_rate_hits[key] = hits
+
+
+def _paging_requested(*values: Optional[str]) -> bool:
+    return any(value is not None for value in values)
+
+
+def _parse_ledger_seq_param(name: str, raw: Optional[str]) -> Optional[int]:
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text.isdigit():
+        raise HTTPException(status_code=400, detail=f"{name} must be a non-negative integer")
+    return int(text)
+
+
+def _parse_ledger_limit(raw: Optional[str]) -> int:
+    if raw is None:
+        return LEDGER_PAGE_DEFAULT_LIMIT
+    text = raw.strip()
+    if not text.isdigit():
+        raise HTTPException(status_code=400, detail="limit must be an integer from 1 to 1000")
+    value = int(text)
+    if value < 1 or value > LEDGER_PAGE_MAX_LIMIT:
+        raise HTTPException(status_code=400, detail="limit must be an integer from 1 to 1000")
+    return value
+
+
+def _parse_ledger_event_types(raw: Optional[str]) -> Optional[frozenset]:
+    if raw is None:
+        return None
+    parts = [part.strip() for part in raw.split(",")]
+    if not parts or any(not part or _LEDGER_EVENT_NAME.fullmatch(part) is None for part in parts):
+        raise HTTPException(
+            status_code=400,
+            detail="event_type must be a comma-separated list of event names",
+        )
+    return frozenset(parts)
+
+
+def _parse_ledger_ct_bound(name: str, raw: Optional[str], *, is_end: bool) -> Optional[datetime]:
+    """UTC instant for a Central Time bound.
+
+    YYYY-MM-DD is a Chicago calendar day. `start` is that midnight inclusive.
+    `end` is the next Chicago midnight exclusive, so the named day is included.
+    A timestamp with an offset is that instant. A naive timestamp is Central Time.
+    """
+    if raw is None:
+        return None
+    text = raw.strip()
+    if len(text) == 10 and text[4:5] == "-" and text[7:8] == "-":
+        try:
+            day = date.fromisoformat(text)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be a CT date (YYYY-MM-DD) or timestamp",
+            )
+        if is_end:
+            day = day + timedelta(days=1)
+        return datetime(day.year, day.month, day.day, tzinfo=_LEDGER_CT).astimezone(timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name} must be a CT date (YYYY-MM-DD) or timestamp",
+        )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_LEDGER_CT)
+    return parsed.astimezone(timezone.utc)
+
+
+class _LedgerQuery:
+    __slots__ = ("since_seq", "before_seq", "limit", "event_types", "start", "end", "ascending")
+
+    def __init__(
+        self,
+        since_seq: Optional[int],
+        before_seq: Optional[int],
+        limit: int,
+        event_types: Optional[frozenset],
+        start: Optional[datetime],
+        end: Optional[datetime],
+    ) -> None:
+        self.since_seq = since_seq
+        self.before_seq = before_seq
+        self.limit = limit
+        self.event_types = event_types
+        self.start = start
+        self.end = end
+        self.ascending = since_seq is not None
+
+    def upper_ok(self, rec: Dict[str, Any]) -> bool:
+        if self.before_seq is not None:
+            seq = _ledger_seq(rec)
+            if seq is None or seq >= self.before_seq:
+                return False
+        if self.end is not None:
+            ts = _ledger_ts(rec)
+            if ts is None or ts >= self.end:
+                return False
+        return True
+
+    def lower_in(self, rec: Dict[str, Any]) -> bool:
+        if self.since_seq is not None:
+            seq = _ledger_seq(rec)
+            if seq is None or seq <= self.since_seq:
+                return False
+        if self.start is not None:
+            ts = _ledger_ts(rec)
+            if ts is None or ts < self.start:
+                return False
+        return True
+
+    def event_ok(self, rec: Dict[str, Any]) -> bool:
+        if self.event_types is None:
+            return True
+        return str(rec.get("event") or "") in self.event_types
+
+
+def _parse_ledger_query(
+    since_seq: Optional[str],
+    before_seq: Optional[str],
+    limit: Optional[str],
+    event_type: Optional[str],
+    start: Optional[str],
+    end: Optional[str],
+) -> _LedgerQuery:
+    since = _parse_ledger_seq_param("since_seq", since_seq)
+    before = _parse_ledger_seq_param("before_seq", before_seq)
+    if since is not None and before is not None and since >= before:
+        raise HTTPException(status_code=400, detail="since_seq must be less than before_seq")
+    start_at = _parse_ledger_ct_bound("start", start, is_end=False)
+    end_at = _parse_ledger_ct_bound("end", end, is_end=True)
+    if start_at is not None and end_at is not None and start_at >= end_at:
+        raise HTTPException(status_code=400, detail="start must be on or before end")
+    return _LedgerQuery(
+        since, before, _parse_ledger_limit(limit), _parse_ledger_event_types(event_type),
+        start_at, end_at,
+    )
+
+
+def _ledger_seq(rec: Dict[str, Any]) -> Optional[int]:
+    seq = rec.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        return None
+    if seq < 0:
+        return None
+    return seq
+
+
+def _ledger_ts(rec: Dict[str, Any]) -> Optional[datetime]:
+    raw = rec.get("ts")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_ledger_obj(raw: bytes) -> Optional[Dict[str, Any]]:
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        rec = json.loads(text.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    return rec
+
+
+def _line_at(handle, pos: int, size: int) -> Tuple[int, int, bytes]:
+    """Byte range of the line containing `pos`, and the line without its newline.
+
+    A line longer than LEDGER_PAGE_MAX_LINE is skipped (empty payload, end
+    moved past it) so one huge line cannot be loaded whole.
+    """
+    if size <= 0:
+        return 0, 0, b""
+    pos = min(max(pos, 0), size - 1)
+    start = pos
+    back_budget = LEDGER_PAGE_MAX_LINE
+    while start > 0 and (pos - start) < back_budget:
+        step = min(4096, start, back_budget - (pos - start))
+        if step <= 0:
+            break
+        handle.seek(start - step)
+        block = handle.read(step)
+        rel = block.rfind(b"\n")
+        if rel != -1:
+            start = start - step + rel + 1
+            break
+        start -= step
+    handle.seek(start)
+    buf = bytearray()
+    end = start
+    while end < size and len(buf) < LEDGER_PAGE_MAX_LINE:
+        block = handle.read(min(4096, size - end, LEDGER_PAGE_MAX_LINE - len(buf)))
+        if not block:
+            break
+        rel = block.find(b"\n")
+        if rel != -1:
+            buf.extend(block[:rel])
+            end += rel + 1
+            return start, end, bytes(buf)
+        buf.extend(block)
+        end += len(block)
+    if len(buf) >= LEDGER_PAGE_MAX_LINE:
+        while end < size:
+            block = handle.read(min(4096, size - end))
+            if not block:
+                break
+            rel = block.find(b"\n")
+            if rel != -1:
+                end += rel + 1
+                break
+            end += len(block)
+        return start, end, b""
+    return start, end, bytes(buf)
+
+
+def _readline_capped(handle, cap: int) -> Tuple[bytes, bool]:
+    """Next line without its newline, and whether EOF was reached on this read."""
+    buf = bytearray()
+    while len(buf) < cap:
+        chunk = handle.read(min(4096, cap - len(buf)))
+        if not chunk:
+            return bytes(buf), True
+        rel = chunk.find(b"\n")
+        if rel != -1:
+            buf.extend(chunk[:rel])
+            extra = len(chunk) - (rel + 1)
+            if extra:
+                handle.seek(handle.tell() - extra)
+            return bytes(buf), False
+        buf.extend(chunk)
+    while True:
+        chunk = handle.read(4096)
+        if not chunk:
+            return b"", True
+        rel = chunk.find(b"\n")
+        if rel != -1:
+            extra = len(chunk) - (rel + 1)
+            if extra:
+                handle.seek(handle.tell() - extra)
+            return b"", False
+
+
+def _empty_ledger_page() -> Dict[str, Any]:
+    return {
+        "records": [],
+        "next_before_seq": None,
+        "next_since_seq": None,
+        "has_more": False,
+    }
+
+
+def _finish_ledger_page(
+    included: List[Dict[str, Any]],
+    next_before: Optional[int],
+    next_since: Optional[int],
+    has_more: bool,
+) -> Dict[str, Any]:
+    return {
+        "records": included,
+        "next_before_seq": next_before,
+        "next_since_seq": next_since,
+        "has_more": has_more,
+    }
+
+
+def _newest_line_start(path: Path) -> Optional[int]:
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        _ledger_log_failure("stat", exc)
+        return None
+    if size <= 0:
+        return None
+    with open(path, "rb") as handle:
+        pos = size - 1
+        steps = 0
+        while pos >= 0 and steps < LEDGER_PAGE_SCAN_CAP:
+            steps += 1
+            start, _end, raw = _line_at(handle, pos, size)
+            if raw.strip():
+                return start
+            if start <= 0:
+                return None
+            pos = start - 1
+    return None
+
+
+def _seek_rightmost(path: Path, pred) -> Optional[int]:
+    """Line start of the newest record for which `pred` is true. Monotonic pred."""
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        _ledger_log_failure("stat", exc)
+        return None
+    if size <= 0:
+        return None
+    lo = 0
+    hi = size
+    best: Optional[int] = None
+    with open(path, "rb") as handle:
+        for _ in range(64):
+            if lo >= hi:
+                break
+            start, end, raw = _line_at(handle, (lo + hi) // 2, size)
+            if end <= lo:
+                break
+            rec = _parse_ledger_obj(raw)
+            if rec is not None and pred(rec):
+                best = start
+                if end >= hi:
+                    break
+                lo = end
+            else:
+                if start <= lo:
+                    break
+                hi = start
+    return best
+
+
+def _seek_leftmost(path: Path, pred) -> Optional[int]:
+    """Line start of the oldest record for which `pred` is true. Monotonic pred."""
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        _ledger_log_failure("stat", exc)
+        return None
+    if size <= 0:
+        return None
+    lo = 0
+    hi = size
+    best: Optional[int] = None
+    with open(path, "rb") as handle:
+        for _ in range(64):
+            if lo >= hi:
+                break
+            start, end, raw = _line_at(handle, (lo + hi) // 2, size)
+            if end <= lo:
+                break
+            rec = _parse_ledger_obj(raw)
+            if rec is not None and pred(rec):
+                best = start
+                if start <= lo:
+                    break
+                hi = start
+            else:
+                if end >= hi:
+                    break
+                lo = end
+    return best
+
+
+def _page_descending(path: Path, query: _LedgerQuery) -> Dict[str, Any]:
+    if query.before_seq is None and query.end is None:
+        start = _newest_line_start(path)
+    else:
+        start = _seek_rightmost(path, query.upper_ok)
+    if start is None:
+        return _empty_ledger_page()
+    included: List[Dict[str, Any]] = []
+    oldest_included: Optional[int] = None
+    newest_included: Optional[int] = None
+    oldest_scanned: Optional[int] = None
+    extra = False
+    hit_cap = False
+    scanned = 0
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        _ledger_log_failure("stat", exc)
+        return _empty_ledger_page()
+    offset: Optional[int] = start
+    seen = set()
+    with open(path, "rb") as handle:
+        while offset is not None and offset >= 0:
+            if scanned >= LEDGER_PAGE_SCAN_CAP:
+                hit_cap = True
+                break
+            start_b, _end, raw = _line_at(handle, offset, size)
+            if start_b in seen:
+                break
+            seen.add(start_b)
+            scanned += 1
+            rec = _parse_ledger_obj(raw)
+            seq = _ledger_seq(rec) if rec is not None else None
+            if seq is not None:
+                oldest_scanned = seq
+            if rec is not None and seq is not None:
+                if not query.lower_in(rec):
+                    break
+                if query.upper_ok(rec) and query.event_ok(rec):
+                    if len(included) < query.limit:
+                        included.append(rec)
+                        newest_included = seq if newest_included is None else max(newest_included, seq)
+                        oldest_included = seq if oldest_included is None else min(oldest_included, seq)
+                    else:
+                        extra = True
+                        break
+            if start_b <= 0:
+                break
+            offset = start_b - 1
+    has_more = extra or hit_cap
+    next_before = oldest_included if extra or not has_more else oldest_scanned
+    if has_more and (
+        next_before is None
+        or (query.before_seq is not None and next_before >= query.before_seq)
+    ):
+        has_more = False
+    return _finish_ledger_page(included, next_before, newest_included, has_more)
+
+
+def _page_ascending(path: Path, query: _LedgerQuery) -> Dict[str, Any]:
+    start = _seek_leftmost(path, query.lower_in)
+    if start is None:
+        return _empty_ledger_page()
+    included: List[Dict[str, Any]] = []
+    oldest_included: Optional[int] = None
+    newest_included: Optional[int] = None
+    newest_scanned: Optional[int] = None
+    extra = False
+    hit_cap = False
+    scanned = 0
+    with open(path, "rb") as handle:
+        handle.seek(start)
+        while True:
+            if scanned >= LEDGER_PAGE_SCAN_CAP:
+                hit_cap = True
+                break
+            raw, eof = _readline_capped(handle, LEDGER_PAGE_MAX_LINE)
+            if eof and not raw.strip():
+                break
+            scanned += 1
+            rec = _parse_ledger_obj(raw)
+            seq = _ledger_seq(rec) if rec is not None else None
+            if seq is not None:
+                newest_scanned = seq
+            if rec is not None and seq is not None:
+                if not query.upper_ok(rec):
+                    break
+                if query.lower_in(rec) and query.event_ok(rec):
+                    if len(included) < query.limit:
+                        included.append(rec)
+                        if oldest_included is None:
+                            oldest_included = seq
+                        newest_included = seq
+                    else:
+                        extra = True
+                        break
+            if eof:
+                break
+    has_more = extra or hit_cap
+    next_since = newest_included if extra or not has_more else newest_scanned
+    if has_more and (
+        next_since is None
+        or (query.since_seq is not None and next_since <= query.since_seq)
+    ):
+        has_more = False
+    return _finish_ledger_page(included, oldest_included, next_since, has_more)
+
+
+def _read_ledger_page(query: _LedgerQuery) -> Dict[str, Any]:
+    """One capped range read of the JSONL ledger. Never writes."""
+    path = _active_ledger_path()
+    if path is None or not path.is_file():
+        return _empty_ledger_page()
+    try:
+        if path.stat().st_size == 0:
+            return _empty_ledger_page()
+        if query.ascending:
+            return _page_ascending(path, query)
+        return _page_descending(path, query)
+    except OSError as exc:
+        _ledger_log_failure("page", exc)
+        return _empty_ledger_page()
+
+
+def _legacy_tail_records(count: int) -> List[Any]:
+    """Newest `count` non-empty lines, parsed. Same records as trade_ledger.tail.
+
+    Walks backward from EOF and stops after `count` non-empty lines, so the
+    default GET does not load the rest of the file.
+    """
+    path = _active_ledger_path()
+    if path is None or count <= 0 or not path.is_file():
+        return []
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            return []
+        lines: List[bytes] = []
+        with open(path, "rb") as handle:
+            offset = size - 1
+            seen = set()
+            while offset >= 0 and len(lines) < count:
+                start, _end, raw = _line_at(handle, offset, size)
+                if start in seen:
+                    break
+                seen.add(start)
+                if raw.strip():
+                    lines.append(raw)
+                if start <= 0:
+                    break
+                offset = start - 1
+    except OSError as exc:
+        _ledger_log_failure("tail", exc)
+        return []
+    out: List[Any] = []
+    for raw in lines:
+        try:
+            out.append(json.loads(raw.strip().decode("utf-8")))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _ledger_http_body(
+    records: List[Any],
+    verify: bool,
+    page: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {"records": [_redact_ledger_payload(rec) for rec in records]}
+    if page is not None:
+        body["next_before_seq"] = page["next_before_seq"]
+        body["next_since_seq"] = page["next_since_seq"]
+        body["has_more"] = page["has_more"]
     if _ledger_memory is not None:
-        out["memory"] = _ledger_memory
+        body["memory"] = _ledger_memory
     if verify:
         ok, checked, err = trade_ledger.verify()
-        out["chain_ok"] = ok
-        out["chain_records_checked"] = checked
-        out["chain_error"] = err
-    return out
+        body["chain_ok"] = ok
+        body["chain_records_checked"] = checked
+        body["chain_error"] = (
+            None if err is None else scrub_etrade_text(str(err), secrets=_ledger_scrub_secrets())
+        )
+    return body
+
+
+@app.get("/ledger")
+async def ledger_tail(
+    request: Request,
+    count: int = Query(100, ge=1, le=500),
+    verify: bool = Query(False),
+    since_seq: Optional[str] = Query(None),
+    before_seq: Optional[str] = Query(None),
+    limit: Optional[str] = Query(None),
+    event_type: Optional[str] = Query(None),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+):
+    """Read the immutable trade ledger.
+
+    The file is append-only JSONL. This route only reads it. With no paging
+    params the body matches the historical tail: `records` is the newest
+    `count` lines (default 100, max 500), newest first, plus `memory` when
+    the boot verdict is set and the chain fields when `verify=true`.
+
+    Paging params (any one of them opts into a page):
+
+    * `since_seq` — exclusive. Records with seq greater than this, **oldest
+      first**. This is the only mode that is ascending.
+    * `before_seq` — exclusive. Records with seq less than this, **newest
+      first** (also the default order when `since_seq` is omitted).
+    * `limit` — page size, default 500, maximum 1000. Ignored on the legacy
+      tail; `count` is ignored once a paging param is present.
+    * `event_type` — comma-separated exact event names
+      (`position_opened,stop_updated`).
+    * `start` / `end` — Central Time dates (`YYYY-MM-DD`, inclusive) or
+      timestamps. Example for the Nov 11–18 2026 opens::
+
+        GET /ledger?event_type=position_opened&start=2026-11-11&end=2026-11-18
+
+    The page carries `next_before_seq`, `next_since_seq`, and `has_more`.
+    Cursors are exclusive. Follow `next_before_seq` as `before_seq` to walk
+    older, or `next_since_seq` as `since_seq` to walk newer. A request scans
+    at most LEDGER_PAGE_SCAN_CAP lines; `has_more` stays true when that cap
+    stops the scan before the window ends, and the cursor advances past the
+    lines already examined.
+
+    `verify=true` still walks the whole hash chain. That check is separate
+    from the page scan.
+
+    Auth is the X-Rork-Secret middleware (401 when the secret is unset or
+    wrong). After that, this route allows 30 requests a minute per client
+    (429). `accountId` and `accountIdKey` are removed from every record.
+    String fields and error text go through `scrub_etrade_text`.
+    """
+    _enforce_ledger_rate_limit(request)
+    try:
+        if not _paging_requested(since_seq, before_seq, limit, event_type, start, end):
+            return await asyncio.to_thread(_ledger_http_body_legacy, count, verify)
+        query = _parse_ledger_query(since_seq, before_seq, limit, event_type, start, end)
+        page = await asyncio.to_thread(_read_ledger_page, query)
+        return _ledger_http_body(page["records"], verify, page)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _ledger_log_failure("read", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=scrub_etrade_text(str(exc), secrets=_ledger_scrub_secrets()),
+        )
+
+
+def _ledger_http_body_legacy(count: int, verify: bool) -> Dict[str, Any]:
+    return _ledger_http_body(_legacy_tail_records(count), verify, page=None)
 
 
 def _active_ledger_path() -> Optional[Path]:
