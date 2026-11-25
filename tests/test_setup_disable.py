@@ -1526,13 +1526,15 @@ def test_restore_failure_uses_boot_unique_keys_then_accepts_two_chains(tmp_path,
         assert main_bot._shadow_boot_nonce in key_a
         assert len(core_keys) == len(set(core_keys))
 
-        def chained(seq, payload, prev="0" * 64):
+        def chained(seq, payload, prev="0" * 64, chain_id="legacy"):
             rec = {
                 "seq": seq,
                 "ts": "2026-11-30T16:00:00+00:00",
                 "event": "setup_disable_shadow",
                 "data": payload,
                 "prev_hash": prev,
+                "chain_id": chain_id,
+                "restart": prev == "0" * 64,
             }
             body = json.dumps(rec, sort_keys=True)
             rec["hash"] = hashlib.sha256((prev + body).encode("utf-8")).hexdigest()
@@ -1540,8 +1542,8 @@ def test_restore_failure_uses_boot_unique_keys_then_accepts_two_chains(tmp_path,
 
         async def up():
             return [
-                chained(1, {"signal_key": "OLD|breakdown|same|1", "setup": "breakdown"}),
-                chained(1, {"signal_key": "NEW|breakdown|same|1", "setup": "breakdown"}),
+                chained(1, {"signal_key": "OLD|breakdown|same|1", "setup": "breakdown"}, chain_id="old"),
+                chained(1, {"signal_key": "NEW|breakdown|same|1", "setup": "breakdown"}, chain_id="new"),
             ]
 
         main_bot._shadow_line_loader = up
@@ -1563,3 +1565,202 @@ def test_restore_failure_uses_boot_unique_keys_then_accepts_two_chains(tmp_path,
     assert ok is True, err
     assert checked == 2
     assert main_bot.setup_disable_status()["ledger"]["restore_failed"] is False
+
+
+def _signal_keys(lines):
+    found = []
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        key = data.get("signal_key")
+        if rec.get("event") == "position_opened" or key:
+            if key:
+                found.append(key)
+    return found
+
+
+def _unique_lines(lines):
+    seen = set()
+    out = []
+    for line in lines:
+        try:
+            digest = json.loads(line).get("hash")
+        except json.JSONDecodeError:
+            continue
+        if not digest or digest in seen:
+            continue
+        seen.add(digest)
+        out.append(line)
+    return out
+
+
+async def _cancel_shadow_tasks():
+    main_bot._shadow_accepting = False
+    current = asyncio.current_task()
+    pending = [task for task in asyncio.all_tasks() if task is not current]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def test_t2_degraded_boot_keeps_the_nonce_and_reseeds(tmp_path, monkeypatch):
+    """T2: |1 and |2 with the DB up, wipe, boot with the DB down, then the retry restore."""
+    main_bot.reset_setup_disable_state()
+    main_bot._shadow_mirrored_hashes.clear()
+    monkeypatch.setattr(main_bot, "_shadow_restore_delays", (0.0, 0.0, 0.0))
+    monkeypatch.setattr(main_bot, "_SHADOW_RESTORE_RETRY_S", 0.01)
+    path = tmp_path / "setup_disable_shadow.jsonl"
+    core_path = tmp_path / "core.jsonl"
+    saved_state = main_bot.state
+    saved_ledger = main_bot.trade_ledger._ledger
+    main_bot.state = main_bot.StateStore(None)
+    main_bot.trade_ledger.init(core_path)
+    side_lines = []
+    core_lines = []
+    db_up = {"value": True}
+
+    async def side_mirror(seq, rec_hash, line):
+        side_lines.append(line)
+
+    async def core_mirror(seq, rec_hash, line):
+        core_lines.append(line)
+
+    async def loader():
+        if not db_up["value"]:
+            raise ConnectionError("down")
+        return list(side_lines)
+
+    main_bot.set_shadow_mirror(side_mirror)
+    main_bot.trade_ledger.set_mirror(core_mirror)
+    main_bot._shadow_line_loader = loader
+    payload = {"ticker": "FAKE", "setup": "breakdown", "action": "BUY", "signal_id": "t2"}
+
+    async def open_once():
+        reserved = main_bot._reserve_setup_disable_attempt(payload)
+        await main_bot._record_open(
+            "FAKE", 1, 10.0, 9.0, 12.0, None, "BUY", "breakdown",
+            signal_id="t2", instrument="equity", signal_key=reserved[1],
+        )
+        await main_bot.persist_setup_disable_decision(
+            payload, quantity=1, enforced=False, quantity_basis="after_sizing",
+            path="entry", fresh_order=True, reserved=reserved,
+            outcome={"order_id": reserved[1], "placement_status": "placed"},
+        )
+        return reserved[1]
+
+    async def scenario():
+        _open_shadow(tmp_path)
+        first = await open_once()
+        second = await open_once()
+        assert first.endswith("|1")
+        assert second.endswith("|2")
+        path.unlink()
+        core_path.unlink()
+        main_bot.trade_ledger.init(core_path)
+        main_bot.reset_setup_disable_state()
+        main_bot._shadow_nonce_for_boot = False
+        db_up["value"] = False
+        await main_bot.prepare_setup_disable_shadow(path)
+        status = main_bot.setup_disable_status()["ledger"]
+        degraded = await open_once()
+        assert status["restore_failed"] is True
+        assert main_bot._shadow_boot_nonce in degraded
+        assert degraded.endswith("|1|" + main_bot._shadow_boot_nonce)
+        db_up["value"] = True
+        for _ in range(100):
+            if not main_bot._shadow_restore_failed:
+                break
+            await asyncio.sleep(0.02)
+        assert main_bot._shadow_restore_failed is False
+        assert main_bot._shadow_nonce_for_boot is True
+        nxt = await open_once()
+        assert main_bot._shadow_boot_nonce in nxt
+        assert nxt.endswith("|3|" + main_bot._shadow_boot_nonce)
+        core_keys = _signal_keys(_unique_lines(core_lines))
+        side_keys = _signal_keys(_unique_lines(side_lines))
+        assert set(core_keys) == {first, second, degraded, nxt}
+        assert set(side_keys) == {first, second, degraded, nxt}
+        assert len(core_keys) == len(set(core_keys)) == 4
+        assert len(side_keys) == len(set(side_keys)) == 4
+        live_core = [ln for ln in core_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        path.unlink()
+        core_path.unlink()
+        restored_side = main_bot.restore_shadow_lines(path, _unique_lines(side_lines))
+        restored_core = main_bot.trade_ledger.restore_lines(core_path, live_core)
+        main_bot.init_setup_disable_shadow_log(path)
+        main_bot.trade_ledger.init(core_path)
+        result = restored_side, restored_core, main_bot._shadow_log.verify(), main_bot.trade_ledger.verify()
+        await _cancel_shadow_tasks()
+        return result
+
+    try:
+        restored_side, restored_core, side_ok, core_ok = asyncio.run(scenario())
+    finally:
+        main_bot._shadow_accepting = False
+        main_bot._shadow_line_loader = None
+        main_bot.set_shadow_mirror(None)
+        main_bot.trade_ledger.set_mirror(None)
+        main_bot.state = saved_state
+        main_bot.trade_ledger._ledger = saved_ledger
+        main_bot.reset_setup_disable_state()
+    assert restored_side >= 4
+    assert restored_core >= 2
+    assert side_ok[0] is True, side_ok
+    assert core_ok[0] is True, core_ok
+    assert side_ok[1] >= 4
+    assert core_ok[1] >= 2
+
+
+def test_shadow_backfill_does_not_stall_the_event_loop(tmp_path, monkeypatch):
+    import time
+    main_bot.reset_setup_disable_state()
+    main_bot._shadow_mirrored_hashes.clear()
+    monkeypatch.setattr(main_bot, "_shadow_restore_delays", (0.0, 0.0, 0.0))
+    path = tmp_path / "setup_disable_shadow.jsonl"
+
+    async def empty():
+        return []
+
+    async def hung(seq, rec_hash, line):
+        await asyncio.Event().wait()
+
+    real = os.fsync
+
+    def slow(fd):
+        time.sleep(1.5)
+        return real(fd)
+
+    main_bot._shadow_line_loader = empty
+    _open_shadow(tmp_path)
+    main_bot._shadow_log.append({"signal_id": "already"})
+    monkeypatch.setattr(main_bot.os, "fsync", slow)
+    main_bot.set_shadow_mirror(hung)
+
+    async def run():
+        started = asyncio.get_running_loop().time()
+        await main_bot.prepare_setup_disable_shadow(path)
+        startup = asyncio.get_running_loop().time() - started
+        log = main_bot._shadow_log
+        append_task = asyncio.create_task(asyncio.to_thread(log.append, {"signal_id": "lag"}))
+        lags = []
+        for _ in range(8):
+            mark = asyncio.get_running_loop().time()
+            await asyncio.sleep(0)
+            lags.append(asyncio.get_running_loop().time() - mark)
+        await append_task
+        await _cancel_shadow_tasks()
+        return startup, max(lags)
+
+    try:
+        startup, lag = asyncio.run(run())
+    finally:
+        main_bot._shadow_accepting = False
+        main_bot._shadow_line_loader = None
+        main_bot.set_shadow_mirror(None)
+        main_bot.reset_setup_disable_state()
+    assert startup < 1.0
+    assert lag < 0.05

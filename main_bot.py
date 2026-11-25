@@ -16866,13 +16866,15 @@ _shadow_line_loader: Optional[Any] = None
 _shadow_inflight = 0
 _shadow_writer_restarted = False
 _shadow_restore_failed = False
+_shadow_nonce_for_boot = False
 _shadow_restore_attempts = 0
 _shadow_restore_delays: Tuple[float, ...] = (0.0, 2.0, 3.0)
 _shadow_boot_nonce = "b" + uuid.uuid4().hex[:8]
 _shadow_mirrored_hashes: set = set()
 _shadow_backfill_task: Optional[asyncio.Task] = None
 _shadow_restore_task: Optional[asyncio.Task] = None
-_SHADOW_MIRROR_TIMEOUT_S = 2.0
+_SHADOW_DB_TIMEOUT_S = 5.0
+_SHADOW_RESTORE_RETRY_S = 5.0
 _SHADOW_BACKFILL_INTERVAL_S = 60.0
 _shadow_ledger_counts: Dict[str, int] = {
     "written": 0, "dropped": 0, "on_disk": 0, "durable": 0, "mirror_failed": 0,
@@ -16971,8 +16973,8 @@ def setup_disable_signal_parts(payload: Any) -> Tuple[str, str, str]:
 
 
 def _shadow_key_tail() -> str:
-    """Boot-unique suffix while restore is degraded, so core keys cannot collide."""
-    if _shadow_restore_failed and _shadow_boot_nonce:
+    """Nonce stays for the whole boot once restore has failed, even after a retry."""
+    if _shadow_nonce_for_boot and _shadow_boot_nonce:
         return f"|{_shadow_boot_nonce}"
     return ""
 
@@ -17004,9 +17006,8 @@ def _claim_setup_disable_attempt(payload: Dict[str, Any], *, fresh_order: bool) 
     if current and current not in _setup_disable_closed_attempt and not fresh_order:
         return None
     if current and current not in _setup_disable_closed_attempt and fresh_order:
-        # The open row is this same order, not a second entry.
-        attempt = int(current.rsplit("|", 1)[-1])
-        return attempt, current
+        # The open row is this same order, not a second entry. The tail may be a nonce.
+        return _attempt_from_signal_key(current), current
     n = int(_setup_disable_attempt_n.get((symbol, setup, day)) or 0) + 1
     _setup_disable_attempt_n[(symbol, setup, day)] = n
     key = f"{symbol}|{setup}|{signal_id}|{n}{_shadow_key_tail()}"
@@ -17450,7 +17451,7 @@ class SetupDisableShadowLog:
         self.path = Path(path)
         self._lock = threading.Lock()
         self.partial_truncated = self._repair_partial_tail()
-        self._seq, self._prev_hash = self._load_tail()
+        self._seq, self._prev_hash, self.chain_id = self._load_tail()
 
     def _repair_partial_tail(self) -> int:
         """Truncate a torn last line. The bytes before it stay where they are."""
@@ -17487,7 +17488,7 @@ class SetupDisableShadowLog:
     def _load_tail(self) -> Tuple[int, str]:
         try:
             if not self.path.exists():
-                return 0, "0" * 64
+                return 0, "0" * 64, uuid.uuid4().hex[:12]
             last = ""
             with open(self.path, "r", encoding="utf-8") as handle:
                 for line in handle:
@@ -17498,15 +17499,16 @@ class SetupDisableShadowLog:
                             continue
                         last = line
             if not last:
-                return 0, "0" * 64
+                return 0, "0" * 64, uuid.uuid4().hex[:12]
             rec = json.loads(last)
-            return int(rec.get("seq") or 0), str(rec.get("hash") or ("0" * 64))
+            chain = str(rec.get("chain_id") or "") or uuid.uuid4().hex[:12]
+            return int(rec.get("seq") or 0), str(rec.get("hash") or ("0" * 64)), chain
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            return 0, "0" * 64
+            return 0, "0" * 64, uuid.uuid4().hex[:12]
 
     def _reload_tail(self) -> None:
         self.partial_truncated += self._repair_partial_tail()
-        self._seq, self._prev_hash = self._load_tail()
+        self._seq, self._prev_hash, self.chain_id = self._load_tail()
         _shadow_ledger_counts["on_disk"] = self._seq
         _shadow_ledger_counts["partial_truncated"] = self.partial_truncated
 
@@ -17514,13 +17516,17 @@ class SetupDisableShadowLog:
         """Hash, write, then advance the head. The lock keeps two writers in order."""
         with self._lock:
             self._seq += 1
+            genesis = self._prev_hash == ("0" * 64)
             rec: Dict[str, Any] = {
                 "seq": self._seq,
                 "ts": _utcnow().isoformat(),
                 "event": SETUP_DISABLE_EVENT,
                 "data": data or {},
                 "prev_hash": self._prev_hash,
+                "chain_id": self.chain_id,
             }
+            if genesis:
+                rec["restart"] = True
             body = json.dumps(rec, sort_keys=True, default=str)
             rec["hash"] = hashlib.sha256((self._prev_hash + body).encode("utf-8")).hexdigest()
             line = json.dumps(rec, sort_keys=True, default=str)
@@ -17543,25 +17549,35 @@ class SetupDisableShadowLog:
             return rec
 
     def verify(self) -> Tuple[bool, int, Optional[str]]:
-        prev = "0" * 64
-        checked = 0
+        """Check each chain_id on its own. A genesis row must be marked restart."""
+        genesis = "0" * 64
         try:
             if not self.path.exists():
                 return True, 0, None
+            groups: Dict[str, List[Dict[str, Any]]] = {}
             with open(self.path, "r", encoding="utf-8") as handle:
-                for line_no, line in enumerate(handle, start=1):
+                for line in handle:
                     if not line.strip():
                         continue
                     rec = json.loads(line)
+                    groups.setdefault(str(rec.get("chain_id") or ""), []).append(rec)
+            checked = 0
+            for chain_id in sorted(groups):
+                prev = genesis
+                rows = sorted(groups[chain_id], key=lambda rec: int(rec.get("seq") or 0))
+                for rec in rows:
                     claimed = str(rec.pop("hash", ""))
                     prev_link = str(rec.get("prev_hash"))
-                    # A second chain may start at genesis. Each segment is checked
-                    # on its own instead of failing the whole file.
-                    if prev_link != prev and prev_link != ("0" * 64):
-                        return False, checked, f"line {line_no}: prev_hash broken"
+                    if prev_link == genesis:
+                        if rec.get("restart") is not True:
+                            return False, checked, (
+                                f"chain {chain_id or 'legacy'} seq {rec.get('seq')}: restart missing"
+                            )
+                    elif prev_link != prev:
+                        return False, checked, f"chain {chain_id or 'legacy'} seq {rec.get('seq')}: prev_hash broken"
                     body = json.dumps(rec, sort_keys=True, default=str)
-                    if hashlib.sha256((str(rec.get("prev_hash")) + body).encode("utf-8")).hexdigest() != claimed:
-                        return False, checked, f"line {line_no}: hash mismatch"
+                    if hashlib.sha256((prev_link + body).encode("utf-8")).hexdigest() != claimed:
+                        return False, checked, f"chain {chain_id or 'legacy'} seq {rec.get('seq')}: hash mismatch"
                     prev = claimed
                     checked += 1
             return True, checked, None
@@ -17599,8 +17615,19 @@ def set_shadow_mirror(fn: Optional[Any]) -> None:
     _shadow_mirror = fn
 
 
+def _shadow_line_order(line: str) -> Tuple[str, int]:
+    try:
+        rec = json.loads(line)
+    except json.JSONDecodeError:
+        return ("", 0)
+    return (str(rec.get("chain_id") or ""), int(rec.get("seq") or 0))
+
+
 def restore_shadow_lines(path: Path, lines: List[str]) -> int:
-    """Rewrite an empty or missing side log from durable lines. A non-empty file stays."""
+    """Rewrite an empty or missing side log from durable lines. A non-empty file stays.
+
+    Lines are written chain-by-chain, then by seq, so two boots are not interleaved.
+    """
     try:
         target = Path(path)
         if target.exists() and target.stat().st_size > 0:
@@ -17608,6 +17635,7 @@ def restore_shadow_lines(path: Path, lines: List[str]) -> int:
         payload = [ln for ln in lines if ln and str(ln).strip()]
         if not payload:
             return 0
+        payload.sort(key=_shadow_line_order)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("\n".join(payload) + "\n", encoding="utf-8")
         return len(payload)
@@ -17616,30 +17644,72 @@ def restore_shadow_lines(path: Path, lines: List[str]) -> int:
         return 0
 
 
-async def _shadow_postgres_mirror(seq: int, rec_hash: str, line: str) -> None:
+async def _shadow_postgres_mirror(seq: int, rec_hash: str, line: str, chain_id: Optional[str] = None) -> None:
     """Mirror one side-log row. Separate table from bot_ledger."""
     if engine is None:
         return
+    if chain_id is None:
+        try:
+            chain_id = json.loads(line).get("chain_id")
+        except json.JSONDecodeError:
+            chain_id = None
     async with engine.begin() as conn:
         await conn.execute(
             sql_text(
-                f"INSERT INTO {_bt('bot_shadow_ledger')} (hash, seq, line) "
-                "VALUES (:hash, :seq, :line) ON CONFLICT (hash) DO NOTHING"
+                f"INSERT INTO {_bt('bot_shadow_ledger')} (hash, seq, line, chain_id) "
+                "VALUES (:hash, :seq, :line, :chain_id) ON CONFLICT (hash) DO NOTHING"
             ),
-            {"hash": rec_hash, "seq": int(seq), "line": line},
+            {"hash": rec_hash, "seq": int(seq), "line": line, "chain_id": chain_id},
         )
 
 
 async def _load_durable_shadow_lines() -> List[str]:
     loader = _shadow_line_loader
     if loader is not None:
-        return list(await loader())
+        lines = list(await asyncio.wait_for(loader(), timeout=_SHADOW_DB_TIMEOUT_S))
+        return await asyncio.to_thread(lambda: sorted(lines, key=_shadow_line_order))
     if engine is None:
         return []
-    async with engine.connect() as conn:
-        result = await conn.execute(
-            sql_text(f"SELECT line FROM {_bt('bot_shadow_ledger')} ORDER BY seq"))
-        return [row[0] for row in result.fetchall()]
+
+    async def _query() -> List[str]:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                sql_text(
+                    f"SELECT chain_id, seq, line FROM {_bt('bot_shadow_ledger')}"
+                ))
+            rows = [(row[0], row[1], row[2]) for row in result.fetchall()]
+        rows.sort(key=lambda item: (str(item[0] or ""), int(item[1] or 0)))
+        return [item[2] for item in rows]
+
+    return await asyncio.wait_for(_query(), timeout=_SHADOW_DB_TIMEOUT_S)
+
+
+async def _load_durable_shadow_hashes() -> set:
+    """One query for hashes already stored. Missing file lines are the only pushes."""
+    loader = _shadow_line_loader
+    if loader is not None:
+        lines = list(await asyncio.wait_for(loader(), timeout=_SHADOW_DB_TIMEOUT_S))
+
+        def _hashes() -> set:
+            found = set()
+            for line in lines:
+                try:
+                    found.add(str(json.loads(line).get("hash") or ""))
+                except json.JSONDecodeError:
+                    continue
+            found.discard("")
+            return found
+
+        return await asyncio.to_thread(_hashes)
+    if engine is None:
+        return set()
+
+    async def _query() -> set:
+        async with engine.connect() as conn:
+            result = await conn.execute(sql_text(f"SELECT hash FROM {_bt('bot_shadow_ledger')}"))
+            return {str(row[0]) for row in result.fetchall() if row[0]}
+
+    return await asyncio.wait_for(_query(), timeout=_SHADOW_DB_TIMEOUT_S)
 
 
 async def _mirror_shadow_line(seq: int, rec_hash: str, line: str) -> None:
@@ -17650,7 +17720,7 @@ async def _mirror_shadow_line(seq: int, rec_hash: str, line: str) -> None:
     if digest in _shadow_mirrored_hashes:
         return
     try:
-        await asyncio.wait_for(mirror(int(seq), digest, line), timeout=_SHADOW_MIRROR_TIMEOUT_S)
+        await asyncio.wait_for(mirror(int(seq), digest, line), timeout=_SHADOW_DB_TIMEOUT_S)
         _shadow_mirrored_hashes.add(digest)
         _shadow_ledger_counts["durable"] = int(_shadow_ledger_counts.get("durable") or 0) + 1
     except Exception as exc:
@@ -17659,32 +17729,84 @@ async def _mirror_shadow_line(seq: int, rec_hash: str, line: str) -> None:
         _log_setup_disable_observer_error(exc)
 
 
-def _shadow_file_lines() -> List[str]:
+def _missing_shadow_rows(known: set) -> List[Tuple[int, str, str, Optional[str]]]:
+    """Read and parse the side log. Caller must run this in a thread."""
     log = _shadow_log
     if log is None or not log.path.exists():
         return []
     try:
         with log._lock:
             raw = log.path.read_text(encoding="utf-8")
-    except OSError as exc:
-        _log_setup_disable_observer_error(exc)
+    except OSError:
         return []
-    return [ln for ln in raw.splitlines() if ln.strip()]
-
-
-async def backfill_shadow_mirror() -> int:
-    """Push on-disk lines that Postgres does not have yet. Off the order path."""
-    pushed = 0
-    for line in _shadow_file_lines():
+    missing: List[Tuple[int, str, str, Optional[str]]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue
         digest = str(rec.get("hash") or "")
-        if not digest or digest in _shadow_mirrored_hashes:
+        if not digest or digest in known:
             continue
+        missing.append((int(rec.get("seq") or 0), digest, line, rec.get("chain_id")))
+    return missing
+
+
+async def _insert_shadow_batch(rows: List[Tuple[int, str, str, Optional[str]]]) -> None:
+    if engine is None or not rows:
+        return
+    values = []
+    params: Dict[str, Any] = {}
+    for index, (seq, digest, line, chain_id) in enumerate(rows):
+        values.append(f"(:h{index}, :s{index}, :l{index}, :c{index})")
+        params[f"h{index}"] = digest
+        params[f"s{index}"] = seq
+        params[f"l{index}"] = line
+        params[f"c{index}"] = chain_id
+    statement = (
+        f"INSERT INTO {_bt('bot_shadow_ledger')} (hash, seq, line, chain_id) "
+        f"VALUES {', '.join(values)} ON CONFLICT (hash) DO NOTHING"
+    )
+    async with engine.begin() as conn:
+        await conn.execute(sql_text(statement), params)
+
+
+async def backfill_shadow_mirror() -> int:
+    """Push on-disk lines that the durable table does not have yet.
+
+    File reads and parsing happen off the event loop. The boot path must not await this.
+    """
+    known = set(_shadow_mirrored_hashes)
+    try:
+        known |= await asyncio.wait_for(_load_durable_shadow_hashes(), timeout=_SHADOW_DB_TIMEOUT_S)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+    missing = await asyncio.to_thread(_missing_shadow_rows, known)
+    if not missing:
+        return 0
+    pushed = 0
+    use_batch = engine is not None and _shadow_mirror is _shadow_postgres_mirror
+    if use_batch:
+        for start in range(0, len(missing), 200):
+            batch = missing[start:start + 200]
+            try:
+                await asyncio.wait_for(_insert_shadow_batch(batch), timeout=_SHADOW_DB_TIMEOUT_S)
+            except Exception as exc:
+                _shadow_ledger_counts["mirror_failed"] = int(_shadow_ledger_counts.get("mirror_failed") or 0) + len(batch)
+                _shadow_ledger_counts["mirror_failures"] = int(_shadow_ledger_counts.get("mirror_failures") or 0) + len(batch)
+                _log_setup_disable_observer_error(exc)
+                continue
+            for seq, digest, _line, _chain in batch:
+                if digest not in _shadow_mirrored_hashes:
+                    _shadow_mirrored_hashes.add(digest)
+                    _shadow_ledger_counts["durable"] = int(_shadow_ledger_counts.get("durable") or 0) + 1
+                    pushed += 1
+        return pushed
+    for seq, digest, line, _chain in missing:
         before = int(_shadow_ledger_counts.get("durable") or 0)
-        await _mirror_shadow_line(int(rec.get("seq") or 0), digest, line)
+        await _mirror_shadow_line(seq, digest, line)
         if int(_shadow_ledger_counts.get("durable") or 0) > before:
             pushed += 1
     return pushed
@@ -17699,6 +17821,67 @@ async def _shadow_backfill_loop() -> None:
             await backfill_shadow_mirror()
         except Exception as exc:
             _log_setup_disable_observer_error(exc)
+
+
+def _read_shadow_file_sync() -> List[str]:
+    """Read the side log. Must run in a thread: it takes the append lock."""
+    log = _shadow_log
+    if log is None or not log.path.exists():
+        return []
+    try:
+        with log._lock:
+            raw = log.path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [ln for ln in raw.splitlines() if ln.strip()]
+
+
+def _absorb_shadow_line(line: str) -> None:
+    try:
+        rec = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+    key = str(data.get("signal_key") or "")
+    if not key:
+        return
+    setup = canonical_setup_id(data.get("setup"))
+    parts = key.split("|")
+    if len(parts) < 4 or not parts[0] or not parts[1]:
+        return
+    attempt = _attempt_from_signal_key(key)
+    day = str(data.get("et_timestamp") or rec.get("ts") or "")[:10]
+    if day:
+        bucket = (parts[0], parts[1], day)
+        _setup_disable_attempt_n[bucket] = max(int(_setup_disable_attempt_n.get(bucket) or 0), attempt)
+        _setup_disable_inflight[(parts[0], parts[1], day, parts[2])] = key
+    _setup_disable_ledger_keys.add(key)
+    outcome = data.get("outcome") if isinstance(data.get("outcome"), dict) else {}
+    if outcome.get("order_id") or outcome.get("placement_status"):
+        _setup_disable_closed_attempt.add(key)
+    if setup:
+        field = "skipped" if data.get("enforced") is True else "would_skip"
+        _bump_setup_count(setup, field)
+
+
+async def _reseed_shadow_attempts() -> None:
+    """Max the attempt counters from the file and the durable rows."""
+    file_lines = await asyncio.to_thread(_read_shadow_file_sync)
+    try:
+        durable = await asyncio.wait_for(_load_durable_shadow_lines(), timeout=_SHADOW_DB_TIMEOUT_S)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+        durable = []
+    for line in list(file_lines) + list(durable):
+        _absorb_shadow_line(line)
+
+
+def _start_shadow_backfill_now() -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(backfill_shadow_mirror(), name="setup-disable-shadow-backfill-now")
 
 
 def _start_shadow_backfill_loop() -> None:
@@ -17725,7 +17908,7 @@ async def _restore_shadow_once(path: Path) -> None:
 async def _shadow_restore_retry(path: Path) -> None:
     """Keep trying after boot. A later success clears the degraded flag."""
     global _shadow_restore_failed, _shadow_restore_attempts, _setup_disable_seeded
-    delay = 5.0
+    delay = _SHADOW_RESTORE_RETRY_S
     while _shadow_restore_failed and _shadow_accepting:
         await asyncio.sleep(delay)
         if not _shadow_restore_failed or not _shadow_accepting:
@@ -17739,12 +17922,8 @@ async def _shadow_restore_retry(path: Path) -> None:
             continue
         _shadow_restore_failed = False
         init_setup_disable_shadow_log(path)
-        try:
-            await backfill_shadow_mirror()
-        except Exception as exc:
-            _log_setup_disable_observer_error(exc)
-        _setup_disable_seeded = False
-        seed_setup_disable_from_ledger()
+        await _reseed_shadow_attempts()
+        _start_shadow_backfill_now()
         return
 
 
@@ -17766,7 +17945,7 @@ async def prepare_setup_disable_shadow(path: Path) -> None:
     A failure stays visible and keeps retrying. Keys minted while degraded
     carry this boot's nonce.
     """
-    global _shadow_restore_failed, _shadow_restore_attempts
+    global _shadow_restore_failed, _shadow_restore_attempts, _shadow_nonce_for_boot
     ok = False
     for delay in _shadow_restore_delays:
         if delay:
@@ -17779,15 +17958,14 @@ async def prepare_setup_disable_shadow(path: Path) -> None:
         except Exception as exc:
             _log_setup_disable_observer_error(exc)
     _shadow_restore_failed = not ok
+    if not ok:
+        _shadow_nonce_for_boot = True
     init_setup_disable_shadow_log(path)
     if engine is not None and _shadow_mirror is None:
         set_shadow_mirror(_shadow_postgres_mirror)
-    try:
-        await backfill_shadow_mirror()
-    except Exception as exc:
-        _log_setup_disable_observer_error(exc)
     if _shadow_restore_failed:
         _start_shadow_restore_retry(path)
+    _start_shadow_backfill_now()
     _start_shadow_backfill_loop()
 
 
@@ -18023,9 +18201,10 @@ def reset_setup_disable_state() -> None:
     _shadow_ledger_counts["durable"] = 0
     _shadow_ledger_counts["mirror_failed"] = 0
     _shadow_ledger_counts["partial_truncated"] = 0
-    global _shadow_accepting, _shadow_restore_failed, _shadow_restore_attempts, _shadow_writer_restarted
+    global _shadow_accepting, _shadow_restore_failed, _shadow_nonce_for_boot, _shadow_restore_attempts, _shadow_writer_restarted
     _shadow_accepting = True
     _shadow_restore_failed = False
+    _shadow_nonce_for_boot = False
     _shadow_restore_attempts = 0
     _shadow_writer_restarted = False
     _opened_seq_by_signal.clear()
@@ -24719,7 +24898,8 @@ def _shadow_ledger_table_sql() -> str:
         f"CREATE TABLE IF NOT EXISTS {_bt('bot_shadow_ledger')} ("
         "hash TEXT PRIMARY KEY, "
         "seq BIGINT NOT NULL, "
-        "line TEXT NOT NULL)"
+        "line TEXT NOT NULL, "
+        "chain_id TEXT)"
     )
 
 
@@ -24774,6 +24954,9 @@ async def _init_durable_state() -> Optional[PgStatePersistence]:
         try:
             async with engine.begin() as conn:
                 await conn.execute(sql_text(_shadow_ledger_table_sql()))
+                await conn.execute(sql_text(
+                    f"ALTER TABLE {_bt('bot_shadow_ledger')} ADD COLUMN IF NOT EXISTS chain_id TEXT"
+                ))
         except Exception as shadow_err:
             logger.error("shadow ledger table init failed (%s)", type(shadow_err).__name__)
         _state_persistence = PgStatePersistence(engine)
@@ -40247,7 +40430,7 @@ async def on_startup():
     if engine is not None:
         set_shadow_mirror(_shadow_postgres_mirror)
     await prepare_setup_disable_shadow(shadow_path)
-    seed_setup_disable_from_ledger()
+    await asyncio.to_thread(seed_setup_disable_from_ledger)
     # Say out loud whether this process actually remembers anything. A ledger
     # that comes up empty is indistinguishable from a healthy one in the logs,
     # and it silently disarms the only mechanism that learns from past trades.
