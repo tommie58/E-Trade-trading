@@ -2056,6 +2056,112 @@ class ETradeAsyncClient:
             params={"instType": institution_type, "realTimeNAV": "true"},
         )
 
+    async def list_transactions(
+        self,
+        account_id_key: str,
+        start_date: str,
+        end_date: str,
+        count: int = 50,
+        page_cap: int = 40,
+    ) -> Dict[str, Any]:
+        """Page GET /v1/accounts/{accountIdKey}/transactions.
+
+        ``start_date`` and ``end_date`` are MMDDYYYY. ``count`` is clamped to
+        1..50 (E*TRADE's maximum). ``page_cap`` is clamped to 1..40. Each page
+        is one GET; the following page sends the prior response marker
+        (``next``, then ``marker``, then ``pageMarker``). A repeated marker
+        stops the walk. An empty body (HTTP 204) is an empty page, not an
+        error. Any error from ``_request`` propagates, including a failure
+        on a later page — the partial rows are not returned as a success.
+        ``truncated`` is true when the cap is hit while another marker remains.
+
+        Returns ``{"transactions": [raw, ...], "pages": int, "truncated": bool}``.
+        Rows are not scrubbed here. pyetrade's single-page ``list_transactions``
+        is not used: it debug-logs the raw body, which can carry the account id.
+        """
+        try:
+            count_n = int(count)
+        except (TypeError, ValueError):
+            count_n = 50
+        if count_n < 1:
+            count_n = 1
+        if count_n > 50:
+            count_n = 50
+        try:
+            cap = int(page_cap)
+        except (TypeError, ValueError):
+            cap = 40
+        if cap < 1:
+            cap = 1
+        if cap > 40:
+            cap = 40
+        start = str(start_date or "").strip()
+        end = str(end_date or "").strip()
+        if len(start) != 8 or not start.isdigit() or len(end) != 8 or not end.isdigit():
+            raise ValueError("transaction dates must be MMDDYYYY")
+
+        def _page(resp: Any):
+            if not isinstance(resp, dict) or not resp:
+                return [], None
+            root = resp.get("TransactionListResponse")
+            if root is None:
+                root = resp.get("transactionListResponse")
+            if not isinstance(root, dict):
+                if "Transaction" in resp or "transaction" in resp:
+                    root = resp
+                else:
+                    root = {}
+            rows = root.get("Transaction")
+            if rows is None:
+                rows = root.get("transaction") or []
+            if isinstance(rows, dict):
+                rows = [rows]
+            if not isinstance(rows, list):
+                rows = []
+            more = root.get("moreTransactions")
+            if more is None:
+                more = root.get("more_transactions")
+            if isinstance(more, str):
+                more = more.strip().lower() == "true"
+            nxt = root.get("next") or root.get("marker") or root.get("pageMarker")
+            if isinstance(nxt, dict):
+                nxt = nxt.get("next") or nxt.get("marker")
+            if nxt is not None:
+                nxt = str(nxt).strip() or None
+            if more is False:
+                nxt = None
+            return [row for row in rows if isinstance(row, dict)], nxt
+
+        collected: List[Any] = []
+        marker: Optional[str] = None
+        seen = set()
+        pages = 0
+        truncated = False
+        for index in range(cap):
+            params: Dict[str, Any] = {
+                "startDate": start,
+                "endDate": end,
+                "count": count_n,
+            }
+            if marker:
+                params["marker"] = marker
+            resp = await self._request(
+                "GET",
+                f"/v1/accounts/{account_id_key}/transactions",
+                params=params,
+            )
+            pages += 1
+            rows, nxt = _page(resp)
+            collected.extend(rows)
+            if not nxt or nxt in seen:
+                break
+            seen.add(nxt)
+            if index == cap - 1:
+                truncated = True
+                break
+            marker = nxt
+        return {"transactions": collected, "pages": pages, "truncated": truncated}
+
     # ------------------------------------------------------------------
     # Payload builders (pure functions — unit-testable)
     # ------------------------------------------------------------------
@@ -15097,6 +15203,8 @@ import asyncio
 import hashlib
 import hmac
 import contextvars
+import threading
+import traceback
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15445,7 +15553,10 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # /status positions_open is the open book with status, side, and qty.
 # Logs, alerts, and HTTP responses mask accountIdKey (**** + last 4).
 # Order routing still uses the real key.
-BOT_VERSION = "5.99.11-pro-day-trader"
+# 5.99.13: GET /etrade/transactions is a read-only fee/commission pull.
+# It does not write Redis or the ledger and does not change orders, stops,
+# policy, or the scanner. The version is a placeholder until merge.
+BOT_VERSION = "5.99.13-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -22555,6 +22666,463 @@ async def get_option_quote(
     logger.info(
         f"Option quote served: {body['symbol']} {snapped_expiry} {snapped_strike} "
         f"{call_put} -> " + (f"bid={real_bid} ask={real_ask}" if quoted else "NO TWO-SIDED QUOTE")
+    )
+    return body
+
+
+# ==================== READ-ONLY TRANSACTIONS ====================
+# GET /etrade/transactions feeds Quant Lab actual fees and commissions.
+# Read-only: no order, cancel, policy, Redis, or ledger writes. The order
+# routing cache is consulted and never updated.
+_CT_ZONE = ZoneInfo("America/Chicago")
+TRANSACTIONS_RATE_LIMIT = 6
+TRANSACTIONS_RATE_WINDOW_SECONDS = 60.0
+TRANSACTIONS_PAGE_CAP = 40
+TRANSACTIONS_PAGE_SIZE = 50
+_TXN_RATE_LOCK = threading.Lock()
+_TXN_RATE_HITS: List[float] = []
+_TXN_FORBIDDEN_RESPONSE_KEYS = {
+    "accountId", "accountIdKey", "account_id", "account_id_key",
+    "detailsURI", "detailsUri", "DetailsURI", "links",
+}
+
+
+def _reset_transactions_rate_limit() -> None:
+    with _TXN_RATE_LOCK:
+        _TXN_RATE_HITS.clear()
+
+
+def _transactions_now() -> float:
+    return time.monotonic()
+
+
+def _transactions_rate_allow() -> bool:
+    """At most TRANSACTIONS_RATE_LIMIT hits per window, for this process."""
+    now = _transactions_now()
+    window = float(TRANSACTIONS_RATE_WINDOW_SECONDS)
+    limit = int(TRANSACTIONS_RATE_LIMIT)
+    with _TXN_RATE_LOCK:
+        fresh = [hit for hit in _TXN_RATE_HITS if now - hit < window]
+        _TXN_RATE_HITS[:] = fresh
+        if len(_TXN_RATE_HITS) >= max(0, limit):
+            return False
+        _TXN_RATE_HITS.append(now)
+        return True
+
+
+def _transactions_today() -> date:
+    """Calendar day in Central Time. transactionDate is returned in that zone."""
+    return datetime.now(_CT_ZONE).date()
+
+
+def _add_years(day: date, years: int) -> date:
+    try:
+        return day.replace(year=day.year + years)
+    except ValueError:
+        return day.replace(year=day.year + years, day=28)
+
+
+def _parse_iso_day(raw: Optional[str]) -> date:
+    text = str(raw or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise ValueError("start and end must be YYYY-MM-DD")
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("start and end must be YYYY-MM-DD") from exc
+
+
+def _mmddyyyy(day: date) -> str:
+    return day.strftime("%m%d%Y")
+
+
+def _transactions_auth_failure(exc: BaseException) -> bool:
+    if _http_status_of(exc) == 401:
+        return True
+    text = str(exc).lower()
+    markers = (
+        "oauth_problem", "token_expired", "token expired", "token_rejected",
+        "unauthorized", "invalid token", "not authenticated", "revoked",
+    )
+    if any(marker in text for marker in markers):
+        return True
+    return _looks_like_auth_failure(exc)
+
+
+def _extend_account_secrets(text: str, secrets: List[str]) -> None:
+    for match in _ACCT_IN_PATH.finditer(text or ""):
+        token = match.group(2)
+        if token and token not in {"{acct}", "{redacted}"} and len(token) >= 4 and token not in secrets:
+            secrets.append(token)
+    for match in _ACCT_KEY_QUERY.finditer(text or ""):
+        token = match.group(2)
+        if token and token not in {"{acct}", "{redacted}"} and len(token) >= 4 and token not in secrets:
+            secrets.append(token)
+
+
+def _scrub_exc(exc: BaseException, secrets: Sequence[str]) -> str:
+    """Scrubbed exception text plus traceback. Never the raw str(e)."""
+    parts = [str(exc)]
+    body = getattr(exc, "body", None)
+    if body:
+        parts.append(str(body)[:800])
+    try:
+        if exc.__traceback__ is not None:
+            parts.append("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    except Exception:
+        pass
+    blob = "\n".join(parts)
+    bag = [item for item in secrets if item]
+    _extend_account_secrets(blob, bag)
+    return scrub_etrade_text(blob, secrets=bag)
+
+
+def _public_transaction_id(raw: Any, secrets: Sequence[str]) -> Any:
+    """Numeric broker ids stay integers.
+
+    An id is account-linked when it contains a known account key or account
+    number, or when it is not purely numeric (an opaque key has that shape).
+    Those are replaced with ``h:`` plus the first 16 hex chars of SHA-256.
+    The digest is not reversible. Integer ids skip ``scrub_etrade_text``,
+    which would redact an 8-digit run inside a string.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    linked = not text.isdigit()
+    if not linked:
+        for secret in secrets:
+            if secret and secret in text:
+                linked = True
+                break
+    if linked or not text.isdigit():
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        return "h:" + digest
+    try:
+        return int(text)
+    except ValueError:
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        return "h:" + digest
+
+
+def _epoch_to_ct_iso(value: Any) -> Optional[str]:
+    """E*TRADE epoch milliseconds (or seconds) as ISO-8601 in America/Chicago."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}.*", text):
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return text
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(_CT_ZONE).isoformat()
+        if re.fullmatch(r"\d{8}", text):
+            try:
+                day = datetime.strptime(text, "%m%d%Y")
+            except ValueError:
+                return None
+            return day.replace(tzinfo=_CT_ZONE).isoformat()
+        try:
+            value = float(text)
+        except ValueError:
+            return text
+    try:
+        stamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(stamp):
+        return None
+    seconds = stamp / 1000.0 if abs(stamp) >= 1e11 else stamp
+    try:
+        instant = datetime.fromtimestamp(seconds, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return instant.astimezone(_CT_ZONE).isoformat()
+
+
+def _txn_number(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _collect_account_secrets(value: Any, secrets: List[str]) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            name = str(key).lower().replace("_", "")
+            if name in {"accountid", "accountidkey"} and not isinstance(item, (dict, list)):
+                token = str(item).strip()
+                if len(token) >= 4 and token not in secrets:
+                    secrets.append(token)
+            else:
+                _collect_account_secrets(item, secrets)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_account_secrets(item, secrets)
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
+def _brokerage_view(row: Dict[str, Any]) -> Dict[str, Any]:
+    brok = _as_dict(row.get("brokerage") if row.get("brokerage") is not None else row.get("Brokerage"))
+    product = _as_dict(brok.get("product") if brok.get("product") is not None else brok.get("Product"))
+    symbol = product.get("symbol")
+    if symbol is None:
+        symbol = brok.get("displaySymbol")
+    currency = brok.get("settlementCurrency")
+    return {
+        "symbol": None if symbol is None else str(symbol),
+        "quantity": _txn_number(brok.get("quantity")),
+        "price": _txn_number(brok.get("price")),
+        "fee": _txn_number(brok.get("fee")),
+        "settlementCurrency": None if currency is None else str(currency),
+    }
+
+
+def _normalize_transaction(row: Dict[str, Any], secrets: Sequence[str]) -> Dict[str, Any]:
+    brok_raw = _as_dict(row.get("brokerage") if row.get("brokerage") is not None else row.get("Brokerage"))
+    ttype = row.get("transactionType")
+    if ttype is None:
+        ttype = brok_raw.get("transactionType")
+    parts = []
+    for key in ("description", "description2"):
+        val = row.get(key)
+        if val:
+            parts.append(str(val))
+    return {
+        "transactionId": _public_transaction_id(row.get("transactionId"), secrets),
+        "transactionDate": _epoch_to_ct_iso(row.get("transactionDate")),
+        "postDate": _epoch_to_ct_iso(row.get("postDate")),
+        "amount": _txn_number(row.get("amount")),
+        "description": " ".join(parts),
+        "transactionType": None if ttype is None else str(ttype),
+        "brokerage": _brokerage_view(row),
+    }
+
+
+def _scrub_tree(value: Any, secrets: Sequence[str]) -> Any:
+    if isinstance(value, str):
+        return scrub_etrade_text(value, secrets=secrets)
+    if isinstance(value, dict):
+        return {
+            key: _scrub_tree(item, secrets)
+            for key, item in value.items()
+            if key not in _TXN_FORBIDDEN_RESPONSE_KEYS
+        }
+    if isinstance(value, list):
+        return [_scrub_tree(item, secrets) for item in value]
+    return value
+
+
+def _transactions_payload(
+    start: date, end: date, raw_rows: List[dict], truncated: bool, secrets: Sequence[str],
+) -> Dict[str, Any]:
+    rows = []
+    fee_total = 0.0
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        norm = _normalize_transaction(row, secrets)
+        fee = norm["brokerage"]["fee"]
+        if fee is not None:
+            fee_total += fee
+        rows.append(norm)
+    body = {
+        "ok": True,
+        "bot_version": BOT_VERSION,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "timezone": "America/Chicago",
+        "count": len(rows),
+        "fee_total": round(fee_total, 4),
+        "truncated": bool(truncated),
+        "transactions": rows,
+    }
+    return _scrub_tree(body, secrets)
+
+
+async def _transactions_account_key(tokens: Dict[str, str]) -> str:
+    """Key for the read. Does not refresh or replace the order-routing cache.
+
+    ``_load_pinned_account`` and ``_resolve_account_id_key`` can clear that
+    cache and send an alert (a Redis write). This path only reads.
+    """
+    cached = _resolved_account_id_key
+    if cached:
+        return str(cached)
+    pinned = _pinned_account_id
+    try:
+        raw_pin = await state.get(ACCOUNT_PIN_KEY)
+        if raw_pin is not None:
+            pinned = str(raw_pin).strip() or None
+    except Exception as exc:
+        pin_secrets = [pinned] if pinned else []
+        logger.warning(
+            "transactions pin read failed: %s",
+            scrub_etrade_text(str(exc), secrets=pin_secrets),
+        )
+    client = _raw_client(tokens)
+    resp = await client.list_accounts()
+    account_list = (((resp or {}).get("AccountListResponse") or {}).get("Accounts") or {}).get("Account") or []
+    if isinstance(account_list, dict):
+        account_list = [account_list]
+    if not account_list:
+        raise ETradeAPIError(502, "E*TRADE returned no accounts")
+    brokerage = _brokerage_accounts(account_list) or list(account_list)
+    target = (TARGET_ACCOUNT_ID or "").strip()
+    chosen = None
+    if pinned:
+        for acct in brokerage:
+            if account_matches_id(acct, pinned):
+                chosen = acct
+                break
+    if chosen is None and target:
+        for acct in brokerage:
+            if account_matches_id(acct, target):
+                chosen = acct
+                break
+    if chosen is None:
+        chosen = next(
+            (acct for acct in brokerage if str(acct.get("accountStatus", "")).upper() == "ACTIVE"),
+            brokerage[0],
+        )
+    key = str((chosen or {}).get("accountIdKey") or "").strip()
+    if not key:
+        raise ETradeAPIError(502, "Matched E*TRADE account has no accountIdKey")
+    return key
+
+
+def _transactions_error(exc: BaseException, secrets: Sequence[str]) -> JSONResponse:
+    scrubbed = _scrub_exc(exc, secrets) or "etrade_unavailable"
+    # The message is already scrubbed. exc_info would attach the raw frames;
+    # #38's filter scrubs URL-shaped tracebacks, and this line never hands it
+    # the unscrubbed text.
+    logger.error("E*TRADE transactions failed: %s", scrubbed[:4000])
+    if _transactions_auth_failure(exc):
+        return JSONResponse(
+            status_code=503,
+            content={"reason": "etrade_auth", "detail": scrubbed[:500]},
+        )
+    return JSONResponse(
+        status_code=502,
+        content={"reason": scrubbed[:300], "detail": scrubbed[:500]},
+    )
+
+
+@app.get("/etrade/transactions")
+async def get_etrade_transactions(
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+):
+    """Read E*TRADE transactions. GET only.
+
+    Auth is the process-wide ``X-Rork-Secret`` middleware (401, fail closed).
+    This handler allows at most 6 calls per minute per process (429).
+
+    Dates are ``YYYY-MM-DD``. ``start`` must be on or before ``end``, ``end``
+    on or before today in America/Chicago, and the span at most 2 years
+    (E*TRADE's documented lookback). The broker call is
+    ``GET /v1/accounts/{accountIdKey}/transactions`` with ``startDate`` and
+    ``endDate`` as ``MMDDYYYY``, ``count`` 50, and marker paging capped at
+    40 pages. HTTP 204 or an empty page is an empty list. An E*TRADE 401 or
+    an expired token is 503 ``reason=etrade_auth``. Any other broker error is
+    502 with a scrubbed reason. An error is never returned as an empty list.
+
+    ``transactionId`` stays an integer when it is purely numeric and does not
+    contain the account key or account number. Otherwise it is ``h:`` plus
+    the first 16 hex characters of SHA-256 (not reversible). Every string
+    field, error detail, and log line is passed through ``scrub_etrade_text``.
+    ``accountId``, ``accountIdKey``, ``detailsURI``, and links are omitted.
+    ``transactionDate`` and ``postDate`` are ISO-8601 in America/Chicago.
+    ``fee_total`` is the sum of brokerage fees. ``count`` is the row count.
+    """
+    if not _transactions_rate_allow():
+        raise HTTPException(429, "rate limit: at most 6 transaction reads per minute")
+    try:
+        if start is None or end is None or not str(start).strip() or not str(end).strip():
+            raise ValueError("start and end are required (YYYY-MM-DD)")
+        start_day = _parse_iso_day(start)
+        end_day = _parse_iso_day(end)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    if start_day > end_day:
+        raise HTTPException(400, "start must be on or before end")
+    if end_day > _transactions_today():
+        raise HTTPException(400, "end must be on or before today (America/Chicago)")
+    if end_day > _add_years(start_day, 2):
+        raise HTTPException(400, "date span must be at most 2 years")
+
+    tokens = load_tokens()
+    if not tokens:
+        return JSONResponse(
+            status_code=503,
+            content={"reason": "etrade_auth", "detail": "E*TRADE account is not linked"},
+        )
+
+    secrets: List[str] = []
+    account_key = ""
+    page: Dict[str, Any] = {"transactions": [], "pages": 0, "truncated": False}
+    try:
+        account_key = await _transactions_account_key(tokens)
+        if account_key:
+            secrets.append(account_key)
+        client = _raw_client(tokens)
+        fetched = await client.list_transactions(
+            account_key,
+            _mmddyyyy(start_day),
+            _mmddyyyy(end_day),
+            count=TRANSACTIONS_PAGE_SIZE,
+            page_cap=TRANSACTIONS_PAGE_CAP,
+        )
+        if isinstance(fetched, dict):
+            page = fetched
+    except ValueError as exc:
+        raise HTTPException(400, scrub_etrade_text(str(exc), secrets=secrets)) from None
+    except Exception as exc:
+        if _http_status_of(exc) == 204:
+            page = {"transactions": [], "pages": 0, "truncated": False}
+        else:
+            if account_key and account_key not in secrets:
+                secrets.append(account_key)
+            return _transactions_error(exc, secrets)
+
+    rows = page.get("transactions") if isinstance(page, dict) else []
+    if not isinstance(rows, list):
+        rows = []
+    _collect_account_secrets(rows, secrets)
+    if account_key and account_key not in secrets:
+        secrets.append(account_key)
+    body = _transactions_payload(
+        start_day,
+        end_day,
+        rows,
+        bool(page.get("truncated")) if isinstance(page, dict) else False,
+        secrets,
+    )
+    logger.info(
+        "served %s transactions fee_total=%s truncated=%s",
+        body["count"], body["fee_total"], body["truncated"],
     )
     return body
 
