@@ -15320,8 +15320,12 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # no double count), on cancel, reject, expiry, or timeout, and the
 # unfilled remainder of a partial stays reserved until that order is done.
 # HEAT_RESERVATION_TTL_S defaults to the entry-fill timeout (20 minutes)
-# and is clamped at one hour. A restart also drops reservations. The
-# settle after a stop is armed does not wait on that lock.
+# and is clamped at one hour. A fill releases by filled quantity, not by
+# comparing booked dollars with the nominal plan. A close releases the
+# ticker. A restart drops only expired reservations. A recovered job
+# re-checks heat before it places. A skipped try-lock settle or release
+# is retried by the placement-worker sweep. The settle after a stop is
+# armed does not wait on that lock.
 # HEAT_RESERVATION_ENABLED defaults on. Setting it false is the rollback:
 # heat is judged at fill time again.
 # The session VWAP stays the scanner's own samples. Each volume delta is
