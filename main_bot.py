@@ -27110,8 +27110,10 @@ async def _read_etrade_quote_log(
 # Read-only: enqueue and a quote fetch. No orders, positions, or stops.
 # OPTION_QUOTE_SNAPSHOT_MAX_PENDING caps queued fetches (default 200).
 OPTION_SNAPSHOT_OFFSETS_MIN = (15, 30, 60)
-_OPTION_SNAPSHOT_PENDING: Dict[Tuple[str, int], Dict[str, Any]] = {}
-_OPTION_SNAPSHOT_SEEN: Dict[Tuple[str, int], float] = {}
+_OPTION_SNAPSHOT_PENDING: Dict[Tuple[str, Any], Dict[str, Any]] = {}
+_OPTION_SNAPSHOT_SEEN: Dict[Tuple[str, Any], float] = {}
+_OPTION_SNAPSHOT_STOP_TOUCHED: set = set()
+_LAST_QUOTE_STAMP: Dict[str, Dict[str, Any]] = {}
 _OPTION_SNAPSHOT_LOCK = threading.Lock()
 
 
@@ -27234,12 +27236,94 @@ def _trim_option_snapshot_seen() -> None:
         _OPTION_SNAPSHOT_SEEN.pop(next(iter(_OPTION_SNAPSHOT_SEEN)), None)
 
 
+_ET_QUOTE_CLOCK = re.compile(
+    r"^(\d{1,2}):(\d{2}):(\d{2})\s+([A-Za-z]{2,5})\s+(\d{1,2})-(\d{1,2})-(\d{4})$"
+)
+_ET_OFFSETS = {
+    "EST": -5, "EDT": -4, "CST": -6, "CDT": -5, "MST": -7, "MDT": -6,
+    "PST": -8, "PDT": -7, "UTC": 0, "GMT": 0,
+}
+
+
+def _parse_iso_utc(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_broker_quote_time(value: Any, broker_epoch: Any = None) -> Optional[datetime]:
+    """Clock from QuoteData.dateTime / dateTimeUTC. None when it will not parse."""
+    epoch_dt = None
+    if broker_epoch is not None and not isinstance(broker_epoch, bool):
+        iso = _epoch_to_iso(float(broker_epoch)) if isinstance(broker_epoch, (int, float)) else _epoch_to_iso(
+            float(broker_epoch) if str(broker_epoch).isdigit() else float("nan")
+        )
+        epoch_dt = _parse_iso_utc(iso) if iso else None
+    if epoch_dt is not None:
+        return epoch_dt
+    text = str(value or "").strip()
+    if not text:
+        return None
+    iso_dt = _parse_iso_utc(text)
+    if iso_dt is not None and "T" in text:
+        return iso_dt
+    match = _ET_QUOTE_CLOCK.match(text)
+    if not match:
+        return None
+    hour, minute, second, zone, month, day, year = match.groups()
+    offset = _ET_OFFSETS.get(zone.upper())
+    if offset is None:
+        return None
+    try:
+        local = datetime(
+            int(year), int(month), int(day), int(hour), int(minute), int(second),
+            tzinfo=timezone(timedelta(hours=offset)),
+        )
+    except ValueError:
+        return None
+    return local.astimezone(timezone.utc)
+
+
+def _quote_age_ms(date_time: Any, fetched_at: Any, broker_epoch: Any = None) -> Optional[int]:
+    """fetched_at minus the broker stamp, in milliseconds. None if either side is missing."""
+    fetched = _parse_iso_utc(fetched_at)
+    broker = _parse_broker_quote_time(date_time, broker_epoch)
+    if fetched is None or broker is None:
+        return None
+    return int(round((fetched - broker).total_seconds() * 1000.0))
+
+
+def _snapshot_dedupe_key(signal_key: str, offset_min: Any, offset_kind: str, order_id: Optional[str]) -> Tuple[str, Any]:
+    if offset_kind in {"entry", "modeled"}:
+        return (str(signal_key), int(offset_min))
+    ident = str(order_id or signal_key)
+    return (str(signal_key), f"{offset_kind}:{ident}")
+
+
 def _enqueue_option_snapshot(
-    signal_key: str, offset_min: int, due: datetime, spec: Dict[str, Any],
+    signal_key: str,
+    offset_min: Any,
+    due: datetime,
+    spec: Dict[str, Any],
+    offset_kind: Optional[str] = None,
+    order_id: Optional[str] = None,
+    preset_quote: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """'queued', 'duplicate', or 'capped'. Does not fetch."""
-    key = (str(signal_key), int(offset_min))
-    due_epoch = due.astimezone(timezone.utc).timestamp()
+    """'queued', 'duplicate', or 'capped'. Does not fetch and does not await."""
+    kind = offset_kind or ("entry" if offset_min == 0 else "modeled")
+    key = _snapshot_dedupe_key(signal_key, offset_min, kind, order_id)
+    due_epoch = due.astimezone(timezone.utc).timestamp() if due.tzinfo else due.replace(
+        tzinfo=timezone.utc,
+    ).timestamp()
     with _OPTION_SNAPSHOT_LOCK:
         if key in _OPTION_SNAPSHOT_SEEN or key in _OPTION_SNAPSHOT_PENDING:
             return "duplicate"
@@ -27248,9 +27332,12 @@ def _enqueue_option_snapshot(
             return "capped"
         _OPTION_SNAPSHOT_PENDING[key] = {
             "signal_key": str(signal_key),
-            "offset_min": int(offset_min),
+            "offset_min": offset_min,
+            "offset_kind": kind,
+            "order_id": None if order_id is None else str(order_id),
             "due_epoch": due_epoch,
             "spec": spec,
+            "preset_quote": preset_quote,
         }
         return "queued"
 
@@ -27294,11 +27381,20 @@ async def _read_option_snapshot_quote(spec: Dict[str, Any]) -> Dict[str, Any]:
         )
         return missing
     if not records:
+        missing["_quote_time_source"] = "broker_unverified"
+        missing["_fetched_at"] = _utcnow().isoformat()
         return missing
     rec = records[0]
+    # QuoteData.dateTime / dateTimeUTC are documented as the quote time.
+    # A chain timeStamp is not that field, so a missing QuoteData stamp stays unverified.
+    source = "broker_quote" if rec.get("dateTime") else "broker_unverified"
+    fetched_at = rec.get("fetched_at") or _utcnow().isoformat()
     if rec.get("bid") is None and rec.get("ask") is None and rec.get("last") is None:
         missing["option_symbol"] = rec.get("option_symbol") or symbol
         missing["dateTime"] = rec.get("dateTime")
+        missing["_quote_time_source"] = source if rec.get("dateTime") else "broker_unverified"
+        missing["_fetched_at"] = fetched_at
+        missing["_broker_epoch"] = rec.get("broker_epoch")
         return missing
     return {
         "status": "ok",
@@ -27307,26 +27403,50 @@ async def _read_option_snapshot_quote(spec: Dict[str, Any]) -> Dict[str, Any]:
         "last": rec.get("last"),
         "dateTime": rec.get("dateTime"),
         "option_symbol": rec.get("option_symbol") or symbol,
+        "_quote_time_source": source,
+        "_fetched_at": fetched_at,
+        "_broker_epoch": rec.get("broker_epoch"),
     }
 
 
-async def _write_option_snapshot_row(
-    signal_key: str, offset_min: int, spec: Dict[str, Any],
-) -> None:
+def _public_snapshot_quote(quote: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[int], str]:
+    """Drop internal stamp fields. Age uses the fetch time stored with the quote."""
+    raw = dict(quote or {})
+    source = raw.pop("_quote_time_source", None)
+    fetched_at = raw.pop("_fetched_at", None)
+    broker_epoch = raw.pop("_broker_epoch", None)
+    if source not in {"broker_quote", "broker_unverified"}:
+        source = "broker_quote" if raw.get("dateTime") else "broker_unverified"
+    age = _quote_age_ms(raw.get("dateTime"), fetched_at, broker_epoch)
+    if not raw.get("dateTime") and broker_epoch is None:
+        source = "broker_unverified"
+        age = None
+    return raw, age, source
+
+
+async def _write_option_snapshot_row(job: Dict[str, Any]) -> None:
+    spec = job.get("spec") if isinstance(job.get("spec"), dict) else {}
+    preset = job.get("preset_quote") if isinstance(job.get("preset_quote"), dict) else None
     try:
-        quote = await _read_option_snapshot_quote(spec)
+        quote = dict(preset) if preset is not None else await _read_option_snapshot_quote(spec)
     except Exception as e:
         logger.warning(
             "option quote snapshot read failed: %s",
             scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
         )
         quote = _missing_option_quote(spec)
+    public, age_ms, time_source = _public_snapshot_quote(quote if isinstance(quote, dict) else {})
+    offset_min = job.get("offset_min")
     body = _scrub_snapshot_value({
         "event_type": "option_quote_snapshot",
-        "signal_key": str(signal_key),
-        "offset_min": int(offset_min),
-        "status": quote.get("status") or "missing",
-        "quote": quote,
+        "signal_key": str(job.get("signal_key") or ""),
+        "offset_min": offset_min,
+        "offset_kind": job.get("offset_kind") or ("entry" if offset_min == 0 else "modeled"),
+        "order_id": job.get("order_id"),
+        "status": public.get("status") or "missing",
+        "quote_age_ms": age_ms,
+        "quote_time_source": time_source,
+        "quote": public,
     })
     try:
         await trade_ledger.record("option_quote_snapshot", body)
@@ -27351,14 +27471,18 @@ async def note_option_quote_snapshots(payload: Dict[str, Any], now: Optional[dat
         if not isinstance(spec, dict):
             spec = _option_snapshot_spec(payload)
         signal_at = now or _utcnow()
-        outcome = _enqueue_option_snapshot(signal_key, 0, signal_at, spec)
+        outcome = _enqueue_option_snapshot(
+            signal_key, 0, signal_at, spec, offset_kind="entry",
+        )
         if outcome == "capped":
             logger.warning(
                 "option quote snapshot pending cap reached (%s) — not scheduling %s offset 0",
                 _option_snapshot_max_pending(), signal_key,
             )
         for offset_min, due in plan_option_snapshot_schedule(signal_at):
-            queued = _enqueue_option_snapshot(signal_key, offset_min, due, spec)
+            queued = _enqueue_option_snapshot(
+                signal_key, offset_min, due, spec, offset_kind="modeled",
+            )
             if queued == "capped":
                 logger.warning(
                     "option quote snapshot pending cap reached (%s) — not scheduling %s offset %s",
@@ -27393,11 +27517,7 @@ async def _option_snapshot_tick(now: Optional[datetime] = None) -> int:
     wrote = 0
     for job in jobs:
         try:
-            await _write_option_snapshot_row(
-                str(job.get("signal_key") or ""),
-                int(job.get("offset_min") or 0),
-                job.get("spec") if isinstance(job.get("spec"), dict) else {},
-            )
+            await _write_option_snapshot_row(job)
             wrote += 1
         except Exception as e:
             logger.warning(
@@ -27414,6 +27534,157 @@ async def _note_entry_signal_snapshot(payload: Dict[str, Any]) -> None:
     except Exception as e:
         logger.warning(
             "option quote snapshot schedule failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+
+
+def _position_signal_key(ticker: str, pos: Optional[dict], payload: Optional[dict]) -> str:
+    sig = (pos or {}).get("entry_signal") if isinstance((pos or {}).get("entry_signal"), dict) else {}
+    if not sig and isinstance(payload, dict) and payload.get("signal_id"):
+        sig = payload
+    if isinstance(sig, dict) and (sig.get("signal_id") or sig.get("ticker")):
+        try:
+            return _signal_key(sig)
+        except Exception:
+            pass
+    opened = str((pos or {}).get("ts") or "")
+    return f"pos:{str(ticker).upper()}:{opened}"
+
+
+def _snapshot_order_id(pos: Optional[dict], payload: Optional[dict]) -> Optional[str]:
+    for src in (payload, pos or {}):
+        if not isinstance(src, dict):
+            continue
+        for key in ("order_id", "close_order_id", "stop_order_id", "exit_order_id"):
+            val = src.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+    return None
+
+
+def _is_stop_close_reason(reason: Any) -> bool:
+    """A booked close that is a stop trigger or a stop fill.
+
+    Matched on the reason text. The reconciler's stop-fill set lives in a
+    bundled module and is not required here: those reasons all contain "stop".
+    """
+    return "stop" in str(reason or "").lower()
+
+
+def _spec_from_position(ticker: str, pos: Optional[dict], payload: Optional[dict]) -> Dict[str, Any]:
+    contract = (pos or {}).get("contract") if isinstance((pos or {}).get("contract"), dict) else {}
+    body = {
+        "ticker": ticker,
+        "contract": contract,
+        "option_right": contract.get("right") or (payload or {}).get("option_right"),
+        "expiration_hint": contract.get("expiration") or (payload or {}).get("expiration_hint"),
+        "strike_hint": (
+            contract.get("strike") if isinstance(contract, dict) and contract.get("strike") is not None
+            else (payload or {}).get("strike_hint")
+        ),
+    }
+    spec = _option_snapshot_spec(body)
+    scrubbed = _scrub_snapshot_value(spec)
+    return scrubbed if isinstance(scrubbed, dict) else spec
+
+
+def enqueue_exit_option_snapshot(
+    ticker: str, pos: Optional[dict], payload: Optional[dict],
+    close_reason: Optional[str], expired: bool = False,
+) -> None:
+    """Queue an exit_fill or stop_trigger snapshot. Sync: no quote fetch, no await."""
+    try:
+        if expired:
+            return
+        kind = "stop_trigger" if _is_stop_close_reason(close_reason) else "exit_fill"
+        signal_key = _position_signal_key(ticker, pos, payload)
+        spec = _spec_from_position(ticker, pos, payload)
+        order_id = _snapshot_order_id(pos, payload)
+        outcome = _enqueue_option_snapshot(
+            signal_key, None, _utcnow(), spec,
+            offset_kind=kind, order_id=order_id,
+        )
+        if outcome == "capped":
+            logger.warning(
+                "option quote snapshot pending cap reached (%s) — not scheduling %s %s",
+                _option_snapshot_max_pending(), signal_key, kind,
+            )
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot enqueue failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+
+
+def _tracked_stop_level(pos: dict) -> Optional[float]:
+    contract = pos.get("contract") if isinstance(pos.get("contract"), dict) else {}
+    is_option = bool(contract.get("right"))
+    raw = pos.get("stop_premium") if is_option else pos.get("stop")
+    if raw is None:
+        raw = pos.get("trail")
+    try:
+        level = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(level) or level <= 0:
+        return None
+    return level
+
+
+def note_polled_stop_touch(ticker: str, pos: dict, bid: Any, ask: Any, mark: Any) -> None:
+    """First time the polled mark touches the tracked stop. Uses that quote; no new fetch."""
+    try:
+        if not isinstance(pos, dict):
+            return
+        stop = _tracked_stop_level(pos)
+        try:
+            mark_f = float(mark)
+        except (TypeError, ValueError):
+            return
+        if stop is None or not math.isfinite(mark_f) or mark_f <= 0:
+            return
+        contract = pos.get("contract") if isinstance(pos.get("contract"), dict) else {}
+        is_option = bool(contract.get("right"))
+        is_long = is_option or str(pos.get("action") or "BUY").upper() != "SELL"
+        touched = mark_f <= stop if is_long else mark_f >= stop
+        if not touched:
+            return
+        once = f"{str(ticker).upper()}|{pos.get('ts') or ''}|{pos.get('stop_order_id') or ''}"
+        with _OPTION_SNAPSHOT_LOCK:
+            if once in _OPTION_SNAPSHOT_STOP_TOUCHED:
+                return
+            _OPTION_SNAPSHOT_STOP_TOUCHED.add(once)
+        spec = _spec_from_position(ticker, pos, {})
+        sym = _quote_symbol(ticker, contract) if contract.get("right") else str(ticker).upper()
+        stamp = _LAST_QUOTE_STAMP.get(sym) if isinstance(_LAST_QUOTE_STAMP.get(sym), dict) else {}
+        date_time = stamp.get("dateTime")
+        broker_epoch = stamp.get("dateTimeUTC")
+        source = "broker_quote" if (date_time or broker_epoch is not None) else "broker_unverified"
+        quote = {
+            "status": "ok",
+            "bid": float(bid) if isinstance(bid, (int, float)) and not isinstance(bid, bool) else None,
+            "ask": float(ask) if isinstance(ask, (int, float)) and not isinstance(ask, bool) else None,
+            "last": stamp.get("last"),
+            "dateTime": _format_broker_time(date_time) or _format_broker_time(broker_epoch),
+            "option_symbol": spec.get("option_symbol"),
+            "_quote_time_source": source,
+            "_fetched_at": stamp.get("fetched_at") or _utcnow().isoformat(),
+            "_broker_epoch": broker_epoch,
+        }
+        outcome = _enqueue_option_snapshot(
+            _position_signal_key(ticker, pos, {}), None, _utcnow(), spec,
+            offset_kind="stop_touch",
+            order_id=str(pos.get("stop_order_id")) if pos.get("stop_order_id") else None,
+            preset_quote=quote,
+        )
+        if outcome == "capped":
+            logger.warning(
+                "option quote snapshot pending cap reached (%s) — not scheduling stop_touch %s",
+                _option_snapshot_max_pending(), ticker,
+            )
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot stop-touch enqueue failed: %s",
             scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
         )
 
@@ -28849,6 +29120,15 @@ async def _etrade_bid_ask(ticker: str, contract: Optional[dict] = None) -> Tuple
                 q.get("quoteStatus"), q.get("dateTimeUTC"), time.time(),
                 max_age_seconds=MAX_MARK_AGE_SECONDS,
             )
+            # Side stamp for the snapshot log. The returned bid/ask are unchanged.
+            _LAST_QUOTE_STAMP[sym] = {
+                "bid": bid,
+                "ask": ask,
+                "last": _quote_log_finite(all_q.get("lastTrade")),
+                "dateTime": q.get("dateTime"),
+                "dateTimeUTC": q.get("dateTimeUTC"),
+                "fetched_at": _utcnow().isoformat(),
+            }
             return bid, ask
     except Exception as e:
         logger.warning(f"reprice quote failed for {ticker}: {e}")
@@ -32470,6 +32750,14 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         **_review,
     }
     ledger_seq = await trade_ledger.record("position_closed", close_data)
+    # Enqueue only. A snapshot fetch must not run before the close returns.
+    try:
+        enqueue_exit_option_snapshot(ticker, pos, payload, close_reason, expired_booked)
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot enqueue failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
     await _remember_trade_review(close_data, ledger_seq=ledger_seq)
     # Schedule 15/30-minute post-exit marks — a stop that was too tight shows
     # up as a recovery after the exit. Best-effort; never blocks the close.
@@ -37606,6 +37894,8 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     # Conservative mark: longs (and long options) trail off the BID, shorts
     # off the ASK — the trail only ratchets on prices we could actually exit at.
     mark = bid if (is_buy or is_option) else ask
+    # The quote this pass already polled. Sync enqueue; it does not fetch or write the position.
+    note_polled_stop_touch(ticker, pos, bid, ask, mark)
 
     # Live round-trip spread on the same basis as the mark. It floors the trail
     # distance so a wide chain (ARM at 10.85/11.75) is never stopped out by its
