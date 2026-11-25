@@ -10191,6 +10191,7 @@ def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
             # Top-of-book size — the order-book imbalance feature (edge.py).
             "bid_size": num(all_q, "bidSize"),
             "ask_size": num(all_q, "askSize"),
+            "price_source": str(entry.get("source") or "").strip() or None,
         })
     return out
 
@@ -11384,6 +11385,15 @@ def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) ->
         "source": "bot_scanner",
         "timestamp": candidate["ts"],
     }
+    raw_source = str(quote.get("price_source") or quote.get("source") or "").strip()
+    if raw_source:
+        lowered = raw_source.lower()
+        if lowered == "massive":
+            payload["underlying_source"] = "Massive"
+        elif lowered in {"etrade", "e*trade", "e-trade"}:
+            payload["underlying_source"] = "E*TRADE"
+        else:
+            payload["underlying_source"] = raw_source
     # The measured context the entry filter re-judges the thesis against —
     # and that rides into the ledger so validation can segment by regime.
     if isinstance(candidate.get("edge_features"), dict):
@@ -12041,6 +12051,8 @@ class Scanner:
             try:
                 result = await self.dispatch(payload)
                 verdict = str((result or {}).get("status") or "unknown")
+                if str((result or {}).get("reason") or "") == "setup_disabled":
+                    verdict = "setup_disabled"
             except Exception as e:
                 verdict = f"error: {str(e)[:120]}"
                 logger.error(f"scanner dispatch failed for {cand['ticker']}: {e}")
@@ -15070,7 +15082,10 @@ import uuid
 import asyncio
 import hashlib
 import hmac
+import threading
+import functools
 import contextvars
+from concurrent.futures import ThreadPoolExecutor
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15407,6 +15422,11 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # and never frees every row on the ticker. The settle after a stop is
 # armed does not wait on that lock.
 # 5.99.6 keeps those rules and closes the follow-ups above.
+# 5.99.12 adds SETUP_DISABLE_ENABLED, read on each entry (not at import).
+# Default false leaves every admit and every size unchanged. Setup ids are
+# the scanner's lowercase strings with spaces. The default shadow list is
+# breakdown, breakout, vwap rejection, and momentum. "momentum" does not
+# match "momentum fade".
 # HEAT_RESERVATION_ENABLED defaults on. Setting it false is the rollback:
 # heat is judged at fill time again.
 # The session VWAP stays the scanner's own samples. Each volume delta is
@@ -15417,7 +15437,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # still fail-closes when the two disagree or the Massive side is missing
 # or stale. GET /pro-trader/report includes the gap in basis points.
 # /status positions_open is the open book with status, side, and qty.
-BOT_VERSION = "5.99.6-pro-day-trader"
+BOT_VERSION = "5.99.12-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -16456,6 +16476,2106 @@ def _utcnow() -> datetime:
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("etrade-bot")
+
+# ---------------------------------------------------------------------------
+# Setup disable (5.99.12). Read on every entry. Flag off does not change
+# an admit or a size. Shadow (default on while the flag is off) counts
+# would-have-skipped candidates and does not block.
+# Identifiers are the scanner / thesis strings after edge.normalize_setup:
+# underscores become spaces, so the env token vwap_rejection is "vwap rejection".
+# Match is exact on that string. "momentum" is not "momentum fade".
+# ---------------------------------------------------------------------------
+SETUP_DISABLE_LIST_DEFAULT = "breakdown,breakout,vwap rejection,momentum"
+SETUP_DISABLE_EVENT = "setup_disable_shadow"
+_SETUP_DISABLE_LEDGER_LOOKBACK = 4000
+SETUP_DISABLE_REASON = "setup_disabled"
+_KEPT_SETUP_CAP = frozenset({"momentum fade", "orb"})
+_SETUP_LIST_CHARS = re.compile(r"^[A-Za-z0-9, _-]*$")
+_SETUP_DISABLE_TRUE = {"true", "1", "yes", "on"}
+_SETUP_DISABLE_FALSE = {"false", "0", "no", "off"}
+_setup_disable_counts: Dict[str, Any] = {
+    "skipped": 0,
+    "would_skip": 0,
+    "capped": 0,
+    "by_setup": {},
+}
+_setup_disable_seen: set = set()
+_setup_disable_seen_order: List[str] = []
+_setup_disable_ledger_keys: set = set()
+_setup_disable_list_cache: Dict[str, Any] = {"key": None}
+
+
+def canonical_setup_id(label: Any) -> str:
+    """Same folding as edge.normalize_setup. Exact, not a substring.
+
+    'vwap_rejection' and 'VWAP rejection' both become 'vwap rejection'.
+    'momentum_fade' becomes 'momentum fade', which is not 'momentum'.
+    """
+    text = str(label or "").strip().lower().replace("_", " ")
+    text = text.replace("+ adx", "").replace("+adx", "")
+    return " ".join(text.split())
+
+
+def known_setup_ids() -> frozenset:
+    """Setup strings the thesis table and the no-thesis list actually use."""
+    found = set()
+    for thesis in edge.THESES.values():
+        for alias in thesis.get("setups") or ():
+            canon = canonical_setup_id(alias)
+            if canon:
+                found.add(canon)
+    for alias in getattr(edge, "NO_THESIS_SETUPS", ()):
+        canon = canonical_setup_id(alias)
+        if canon:
+            found.add(canon)
+    return frozenset(found)
+
+
+def _env_bool(name: str) -> Optional[bool]:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    text = str(raw).strip().lower()
+    if text in _SETUP_DISABLE_TRUE:
+        return True
+    if text in _SETUP_DISABLE_FALSE:
+        return False
+    return None
+
+
+def setup_disable_enabled() -> bool:
+    """True only when SETUP_DISABLE_ENABLED is explicitly on. Default false.
+
+    An unreadable value stays off, so a bad env does not start skipping.
+    Read at call time. A process that already has the new environment
+    applies it on the next entry. Railway loads env vars by restarting
+    the service; that restart is not a new image.
+    """
+    return _env_bool("SETUP_DISABLE_ENABLED") is True
+
+
+def setup_disable_shadow() -> bool:
+    """Count would-be skips without blocking.
+
+    Unset follows the flag: true while the flag is off, false while it is
+    on. An explicit true/false wins either way. When the flag is on, a
+    skip still blocks even if shadow is also true.
+    """
+    flag = _env_bool("SETUP_DISABLE_SHADOW")
+    if flag is None:
+        return not setup_disable_enabled()
+    return flag
+
+
+def parse_setup_disable_list(raw: Any) -> Dict[str, Any]:
+    """Parse a comma-separated list into canonical setup ids.
+
+    None means the default list (the variable is unset), not a parse error.
+    A value with characters other than letters, digits, comma, space,
+    underscore, or hyphen is unparseable and the caller uses the default.
+    A token that is not a known setup id is dropped. It does not reject
+    the rest of the list.
+    """
+    known = known_setup_ids()
+    default_ids, _default_warnings, default_ignored = _tokenize_setup_list(
+        SETUP_DISABLE_LIST_DEFAULT, known,
+    )
+    if raw is None:
+        return {
+            "ids": default_ids,
+            "warnings": [],
+            "ignored": [],
+            "unparseable": False,
+            "source": "default",
+        }
+    if not isinstance(raw, str) or not raw.strip() or not _SETUP_LIST_CHARS.match(raw):
+        return {
+            "ids": default_ids,
+            "warnings": ["SETUP_DISABLE_LIST empty or unparseable; using the default list"],
+            "ignored": [],
+            "unparseable": True,
+            "source": "fallback",
+        }
+    ids, warnings, ignored = _tokenize_setup_list(raw, known)
+    if not ids:
+        named = ", ".join(repr(token) for token in ignored) or "none"
+        warnings = list(warnings) + [
+            f"SETUP_DISABLE_LIST has no known setups ({named}); using the default list"
+        ]
+        return {
+            "ids": default_ids,
+            "warnings": warnings,
+            "ignored": ignored,
+            "unparseable": True,
+            "source": "fallback",
+        }
+    return {
+        "ids": ids,
+        "warnings": warnings,
+        "ignored": ignored,
+        "unparseable": False,
+        "source": "env",
+    }
+
+
+def _tokenize_setup_list(raw: str, known: frozenset) -> Tuple[frozenset, List[str], List[str]]:
+    ids: List[str] = []
+    warnings: List[str] = []
+    ignored: List[str] = []
+    for part in str(raw).split(","):
+        token = part.strip()
+        if not token:
+            continue
+        canon = canonical_setup_id(token)
+        if canon not in known:
+            ignored.append(token)
+            warnings.append(f"setup disable list ignored unknown name {token!r}")
+            continue
+        if canon not in ids:
+            ids.append(canon)
+    return frozenset(ids), warnings, ignored
+
+
+def resolved_setup_disable_list() -> Dict[str, Any]:
+    """Current list. Re-read when the env value changes. Warnings once per value."""
+    raw = os.getenv("SETUP_DISABLE_LIST")
+    key = raw if isinstance(raw, str) or raw is None else ("bad-type", type(raw).__name__)
+    cached = _setup_disable_list_cache.get("key")
+    if cached == key and "parsed" in _setup_disable_list_cache:
+        return _setup_disable_list_cache["parsed"]
+    parsed = parse_setup_disable_list(raw if isinstance(raw, str) or raw is None else raw)
+    for message in parsed["warnings"]:
+        logger.warning(message)
+    _setup_disable_list_cache["key"] = key
+    _setup_disable_list_cache["parsed"] = parsed
+    return parsed
+
+
+def judge_setup_disable(
+    setup: Any,
+    *,
+    enabled: Any = None,
+    shadow: Any = None,
+    disabled: Any = None,
+) -> str:
+    """'skip', 'shadow', or 'allow'. Exact canonical match. Pure if args are passed.
+
+    'skip' wins when enabled is true, including when shadow is also true.
+    """
+    if enabled is None:
+        enabled = setup_disable_enabled()
+    if shadow is None:
+        shadow = setup_disable_shadow()
+    if disabled is None:
+        disabled = resolved_setup_disable_list()["ids"]
+    canon = canonical_setup_id(setup)
+    if not canon or canon not in disabled:
+        return "allow"
+    if enabled:
+        return "skip"
+    if shadow:
+        return "shadow"
+    return "allow"
+
+
+def _setup_disable_cycle(payload: Dict[str, Any]) -> str:
+    ts = str(payload.get("timestamp") or payload.get("ts") or "").strip()
+    if ts:
+        return ts
+    now = _utcnow().astimezone(_ET_ZONE)
+    return now.strftime("%Y-%m-%dT%H:%M")
+
+
+def _setup_disable_remember(key: str) -> bool:
+    """True the first time this candidate is seen in this cycle."""
+    if key in _setup_disable_seen:
+        return False
+    _setup_disable_seen.add(key)
+    _setup_disable_seen_order.append(key)
+    if len(_setup_disable_seen_order) > 4000:
+        drop = _setup_disable_seen_order.pop(0)
+        _setup_disable_seen.discard(drop)
+    return True
+
+
+def _bump_setup_count(canon: str, field: str) -> None:
+    _setup_disable_counts[field] = int(_setup_disable_counts.get(field) or 0) + 1
+    by_setup = _setup_disable_counts["by_setup"]
+    row = by_setup.get(canon)
+    if not isinstance(row, dict):
+        row = {"skipped": 0, "would_skip": 0}
+        by_setup[canon] = row
+    row[field] = int(row.get(field) or 0) + 1
+
+
+def _log_setup_disable_observer_error(exc: BaseException) -> None:
+    """One scrubbed line per exception type per minute. Never raises.
+
+    The message is the type name only. Exception text is not logged: a
+    counter failure must not print a payload, a token, or an account id.
+    """
+    try:
+        name = type(exc).__name__
+        minute = _utcnow().strftime("%Y-%m-%dT%H:%M")
+        if not _setup_disable_remember(f"observer-error|{name}|{minute}"):
+            return
+        logger.warning("setup_disable observer failed (%s); entry unchanged", name)
+    except Exception:
+        return
+
+
+def observe_setup_disable(payload: Any, *, path: str, dry_run: bool = False) -> Optional[str]:
+    """Return setup_disabled when this entry must be skipped. Otherwise None.
+
+    Counting and logging are the shadow observer. Any exception there is
+    logged once, scrubbed, and swallowed. It cannot block, delay, or change
+    the admit. A skip verdict is returned even when the counter raises.
+    A dry run reports a skip and does not touch the counters, so /explain
+    does not look like a live candidate.
+    """
+    try:
+        if not isinstance(payload, dict) or _is_close_payload(payload):
+            return None
+        verdict = judge_setup_disable(payload.get("setup"))
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+        return None
+    if verdict == "allow":
+        return None
+    if dry_run:
+        return SETUP_DISABLE_REASON if verdict == "skip" else None
+    try:
+        canon = canonical_setup_id(payload.get("setup"))
+        ticker = str(payload.get("ticker") or "").upper()
+        cycle = _setup_disable_cycle(payload)
+        key = f"{ticker}|{canon}|{cycle}|{verdict}"
+        if _setup_disable_remember(key):
+            if verdict == "skip":
+                _bump_setup_count(canon, "skipped")
+                logger.warning(
+                    "setup_disabled path=%s ticker=%s setup=%s cycle=%s",
+                    path, ticker, canon, cycle,
+                )
+            else:
+                _bump_setup_count(canon, "would_skip")
+                logger.info(
+                    "setup_disabled shadow path=%s ticker=%s setup=%s cycle=%s",
+                    path, ticker, canon, cycle,
+                )
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+    if verdict == "skip":
+        return SETUP_DISABLE_REASON
+    return None
+
+
+def cap_kept_setup_quantity(setup: Any, quantity: Any, *, enabled: Any = None) -> Any:
+    """Cap momentum fade and orb at 1 contract when the flag is on.
+
+    Flag off returns quantity unchanged. Never increases a size. A fraction
+    below 1 floors to 0 so a later check can skip it. Values above 1 floor
+    to 1, not to the next contract.
+    """
+    if enabled is None:
+        enabled = setup_disable_enabled()
+    if not enabled:
+        return quantity
+    if canonical_setup_id(setup) not in _KEPT_SETUP_CAP:
+        return quantity
+    if isinstance(quantity, bool) or not isinstance(quantity, (int, float)):
+        return quantity
+    if isinstance(quantity, float) and not math.isfinite(quantity):
+        return quantity
+    floored = math.floor(quantity)
+    if floored > 1:
+        return 1
+    if floored < quantity:
+        return int(floored)
+    return quantity
+
+
+def apply_kept_setup_cap(setup: Any, quantity: Any, *, ticker: str = "", cycle: str = "") -> Any:
+    """Entry-path cap. Counts and logs only when the size actually drops."""
+    capped = cap_kept_setup_quantity(setup, quantity)
+    if capped == quantity or not setup_disable_enabled():
+        return quantity
+    try:
+        canon = canonical_setup_id(setup)
+        name = str(ticker or "").upper()
+        key = f"cap|{name}|{canon}|{cycle}"
+        if _setup_disable_remember(key):
+            _setup_disable_counts["capped"] = int(_setup_disable_counts.get("capped") or 0) + 1
+            logger.warning(
+                "setup_disabled cap path=entry ticker=%s setup=%s qty=%s -> %s",
+                name, canon, quantity, capped,
+            )
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+    return capped
+
+
+def commit_final_kept_setup_qty(
+    setup: Any,
+    upstream_qty: Any,
+    order: Optional[Dict[str, Any]] = None,
+    *,
+    ticker: str = "",
+    cycle: str = "",
+) -> Any:
+    """Last sizing step, after learning, regime, gap, risk, and budget checks.
+
+    Writes the quantity the option order will send. Flag off returns
+    `upstream_qty` and does not rewrite the order. Flag on, for momentum
+    fade and orb only: never increases the size, floors anything above 1
+    to 1, and returns None when the size is below 1 so the caller skips
+    placement instead of rounding up to a contract.
+    """
+    final = apply_kept_setup_cap(setup, upstream_qty, ticker=ticker, cycle=cycle)
+    if not setup_disable_enabled() or canonical_setup_id(setup) not in _KEPT_SETUP_CAP:
+        return upstream_qty
+    if isinstance(final, bool) or not isinstance(final, int) or final < 1:
+        if isinstance(order, dict):
+            order["quantity"] = 0
+        return None
+    if isinstance(order, dict):
+        order["quantity"] = final
+    return final
+
+
+_SHADOW_SECRET_KEYS = {
+    "accountid", "accountidkey", "account_id", "account_id_key",
+    "oauth_token", "oauth_token_secret", "secret", "token",
+    "access_token", "refresh_token", "api_key", "apikey",
+    "password", "authorization", "consumer_key", "consumer_secret",
+}
+_SHADOW_SECRET_ENV = (
+    "ETRADE_ACCOUNT_ID", "ETRADE_CRYPTO_ACCOUNT_ID", "ETRADE_ACCOUNT_ID_KEY",
+    "ETRADE_CONSUMER_KEY", "ETRADE_CONSUMER_SECRET",
+    "ETRADE_OAUTH_TOKEN", "ETRADE_OAUTH_TOKEN_SECRET",
+)
+_SHADOW_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_SHADOW_QUOTE_KEYS = ("bid", "ask", "mid", "spread_pct", "source", "quote_time")
+_SHADOW_LEDGER_QUEUE_MAX = 256
+# Shutdown may spend this long waiting for the side log. Not an order-path wait.
+_SHADOW_SHUTDOWN_DRAIN_S = 2.0
+_shadow_log: Optional["SetupDisableShadowLog"] = None
+_shadow_queue: Optional[asyncio.Queue] = None
+_shadow_writer: Optional[asyncio.Task] = None
+_shadow_loop: Optional[asyncio.AbstractEventLoop] = None
+_shadow_accepting = True
+_shadow_mirror: Optional[Any] = None
+_shadow_line_loader: Optional[Any] = None
+_shadow_inflight = 0
+_shadow_writer_restarted = False
+_shadow_restore_failed = False
+_shadow_nonce_for_boot = False
+_shadow_restore_attempts = 0
+_shadow_restore_delays: Tuple[float, ...] = (0.0, 2.0, 3.0)
+_shadow_boot_nonce = "b" + uuid.uuid4().hex[:8]
+_shadow_mirrored_hashes: set = set()
+_shadow_backfill_task: Optional[asyncio.Task] = None
+_shadow_restore_task: Optional[asyncio.Task] = None
+_shadow_relink_task: Optional[asyncio.Task] = None
+_shadow_boot_task: Optional[asyncio.Task] = None
+_shadow_table_task: Optional[asyncio.Task] = None
+_shadow_count_task: Optional[asyncio.Task] = None
+# Side-log file work stays off the pool _etrade_call and trade_ledger.record share.
+_shadow_io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="shadow-io")
+_shadow_chain_lock = threading.Lock()
+_shadow_restore_async: Optional[asyncio.Event] = None
+_shadow_restore_loop: Optional[asyncio.AbstractEventLoop] = None
+_shadow_restore_depth = 0
+_shadow_parked: List[Tuple[Dict[str, Any], Optional[asyncio.Future]]] = []
+_SHADOW_DB_TIMEOUT_S = 5.0
+_SHADOW_RESTORE_RETRY_S = 5.0
+_SHADOW_POOL_SHUTDOWN_S = 1.0
+_SHADOW_BACKFILL_INTERVAL_S = 60.0
+_shadow_ledger_counts: Dict[str, int] = {
+    "written": 0, "dropped": 0, "on_disk": 0, "durable": 0, "mirror_failed": 0,
+    "partial_truncated": 0,
+}
+_OPENED_SEQ_MAX = 512
+_opened_seq_by_signal: Dict[str, int] = {}
+_opened_seq_order: List[str] = []
+_setup_disable_seeded = False
+_setup_disable_inflight: Dict[tuple, str] = {}
+_setup_disable_attempt_n: Dict[tuple, int] = {}
+_setup_disable_closed_attempt: set = set()
+
+
+def _shadow_secret_values() -> set:
+    """Exact configured secrets. A substring of an OCC symbol is not a secret."""
+    found = set()
+    for name in _SHADOW_SECRET_ENV:
+        token = str(os.getenv(name) or "").strip()
+        if len(token) >= 4:
+            found.add(token)
+    return found
+
+
+def _shadow_key_is_secret(key: Any) -> bool:
+    name = str(key).lower().replace("-", "").replace("_", "").replace(" ", "")
+    if name in {item.replace("_", "") for item in _SHADOW_SECRET_KEYS}:
+        return True
+    return "account" in name and "id" in name
+
+
+def _redact_shadow_text(text: str, secrets: set) -> str:
+    """Redact a URL or a value that is itself a known secret.
+
+    Digit runs stay. An OCC symbol, an order id, and a signal id are not
+    rewritten because they contain eight digits.
+    """
+    if text in secrets:
+        return "[redacted]"
+    return _SHADOW_URL_RE.sub("[redacted]", text)
+
+
+def _shadow_ledger_value(value: Any, secrets: set) -> Any:
+    """Keep known fields. Drop secret keys. Do not scrub digit runs."""
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if _shadow_key_is_secret(key):
+                continue
+            out[str(key)] = _shadow_ledger_value(item, secrets)
+        return out
+    if isinstance(value, list):
+        return [_shadow_ledger_value(item, secrets) for item in value]
+    if isinstance(value, str):
+        return _redact_shadow_text(value, secrets)
+    return value
+
+
+def _shadow_option_quote(option_quote: Any) -> Dict[str, Any]:
+    raw = option_quote if isinstance(option_quote, dict) else {}
+    out = {key: raw.get(key) for key in _SHADOW_QUOTE_KEYS}
+    age_ms = raw.get("quote_age_ms")
+    if age_ms is None and raw.get("quote_age_s") is not None:
+        try:
+            age_ms = round(float(raw["quote_age_s"]) * 1000.0, 3)
+        except (TypeError, ValueError):
+            age_ms = None
+    out["quote_age_ms"] = age_ms
+    return out
+
+
+def _underlying_source_label(raw: Any) -> Optional[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered == "massive":
+        return "Massive"
+    if lowered in {"etrade", "e*trade", "e-trade"}:
+        return "E*TRADE"
+    return text
+
+
+def setup_disable_signal_parts(payload: Any) -> Tuple[str, str, str]:
+    """(symbol, setup, raw signal id). The signal id is not the scan clock."""
+    if not isinstance(payload, dict):
+        return "", "", ""
+    symbol = str(payload.get("ticker") or "").upper().strip()
+    setup = canonical_setup_id(payload.get("setup"))
+    signal_id = str(payload.get("signal_id") or payload.get("client_signal_id") or "").strip()
+    if not signal_id:
+        signal_id = str(payload.get("bar_ts") or payload.get("bar") or "").strip()
+    if not signal_id:
+        signal_id = str(payload.get("timestamp") or payload.get("ts") or "").strip()
+    return symbol, setup, signal_id
+
+
+def _shadow_restore_pending() -> bool:
+    """True while a restore has started and has not finished seeding."""
+    ev = _shadow_restore_async
+    return ev is not None and not ev.is_set()
+
+
+def _shadow_key_tail() -> str:
+    """Nonce stays for the whole boot once restore has failed, even after a retry.
+
+    A key minted while restore is still in flight also takes the nonce. Waiting
+    for the file here would block the order path.
+    """
+    global _shadow_nonce_for_boot
+    if _shadow_restore_pending():
+        _shadow_nonce_for_boot = True
+    if _shadow_nonce_for_boot and _shadow_boot_nonce:
+        return f"|{_shadow_boot_nonce}"
+    return ""
+
+
+def setup_disable_signal_key(payload: Any, attempt: int = 1) -> str:
+    symbol, setup, signal_id = setup_disable_signal_parts(payload)
+    return f"{symbol}|{setup}|{signal_id}|{int(attempt)}{_shadow_key_tail()}"
+
+
+def _attempt_from_signal_key(key: str) -> int:
+    for part in reversed(str(key).split("|")):
+        if part.isdigit():
+            return int(part)
+    return 0
+
+
+def _claim_setup_disable_attempt(payload: Dict[str, Any], *, fresh_order: bool) -> Optional[Tuple[int, str]]:
+    """Attempt number for this decision. A rescan reuses the open attempt.
+
+    A later order the same day, even with the same signal id, gets the next
+    attempt so the second entry is not dropped.
+    """
+    symbol, setup, signal_id = setup_disable_signal_parts(payload)
+    if not symbol or not setup or not signal_id:
+        return None
+    day = _utcnow().astimezone(_ET_ZONE).date().isoformat()
+    ident = (symbol, setup, day, signal_id)
+    current = _setup_disable_inflight.get(ident)
+    if current and current not in _setup_disable_closed_attempt and not fresh_order:
+        return None
+    if current and current not in _setup_disable_closed_attempt and fresh_order:
+        # The open row is this same order, not a second entry. The tail may be a nonce.
+        return _attempt_from_signal_key(current), current
+    n = int(_setup_disable_attempt_n.get((symbol, setup, day)) or 0) + 1
+    _setup_disable_attempt_n[(symbol, setup, day)] = n
+    key = f"{symbol}|{setup}|{signal_id}|{n}{_shadow_key_tail()}"
+    _setup_disable_inflight[ident] = key
+    if fresh_order:
+        _setup_disable_closed_attempt.add(key)
+    return n, key
+
+
+def _reserve_setup_disable_attempt(payload: Any) -> Optional[Tuple[int, str]]:
+    """Claim the shadow attempt. A failure here must not touch the order."""
+    try:
+        if not isinstance(payload, dict):
+            return None
+        if canonical_setup_id(payload.get("setup")) not in resolved_setup_disable_list()["ids"]:
+            return None
+        return _claim_setup_disable_attempt(payload, fresh_order=True)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+        return None
+
+
+def _option_type_and_direction(payload: Dict[str, Any], call_put: Any = None) -> Tuple[Optional[str], str]:
+    """Long premium is long the contract. A long put is bearish, not 'short'."""
+    right = str(call_put or payload.get("option_right") or payload.get("call_put") or "").upper()
+    if right.startswith("C"):
+        option_type: Optional[str] = "CALL"
+    elif right.startswith("P"):
+        option_type = "PUT"
+    else:
+        option_type = None
+    action = str(payload.get("action") or "BUY").upper()
+    buying = action not in {"SELL", "SELL_SHORT", "SHORT"}
+    if option_type == "PUT":
+        direction = "bearish" if buying else "bullish"
+    elif option_type == "CALL":
+        direction = "bullish" if buying else "bearish"
+    else:
+        direction = "bullish" if buying else "bearish"
+    return option_type, direction
+
+
+def _setup_disable_contract(payload: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(payload.get("ticker") or "").upper().strip()
+    right = str(payload.get("option_right") or payload.get("call_put") or "").upper()
+    strike = payload.get("strike") if payload.get("strike") is not None else payload.get("strike_hint")
+    expiry = payload.get("expiration_hint") or payload.get("expiry") or payload.get("expiration")
+    expiry_text = str(expiry)[:10] if expiry else None
+    occ = None
+    try:
+        if symbol and expiry_text and right and strike is not None:
+            occ = _occ_symbol(symbol, expiry_text, right, float(strike))
+    except Exception:
+        occ = None
+    return {"option_symbol": occ, "strike": strike, "expiry": expiry_text}
+
+
+def _setup_disable_quote(payload: Dict[str, Any]) -> Dict[str, Any]:
+    def pick(*keys: str) -> Any:
+        for key in keys:
+            if payload.get(key) is not None:
+                return payload.get(key)
+        return None
+
+    return {
+        "entry": pick("entry"),
+        "bid": pick("bid", "underlying_bid"),
+        "ask": pick("ask", "underlying_ask"),
+        "limit": pick("option_limit_price", "limit_price"),
+    }
+
+
+def _requested_setup_qty(payload: Dict[str, Any]) -> Optional[int]:
+    for key in ("option_contracts", "contracts", "quantity"):
+        value = payload.get(key)
+        if isinstance(value, bool) or value is None:
+            continue
+        try:
+            qty = int(value)
+        except (TypeError, ValueError):
+            continue
+        if qty > 0:
+            return qty
+    return None
+
+
+def seed_setup_disable_from_ledger() -> None:
+    """Load the seen-signal set and per-setup counts once. Not used on the order path."""
+    global _setup_disable_seeded
+    if _setup_disable_seeded:
+        return
+    _setup_disable_seeded = True
+    try:
+        rows = read_setup_disable_shadow(_SETUP_DISABLE_LEDGER_LOOKBACK)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+        return
+    for rec in rows or []:
+        if not isinstance(rec, dict) or rec.get("event") != SETUP_DISABLE_EVENT:
+            continue
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        key = str(data.get("signal_key") or "")
+        setup = canonical_setup_id(data.get("setup"))
+        if key:
+            _setup_disable_ledger_keys.add(key)
+            outcome = data.get("outcome") if isinstance(data.get("outcome"), dict) else {}
+            if (
+                outcome.get("order_id") or outcome.get("placement_status")
+                or data.get("order_id") or data.get("placement_status")
+            ):
+                _setup_disable_closed_attempt.add(key)
+            parts = key.split("|")
+            if len(parts) >= 4 and parts[0] and parts[1]:
+                attempt = _attempt_from_signal_key(key)
+                day = str(data.get("et_timestamp") or "")[:10]
+                if day:
+                    bucket = (parts[0], parts[1], day)
+                    _setup_disable_attempt_n[bucket] = max(
+                        int(_setup_disable_attempt_n.get(bucket) or 0), attempt,
+                    )
+                    _setup_disable_inflight[(parts[0], parts[1], day, parts[2])] = key
+        if not setup:
+            continue
+        field = "skipped" if data.get("enforced") is True else "would_skip"
+        _bump_setup_count(setup, field)
+
+
+def _setup_disable_sizing(
+    before: Any, after_learning: Any, after_risk: Any, final: Any,
+    payload: Dict[str, Any], order: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    stop = payload.get("option_stop_price")
+    limit = order.get("limitPrice") if isinstance(order, dict) else None
+    if limit is None:
+        limit = payload.get("option_limit_price") or payload.get("limit_price")
+    planned = None
+    try:
+        if stop is not None and limit is not None and isinstance(final, int) and final > 0:
+            planned = round(abs(float(limit) - float(stop)) * 100.0 * final, 2)
+    except (TypeError, ValueError):
+        planned = None
+    capped = (
+        setup_disable_enabled()
+        and isinstance(after_risk, int) and not isinstance(after_risk, bool)
+        and isinstance(final, int) and not isinstance(final, bool)
+        and final < after_risk
+        and canonical_setup_id(payload.get("setup")) in _KEPT_SETUP_CAP
+    )
+    return {
+        "qty_before_learning": before,
+        "qty_after_learning": after_learning,
+        "qty_after_risk": after_risk,
+        "initial_stop_premium": stop,
+        "planned_risk_usd": planned,
+        "limit_price": limit,
+        "capped": capped,
+    }
+
+
+def _blank_setup_counts(ids: Any, rows: Dict[str, Any]) -> Dict[str, Dict[str, int]]:
+    out: Dict[str, Dict[str, int]] = {}
+    names = set(ids)
+    names.update(key for key in rows if isinstance(key, str))
+    for name in sorted(names):
+        row = rows.get(name) if isinstance(rows.get(name), dict) else {}
+        out[name] = {
+            "skipped": int((row or {}).get("skipped") or 0),
+            "would_skip": int((row or {}).get("would_skip") or 0),
+        }
+    return out
+
+
+def _copy_present(source: Any, names: Tuple[str, ...]) -> Any:
+    if not isinstance(source, dict):
+        return None
+    for name in names:
+        if source.get(name) is not None:
+            return source.get(name)
+    return None
+
+
+def _shadow_combined_weight(learning: Any, risk: Any) -> Optional[float]:
+    if learning is None or risk is None:
+        return None
+    try:
+        return round(float(learning) * float(risk), 4)
+    except (TypeError, ValueError):
+        return None
+
+
+def _shadow_optional_features(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy scanner features that already exist. Do not compute new ones."""
+    feats = payload.get("edge_features") if isinstance(payload.get("edge_features"), dict) else {}
+    found: Dict[str, Any] = {}
+    mapping = {
+        "stop_over_parkinson": ("stop_over_parkinson", "parkinson_ratio"),
+        "vwap_z": ("vwap_z",),
+        "rv15_over_iv": ("rv15_over_iv", "rv15_iv"),
+        "or_width_over_expected_move": ("or_width_over_expected_move", "or_over_expected_move"),
+        "er": ("er", "efficiency"),
+        "iv": ("iv", "implied_vol", "implied_volatility"),
+    }
+    for label, keys in mapping.items():
+        value = _copy_present(payload, keys)
+        if value is None:
+            value = _copy_present(feats, keys)
+        if value is not None:
+            found[label] = value
+    return found
+
+
+def _live_option_quote(pq: Any, massive_quote: Any) -> Dict[str, Any]:
+    """The bid/ask the order path actually selected. Not the signal's fields."""
+    quote = pq if isinstance(pq, dict) else {}
+    massive = massive_quote if isinstance(massive_quote, dict) else {}
+    bid = quote.get("bid")
+    ask = quote.get("ask")
+    mid = None
+    spread_pct = None
+    try:
+        if bid is not None and ask is not None:
+            mid_f = (float(bid) + float(ask)) / 2.0
+            if mid_f > 0:
+                mid = round(mid_f, 4)
+                spread_pct = round((float(ask) - float(bid)) / mid_f * 100.0, 4)
+    except (TypeError, ValueError):
+        mid = None
+        spread_pct = None
+    source = quote.get("source")
+    if source == "massive":
+        source_name = "Massive"
+        age = massive.get("age_s")
+    elif source == "etrade":
+        source_name = "E*TRADE"
+        age = None
+    else:
+        source_name = None
+        age = None
+    quote_time = None
+    try:
+        if isinstance(age, (int, float)) and math.isfinite(float(age)):
+            quote_time = (_utcnow() - timedelta(seconds=float(age))).astimezone(_ET_ZONE).isoformat()
+    except (TypeError, ValueError):
+        quote_time = None
+    return {
+        "bid": bid,
+        "ask": ask,
+        "mid": mid,
+        "spread_pct": spread_pct,
+        "source": source_name,
+        "quote_time": quote_time,
+        "quote_age_ms": round(float(age) * 1000.0, 3) if isinstance(age, (int, float)) and math.isfinite(float(age)) else None,
+    }
+
+
+def compose_setup_disable_row(
+    payload: Any,
+    *,
+    quantity: Any,
+    enforced: bool,
+    quantity_basis: str,
+    path: str,
+    fresh_order: bool = False,
+    sizing: Optional[Dict[str, Any]] = None,
+    option_quote: Optional[Dict[str, Any]] = None,
+    outcome: Optional[Dict[str, Any]] = None,
+    call_put: Any = None,
+    reserved: Optional[Tuple[int, str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build one shadow row, or None when this signal attempt was already kept.
+
+    Memory only. The ledger write is separate so placement does not wait on it.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return None
+        setup = canonical_setup_id(payload.get("setup"))
+        parsed = resolved_setup_disable_list()
+        if setup not in parsed["ids"]:
+            return None
+        if reserved is not None:
+            attempt, key = reserved
+        else:
+            claimed = _claim_setup_disable_attempt(payload, fresh_order=fresh_order)
+            if claimed is None:
+                return None
+            attempt, key = claimed
+        if key in _setup_disable_ledger_keys and not fresh_order:
+            return None
+        _setup_disable_ledger_keys.add(key)
+        option_type, direction = _option_type_and_direction(payload, call_put)
+        symbol, _, signal_id = setup_disable_signal_parts(payload)
+        risk = payload.get("_risk") if isinstance(payload.get("_risk"), dict) else {}
+        learned = payload.get("_learning") if isinstance(payload.get("_learning"), dict) else {}
+        regime = risk.get("regime") if isinstance(risk.get("regime"), dict) else {}
+        context = risk.get("context") if isinstance(risk.get("context"), dict) else {}
+        features = payload.get("edge_features") if isinstance(payload.get("edge_features"), dict) else {}
+        enabled = setup_disable_enabled()
+        shadow = setup_disable_shadow()
+        verdict = "skip" if enabled else ("shadow" if shadow else "allow")
+        sized = sizing or {}
+        if enabled and canonical_setup_id(setup) in _KEPT_SETUP_CAP and sized.get("capped"):
+            verdict = "cap"
+        quote = _shadow_option_quote(option_quote)
+        underlying = payload.get("underlying_price")
+        if underlying is None:
+            underlying = payload.get("entry")
+        body = {
+            "setup": setup,
+            "symbol": symbol,
+            "signal_id": signal_id,
+            "attempt": attempt,
+            "signal_key": key,
+            "option_type": option_type,
+            "direction": direction,
+            "et_timestamp": _utcnow().astimezone(_ET_ZONE).isoformat(),
+            "path": path,
+            "enforced": bool(enforced),
+            "would_skip": verdict in {"shadow", "skip"},
+            "list_source": parsed["source"],
+            "config": {
+                "enabled": enabled,
+                "shadow": shadow,
+                "verdict": verdict,
+                "would_skip": verdict in {"shadow", "skip"},
+                "list": sorted(parsed["ids"]),
+                "list_source": parsed["source"],
+                "bot_version": BOT_VERSION,
+            },
+            "would_be_contract": _setup_disable_contract(payload),
+            "would_be_quantity": quantity,
+            "quantity_basis": quantity_basis,
+            "sizing": {
+                "qty_before_learning": sized.get("qty_before_learning"),
+                "qty_after_learning": sized.get("qty_after_learning"),
+                "qty_after_risk": sized.get("qty_after_risk"),
+                "qty_final": quantity,
+                "initial_stop_premium": sized.get("initial_stop_premium", payload.get("option_stop_price")),
+                "planned_risk_usd": sized.get("planned_risk_usd"),
+                "limit_price": sized.get("limit_price", payload.get("option_limit_price") or payload.get("limit_price")),
+            },
+            "option_quote": quote,
+            "entry_price": payload.get("entry"),
+            "underlying_price": underlying,
+            "underlying_source": _underlying_source_label(
+                payload.get("underlying_source") or features.get("price_source") or payload.get("price_source")
+            ),
+            "vol_regime": features.get("vol_regime") or regime.get("regime"),
+            "regime_weight": regime.get("weight") if regime.get("weight") is not None else risk.get("weight"),
+            "spy_gap_pct": context.get("spy_gap_pct") if context.get("spy_gap_pct") is not None else (payload.get("risk_context") or {}).get("spy_gap_pct") if isinstance(payload.get("risk_context"), dict) else None,
+            "gap_cut_applied": bool(regime.get("reasons")) and any("gap" in str(item).lower() for item in (regime.get("reasons") or [])),
+            "unproven_weight": risk.get("ev_weight"),
+            "learning_weight": learned.get("weight"),
+            "combined_weight": _shadow_combined_weight(learned.get("weight"), risk.get("weight")),
+            "score": payload.get("score"),
+            "rvol": payload.get("rvol") if payload.get("rvol") is not None else features.get("rvol"),
+            "delta": payload.get("option_delta"),
+            "outcome": {
+                "order_id": (outcome or {}).get("order_id"),
+                "placement_status": (outcome or {}).get("placement_status"),
+                "reason": (outcome or {}).get("reason"),
+                "position_opened_seq": (outcome or {}).get("position_opened_seq"),
+            },
+        }
+        optional = _shadow_optional_features(payload)
+        if optional:
+            body["scanner_features"] = optional
+        return _shadow_ledger_value(body, _shadow_secret_values())
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+        return None
+
+
+async def persist_setup_disable_decision(
+    payload: Any,
+    *,
+    quantity: Any,
+    enforced: bool,
+    quantity_basis: str,
+    path: str,
+    fresh_order: bool = False,
+    sizing: Optional[Dict[str, Any]] = None,
+    option_quote: Optional[Dict[str, Any]] = None,
+    outcome: Optional[Dict[str, Any]] = None,
+    call_put: Any = None,
+    reserved: Optional[Tuple[int, str]] = None,
+) -> None:
+    """Append one row. Tests await this. The order path must use the scheduler."""
+    try:
+        body = compose_setup_disable_row(
+            payload, quantity=quantity, enforced=enforced,
+            quantity_basis=quantity_basis, path=path, fresh_order=fresh_order,
+            sizing=sizing, option_quote=option_quote, outcome=outcome, call_put=call_put,
+            reserved=reserved,
+        )
+        if body is None:
+            return
+        await _await_shadow_write(body)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+
+
+def note_setup_disable_decision(
+    payload: Any,
+    *,
+    quantity: Any,
+    enforced: bool,
+    quantity_basis: str,
+    path: str,
+    fresh_order: bool = False,
+    sizing: Optional[Dict[str, Any]] = None,
+    option_quote: Optional[Dict[str, Any]] = None,
+    outcome: Optional[Dict[str, Any]] = None,
+    call_put: Any = None,
+    reserved: Optional[Tuple[int, str]] = None,
+) -> None:
+    """Hand the ledger row off. Returns immediately. A slow write cannot delay an order."""
+    try:
+        body = compose_setup_disable_row(
+            payload, quantity=quantity, enforced=enforced,
+            quantity_basis=quantity_basis, path=path, fresh_order=fresh_order,
+            sizing=sizing, option_quote=option_quote, outcome=outcome, call_put=call_put,
+            reserved=reserved,
+        )
+        if body is None:
+            return
+        _enqueue_shadow_row(body)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+
+
+class SetupDisableShadowLog:
+    """Append-only hash chain for setup-disable shadow rows. Not the trade ledger.
+
+    Read it with read_setup_disable_shadow(n), or open the JSONL file named in
+    setup_disable_status()["ledger"]["file"]. Each line is one record:
+    seq, ts, event, data, prev_hash, hash.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self.chain_anchors: Dict[str, Dict[str, Any]] = {}
+        self.partial_truncated = self._repair_partial_tail()
+        self._seq, self._prev_hash, self.chain_id = self._load_tail()
+
+    def _repair_partial_tail(self) -> int:
+        """Truncate a torn last line. The bytes before it stay where they are."""
+        try:
+            if not self.path.exists() or self.path.stat().st_size == 0:
+                return 0
+            raw = self.path.read_bytes()
+        except OSError:
+            return 0
+        keep = raw
+        removed = 0
+        if keep and not keep.endswith(b"\n"):
+            cut = keep.rfind(b"\n")
+            keep = keep[: cut + 1] if cut >= 0 else b""
+            removed += 1
+        while keep:
+            body = keep[:-1] if keep.endswith(b"\n") else keep
+            split = body.rfind(b"\n")
+            last = body[split + 1:]
+            try:
+                json.loads(last.decode("utf-8"))
+                break
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                keep = keep[: split + 1] if split >= 0 else b""
+                removed += 1
+        if removed and len(keep) != len(raw):
+            try:
+                with open(self.path, "rb+") as handle:
+                    handle.truncate(len(keep))
+            except OSError:
+                return 0
+        return removed
+
+    def _load_tail(self) -> Tuple[int, str]:
+        self.chain_anchors = {}
+        try:
+            if not self.path.exists():
+                return 0, "0" * 64, uuid.uuid4().hex[:12]
+            anchors: Dict[str, Dict[str, Any]] = {}
+            last_rec: Optional[Dict[str, Any]] = None
+            with open(self.path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    last_rec = rec
+                    cid = str(rec.get("chain_id") or "")
+                    slot = anchors.setdefault(cid, {"rows": 0, "tail": ""})
+                    slot["rows"] = int(slot["rows"]) + 1
+                    slot["tail"] = str(rec.get("hash") or "")
+            self.chain_anchors = anchors
+            if not last_rec:
+                return 0, "0" * 64, uuid.uuid4().hex[:12]
+            # A file written before chain_id existed stays one legacy chain.
+            return (
+                int(last_rec.get("seq") or 0),
+                str(last_rec.get("hash") or ("0" * 64)),
+                str(last_rec.get("chain_id") or ""),
+            )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            self.chain_anchors = {}
+            return 0, "0" * 64, uuid.uuid4().hex[:12]
+
+    def _reload_tail(self) -> None:
+        self.partial_truncated += self._repair_partial_tail()
+        self._seq, self._prev_hash, self.chain_id = self._load_tail()
+        _shadow_ledger_counts["on_disk"] = self._seq
+        _shadow_ledger_counts["partial_truncated"] = self.partial_truncated
+
+    def append(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Hash, write, then advance the head. The lock keeps two writers in order."""
+        with self._lock:
+            self._seq += 1
+            genesis = self._prev_hash == ("0" * 64)
+            rec: Dict[str, Any] = {
+                "seq": self._seq,
+                "ts": _utcnow().isoformat(),
+                "event": SETUP_DISABLE_EVENT,
+                "data": data or {},
+                "prev_hash": self._prev_hash,
+                "chain_id": self.chain_id,
+            }
+            if genesis:
+                rec["restart"] = True
+            body = json.dumps(rec, sort_keys=True, default=str)
+            rec["hash"] = hashlib.sha256((self._prev_hash + body).encode("utf-8")).hexdigest()
+            line = json.dumps(rec, sort_keys=True, default=str)
+            advanced = False
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.path, "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+                    self._prev_hash = rec["hash"]
+                    advanced = True
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except Exception:
+                self._reload_tail()
+                if not advanced:
+                    raise
+                # write() returned, so the line is on disk. fsync can fail
+                # without dropping the row. The head now matches the file.
+            _shadow_ledger_counts["on_disk"] = self._seq
+            cid = str(self.chain_id or "")
+            anchors = dict(self.chain_anchors or {})
+            slot = dict(anchors.get(cid) or {"rows": 0, "tail": ""})
+            slot["rows"] = int(slot.get("rows") or 0) + 1
+            slot["tail"] = rec["hash"]
+            anchors[cid] = slot
+            self.chain_anchors = anchors
+            return rec
+
+    def verify(self) -> Tuple[bool, int, Optional[str]]:
+        """Check each chain_id on its own.
+
+        Rows with no chain_id are one legacy chain, and that chain's first row
+        may omit restart. Every later genesis row, and every genesis row that
+        carries a chain_id, must set restart. A missing marker means the tail
+        of a segment was deleted.
+        """
+        genesis = "0" * 64
+        try:
+            if not self.path.exists():
+                return True, 0, None
+            groups: Dict[str, List[Dict[str, Any]]] = {}
+            with open(self.path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    groups.setdefault(str(rec.get("chain_id") or ""), []).append(rec)
+            checked = 0
+            for chain_id in sorted(groups):
+                prev = genesis
+                rows = sorted(groups[chain_id], key=lambda rec: int(rec.get("seq") or 0))
+                legacy = chain_id == ""
+                for index, rec in enumerate(rows):
+                    claimed = str(rec.pop("hash", ""))
+                    prev_link = str(rec.get("prev_hash"))
+                    if prev_link == genesis:
+                        if rec.get("restart") is not True and not (legacy and index == 0):
+                            return False, checked, (
+                                f"chain {chain_id or 'legacy'} seq {rec.get('seq')}: restart missing"
+                            )
+                    elif prev_link != prev:
+                        return False, checked, f"chain {chain_id or 'legacy'} seq {rec.get('seq')}: prev_hash broken"
+                    body = json.dumps(rec, sort_keys=True, default=str)
+                    if hashlib.sha256((prev_link + body).encode("utf-8")).hexdigest() != claimed:
+                        return False, checked, f"chain {chain_id or 'legacy'} seq {rec.get('seq')}: hash mismatch"
+                    prev = claimed
+                    checked += 1
+            return True, checked, None
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            return False, checked, type(exc).__name__
+
+    def recent(self, count: int = 100) -> List[Dict[str, Any]]:
+        if count < 1 or not self.path.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        try:
+            with self._lock:
+                with open(self.path, "r", encoding="utf-8") as handle:
+                    lines = [ln for ln in handle if ln.strip()]
+            for line in lines[-count:]:
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except OSError:
+            return []
+        return out
+
+
+def _install_shadow_log(log: "SetupDisableShadowLog") -> None:
+    global _shadow_log
+    _shadow_log = log
+    _shadow_ledger_counts["on_disk"] = int(log._seq)
+    _shadow_ledger_counts["partial_truncated"] = int(log.partial_truncated)
+
+
+def init_setup_disable_shadow_log(path: Path) -> None:
+    """Point the side log at `path`. Does not touch the trade ledger."""
+    _install_shadow_log(SetupDisableShadowLog(Path(path)))
+
+
+async def init_setup_disable_shadow_log_async(path: Path) -> None:
+    """Open the side log on the side-log pool. A large file must not stall the loop."""
+    log = await _shadow_io(SetupDisableShadowLog, Path(path))
+    _install_shadow_log(log)
+
+
+def set_shadow_mirror(fn: Optional[Any]) -> None:
+    """Install the durable mirror. None disables it. Failures stay off the order path."""
+    global _shadow_mirror
+    _shadow_mirror = fn
+
+
+def _shadow_restore_event() -> asyncio.Event:
+    """Per-loop gate. Clear while restore has not finished seeding."""
+    global _shadow_restore_async, _shadow_restore_loop, _shadow_restore_depth
+    loop = asyncio.get_running_loop()
+    if _shadow_restore_async is None or _shadow_restore_loop is not loop:
+        _shadow_restore_async = asyncio.Event()
+        _shadow_restore_async.set()
+        _shadow_restore_loop = loop
+        _shadow_restore_depth = 0
+        _shadow_parked.clear()
+    return _shadow_restore_async
+
+
+def _shadow_restore_begin() -> None:
+    global _shadow_restore_depth
+    _shadow_restore_event()
+    _shadow_restore_depth += 1
+    _shadow_restore_event().clear()
+
+
+def _shadow_restore_end() -> None:
+    global _shadow_restore_depth
+    _shadow_restore_depth = max(0, _shadow_restore_depth - 1)
+    if _shadow_restore_depth == 0:
+        _shadow_restore_event().set()
+        if _shadow_parked:
+            _ensure_shadow_relink()
+
+
+async def _shadow_io(fn, *args):
+    """Run side-log file work on the dedicated pool, not the default executor."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_shadow_io_executor, functools.partial(fn, *args))
+
+
+async def _wait_shadow_restore() -> bool:
+    """Wait out an in-flight restore. The wait is bounded and does not block the loop."""
+    if not _shadow_restore_pending():
+        return True
+    try:
+        await asyncio.wait_for(_shadow_restore_event().wait(), timeout=_SHADOW_DB_TIMEOUT_S)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+def _append_shadow_after_restore(log: "SetupDisableShadowLog", body: Dict[str, Any]):
+    """Link the row onto the chain restore just wrote. None means restore started again."""
+    with _shadow_chain_lock:
+        if _shadow_restore_pending():
+            return None
+        log._reload_tail()
+        return log.append(body)
+
+
+def _restore_shadow_file(path: Path, lines: List[str]) -> int:
+    with _shadow_chain_lock:
+        return restore_shadow_lines(path, lines)
+
+
+def _shadow_line_order(line: str) -> Tuple[str, int]:
+    try:
+        rec = json.loads(line)
+    except json.JSONDecodeError:
+        return ("", 0)
+    return (str(rec.get("chain_id") or ""), int(rec.get("seq") or 0))
+
+
+def restore_shadow_lines(path: Path, lines: List[str]) -> int:
+    """Rewrite an empty or missing side log from durable lines. A non-empty file stays.
+
+    Lines are written chain-by-chain, then by seq, so two boots are not interleaved.
+    """
+    try:
+        target = Path(path)
+        if target.exists() and target.stat().st_size > 0:
+            return 0
+        payload = [ln for ln in lines if ln and str(ln).strip()]
+        if not payload:
+            return 0
+        payload.sort(key=_shadow_line_order)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(payload) + "\n", encoding="utf-8")
+        return len(payload)
+    except OSError as exc:
+        _log_setup_disable_observer_error(exc)
+        return 0
+
+
+async def _shadow_postgres_mirror(seq: int, rec_hash: str, line: str, chain_id: Optional[str] = None) -> None:
+    """Mirror one side-log row. Separate table from bot_ledger."""
+    if engine is None:
+        return
+    if chain_id is None:
+        try:
+            chain_id = json.loads(line).get("chain_id")
+        except json.JSONDecodeError:
+            chain_id = None
+    async with engine.begin() as conn:
+        await conn.execute(
+            sql_text(
+                f"INSERT INTO {_bt('bot_shadow_ledger')} (hash, seq, line, chain_id) "
+                "VALUES (:hash, :seq, :line, :chain_id) ON CONFLICT (hash) DO NOTHING"
+            ),
+            {"hash": rec_hash, "seq": int(seq), "line": line, "chain_id": chain_id},
+        )
+
+
+async def _load_durable_shadow_lines() -> List[str]:
+    loader = _shadow_line_loader
+    if loader is not None:
+        lines = list(await asyncio.wait_for(loader(), timeout=_SHADOW_DB_TIMEOUT_S))
+        return await _shadow_io(lambda: sorted(lines, key=_shadow_line_order))
+    if engine is None:
+        return []
+
+    async def _query() -> List[str]:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                sql_text(
+                    f"SELECT chain_id, seq, line FROM {_bt('bot_shadow_ledger')}"
+                ))
+            rows = [(row[0], row[1], row[2]) for row in result.fetchall()]
+        rows.sort(key=lambda item: (str(item[0] or ""), int(item[1] or 0)))
+        return [item[2] for item in rows]
+
+    return await asyncio.wait_for(_query(), timeout=_SHADOW_DB_TIMEOUT_S)
+
+
+async def _load_durable_shadow_hashes() -> set:
+    """One query for hashes already stored. Missing file lines are the only pushes."""
+    loader = _shadow_line_loader
+    if loader is not None:
+        lines = list(await asyncio.wait_for(loader(), timeout=_SHADOW_DB_TIMEOUT_S))
+
+        def _hashes() -> set:
+            found = set()
+            for line in lines:
+                try:
+                    found.add(str(json.loads(line).get("hash") or ""))
+                except json.JSONDecodeError:
+                    continue
+            found.discard("")
+            return found
+
+        return await _shadow_io(_hashes)
+    if engine is None:
+        return set()
+
+    async def _query() -> set:
+        async with engine.connect() as conn:
+            result = await conn.execute(sql_text(f"SELECT hash FROM {_bt('bot_shadow_ledger')}"))
+            return {str(row[0]) for row in result.fetchall() if row[0]}
+
+    return await asyncio.wait_for(_query(), timeout=_SHADOW_DB_TIMEOUT_S)
+
+
+async def _mirror_shadow_line(seq: int, rec_hash: str, line: str) -> None:
+    mirror = _shadow_mirror
+    if mirror is None:
+        return
+    digest = str(rec_hash)
+    if digest in _shadow_mirrored_hashes:
+        return
+    try:
+        await asyncio.wait_for(mirror(int(seq), digest, line), timeout=_SHADOW_DB_TIMEOUT_S)
+        _shadow_mirrored_hashes.add(digest)
+        _shadow_ledger_counts["durable"] = int(_shadow_ledger_counts.get("durable") or 0) + 1
+    except Exception as exc:
+        _shadow_ledger_counts["mirror_failed"] = int(_shadow_ledger_counts.get("mirror_failed") or 0) + 1
+        _shadow_ledger_counts["mirror_failures"] = int(_shadow_ledger_counts.get("mirror_failures") or 0) + 1
+        _log_setup_disable_observer_error(exc)
+
+
+def _missing_shadow_rows(known: set) -> List[Tuple[int, str, str, Optional[str]]]:
+    """Read and parse the side log. Caller must run this in a thread."""
+    log = _shadow_log
+    if log is None or not log.path.exists():
+        return []
+    try:
+        with log._lock:
+            raw = log.path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    missing: List[Tuple[int, str, str, Optional[str]]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        digest = str(rec.get("hash") or "")
+        if not digest or digest in known:
+            continue
+        missing.append((int(rec.get("seq") or 0), digest, line, rec.get("chain_id")))
+    return missing
+
+
+async def _insert_shadow_batch(rows: List[Tuple[int, str, str, Optional[str]]]) -> None:
+    if engine is None or not rows:
+        return
+    values = []
+    params: Dict[str, Any] = {}
+    for index, (seq, digest, line, chain_id) in enumerate(rows):
+        values.append(f"(:h{index}, :s{index}, :l{index}, :c{index})")
+        params[f"h{index}"] = digest
+        params[f"s{index}"] = seq
+        params[f"l{index}"] = line
+        params[f"c{index}"] = chain_id
+    statement = (
+        f"INSERT INTO {_bt('bot_shadow_ledger')} (hash, seq, line, chain_id) "
+        f"VALUES {', '.join(values)} ON CONFLICT (hash) DO NOTHING"
+    )
+    async with engine.begin() as conn:
+        await conn.execute(sql_text(statement), params)
+
+
+async def backfill_shadow_mirror() -> int:
+    """Push on-disk lines that the durable table does not have yet.
+
+    File reads and parsing happen off the event loop. The boot path must not await this.
+    A restore still in flight is left alone so a new genesis row is not mirrored beside it.
+    """
+    if _shadow_restore_pending():
+        return 0
+    known = set(_shadow_mirrored_hashes)
+    try:
+        known |= await asyncio.wait_for(_load_durable_shadow_hashes(), timeout=_SHADOW_DB_TIMEOUT_S)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+    missing = await _shadow_io(_missing_shadow_rows, known)
+    if not missing:
+        return 0
+    pushed = 0
+    use_batch = engine is not None and _shadow_mirror is _shadow_postgres_mirror
+    if use_batch:
+        for start in range(0, len(missing), 200):
+            batch = missing[start:start + 200]
+            try:
+                await asyncio.wait_for(_insert_shadow_batch(batch), timeout=_SHADOW_DB_TIMEOUT_S)
+            except Exception as exc:
+                _shadow_ledger_counts["mirror_failed"] = int(_shadow_ledger_counts.get("mirror_failed") or 0) + len(batch)
+                _shadow_ledger_counts["mirror_failures"] = int(_shadow_ledger_counts.get("mirror_failures") or 0) + len(batch)
+                _log_setup_disable_observer_error(exc)
+                continue
+            for seq, digest, _line, _chain in batch:
+                if digest not in _shadow_mirrored_hashes:
+                    _shadow_mirrored_hashes.add(digest)
+                    _shadow_ledger_counts["durable"] = int(_shadow_ledger_counts.get("durable") or 0) + 1
+                    pushed += 1
+        return pushed
+    for seq, digest, line, _chain in missing:
+        before = int(_shadow_ledger_counts.get("durable") or 0)
+        await _mirror_shadow_line(seq, digest, line)
+        if int(_shadow_ledger_counts.get("durable") or 0) > before:
+            pushed += 1
+    return pushed
+
+
+async def _shadow_backfill_loop() -> None:
+    while _shadow_accepting:
+        await asyncio.sleep(_SHADOW_BACKFILL_INTERVAL_S)
+        if not _shadow_accepting:
+            return
+        try:
+            await backfill_shadow_mirror()
+        except Exception as exc:
+            _log_setup_disable_observer_error(exc)
+
+
+def _read_shadow_file_sync() -> List[str]:
+    """Read the side log. Must run in a thread: it takes the append lock."""
+    log = _shadow_log
+    if log is None or not log.path.exists():
+        return []
+    try:
+        with log._lock:
+            raw = log.path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [ln for ln in raw.splitlines() if ln.strip()]
+
+
+def _absorb_shadow_line(line: str) -> None:
+    try:
+        rec = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+    key = str(data.get("signal_key") or "")
+    if not key:
+        return
+    setup = canonical_setup_id(data.get("setup"))
+    parts = key.split("|")
+    if len(parts) < 4 or not parts[0] or not parts[1]:
+        return
+    attempt = _attempt_from_signal_key(key)
+    day = str(data.get("et_timestamp") or rec.get("ts") or "")[:10]
+    if day:
+        bucket = (parts[0], parts[1], day)
+        _setup_disable_attempt_n[bucket] = max(int(_setup_disable_attempt_n.get(bucket) or 0), attempt)
+        _setup_disable_inflight[(parts[0], parts[1], day, parts[2])] = key
+    _setup_disable_ledger_keys.add(key)
+    outcome = data.get("outcome") if isinstance(data.get("outcome"), dict) else {}
+    if outcome.get("order_id") or outcome.get("placement_status"):
+        _setup_disable_closed_attempt.add(key)
+    if setup:
+        field = "skipped" if data.get("enforced") is True else "would_skip"
+        _bump_setup_count(setup, field)
+
+
+async def _reseed_shadow_attempts() -> None:
+    """Max the attempt counters from the file and the durable rows."""
+    file_lines = await _shadow_io(_read_shadow_file_sync)
+    try:
+        durable = await asyncio.wait_for(_load_durable_shadow_lines(), timeout=_SHADOW_DB_TIMEOUT_S)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+        durable = []
+    for line in list(file_lines) + list(durable):
+        _absorb_shadow_line(line)
+    global _setup_disable_seeded
+    _setup_disable_seeded = True
+
+
+def _start_shadow_backfill_now() -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(backfill_shadow_mirror(), name="setup-disable-shadow-backfill-now")
+
+
+def _start_shadow_backfill_loop() -> None:
+    global _shadow_backfill_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _shadow_backfill_task is not None and not _shadow_backfill_task.done():
+        return
+    _shadow_backfill_task = loop.create_task(_shadow_backfill_loop(), name="setup-disable-shadow-backfill")
+
+
+async def _restore_shadow_once(path: Path) -> None:
+    lines = await _load_durable_shadow_lines()
+    if not lines:
+        return
+    written = await _shadow_io(_restore_shadow_file, path, lines)
+    _shadow_ledger_counts["durable"] = max(int(_shadow_ledger_counts.get("durable") or 0), len(lines))
+    if written:
+        _shadow_ledger_counts["on_disk"] = written
+
+
+async def _shadow_restore_retry(path: Path) -> None:
+    """Keep trying after boot. A later success clears the degraded flag."""
+    global _shadow_restore_failed, _shadow_restore_attempts, _setup_disable_seeded
+    delay = _SHADOW_RESTORE_RETRY_S
+    while _shadow_restore_failed and _shadow_accepting:
+        await asyncio.sleep(delay)
+        if not _shadow_restore_failed or not _shadow_accepting:
+            return
+        _shadow_restore_attempts += 1
+        _shadow_restore_begin()
+        try:
+            try:
+                await _restore_shadow_once(path)
+            except Exception as exc:
+                _log_setup_disable_observer_error(exc)
+                delay = min(delay * 2.0, 60.0)
+                continue
+            _shadow_restore_failed = False
+            await init_setup_disable_shadow_log_async(path)
+            await _reseed_shadow_attempts()
+            _start_shadow_backfill_now()
+            return
+        finally:
+            _shadow_restore_end()
+
+
+def _start_shadow_restore_retry(path: Path) -> None:
+    global _shadow_restore_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _shadow_restore_task is not None and not _shadow_restore_task.done():
+        return
+    _shadow_restore_task = loop.create_task(_shadow_restore_retry(path), name="setup-disable-shadow-restore")
+
+
+async def _await_shadow_schema() -> None:
+    """Let CREATE finish before the first restore, so a missing table is not a failed boot."""
+    task = _shadow_table_task
+    if task is None:
+        return
+    if task.done():
+        return
+    try:
+        await task
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+
+
+async def _prepare_shadow_body(path: Path) -> None:
+    """Restore and seed. The caller holds the restore gate."""
+    global _shadow_restore_failed, _shadow_restore_attempts, _shadow_nonce_for_boot
+    await _await_shadow_schema()
+    ok = False
+    for delay in _shadow_restore_delays:
+        if delay:
+            await asyncio.sleep(delay)
+        _shadow_restore_attempts += 1
+        try:
+            await _restore_shadow_once(path)
+            ok = True
+            break
+        except Exception as exc:
+            _log_setup_disable_observer_error(exc)
+    _shadow_restore_failed = not ok
+    if not ok:
+        _shadow_nonce_for_boot = True
+    await init_setup_disable_shadow_log_async(path)
+    if ok:
+        await _reseed_shadow_attempts()
+    else:
+        await _shadow_io(seed_setup_disable_from_ledger)
+    if engine is not None and _shadow_mirror is None:
+        set_shadow_mirror(_shadow_postgres_mirror)
+    if _shadow_restore_failed:
+        _start_shadow_restore_retry(path)
+    _start_shadow_backfill_now()
+    _start_shadow_backfill_loop()
+
+
+async def prepare_setup_disable_shadow(path: Path) -> None:
+    """Restore, backfill, then leave seeding to the caller.
+
+    Three tries span about five seconds. They do not run on the order path.
+    A failure stays visible and keeps retrying. Keys minted while degraded
+    carry this boot's nonce. Startup uses start_setup_disable_shadow so a
+    hung database does not hold the process open.
+    """
+    _shadow_restore_begin()
+    try:
+        await _prepare_shadow_body(path)
+    finally:
+        _shadow_restore_end()
+
+
+def start_setup_disable_shadow(path: Path) -> None:
+    """Schedule restore, the shadow schema is separate. Returns immediately."""
+    global _shadow_boot_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _shadow_boot_task is not None and not _shadow_boot_task.done():
+        return
+    _shadow_restore_begin()
+    _shadow_boot_task = loop.create_task(_shadow_boot(path), name="setup-disable-shadow-boot")
+
+
+async def _shadow_boot(path: Path) -> None:
+    try:
+        await _prepare_shadow_body(path)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+    finally:
+        _shadow_restore_end()
+
+
+def read_setup_disable_shadow(count: int = 100) -> List[Dict[str, Any]]:
+    """Newest-last shadow rows from the side log. Empty when the log is not open.
+
+    Callers on the event loop use read_setup_disable_shadow_async. This sync
+    read takes the append lock and parses the file.
+    """
+    log = _shadow_log
+    if log is None:
+        return []
+    try:
+        return log.recent(count)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+        return []
+
+
+async def read_setup_disable_shadow_async(count: int = 100) -> List[Dict[str, Any]]:
+    """Parse the side log on the side-log pool, off the event loop."""
+    return await _shadow_io(read_setup_disable_shadow, count)
+
+
+def _start_shadow_writer() -> None:
+    global _shadow_writer
+    if _shadow_writer is not None and not _shadow_writer.done():
+        return
+    loop = asyncio.get_running_loop()
+    _shadow_writer = loop.create_task(_shadow_ledger_writer(), name="setup-disable-shadow-writer")
+    _shadow_writer.add_done_callback(_on_shadow_writer_done)
+
+
+def _on_shadow_writer_done(task: asyncio.Task) -> None:
+    """Restart a writer that died. A shutdown or a clean cancel stays down."""
+    if not _shadow_accepting:
+        return
+    if task.cancelled():
+        return
+    try:
+        exc = task.exception()
+    except Exception:
+        return
+    if exc is None:
+        return
+    logger.error("setup disable shadow writer died (%s)", type(exc).__name__)
+    global _shadow_writer_restarted
+    _shadow_writer_restarted = True
+    try:
+        task.get_loop().call_soon(_start_shadow_writer)
+    except Exception as restart_exc:
+        _log_setup_disable_observer_error(restart_exc)
+
+
+def _ensure_shadow_writer() -> asyncio.Queue:
+    """One consumer. A dead writer is replaced. The queue itself stays put."""
+    global _shadow_queue, _shadow_writer, _shadow_loop
+    loop = asyncio.get_running_loop()
+    if _shadow_loop is not loop or _shadow_queue is None:
+        _shadow_queue = asyncio.Queue(maxsize=max(1, int(_SHADOW_LEDGER_QUEUE_MAX)))
+        _shadow_loop = loop
+        _shadow_writer = None
+    if _shadow_writer is None or _shadow_writer.done():
+        _start_shadow_writer()
+    return _shadow_queue
+
+
+def _park_shadow_row(body: Dict[str, Any], fut: Optional[asyncio.Future]) -> bool:
+    """Hold a row until restore has opened the log. Overflow is counted and dropped."""
+    if len(_shadow_parked) >= max(1, int(_SHADOW_LEDGER_QUEUE_MAX)):
+        _shadow_ledger_counts["dropped"] += 1
+        if fut is not None and not fut.done():
+            fut.set_result(None)
+        return False
+    _shadow_parked.append((body, fut))
+    _ensure_shadow_relink()
+    return True
+
+
+def _resolve_shadow_future_dropped(fut: Optional[asyncio.Future]) -> None:
+    """Mark a waiter dropped. A stored exception is retrieved so it is not logged later."""
+    if fut is None:
+        return
+    if fut.cancelled():
+        return
+    if fut.done():
+        try:
+            fut.exception()
+        except Exception:
+            pass
+        return
+    try:
+        fut.set_result(None)
+    except asyncio.InvalidStateError:
+        pass
+
+
+def _drop_parked_shadow_rows() -> int:
+    """Count every parked row as dropped, release its waiter, and clear the list."""
+    dropped = 0
+    while _shadow_parked:
+        _body, fut = _shadow_parked.pop(0)
+        _shadow_ledger_counts["dropped"] += 1
+        dropped += 1
+        _resolve_shadow_future_dropped(fut)
+    return dropped
+
+
+def _ensure_shadow_relink() -> None:
+    global _shadow_relink_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _shadow_relink_task is not None and not _shadow_relink_task.done():
+        return
+    _shadow_relink_task = loop.create_task(_drain_shadow_parked(), name="setup-disable-shadow-relink")
+
+
+async def _finish_shadow_append(body: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
+    """Append only after restore has seeded, then mirror that linked row.
+
+    The bool is True when the row should be tried again. A missing log drops it.
+    """
+    ready = await _wait_shadow_restore()
+    log = _shadow_log
+    if log is None:
+        return False, None
+    if not ready:
+        return True, None
+    rec = await _shadow_io(_append_shadow_after_restore, log, body)
+    if rec is None:
+        return True, None
+    _shadow_ledger_counts["written"] += 1
+    line = json.dumps(rec, sort_keys=True, default=str)
+    await _mirror_shadow_line(int(rec.get("seq") or 0), str(rec.get("hash") or ""), line)
+    return False, rec.get("seq")
+
+
+async def _drain_shadow_parked() -> None:
+    """Relink rows that refused to append during an in-flight restore."""
+    while _shadow_parked and _shadow_accepting:
+        ready = await _wait_shadow_restore()
+        if not _shadow_parked:
+            return
+        if not ready:
+            if not _shadow_accepting:
+                return
+            continue
+        body, fut = _shadow_parked.pop(0)
+        seq = None
+        try:
+            again, seq = await _finish_shadow_append(body)
+            if again:
+                _shadow_parked.insert(0, (body, fut))
+                await asyncio.sleep(0)
+                continue
+            if seq is None:
+                _shadow_ledger_counts["dropped"] += 1
+        except asyncio.CancelledError:
+            _shadow_parked.insert(0, (body, fut))
+            raise
+        except Exception as exc:
+            _shadow_ledger_counts["dropped"] += 1
+            _log_setup_disable_observer_error(exc)
+        if fut is not None and not fut.done():
+            fut.set_result(seq)
+
+
+async def _shadow_ledger_writer() -> None:
+    """The only task that appends shadow rows. The append runs off the event loop."""
+    global _shadow_inflight
+    queue = _shadow_queue
+    while queue is not None:
+        body, fut = await queue.get()
+        seq = None
+        parked = False
+        accounted = False
+        work = None
+        _shadow_inflight += 1
+        loop = asyncio.get_running_loop()
+
+        def _apply_append(rec: Optional[Dict[str, Any]]) -> None:
+            nonlocal accounted, seq
+            if accounted:
+                return
+            accounted = True
+            if rec:
+                _shadow_ledger_counts["written"] += 1
+                seq = rec.get("seq")
+                line = json.dumps(rec, sort_keys=True, default=str)
+                if fut is not None and not fut.done():
+                    fut.set_result(seq)
+                try:
+                    loop.create_task(_mirror_shadow_line(int(seq or 0), str(rec.get("hash") or ""), line))
+                except RuntimeError:
+                    pass
+            else:
+                _shadow_ledger_counts["dropped"] += 1
+                _resolve_shadow_future_dropped(fut)
+
+        def _on_append_done(cf_fut) -> None:
+            rec = None
+            try:
+                rec = cf_fut.result()
+            except BaseException:
+                rec = None
+            try:
+                loop.call_soon_threadsafe(_apply_append, rec)
+            except RuntimeError:
+                _apply_append(rec)
+
+        try:
+            log = _shadow_log
+            if _shadow_restore_pending():
+                # The log is still None during the boot window. Park, do not drop.
+                parked = _park_shadow_row(body, fut)
+            elif log is None:
+                _shadow_ledger_counts["dropped"] += 1
+                _resolve_shadow_future_dropped(fut)
+            else:
+                ready = await _wait_shadow_restore()
+                log = _shadow_log
+                if not ready or log is None:
+                    parked = _park_shadow_row(body, fut)
+                else:
+                    work = _shadow_io_executor.submit(_append_shadow_after_restore, log, body)
+                    rec = await asyncio.wrap_future(work)
+                    if rec is None:
+                        parked = _park_shadow_row(body, fut)
+                    else:
+                        accounted = True
+                        _shadow_ledger_counts["written"] += 1
+                        seq = rec.get("seq")
+                        line = json.dumps(rec, sort_keys=True, default=str)
+                        await _mirror_shadow_line(int(seq or 0), str(rec.get("hash") or ""), line)
+                        if fut is not None and not fut.done():
+                            fut.set_result(seq)
+        except asyncio.CancelledError:
+            if not parked and not accounted:
+                if work is not None and not work.done():
+                    # Cancelling the task cancels the wrapper, not a write already running.
+                    work.add_done_callback(_on_append_done)
+                elif work is not None:
+                    _on_append_done(work)
+                else:
+                    _shadow_ledger_counts["dropped"] += 1
+                    _resolve_shadow_future_dropped(fut)
+            queue.task_done()
+            raise
+        except Exception as exc:
+            _shadow_ledger_counts["dropped"] += 1
+            _log_setup_disable_observer_error(exc)
+            if fut is not None and not fut.done():
+                fut.set_result(None)
+            queue.task_done()
+        else:
+            queue.task_done()
+        finally:
+            _shadow_inflight = max(0, _shadow_inflight - 1)
+
+
+def _enqueue_shadow_row(body: Dict[str, Any], fut: Optional[asyncio.Future] = None) -> str:
+    """Queue one shadow row. A full queue drops this row and counts it."""
+    if not _shadow_accepting:
+        _shadow_ledger_counts["dropped"] += 1
+        if fut is not None and not fut.done():
+            fut.set_result(None)
+        return "dropped"
+    try:
+        queue = _ensure_shadow_writer()
+        queue.put_nowait((body, fut))
+        return "queued"
+    except asyncio.QueueFull:
+        _shadow_ledger_counts["dropped"] += 1
+        if fut is not None and not fut.done():
+            fut.set_result(None)
+        return "dropped"
+
+
+async def _await_shadow_write(body: Dict[str, Any]) -> None:
+    """Tests wait for the side-log row. The order path must not call this."""
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    if _enqueue_shadow_row(body, fut) == "dropped":
+        return
+    await fut
+
+
+async def drain_shadow_queue(timeout: float = _SHADOW_SHUTDOWN_DRAIN_S) -> int:
+    """Wait for the shadow queue, then count anything still waiting as dropped.
+
+    Shutdown uses 2 seconds while a writer is alive. A dead writer does not
+    wait. An in-flight row whose task has already ended is counted as dropped
+    when it was not already counted as written.
+    """
+    global _shadow_accepting, _shadow_inflight
+    _shadow_accepting = False
+    queue = _shadow_queue
+    writer = _shadow_writer
+    if queue is None:
+        return _drop_parked_shadow_rows()
+    # A writer that died and was replaced is not a live drain. Don't sit out the budget.
+    dead = writer is None or writer.done() or _shadow_writer_restarted
+    wait = 0.0 if dead else max(0.0, float(timeout))
+    if wait:
+        try:
+            await asyncio.wait_for(queue.join(), timeout=wait)
+        except asyncio.TimeoutError:
+            pass
+    if writer is not None and writer.done() and _shadow_inflight:
+        _shadow_ledger_counts["dropped"] += int(_shadow_inflight)
+        _shadow_inflight = 0
+    dropped = 0
+    while True:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        queue.task_done()
+        _shadow_ledger_counts["dropped"] += 1
+        dropped += 1
+    dropped += _drop_parked_shadow_rows()
+    return dropped
+
+
+def _shadow_queue_depth() -> int:
+    queue = _shadow_queue
+    if queue is None:
+        return 0
+    try:
+        return int(queue.qsize())
+    except Exception:
+        return 0
+
+
+def setup_disable_status() -> Dict[str, Any]:
+    """Read-only counters for /pro-trader/status. Does not change an order.
+
+    Counts live in memory. Startup seeds them once from the ledger tail.
+    A status poll does not re-read the ledger. Each setup in the list is
+    reported on its own, including a zero. ``chain_anchors`` is a point-in-time
+    snapshot of each chain's row count and tail hash from the last open or
+    append. A status poll does not rescan the file. Those numbers show a
+    truncated tail only when they are compared with an external copy of the chain.
+    """
+    parsed = resolved_setup_disable_list()
+    by_setup = _setup_disable_counts.get("by_setup") or {}
+    session_by = _blank_setup_counts(parsed["ids"], by_setup)
+    return {
+        "enabled": setup_disable_enabled(),
+        "shadow": setup_disable_shadow(),
+        "reason": SETUP_DISABLE_REASON,
+        "list": sorted(parsed["ids"]),
+        "list_source": parsed["source"],
+        "known_setups": sorted(known_setup_ids()),
+        "kept_capped_at_1": sorted(_KEPT_SETUP_CAP),
+        "unparseable_env": bool(parsed["unparseable"]),
+        "ignored_unknown": list(parsed["ignored"]),
+        "counts": {
+            "skipped": int(_setup_disable_counts.get("skipped") or 0),
+            "would_skip": int(_setup_disable_counts.get("would_skip") or 0),
+            "capped": int(_setup_disable_counts.get("capped") or 0),
+            "by_setup": session_by,
+        },
+        "ledger": {
+            "written": int(_shadow_ledger_counts.get("written") or 0),
+            "dropped": int(_shadow_ledger_counts.get("dropped") or 0),
+            "queued": _shadow_queue_depth(),
+            "file": str(_shadow_log.path) if _shadow_log is not None else None,
+            "read": "read_setup_disable_shadow",
+            "on_disk": int(_shadow_ledger_counts.get("on_disk") or 0),
+            "durable": int(_shadow_ledger_counts.get("durable") or 0),
+            "mirror_failed": int(_shadow_ledger_counts.get("mirror_failed") or 0),
+            "mirror_failures": int(_shadow_ledger_counts.get("mirror_failures") or _shadow_ledger_counts.get("mirror_failed") or 0),
+            "partial_truncated": int(_shadow_ledger_counts.get("partial_truncated") or 0),
+            "restore_failed": bool(_shadow_restore_failed),
+            "restore_attempts": int(_shadow_restore_attempts),
+            # In memory from the last load or append. A poll does not rescan the file.
+            # A truncated tail shows up as a lower rows count and an older tail hash.
+            "chain_anchors": {
+                str(chain_id): {"rows": int(slot.get("rows") or 0), "tail": str(slot.get("tail") or "")}
+                for chain_id, slot in (
+                    getattr(_shadow_log, "chain_anchors", {}) or {}
+                ).items()
+            },
+        },
+        "read_only": True,
+        "env_read": "each_entry",
+    }
+
+
+def reset_setup_disable_state() -> None:
+    """Clear counters, the once-per-cycle log, and the parsed-list cache."""
+    _setup_disable_counts["skipped"] = 0
+    _setup_disable_counts["would_skip"] = 0
+    _setup_disable_counts["capped"] = 0
+    _setup_disable_counts["by_setup"] = {}
+    _setup_disable_seen.clear()
+    _setup_disable_seen_order.clear()
+    _setup_disable_ledger_keys.clear()
+    _setup_disable_inflight.clear()
+    _setup_disable_attempt_n.clear()
+    _setup_disable_closed_attempt.clear()
+    global _setup_disable_seeded
+    _setup_disable_seeded = False
+    _setup_disable_list_cache.clear()
+    _setup_disable_list_cache["key"] = None
+    _shadow_ledger_counts["written"] = 0
+    _shadow_ledger_counts["dropped"] = 0
+    _shadow_ledger_counts["on_disk"] = 0
+    _shadow_ledger_counts["durable"] = 0
+    _shadow_ledger_counts["mirror_failed"] = 0
+    _shadow_ledger_counts["partial_truncated"] = 0
+    global _shadow_accepting, _shadow_restore_failed, _shadow_nonce_for_boot, _shadow_restore_attempts, _shadow_writer_restarted, _shadow_restore_depth
+    _shadow_accepting = True
+    _shadow_restore_failed = False
+    _shadow_nonce_for_boot = False
+    _shadow_restore_attempts = 0
+    _shadow_writer_restarted = False
+    _shadow_restore_depth = 0
+    _shadow_parked.clear()
+    if _shadow_restore_async is not None:
+        _shadow_restore_async.set()
+    _opened_seq_by_signal.clear()
+    _opened_seq_order.clear()
 
 app = FastAPI(title="E*TRADE Trading Bot")
 # No cross-origin browser access unless CORS_ORIGINS lists the origins.
@@ -20532,6 +22652,25 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
 
     `dry_run` is keyword-only and defaults False. Only /explain passes True.
     The live path calls the same helpers with no extra arguments."""
+    if not _is_close_payload(p):
+        origin = str(p.get(DISPATCH_ORIGIN_FIELD) or "").strip().lower()
+        disable_reason = observe_setup_disable(
+            p,
+            path="scanner" if origin == DISPATCH_ORIGIN_SCANNER else "app",
+            dry_run=dry_run,
+        )
+        if disable_reason:
+            if not dry_run:
+                note_setup_disable_decision(
+                    p,
+                    quantity=_requested_setup_qty(p),
+                    enforced=True,
+                    quantity_basis="requested",
+                    path="scanner" if origin == DISPATCH_ORIGIN_SCANNER else "app",
+                    outcome={"placement_status": "skipped", "reason": SETUP_DISABLE_REASON},
+                )
+            return False, [disable_reason]
+
     async def _risk_ref() -> float:
         if dry_run:
             return await _risk_account_reference(dry_run=True)
@@ -23120,6 +25259,17 @@ def _ledger_table_sql() -> str:
     )
 
 
+def _shadow_ledger_table_sql() -> str:
+    """Side log only. Core ledger reads stay on bot_ledger."""
+    return (
+        f"CREATE TABLE IF NOT EXISTS {_bt('bot_shadow_ledger')} ("
+        "hash TEXT PRIMARY KEY, "
+        "seq BIGINT NOT NULL, "
+        "line TEXT NOT NULL, "
+        "chain_id TEXT)"
+    )
+
+
 class PgStatePersistence:
     """Duck-typed persistence adapter for StateStore's durable memory mode.
     All methods are best-effort from the caller's perspective — StateStore
@@ -23157,6 +25307,62 @@ _state_persistence: Optional[PgStatePersistence] = None
 _study_views: Optional[Dict[str, Any]] = None
 
 
+def _schedule_shadow_schema() -> None:
+    """Create the side-log table in the background. A failure cannot change core init."""
+    global _shadow_table_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _shadow_table_task is not None and not _shadow_table_task.done():
+        return
+    _shadow_table_task = loop.create_task(_ensure_shadow_schema(), name="setup-disable-shadow-schema")
+
+
+async def _ensure_shadow_schema() -> None:
+    if engine is None:
+        return
+    try:
+        async def _create() -> None:
+            async with engine.begin() as conn:
+                await conn.execute(sql_text(_shadow_ledger_table_sql()))
+                await conn.execute(sql_text(
+                    f"ALTER TABLE {_bt('bot_shadow_ledger')} ADD COLUMN IF NOT EXISTS chain_id TEXT"
+                ))
+
+        await asyncio.wait_for(_create(), timeout=_SHADOW_DB_TIMEOUT_S)
+    except Exception as shadow_err:
+        logger.error("shadow ledger table init failed (%s)", type(shadow_err).__name__)
+
+
+def _schedule_shadow_count() -> None:
+    """Count side-log rows in the background. The core mirror count is untouched."""
+    global _shadow_count_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _shadow_count_task is not None and not _shadow_count_task.done():
+        return
+    _shadow_count_task = loop.create_task(_count_shadow_ledger(), name="setup-disable-shadow-count")
+
+
+async def _count_shadow_ledger() -> None:
+    if engine is None:
+        return
+    try:
+        async def _query() -> int:
+            async with engine.connect() as conn:
+                return int((await conn.execute(
+                    sql_text(f"SELECT COUNT(*) FROM {_bt('bot_shadow_ledger')}")
+                )).scalar() or 0)
+
+        counted = await asyncio.wait_for(_query(), timeout=_SHADOW_DB_TIMEOUT_S)
+        _shadow_ledger_counts["durable"] = max(int(_shadow_ledger_counts.get("durable") or 0), counted)
+    except Exception as exc:
+        logger.warning("shadow ledger count unavailable (%s)", type(exc).__name__)
+
+
 async def _init_durable_state() -> Optional[PgStatePersistence]:
     """Create the durable-state tables and return the adapter — None when the
     DB is unavailable (the store then falls back to plain memory, loudly)."""
@@ -23169,6 +25375,10 @@ async def _init_durable_state() -> Optional[PgStatePersistence]:
             await conn.execute(sql_text(_state_table_sql()))
             await conn.execute(sql_text(_ledger_table_sql()))
         _state_persistence = PgStatePersistence(engine)
+        try:
+            _schedule_shadow_schema()
+        except Exception as shadow_err:
+            logger.error("shadow ledger table init failed (%s)", type(shadow_err).__name__)
         return _state_persistence
     except Exception as e:
         logger.error(f"durable state init failed — falling back to plain memory: {e}")
@@ -23420,6 +25630,10 @@ async def _announce_ledger_memory() -> None:
             )
         else:
             logger.info(f"[ledger] {verdict['message']}")
+        try:
+            _schedule_shadow_count()
+        except Exception as exc:
+            logger.warning("shadow ledger count unavailable (%s)", type(exc).__name__)
     except Exception as e:
         logger.error(f"ledger memory check failed (non-fatal): {e}")
 
@@ -30637,6 +32851,30 @@ async def exit_followup_worker():
         await asyncio.sleep(max(15, EXIT_FOLLOWUP_WORKER_SECONDS))
 
 
+def _remember_opened_seq(signal_key: Optional[str], seq: Optional[int]) -> None:
+    """Remember which ledger seq opened this signal. Not written onto the position."""
+    if not signal_key or seq is None:
+        return
+    key = str(signal_key)
+    if key not in _opened_seq_by_signal:
+        _opened_seq_order.append(key)
+    _opened_seq_by_signal[key] = int(seq)
+    while len(_opened_seq_order) > _OPENED_SEQ_MAX:
+        old = _opened_seq_order.pop(0)
+        _opened_seq_by_signal.pop(old, None)
+
+
+def _take_opened_seq(signal_key: Optional[str]) -> Optional[int]:
+    """Pop the open seq for a close. Missing stays missing."""
+    if not signal_key:
+        return None
+    key = str(signal_key)
+    seq = _opened_seq_by_signal.pop(key, None)
+    if key in _opened_seq_order:
+        _opened_seq_order.remove(key)
+    return seq
+
+
 async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Optional[float],
                        target: Optional[float], contract: Optional[dict],
                        action: str = "BUY", setup: Optional[str] = None,
@@ -30647,7 +32885,8 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
                        option_delta: Any = None,
                        instrument: Optional[str] = None,
                        pro_trader_decision: Optional[dict] = None,
-                       heat_reservation_id: Optional[str] = None) -> None:
+                       heat_reservation_id: Optional[str] = None,
+                       signal_key: Optional[str] = None) -> Optional[int]:
     # The setup label rides on the position and into the ledger so the trade
     # can be attributed when it settles. Without it the bot writes a history it
     # can never learn from: every close lands in an anonymous pile and the
@@ -30684,6 +32923,8 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
     heat_id = str(heat_reservation_id or "").strip()
     if heat_id:
         position["_heat_reservation_id"] = heat_id
+    if signal_key:
+        position["signal_key"] = signal_key
     await state.set_position(ticker, position)
     await state.incr_trades_today()
     # 5.84.1 0DTE cap memory: count a same-day-expiry open on its ET day.
@@ -30693,7 +32934,7 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
             await state.incr_day_counter("zero_dte_entries", today_et)
     except Exception as e:
         logger.warning(f"[0DTE CAP] {ticker} same-day entry count not recorded: {e}")
-    await trade_ledger.record("position_opened", {
+    opened = {
         "ticker": ticker, "qty": int(qty), "action": str(action or "BUY").upper(),
         "entry": float(entry) if entry else None,
         "stop": float(stop) if stop else None,
@@ -30707,7 +32948,14 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         "option_delta": delta,
         "instrument": instrument_label,
         **pt_fields,
-    })
+    }
+    if signal_key:
+        opened["signal_key"] = signal_key
+    seq = await trade_ledger.record("position_opened", opened)
+    # The seq stays in memory. Writing the position again here would put back
+    # a row deleted during the append, or erase a stop saved while it ran.
+    _remember_opened_seq(signal_key, seq)
+    return seq
 
 
 def _mtf_parts(raw: Any) -> Tuple[Optional[int], Optional[int]]:
@@ -31168,6 +33416,11 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         # visible without reconstructing Redis after the fact.
         **_review,
     }
+    _open_key = (pos or {}).get("signal_key")
+    if _open_key:
+        close_data["signal_key"] = _open_key
+    # Missing after a restart stays null. Do not guess a seq from the ledger.
+    close_data["opened_seq"] = _take_opened_seq(_open_key)
     ledger_seq = await trade_ledger.record("position_closed", close_data)
     await _remember_trade_review(close_data, ledger_seq=ledger_seq)
     # Schedule 15/30-minute post-exit marks — a stop that was too tight shows
@@ -34102,9 +36355,15 @@ async def execute_live_order(payload: dict):
             # every live ENTRY raise UnboundLocalError at the priced-risk gate
             # before an order could ever be placed.
             sym_u = str(symbol).upper()
+            live_option_quote = None
+            qty_before_learning = quantity if not is_exit else None
+            qty_after_learning = qty_before_learning
+            qty_after_risk = qty_before_learning
             if not is_exit:
                 quantity = _apply_learning_weight(sym_u, quantity, learning_ctx)
+                qty_after_learning = quantity
                 quantity = _apply_risk_weight(sym_u, quantity, risk_ctx)
+                qty_after_risk = quantity
                 quantity, pt_block = _apply_pro_trader_size(sym_u, quantity, payload)
                 if pt_block:
                     await trade_ledger.record("pro_trader_blocked", {
@@ -34654,6 +36913,7 @@ async def execute_live_order(payload: dict):
                 # but nobody pays 1.5R on a 15-minute-old quote.
                 massive_q = await massive_client.fetch_option_quote(sym_u, *snapped_contract)
                 pq = select_payoff_quote(massive_q, real_bid, real_ask, contract_liquidity.get("quote_type"))
+                live_option_quote = _live_option_quote(pq, massive_q if isinstance(massive_q, dict) else {})
                 if pq["source"] is None:
                     logger.warning(f"⛔ {symbol} {pq['reason']}")
                     await trade_ledger.record("entry_quote_refused", {
@@ -34894,6 +37154,35 @@ async def execute_live_order(payload: dict):
                             logger.error(f"[CLOSE] {sym_u} close failed AND stop re-arm failed: {re_err}")
                     raise
             else:
+                # Kept setups (momentum fade, orb) cap at 1 contract only after
+                # every earlier sizer and budget check. Later steps, including
+                # the funds clamp, can still shrink this. They cannot raise it.
+                committed = commit_final_kept_setup_qty(
+                    payload.get("setup"), quantity, common, ticker=sym_u,
+                    cycle=str(payload.get("timestamp") or payload.get("ts") or ""),
+                )
+                if committed is None:
+                    logger.info(
+                        "setup_disabled cap skip ticker=%s setup=%s",
+                        sym_u, canonical_setup_id(payload.get("setup")),
+                    )
+                    note_setup_disable_decision(
+                        payload, quantity=0, enforced=setup_disable_enabled(),
+                        quantity_basis="after_sizing", path="entry",
+                        sizing=_setup_disable_sizing(
+                            qty_before_learning, qty_after_learning, qty_after_risk,
+                            0, payload, common,
+                        ),
+                        option_quote=live_option_quote, call_put=call_put,
+                        outcome={"placement_status": "skipped", "reason": "kept setup quantity below 1 contract"},
+                    )
+                    return {
+                        "status": "refused",
+                        "reason": "kept setup quantity below 1 contract",
+                        "code": "setup_size_cap",
+                        "paper": True,
+                    }
+                quantity = committed
                 # Per-contract cost = premium × 100 shares. Prefer the sanitized
                 # limit price (set from the real ask above); fall back to the
                 # raw ask for MARKET orders.
@@ -34929,7 +37218,8 @@ async def execute_live_order(payload: dict):
                 # when the signal said SELL (bearish → long PUT). Recording the
                 # signal verb would flip `_entry_direction` to −1 and invert the
                 # premium P&L of every put exit.
-                await _record_open(
+                shadow_reserved = _reserve_setup_disable_attempt(payload)
+                opened_seq = await _record_open(
                     str(symbol).upper(), quantity,
                     payload.get("entry"), payload.get("stop") or payload.get("stop_price"),
                     payload.get("target"), contract, "BUY", payload.get("setup"),
@@ -34941,6 +37231,23 @@ async def execute_live_order(payload: dict):
                     instrument="option",
                     pro_trader_decision=payload.get("_pro_trader"),
                     heat_reservation_id=payload.get("_heat_reservation_id"),
+                    signal_key=shadow_reserved[1] if shadow_reserved else None,
+                )
+                note_setup_disable_decision(
+                    payload, quantity=quantity, enforced=setup_disable_enabled(),
+                    quantity_basis="after_sizing", path="entry", fresh_order=True,
+                    reserved=shadow_reserved,
+                    sizing=_setup_disable_sizing(
+                        qty_before_learning, qty_after_learning, qty_after_risk,
+                        quantity, payload, common,
+                    ),
+                    option_quote=live_option_quote, call_put=call_put,
+                    outcome={
+                        "order_id": _order_id_from_place(final),
+                        "placement_status": "placed",
+                        "reason": None,
+                        "position_opened_seq": opened_seq,
+                    },
                 )
                 # Journal: SPY/QQQ vs day VWAP + the bid/ask the ticket crossed.
                 try:
@@ -38355,6 +40662,21 @@ async def _scanner_dispatch(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Send a scanner candidate down the SAME pipeline as a webhook signal.
     The payload is validated with the identical model first, so a malformed
     scanner signal fails here instead of reaching the broker."""
+    # Skip before process_signal so a disabled setup does not claim the
+    # day's signal id. The next scan is a new cycle and can log again.
+    # Shadow returns None and falls through unchanged.
+    if isinstance(payload, dict) and not _is_close_payload(payload):
+        disable_reason = observe_setup_disable(payload, path="scanner")
+        if disable_reason:
+            note_setup_disable_decision(
+                payload,
+                quantity=_requested_setup_qty(payload),
+                enforced=True,
+                quantity_basis="requested",
+                path="scanner",
+                outcome={"placement_status": "skipped", "reason": SETUP_DISABLE_REASON},
+            )
+            return {"status": "rejected", "reason": disable_reason, "code": "setup_disabled"}
     try:
         pd = WebhookPayload(**payload).dict()
     except ValidationError as e:
@@ -38524,6 +40846,13 @@ async def on_startup():
     trade_ledger.init(TRADE_LEDGER_FILE)
     if persistence is not None:
         trade_ledger.set_mirror(_ledger_mirror)
+    shadow_path = Path(os.getenv(
+        "SETUP_DISABLE_SHADOW_FILE",
+        str(TRADE_LEDGER_FILE.with_name("setup_disable_shadow.jsonl")),
+    ))
+    if engine is not None:
+        set_shadow_mirror(_shadow_postgres_mirror)
+    start_setup_disable_shadow(shadow_path)
     # Say out loud whether this process actually remembers anything. A ledger
     # that comes up empty is indistinguishable from a healthy one in the logs,
     # and it silently disarms the only mechanism that learns from past trades.
@@ -38639,10 +40968,56 @@ async def _announce_preflight() -> None:
         logger.warning(f"preflight report failed (non-fatal): {e}")
 
 
+async def _cancel_shadow_maintenance() -> None:
+    """Stop restore, backfill, schema, and count tasks. The flush has already run."""
+    pending = []
+    for task in (
+        _shadow_writer,
+        _shadow_backfill_task,
+        _shadow_restore_task,
+        _shadow_relink_task,
+        _shadow_boot_task,
+        _shadow_table_task,
+        _shadow_count_task,
+    ):
+        if task is not None and not task.done():
+            task.cancel()
+            pending.append(task)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    # Cancel puts an in-flight relink row back onto the parked list. Count it here.
+    _drop_parked_shadow_rows()
+
+
+async def _shutdown_shadow_pool() -> None:
+    """Stop the side-log workers. A stuck fsync does not hold shutdown open."""
+    global _shadow_io_executor
+    executor = _shadow_io_executor
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(executor.shutdown, True, cancel_futures=True),
+            timeout=_SHADOW_POOL_SHUTDOWN_S,
+        )
+    except Exception as exc:
+        logger.warning("shadow pool shutdown failed (%s)", type(exc).__name__)
+    if _shadow_io_executor is executor:
+        _shadow_io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="shadow-io")
+
+
+async def _shutdown_shadow_side_log() -> None:
+    try:
+        await drain_shadow_queue()
+    except Exception as exc:
+        logger.warning("shadow queue drain failed (%s)", type(exc).__name__)
+    await _cancel_shadow_maintenance()
+    await _shutdown_shadow_pool()
+
+
 @app.on_event("shutdown")
 async def on_shutdown():
     global _worker_stop
     _worker_stop = True
+    await _shutdown_shadow_side_log()
     await _close_study_page_engine()
     await state.close()
 
@@ -39980,6 +42355,7 @@ def _pro_trader_status_payload(trades_today: Any = None) -> Dict[str, Any]:
     rails["flatten_et"] = _flatten_et_label(close)
     body["hard_rails"] = rails
     body["session_phase"] = _pro_session_phase(minute, close)
+    body["setup_disable"] = setup_disable_status()
     return body
 
 

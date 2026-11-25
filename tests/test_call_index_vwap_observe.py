@@ -568,6 +568,11 @@ def test_rejected_entry_ledger_carries_unmeasured_day_vwap(monkeypatch):
     async def refuse_order(payload):
         raise AssertionError("order path reached")
 
+    # 11:00 ET, outside the 15:40 flatten window, so the test does not depend on the clock.
+    monkeypatch.setattr(
+        main_bot, "_utcnow",
+        lambda: datetime(2026, 11, 24, 16, 0, tzinfo=timezone.utc),
+    )
     monkeypatch.setattr(main_bot, "_index_vwap_quotes", feed)
     monkeypatch.setattr(main_bot.trade_ledger, "record", record)
     monkeypatch.setattr(main_bot, "_is_market_open", lambda: True)
