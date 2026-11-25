@@ -13,8 +13,10 @@ import logging
 import httpx
 import requests
 from fastapi.testclient import TestClient
+from starlette.responses import Response
 
 import main_bot
+import etrade_async
 
 
 FAKE_WEBHOOK = "https://discord.com/api/webhooks/123456789012345678/FAKE-TOKEN_abc.def"
@@ -100,24 +102,36 @@ def test_scrub_etrade_text_redacts_webhook_and_credential_urls():
 
 
 def test_success_response_keeps_the_authorize_query():
-    """Linking returns ?key=&token=. That query is not an error body."""
-    kept = main_bot.redact_http_payload("/etrade/auth/start", {"auth_url": AUTH_URL})
+    """Only the auth-start and /link success bodies keep ?key= and ?token=."""
+    assert main_bot._preserve_authorize_query("/etrade/auth/start", 200) is True
+    assert main_bot._preserve_authorize_query("/link", 200) is True
+    assert main_bot._preserve_authorize_query("/etrade/auth/start", 500) is False
+    assert main_bot._preserve_authorize_query("/status", 200) is False
+    kept = main_bot.redact_http_payload(
+        "/etrade/auth/start", {"auth_url": AUTH_URL}, scrub_query_secrets=False,
+    )
     assert kept["auth_url"] == AUTH_URL
     hidden = main_bot.redact_http_payload(
-        "/etrade/auth/start", {"detail": AUTH_URL}, scrub_query_secrets=True,
+        "/status", {"detail": AUTH_URL}, scrub_query_secrets=True,
     )
     assert "CONSUMERKEY" not in hidden["detail"]
     assert "REQUESTTOKEN" not in hidden["detail"]
-    assert "https://us.etrade.com/e/t/etws/authorize?key=[redacted]&token=[redacted]" == hidden["detail"]
+    assert hidden["detail"] == (
+        "https://us.etrade.com/e/t/etws/authorize?key=[redacted]&token=[redacted]"
+    )
 
 
 def test_log_messages_keep_order_ids():
+    line = (
+        "placed order 123456789 OCC O:SPY261120C00500000 "
+        "sig_key=abc123def key_levels=510.25/512.00"
+    )
+
     def emit(log):
-        log.info("placed order 123456789 for SPY")
+        log.info("%s", line)
 
     text = _formatted_handler_output("etrade-bot.order-id-kept", emit)
-    assert "123456789" in text
-    assert "SPY" in text
+    assert text.strip() == line
 
 
 def test_httpx_info_request_log_redacts_the_discord_webhook():
@@ -292,3 +306,152 @@ def test_http_exception_body_redacts_the_webhook(monkeypatch):
     assert "token=[redacted]" in error.text
     assert plain.status_code == 401
     assert plain.json()["detail"] == "E*TRADE account not linked"
+
+
+def test_sync_and_async_scrubbers_are_one_implementation():
+    sample = (
+        f"{FAKE_WEBHOOK} ?accountIdKey=TESTACCTKEY123"
+        "&token=FAKE-TOKEN_abc.def&apikey=FAKE-TOKEN_abc.def"
+    )
+    assert etrade_async.scrub_etrade_text is main_bot.scrub_etrade_text
+    sync = main_bot.scrub_etrade_text(sample)
+    async_out = etrade_async.scrub_etrade_text(sample)
+    assert sync == async_out
+    _assert_no_webhook_secret(sync)
+    assert "accountIdKey={acct}" in sync
+    assert "token=[redacted]" in sync
+    assert "apikey=[redacted]" in sync
+    assert "/api/webhooks/[redacted]" in sync
+
+
+def test_mask_webhook_url_strips_userinfo():
+    masked = main_bot.alerts.mask_webhook_url(
+        "https://FAKE-TOKEN_abc.def:s3cret@discord.com/api/webhooks/"
+        "123456789012345678/FAKE-TOKEN_abc.def"
+    )
+    assert masked is not None
+    _assert_no_webhook_secret(masked)
+    assert "s3cret" not in masked
+    assert "@" not in masked
+    assert masked.startswith("https://discord.com/")
+
+
+def test_long_webhook_url_is_dropped_before_truncation(monkeypatch):
+    marker = "LONGHOOKTOKEN"
+    long_url = "https://alerts.example.com/hooks/" + (marker * 40)
+    assert len(long_url) > 200
+    saved = main_bot.alerts._manager
+    store = main_bot.StateStore(None)
+
+    class _Boom:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json=None):
+            raise _http_status_error(url)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Boom)
+    held = {}
+
+    def emit(log):
+        async def scenario():
+            main_bot.alerts.init(store, long_url)
+            await main_bot.alerts.send("error", "generic_hook", "delivery failed")
+            held["delivery"] = await store.get(main_bot.alerts.ALERTS_LAST_DELIVERY_KEY)
+
+        _run(scenario())
+
+    try:
+        text = _formatted_handler_output("etrade-bot.alerts", emit)
+    finally:
+        main_bot.alerts._manager = saved
+
+    assert marker not in text
+    assert long_url not in text
+    assert "alert webhook delivery failed: webhook delivery failed" in text
+    delivery = json.loads(held["delivery"])
+    assert delivery["detail"] == "webhook delivery failed"
+    assert marker not in delivery["detail"]
+
+
+class _Path:
+    def __init__(self, path):
+        self.path = path
+
+
+class _Request:
+    def __init__(self, path):
+        self.url = _Path(path)
+
+
+def _json_response(body: bytes, status_code: int = 200):
+    return Response(content=body, media_type="application/json", status_code=status_code)
+
+
+def test_authorize_route_keeps_query_and_other_routes_do_not():
+    body = json.dumps({"auth_url": AUTH_URL, "authorize_url": AUTH_URL}).encode()
+
+    async def call_next(_request):
+        return _json_response(body)
+
+    kept = _run(main_bot._redact_account_response(_Request("/etrade/auth/start"), call_next))
+    assert AUTH_URL.encode() in kept.body
+    link = _run(main_bot._redact_account_response(_Request("/link"), call_next))
+    assert AUTH_URL.encode() in link.body
+    other = _run(main_bot._redact_account_response(_Request("/status"), call_next))
+    text = other.body.decode()
+    assert "CONSUMERKEY" not in text
+    assert "REQUESTTOKEN" not in text
+    assert "key=[redacted]" in text
+    assert "token=[redacted]" in text
+
+
+def _probe(monkeypatch, path: str, raw: bytes):
+    monkeypatch.setattr(main_bot, "WEBHOOK_SECRET", "s3cret")
+
+    async def endpoint():
+        return Response(content=raw, media_type="application/json")
+
+    main_bot.app.add_api_route(path, endpoint, methods=["GET"])
+    try:
+        with TestClient(main_bot.app) as client:
+            return client.get(path, headers={"X-Rork-Secret": "s3cret"})
+    finally:
+        main_bot.app.router.routes[:] = [
+            route for route in main_bot.app.router.routes
+            if getattr(route, "path", None) != path
+        ]
+
+
+def test_nan_beside_a_masked_field_returns_the_original_body(monkeypatch, caplog):
+    raw = b'{"accountIdKey":"TESTACCTKEY123","mark":NaN}'
+    caplog.set_level(logging.WARNING, logger="etrade-bot")
+    response = _probe(monkeypatch, "/__redact_probe_nan", raw)
+    assert response.status_code == 200
+    assert response.content == raw
+    warnings = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert any("ValueError" in message for message in warnings)
+    assert all("TESTACCTKEY123" not in message for message in warnings)
+
+
+def test_deeply_nested_body_returns_the_original_body(monkeypatch, caplog):
+    # redact walks one Python frame per object. Past the recursion limit
+    # (about 900 once the request stack is counted; 1000 from a shallow call)
+    # that used to 500 after the endpoint had already produced a body.
+    node = {"accountIdKey": "TESTACCTKEY123"}
+    for _ in range(1000):
+        node = {"n": node}
+    raw = json.dumps(node).encode()
+    caplog.set_level(logging.WARNING, logger="etrade-bot")
+    response = _probe(monkeypatch, "/__redact_probe_deep", raw)
+    assert response.status_code == 200
+    assert response.content == raw
+    warnings = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert any("RecursionError" in message for message in warnings)
+    assert all("TESTACCTKEY123" not in message for message in warnings)

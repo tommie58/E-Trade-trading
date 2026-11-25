@@ -2420,18 +2420,27 @@ def _utcnow_iso() -> str:
 
 
 def mask_webhook_url(url: Optional[str]) -> Optional[str]:
-    """Keep scheme + host + first path segment; hide the secret tail.
-    e.g. https://discord.com/api/webhooks/123…/abc… → https://discord.com/api/…9xYz
+    """Keep scheme + host; hide userinfo and the secret tail.
+    e.g. https://discord.com/api/webhooks/123…/abc… → https://discord.com/…9xYz
     """
     if not url:
         return None
     try:
+        import re
         from urllib.parse import urlparse
-        p = urlparse(url)
-        tail = url[-4:] if len(url) > 24 else ""
-        return f"{p.scheme}://{p.netloc}/…{tail}"
+        stripped = re.sub(
+            r"(?i)(https?://)[^\s/?#@:]+:[^\s/?#@]+@",
+            r"\1",
+            url,
+        )
+        p = urlparse(stripped)
+        host = p.hostname or ""
+        if p.port:
+            host = f"{host}:{p.port}"
+        tail = stripped[-4:] if len(stripped) > 24 else ""
+        return f"{p.scheme}://{host}/…{tail}"
     except Exception:
-        return "…" + url[-4:]
+        return "…"
 
 
 class AlertManager:
@@ -2610,12 +2619,16 @@ class AlertManager:
                 if not ok:
                     logger.warning(f"alert webhook returned {resp.status_code}")
         except Exception as e:
-            # httpx puts the request URL in str(e). Scrub before the log line
-            # and before the delivery record GET /alerts/config returns.
-            detail = _scrub_alert_text(str(e))[:200]
+            # httpx puts the request URL in str(e). Match the configured URL
+            # before truncating, or a long generic hook leaks its prefix into
+            # the log and into the delivery record GET /alerts/config returns.
+            raw_error = str(e)
             secret = self._webhook_url or ""
-            if secret and secret in detail:
+            scrubbed = _scrub_alert_text(raw_error)
+            if secret and (secret in raw_error or secret in scrubbed):
                 detail = "webhook delivery failed"
+            else:
+                detail = scrubbed[:200]
             logger.warning(f"alert webhook delivery failed: {detail}")
         try:
             await self._state.set(ALERTS_LAST_DELIVERY_KEY, json.dumps({
@@ -2708,9 +2721,10 @@ async def send(severity: str, event: str, message: str,
         await _manager.send(severity, event, message, dedupe_key=dedupe_key, data=data,
                             force_deliver=force_deliver, webhook_text=webhook_text)
     except Exception as e:
-        text = _scrub_alert_text(str(e))
+        raw_error = str(e)
+        text = _scrub_alert_text(raw_error)
         secret = (_manager._webhook_url or "") if _manager is not None else ""
-        if secret and secret in text:
+        if secret and (secret in raw_error or secret in text):
             text = "webhook delivery failed"
         logger.error(f"alert send failed ({event}): {text}")
 
@@ -21715,7 +21729,7 @@ async def etrade_auth_start():
         specials = "".join(sorted({c for c in raw if c in "+/="})) or "none"
         logger.info(
             f"[{BOT_VERSION}] auth URL generated | token={raw[:4]}...{raw[-4:]} "
-            f"len={len(raw)} special_chars={specials} encoded_tail=...{auth_url[-24:]}"
+            f"len={len(raw)} special_chars={specials}"
         )
         # Return the request token so the app can cache it and echo it back on
         # /auth/complete — lets us verify we exchange the SAME token the user
@@ -26125,11 +26139,10 @@ async def check_risk_limits(is_close: bool = False) -> None:
 
 
 # ==================== ACCOUNT REDACTION ====================
-# Same name and signature as etrade_async.scrub_etrade_text on
-# cursor/reconcile-etrade-404-3b51 (#36). This copy lives on the main module,
-# not inside that bundle, so the two definitions do not share lines. The body
-# is #36's, plus accountIdKey query redaction (_ACCT_KEY_QUERY) and webhook
-# URL redaction (_scrub_webhook_hosts / _scrub_query_secrets).
+# Single scrubber. etrade_async.scrub_etrade_text is this function: the
+# bundle's copy on cursor/reconcile-etrade-404-3b51 (#36) is replaced at
+# the end of this block so accountIdKey, webhook URLs, and credential
+# query values cannot drift between the sync and async paths.
 _ACCT_IN_PATH = re.compile(r"(/accounts/)([^/?#]+)")
 _LONG_DIGITS = re.compile(r"\d{8,}")
 _AUTH_HEADER = re.compile(r"(?i)authorization\s*[:=]\s*\S+")
@@ -26163,8 +26176,8 @@ _SLACK_WEBHOOK_URL = re.compile(
 _URL_USERINFO = re.compile(
     r"(?i)(https?://)[^\s/?#@:]+:[^\s/?#@]+@"
 )
-# Credential query values only. `token` and `key` are included, so this must
-# not run on a successful authorize URL (`?key=&token=`), which the app needs.
+# Credential query values. A successful /etrade/auth/start or /link response
+# is the one body that must keep ?key= and ?token= so the app can link.
 _SENSITIVE_QUERY = re.compile(
     r"(?i)"
     r"([?&](?:access_token|oauth_signature|oauth_token|api_key|apikey|"
@@ -26186,6 +26199,18 @@ _ACCOUNT_PICKER_PATHS = {
     "/etrade/account/select",
     "/etrade/crypto/account/select",
 }
+# Successful responses from these routes carry the E*TRADE authorize URL.
+# ?key= and ?token= on that URL are what the app follows. Every other
+# response, including errors on these paths, redacts those query values.
+_AUTHORIZE_RESPONSE_PATHS = {
+    "/etrade/auth/start",
+    "/link",
+}
+
+
+def _preserve_authorize_query(path: str, status_code: int) -> bool:
+    normalized = (path or "").rstrip("/") or "/"
+    return int(status_code) < 400 and normalized in _AUTHORIZE_RESPONSE_PATHS
 
 
 def _scrub_webhook_hosts(text: str) -> str:
@@ -26209,9 +26234,9 @@ def _scrub_query_secrets(text: str) -> str:
 def _scrub_etrade_urls(text: str) -> str:
     """Redact webhook hosts, account paths, accountIdKey, and OAuth material.
 
-    Generic ?token= / ?key= values are left alone: the E*TRADE authorize URL
-    returned to the app is ?key=&token=. Logs and error bodies add that pass
-    via _scrub_log_text.
+    Generic ?token= / ?key= values are applied by _scrub_log_text and by
+    response redaction. The authorize URL is exempt only on the auth-start
+    response (see _preserve_authorize_query).
     """
     cleaned = _scrub_webhook_hosts(text)
     cleaned = _ACCT_IN_PATH.sub(
@@ -26240,6 +26265,21 @@ def scrub_etrade_text(text: str, secrets: Optional[Sequence[str]] = None) -> str
     return cleaned
 
 
+def _bind_shared_scrubber() -> None:
+    """Point every etrade_async module object at this one function."""
+    import sys
+    names = ["etrade_async"]
+    if __package__:
+        names.insert(0, f"{__package__}.etrade_async")
+    for name in names:
+        mod = sys.modules.get(name)
+        if mod is not None:
+            mod.scrub_etrade_text = scrub_etrade_text
+
+
+_bind_shared_scrubber()
+
+
 def mask_account_key(value: Optional[str]) -> Optional[str]:
     """**** plus the last 4 characters. None stays None. Already masked stays."""
     if value is None:
@@ -26257,9 +26297,8 @@ def redact_http_payload(path: str, payload: Any, *, scrub_query_secrets: bool = 
 
     Strings are also scrubbed for webhook URLs, /v1/accounts/<key>/,
     accountIdKey=, and OAuth header values. scrub_query_secrets also redacts
-    credential query values; error responses pass True. Success responses
-    leave ?key= and ?token= so the authorize URL still links. The in-memory
-    key is not touched; this runs on the response.
+    credential query values. The authorize response is the caller that passes
+    False. The in-memory key is not touched; this runs on the response.
     """
     mask_numbers = (path or "").rstrip("/") not in _ACCOUNT_PICKER_PATHS
     return _redact_json_value(
@@ -26456,9 +26495,10 @@ async def _redact_http_exception(request: Request, exc: HTTPException):
 async def _redact_account_response(request: Request, call_next):
     """Mask account keys and credential URLs on the way out.
 
-    Internal routing state is unchanged. Error JSON (HTTPException included)
-    also drops credential query values. A successful authorize URL keeps
-    ?key= and ?token=.
+    Internal routing state is unchanged. Credential query values are redacted
+    on every JSON body except a successful /etrade/auth/start or /link
+    response. If redaction or re-encoding fails, the endpoint's original
+    body is returned unchanged.
     """
     response = await call_next(request)
     media = str(response.headers.get("content-type") or "")
@@ -26474,13 +26514,23 @@ async def _redact_account_response(request: Request, call_next):
         _replace_response_body(response, raw)
         return response
     path = request.url.path.rstrip("/") or "/"
-    redacted = redact_http_payload(
-        path, payload, scrub_query_secrets=response.status_code >= 400,
-    )
-    encoded = raw if redacted == payload else json.dumps(
-        redacted, ensure_ascii=False, allow_nan=False, separators=(",", ":"), default=str,
-    ).encode("utf-8")
-    _replace_response_body(response, encoded)
+    try:
+        redacted = redact_http_payload(
+            path,
+            payload,
+            scrub_query_secrets=not _preserve_authorize_query(path, response.status_code),
+        )
+        encoded = raw if redacted == payload else json.dumps(
+            redacted, ensure_ascii=False, allow_nan=False, separators=(",", ":"), default=str,
+        ).encode("utf-8")
+        _replace_response_body(response, encoded)
+    except Exception as exc:
+        try:
+            kind = scrub_etrade_text(type(exc).__name__)
+        except Exception:
+            kind = "Exception"
+        logger.warning("response redaction failed (%s)", kind)
+        _replace_response_body(response, raw)
     return response
 
 
