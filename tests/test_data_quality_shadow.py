@@ -262,15 +262,17 @@ def test_snapshot_gap_uses_official_open_not_the_first_bar():
     assert missing["current_gap_pct"] == pytest.approx(-1.763)
 
 
-def test_cadence_default_is_60s_on_the_minute(monkeypatch):
+def test_cadence_default_is_main_90s_elapsed(monkeypatch):
     monkeypatch.delenv("AGGS_PULL_INTERVAL_S", raising=False)
-    assert dq.aggs_pull_interval_s() == 60
-    assert dq.aggs_alignment_active() is True
+    monkeypatch.delenv("BAR_PULL_ALIGNED_60S", raising=False)
+    assert dq.aggs_pull_interval_s() == 90
+    assert dq.aggs_alignment_active() is False
+    assert dq.bar_pull_aligned_60s() is False
     now = datetime(2026, 11, 24, 12, 2, 40, tzinfo=ET)
     assert dq.agg_pull_due(0, 0, 90, False, now) is True
     assert dq.agg_pull_due(now.timestamp(), now.timestamp() - 89, 90, False, now) is False
     assert dq.agg_pull_due(now.timestamp(), now.timestamp() - 90, 90, False, now) is True
-    monkeypatch.setenv("AGGS_PULL_INTERVAL_S", "60")
+    monkeypatch.setenv("BAR_PULL_ALIGNED_60S", "true")
     assert dq.aggs_pull_interval_s() == 60
     assert dq.aggs_alignment_active() is True
     last = datetime(2026, 11, 24, 12, 1, 40, tzinfo=ET).timestamp()
@@ -280,12 +282,9 @@ def test_cadence_default_is_60s_on_the_minute(monkeypatch):
     assert dq.agg_pull_due(early.timestamp(), last_early, 60, True, early) is False
     budget = dq.call_budget()
     assert budget["requests_per_pull_per_symbol"] == 1
-    assert budget["current_requests_per_hour"] == 120
-    assert budget["proposal_requests_per_hour"] == 120
-    assert budget["legacy_90s_requests_per_hour"] == "48-80"
-    monkeypatch.setenv("AGGS_PULL_INTERVAL_S", "90")
-    assert dq.aggs_pull_interval_s() == 90
-    assert dq.aggs_alignment_active() is False
+    assert budget["current_requests_per_hour"] == "48-80"
+    assert budget["aligned_60s_requests_per_hour"] == 120
+    assert budget["current_throttle_ceiling_per_hour_per_symbol"] == 40
     assert dq.agg_path_range("2026-11-24", None) == ("2026-11-24", "2026-11-24")
     assert dq.agg_path_range("2026-11-24", 1_700_000_000.0)[0] == "1700000000000"
     assert dq.aggs_incremental_merge_enabled() is False
@@ -560,6 +559,86 @@ def test_running_sum_mismatch_keeps_the_full_recompute(monkeypatch):
     assert adopted["vwap"] != pytest.approx(1.0)
 
 
+def _pulls_in_window(due, start, seconds, step):
+    """How many times one symbol pulls if the caller wakes every ``step`` seconds."""
+    last = 0.0
+    count = 0
+    t = float(start)
+    end = float(start) + float(seconds)
+    while t <= end + 1e-9:
+        if due(t, last):
+            count += 1
+            last = t
+        t += float(step)
+    return count
+
+
+def test_default_pull_matches_main_over_a_simulated_rth_hour(monkeypatch):
+    """Flag off: 90s elapsed, full-day URL, and no more GETs than main."""
+    monkeypatch.delenv("BAR_PULL_ALIGNED_60S", raising=False)
+    monkeypatch.delenv("AGGS_INCREMENTAL_MERGE", raising=False)
+    monkeypatch.delenv("AGGS_PULL_INTERVAL_S", raising=False)
+    assert dq.agg_request_range("2026-11-24", 1_700_000_000.0) == ("2026-11-24", "2026-11-24")
+    clock = datetime(2026, 11, 24, 9, 30, tzinfo=ET)
+
+    def main_due(now, last):
+        return last <= 0 or now - last >= 90.0
+
+    def our_due(now, last):
+        when = clock + timedelta(seconds=now)
+        return dq.agg_pull_due(
+            now, last, dq.aggs_pull_interval_s(), dq.aggs_alignment_active(), when,
+        )
+
+    # Scanner wakes every 60s. One regular-session hour, two symbols.
+    main_gets = 2 * _pulls_in_window(main_due, 0, 3600, 60)
+    our_gets = 2 * _pulls_in_window(our_due, 0, 3600, 60)
+    assert our_gets == main_gets
+    assert our_gets <= main_gets
+    # A one-second caller still cannot beat main's 90s ceiling.
+    assert _pulls_in_window(our_due, 0, 3600, 1) == _pulls_in_window(main_due, 0, 3600, 1)
+
+
+def test_admitted_open_survives_a_shadow_verdict_failure(monkeypatch, caplog, tmp_path):
+    import logging
+
+    def boom():
+        raise RuntimeError("super-secret-token")
+
+    monkeypatch.setattr(dq, "bar_vwap_verdict", boom)
+    saved_state = main_bot.state
+    saved_ledger = main_bot.trade_ledger._ledger
+    caplog.set_level(logging.WARNING, logger="etrade-bot")
+
+    async def scenario():
+        main_bot.state = main_bot.StateStore(None)
+        main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+        await main_bot._record_open("NVDA", 1, 100.0, 90.0, 120.0, None)
+        position = await main_bot.state.get_position("NVDA")
+        ok, checked, err = main_bot.trade_ledger.verify()
+        opened = [
+            rec for rec in main_bot.trade_ledger.recent(10)
+            if rec.get("event") == "position_opened"
+        ]
+        return position, ok, checked, err, opened
+
+    try:
+        position, ok, checked, err, opened = asyncio.run(scenario())
+    finally:
+        main_bot.state = saved_state
+        main_bot.trade_ledger._ledger = saved_ledger
+    assert position is not None
+    assert position["qty"] == 1
+    assert opened and opened[-1]["data"]["ticker"] == "NVDA"
+    assert opened[-1]["data"]["bar_vwap_verdict"] is None
+    assert ok is True
+    assert checked >= 1
+    assert err is None
+    assert "snapshot skipped" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "super-secret-token" not in caplog.text
+
+
 def test_enforcement_stale_bar_vwap_fails_closed_without_sampled(monkeypatch):
     monkeypatch.setenv("VWAP_SOURCE", "bars")
     _ok_feeds()
@@ -650,7 +729,8 @@ def test_status_exposes_the_shadow_block(monkeypatch):
     assert shadow["vwap_source"] == "sampled"
     assert shadow["gap_source"] == "current"
     assert shadow["bad_tick_filter_enabled"] is False
-    assert shadow["aggs_pull_interval_s"] == 60
+    assert shadow["aggs_pull_interval_s"] == 90
+    assert shadow["bar_pull_aligned_60s"] is False
     assert shadow["aggs_incremental_merge"] is False
     assert shadow["call_budget"]["proposal_requests_per_hour"] == 120
     assert shadow["entitlement"]["bars"]["status"] == "no_data"

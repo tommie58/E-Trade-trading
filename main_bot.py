@@ -17844,9 +17844,11 @@ async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> No
     """Refresh cached regular-hours minute VWAPs. Never raises.
 
     The scanner loop calls this during the session. /status may call it too.
-    The CALL gate does not. At most once per 90s per symbol, with a 3s timeout
-    per request. Does not use MassiveClient._get, so a failure cannot change
-    auth_status or feed health. A timeout or a bad response leaves the previous
+    The CALL gate does not. The default is main's elapsed 90s throttle, one
+    full-day GET per symbol. ``BAR_PULL_ALIGNED_60S`` uses 60s on the minute
+    boundary. Timeout is 3s. This does not use MassiveClient._get, so a 401,
+    403, or 429 cannot change auth_status or feed health. A timeout or a bad
+    response leaves the previous
     slot in place and records ``error``. A response with no positive
     today-session VWAP does not replace the slot. A prior day's slot is never
     read back as today. The lock only records who is due; the HTTP call sits
@@ -30987,11 +30989,19 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
     delta = _finite_or_none(option_delta)
     instrument_label = str(instrument or "").strip().lower() or None
     pt_fields = _pro_trader_position_fields(pro_trader_decision)
-    bar_vwap_verdict = data_quality.bar_vwap_verdict()
-    logger.info(
-        "[DATA QUALITY] bar vwap admitted ticker=%s verdict=%s",
-        ticker, bar_vwap_verdict,
-    )
+    bar_vwap_verdict = None
+    try:
+        bar_vwap_verdict = data_quality.bar_vwap_verdict()
+        logger.info(
+            "[DATA QUALITY] bar vwap admitted ticker=%s verdict=%s",
+            ticker, bar_vwap_verdict,
+        )
+    except Exception as exc:
+        bar_vwap_verdict = None
+        logger.warning(
+            "[DATA QUALITY] bar vwap admitted snapshot skipped ticker=%s kind=%s",
+            ticker, type(exc).__name__,
+        )
     position = {
         "qty": int(qty),
         "action": str(action or "BUY").upper(),

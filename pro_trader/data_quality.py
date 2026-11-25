@@ -3,7 +3,8 @@
 Switches, each read from the environment on every use (not at import):
 
 - ``VWAP_SOURCE`` ``sampled`` (default) or ``bars`` (enforcement, default off)
-- ``AGGS_PULL_INTERVAL_S`` unset means 60s, aligned to the minute boundary
+- ``BAR_PULL_ALIGNED_60S`` ``false`` (default). Off keeps main's 90s elapsed pull
+- ``AGGS_PULL_INTERVAL_S`` overrides the interval when set. Unset follows the flag
 - ``AGGS_INCREMENTAL_MERGE`` ``false`` (default). Off keeps the full-day pull
 - ``BAD_TICK_FILTER_ENABLED`` ``false`` (default)
 - ``GAP_SOURCE`` ``current`` (default) or ``snapshot``
@@ -31,11 +32,11 @@ SHADOW_NO_DATA = "no_data"
 _IV_STALE_S = 90.0
 _AUTH_REASONS = frozenset({"unauthorized", "forbidden", "not_configured"})
 
-# Quant Lab: a 90s pull was stale 16.2% of the time. 60s on the minute was 0%.
-DEFAULT_AGGS_PULL_INTERVAL_S = 60.0
-# Previous elapsed throttle. Set AGGS_PULL_INTERVAL_S=90 to restore it.
-LEGACY_AGGS_PULL_INTERVAL_S = 90.0
-# Minute boundary. Second 0, not five seconds after the close.
+# Main's SPY/QQQ bar pull: elapsed time, not a clock phase.
+DEFAULT_AGGS_PULL_INTERVAL_S = 90.0
+# Opt-in. Quant Lab measured this cadence stale 0% of the time, versus 16.2% at 90s.
+ALIGNED_PULL_INTERVAL_S = 60.0
+# Minute boundary (second 0) when BAR_PULL_ALIGNED_60S is on.
 AGGS_ALIGN_AFTER_CLOSE_S = 0
 # Newest completed bar older than this is not fresh enough to drive the gate.
 BAR_VWAP_STALE_S = 150.0
@@ -150,29 +151,42 @@ def aggs_incremental_merge_enabled() -> bool:
     return str(raw if raw is not None else "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def bar_pull_aligned_60s() -> bool:
+    """60s minute-boundary pull. Read on each refresh check. Default off.
+
+    Off restores main's 90s elapsed throttle, so the SPY/QQQ bar pull does
+    not add requests. On uses a 60s interval locked to the minute boundary.
+    """
+    raw = os.getenv("BAR_PULL_ALIGNED_60S", "false")
+    return str(raw if raw is not None else "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def aggs_pull_interval_s() -> float:
-    """Seconds between agg pulls. Unset is 60. Read each check."""
+    """Seconds between agg pulls. Unset is 90, or 60 when the aligned flag is on."""
     raw = os.getenv("AGGS_PULL_INTERVAL_S", "")
     text = str(raw if raw is not None else "").strip()
-    if not text:
-        return DEFAULT_AGGS_PULL_INTERVAL_S
-    try:
-        value = float(text)
-    except (TypeError, ValueError):
-        return DEFAULT_AGGS_PULL_INTERVAL_S
-    if not math.isfinite(value) or value <= 0:
-        return DEFAULT_AGGS_PULL_INTERVAL_S
-    return value
+    if text:
+        try:
+            value = float(text)
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and math.isfinite(value) and value > 0:
+            return value
+    if bar_pull_aligned_60s():
+        return ALIGNED_PULL_INTERVAL_S
+    return DEFAULT_AGGS_PULL_INTERVAL_S
 
 
 def aggs_alignment_active(interval_s: Optional[float] = None) -> bool:
-    """Phase-lock to the minute boundary when the interval is 60s or less.
+    """Minute-boundary phase lock. Only when ``BAR_PULL_ALIGNED_60S`` is on.
 
-    The default 60s pull is aligned. An explicit 90s interval stays an
-    elapsed throttle with no phase.
+    The default 90s pull is elapsed time, with no clock phase. An aligned
+    interval above 60s is not phase-locked either.
     """
+    if not bar_pull_aligned_60s():
+        return False
     interval = aggs_pull_interval_s() if interval_s is None else float(interval_s)
-    return interval <= DEFAULT_AGGS_PULL_INTERVAL_S
+    return interval <= ALIGNED_PULL_INTERVAL_S
 
 
 def _fmt(value: Any) -> str:
@@ -231,7 +245,7 @@ def diff_bps(candidate: Any, baseline: Any) -> Optional[float]:
 
 
 def _latest_anchor(now_et: datetime, align_s: int = AGGS_ALIGN_AFTER_CLOSE_S) -> datetime:
-    """Most recent HH:MM:05 that is not in the future."""
+    """Most recent minute boundary (second 0) that is not in the future."""
     anchor = now_et.replace(second=int(align_s), microsecond=0)
     if now_et < anchor:
         anchor -= timedelta(minutes=1)
@@ -248,11 +262,10 @@ def agg_pull_due(
     """Whether this symbol should pull aggs now.
 
     ``last_epoch`` <= 0 is the first pull and is always due, so a restart
-    does not sit fail-closed until the next aligned minute. After that, the
-    unset path is ``elapsed >= interval`` (90s today). An aligned interval
-    also requires that the latest :05 anchor is strictly after the last pull,
-    so a minute produces one request and the request is not sent before the
-    bar has had about five seconds to close.
+    does not wait for the next minute. The default path is
+    ``elapsed >= 90``. ``BAR_PULL_ALIGNED_60S`` also requires that the latest
+    minute boundary is strictly after the last pull, so a minute produces
+    one request.
     """
     try:
         now = float(now_epoch)
@@ -1304,39 +1317,41 @@ def requests_per_hour(spacing_s: float) -> float:
 def call_budget(symbols: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """Agg GET budget. One request per symbol per pull.
 
-    The default is 60s on the minute boundary: 60/hour/symbol and 120/hour
-    for SPY and QQQ. The old 90s elapsed throttle is the 24–40/hour band.
-    Incremental merge is off, so each pull is the full session day.
+    The default is main's 90s elapsed throttle: at most 40/hour/symbol
+    (80/hour for SPY and QQQ) and about 24–40/hour/symbol when the scanner
+    wakes every minute. ``BAR_PULL_ALIGNED_60S`` is 60/hour/symbol, about
+    120/hour for the two names. Incremental merge is off, so each pull is
+    the full session day.
     """
     names = [str(s).upper() for s in (symbols or ("SPY", "QQQ")) if s]
     count = len(names) or 2
     slow = requests_per_hour(OBSERVED_PULL_SPACING_S[1])
     fast = requests_per_hour(OBSERVED_PULL_SPACING_S[0])
-    legacy_ceiling = requests_per_hour(LEGACY_AGGS_PULL_INTERVAL_S)
-    aligned = requests_per_hour(DEFAULT_AGGS_PULL_INTERVAL_S)
+    ceiling = requests_per_hour(DEFAULT_AGGS_PULL_INTERVAL_S)
+    aligned = requests_per_hour(ALIGNED_PULL_INTERVAL_S)
     return {
         "symbols": names,
         "requests_per_pull_per_symbol": 1,
         "current_interval_s": DEFAULT_AGGS_PULL_INTERVAL_S,
-        "current_observed_spacing_s": "60",
-        "current_requests_per_hour_per_symbol": int(round(aligned)),
-        "current_requests_per_hour": int(round(aligned * count)),
-        "legacy_90s_requests_per_hour_per_symbol": "24-40",
-        "legacy_90s_requests_per_hour": f"{int(round(slow * count))}-{int(round(fast * count))}",
-        "current_throttle_ceiling_per_hour_per_symbol": int(round(legacy_ceiling)),
-        "proposal_interval_s": DEFAULT_AGGS_PULL_INTERVAL_S,
+        "current_observed_spacing_s": "90-150",
+        "current_requests_per_hour_per_symbol": "24-40",
+        "current_requests_per_hour": f"{int(round(slow * count))}-{int(round(fast * count))}",
+        "current_throttle_ceiling_per_hour_per_symbol": int(round(ceiling)),
+        "aligned_60s_interval_s": ALIGNED_PULL_INTERVAL_S,
+        "aligned_60s_requests_per_hour_per_symbol": int(round(aligned)),
+        "aligned_60s_requests_per_hour": int(round(aligned * count)),
+        "proposal_interval_s": ALIGNED_PULL_INTERVAL_S,
         "proposal_align_after_close_s": AGGS_ALIGN_AFTER_CLOSE_S,
         "proposal_requests_per_hour_per_symbol": int(round(aligned)),
         "proposal_requests_per_hour": int(round(aligned * count)),
         "incremental_merge": aggs_incremental_merge_enabled(),
         "note": (
-            "One GET per symbol per pull. Unset AGGS_PULL_INTERVAL_S is 60s, "
-            "aligned to the minute boundary (60/hour/symbol, 120/hour for "
-            "SPY+QQQ). AGGS_PULL_INTERVAL_S=90 restores the old elapsed "
-            "throttle. AGGS_INCREMENTAL_MERGE defaults off: every pull is the "
-            "full session day and the live cross-check recomputes from that "
-            "response. The session VWAP seed is a separate fetch and stops "
-            "once the open is stored."
+            "One GET per symbol per pull. Unset BAR_PULL_ALIGNED_60S keeps "
+            "main's 90s elapsed throttle (about 48–80/hour for SPY+QQQ, "
+            "ceiling 80/hour). The flag on is 60s on the minute boundary, "
+            "about 120/hour for SPY+QQQ. AGGS_INCREMENTAL_MERGE defaults "
+            "off: every pull is the full session day. The session VWAP seed "
+            "is a separate fetch and stops once the open is stored."
         ),
     }
 
@@ -1400,6 +1415,8 @@ def shadow_status() -> Dict[str, Any]:
         "bar_stale_after_s": BAR_VWAP_STALE_S,
         "aggs_pull_interval_s": aggs_pull_interval_s(),
         "aggs_pull_interval_read": "runtime",
+        "bar_pull_aligned_60s": bar_pull_aligned_60s(),
+        "bar_pull_aligned_60s_read": "runtime",
         "aggs_alignment": aggs_alignment_active(),
         "aggs_align_after_close_s": AGGS_ALIGN_AFTER_CLOSE_S,
         "aggs_incremental_merge": aggs_incremental_merge_enabled(),

@@ -90,10 +90,10 @@ def main() -> None:
     print(f"as_of={payload['as_of']}")
     budget = dq.call_budget()
     print(
-        "agg budget now "
+        "agg budget default 90s elapsed "
         f"{budget['current_requests_per_hour']}/hour "
         f"({budget['current_observed_spacing_s']}s, one GET per symbol); "
-        f"at 60s {budget['proposal_requests_per_hour']}/hour"
+        f"BAR_PULL_ALIGNED_60S about {budget['aligned_60s_requests_per_hour']}/hour"
     )
     for name, block in payload["symbols"].items():
         _print_symbol(name, block, now)
