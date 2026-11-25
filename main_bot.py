@@ -12082,11 +12082,18 @@ class Scanner:
                 except Exception as e:
                     logger.warning(f"scanner snapshot failed for {cand['ticker']}: {e}")
                 continue
-            payload = build_signal(
-                quote,
-                {**cand, "expiry": next_friday_expiry(self.now_et())},
-                "live",
-            )
+            try:
+                payload = build_signal(
+                    quote,
+                    {**cand, "expiry": next_friday_expiry(self.now_et())},
+                    "live",
+                )
+            except Exception as e:
+                cand["dispatch"] = "error: signal"
+                logger.warning(
+                    f"scanner signal failed for {cand['ticker']}: {type(e).__name__}"
+                )
+                continue
             try:
                 result = await self.dispatch(payload)
                 verdict = str((result or {}).get("status") or "unknown")
@@ -15119,6 +15126,7 @@ import uuid
 import asyncio
 import hashlib
 import hmac
+from concurrent.futures import ThreadPoolExecutor
 import contextvars
 import threading
 import time
@@ -22546,7 +22554,7 @@ async def etrade_quotes_log(
     kind_text = kind.strip().lower() if isinstance(kind, str) else ""
     try:
         if kind_text == "snapshots":
-            records = _read_quote_snapshot_rows(symbol, cutoff, limit_n)
+            records = await _snap_io(_read_quote_snapshot_rows, symbol, cutoff, limit_n)
             return {"snapshots": records, "count": len(records), "limit": limit_n}
         records = await _read_etrade_quote_log(symbol, cutoff, limit_n)
     except Exception:
@@ -23295,9 +23303,13 @@ async def _ensure_quote_snapshot_table() -> bool:
     """Create the side-log table on its own. A failure here does not drop bot_ledger."""
     if engine is None:
         return False
-    try:
+
+    async def _create() -> None:
         async with engine.begin() as conn:
             await conn.execute(sql_text(_quote_snapshot_table_sql()))
+
+    try:
+        await asyncio.wait_for(_create(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
         return True
     except Exception as exc:
         logger.warning("quote snapshot table init failed (%s)", type(exc).__name__)
@@ -23321,12 +23333,16 @@ async def _quote_snapshot_mirror(seq: int, rec_hash: str, line: str) -> None:
 async def _quote_snapshot_durable_count() -> Optional[int]:
     if engine is None:
         return None
-    try:
+
+    async def _query() -> int:
         async with engine.connect() as conn:
             counted = (await conn.execute(
                 sql_text(f"SELECT COUNT(*) FROM {_bt('bot_quote_snapshots')}")
             )).scalar()
         return int(counted or 0)
+
+    try:
+        return await asyncio.wait_for(_query(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
     except Exception as exc:
         logger.warning("quote snapshot mirror count failed (%s)", type(exc).__name__)
         return None
@@ -28264,6 +28280,8 @@ _snap_restore_attempts = 0
 _snap_restore_settled = False
 _snap_restore_loader: Optional[Callable[[], Awaitable[List[str]]]] = None
 _snap_maintenance_task: Optional[asyncio.Task] = None
+_snap_chain_lock = asyncio.Lock()
+_SNAP_IO = ThreadPoolExecutor(max_workers=2, thread_name_prefix="quote-snapshot-io")
 _SNAPSHOT_MIRROR_TIMEOUT_S = 5.0
 _snap_hash_loader: Optional[Callable[[], Awaitable[set]]] = None
 _SNAPSHOT_RESTORE_BEFORE_APPEND = 3
@@ -28454,7 +28472,7 @@ async def backfill_quote_snapshots() -> int:
     if log is None or _snap_mirror is None or _snap_restore_failed:
         return 0
     try:
-        rows = await asyncio.to_thread(_snapshot_lines_for_mirror, log.path)
+        rows = await _snap_io(_snapshot_lines_for_mirror, log.path)
     except Exception as exc:
         logger.warning("quote snapshot backfill failed (%s)", type(exc).__name__)
         return 0
@@ -28613,39 +28631,55 @@ def _apply_restored_snapshot_lines(path: Path, lines: List[str]) -> None:
 
 
 async def restore_quote_snapshots_once(path: Optional[Path] = None) -> bool:
-    """One restore attempt. A database failure is remembered and does not raise."""
+    """One restore attempt. Holds the chain until the SELECT and the file apply finish."""
     global _snap_restore_attempts, _snap_restore_failed
     _snap_restore_attempts += 1
     target = Path(path) if path is not None else (
         _snap_log.path if _snap_log is not None else QUOTE_SNAPSHOT_FILE
     )
+    await _snap_chain_lock.acquire()
     try:
-        lines = await _load_snapshot_mirror_lines()
-    except Exception as exc:
-        _snap_restore_failed = True
-        logger.warning("quote snapshot restore failed (%s)", type(exc).__name__)
-        return False
+        try:
+            lines = await _load_snapshot_mirror_lines()
+        except Exception as exc:
+            _snap_restore_failed = True
+            logger.warning("quote snapshot restore failed (%s)", type(exc).__name__)
+            return False
+        try:
+            await _snap_io(_apply_restored_snapshot_lines, target, lines)
+        except Exception as exc:
+            _snap_restore_failed = True
+            logger.warning("quote snapshot restore failed (%s)", type(exc).__name__)
+            return False
+        _snap_restore_failed = False
+        return True
+    finally:
+        _snap_chain_lock.release()
+
+
+def _snap_io_invoke(job: Tuple[Any, Tuple[Any, ...]]) -> Any:
+    fn, args = job
+    return fn(*args)
+
+
+async def _snap_io(fn: Callable[..., Any], *args: Any) -> Any:
+    """Side-log file work on the dedicated pool, not the default executor."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_SNAP_IO, _snap_io_invoke, (fn, args))
+
+
+async def _quote_snapshot_restore_gate() -> bool:
+    """Wait until no restore holds the chain. 'Not failed' is not settled."""
+    if not _snap_chain_lock.locked():
+        # A restore may acquire between this check and the caller. Callers that
+        # append also take the lock, so this fast path is only a hint.
+        return True
     try:
-        # File parse and the write lock stay off this task's thread only when
-        # the caller is the event loop: run them in a worker thread.
-        await asyncio.to_thread(_apply_restored_snapshot_lines, target, lines)
-    except Exception as exc:
-        _snap_restore_failed = True
-        logger.warning("quote snapshot restore failed (%s)", type(exc).__name__)
+        await asyncio.wait_for(_snap_chain_lock.acquire(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
+    except asyncio.TimeoutError:
         return False
-    _snap_restore_failed = False
+    _snap_chain_lock.release()
     return True
-
-
-async def _quote_snapshot_restore_gate() -> None:
-    """Bounded restore retries before the first append. Later retries stay in the background."""
-    global _snap_restore_settled
-    if _snap_restore_settled or not _snap_restore_failed:
-        _snap_restore_settled = True
-        return
-    while _snap_restore_attempts < _SNAPSHOT_RESTORE_BEFORE_APPEND and _snap_restore_failed:
-        await restore_quote_snapshots_once()
-    _snap_restore_settled = True
 
 
 async def quote_snapshot_maintenance_worker() -> None:
@@ -28666,7 +28700,7 @@ async def boot_quote_snapshot_side_log(path: Optional[Path] = None) -> None:
     Returns without waiting for the database. A hung mirror cannot hold startup.
     """
     target = Path(path) if path is not None else QUOTE_SNAPSHOT_FILE
-    await asyncio.to_thread(init_quote_snapshot_log, target)
+    await _snap_io(init_quote_snapshot_log, target)
     _start_snapshot_maintenance()
 
 
@@ -28794,20 +28828,30 @@ async def _snapshot_write_consumer() -> None:
                 if fut is not None and not fut.done():
                     fut.set_result(None)
             else:
-                rec = await asyncio.shield(asyncio.to_thread(_snap_log.append, body))
-                _snap_written += 1
-                await _mirror_snapshot_record(rec)
-                if fut is not None and not fut.done():
-                    fut.set_result(rec.get("seq"))
+                held = False
+                try:
+                    await asyncio.wait_for(
+                        _snap_chain_lock.acquire(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S,
+                    )
+                    held = True
+                    rec = await asyncio.shield(_snap_io(_snap_log.append, body))
+                    _snap_written += 1
+                    await _mirror_snapshot_record(rec)
+                    if fut is not None and not fut.done():
+                        fut.set_result(rec.get("seq"))
+                except asyncio.TimeoutError:
+                    _snap_dropped += 1
+                    if fut is not None and not fut.done():
+                        fut.set_result(None)
+                finally:
+                    if held:
+                        _snap_chain_lock.release()
         except asyncio.CancelledError:
             queue.task_done()
             raise
         except Exception as e:
             _snap_dropped += 1
-            logger.warning(
-                "quote snapshot append failed: %s",
-                scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
-            )
+            logger.warning("quote snapshot append failed (%s)", type(e).__name__)
             if fut is not None and not fut.done():
                 fut.set_result(None)
             queue.task_done()
@@ -28845,7 +28889,6 @@ async def submit_quote_snapshot(body: Dict[str, Any]) -> Optional[int]:
         except Exception:
             _snap_dropped += 1
         return None
-    await _quote_snapshot_restore_gate()
     fut = loop.create_future()
     if _put_snapshot(body, fut) == "dropped":
         return None

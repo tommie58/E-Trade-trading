@@ -1593,3 +1593,158 @@ def test_outage_retry_relinks_onto_one_chain(tmp_path):
     assert count == 4
     assert rows == ["a", "b", "c", "d"]
 
+
+def test_append_waits_for_an_in_flight_restore(tmp_path):
+    """A submit during the restore SELECT must not mirror a second genesis row."""
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    saved = main_bot._snap_log
+    store = {}
+    release = threading.Event()
+    entered = threading.Event()
+
+    async def mirror(seq, digest, line):
+        store[digest] = (int(seq), line)
+
+    async def loader():
+        entered.set()
+        await asyncio.to_thread(release.wait, 5)
+        ordered = sorted(store.values(), key=lambda item: item[0])
+        return [line for _seq, line in ordered]
+
+    main_bot._snap_restore_loader = loader
+    main_bot.init_quote_snapshot_log(path)
+    main_bot.set_quote_snapshot_mirror(mirror)
+    try:
+        async def scenario():
+            await main_bot.submit_quote_snapshot({"n": "a"})
+            await main_bot.submit_quote_snapshot({"n": "b"})
+            path.unlink()
+            main_bot.init_quote_snapshot_log(path)
+            restore_task = asyncio.create_task(main_bot.restore_quote_snapshots_once(path))
+            assert await asyncio.to_thread(entered.wait, 2)
+            submit_task = asyncio.create_task(main_bot.submit_quote_snapshot({"n": "c"}))
+            await asyncio.sleep(0.05)
+            assert not submit_task.done()
+            release.set()
+            assert await restore_task is True
+            await submit_task
+            path.unlink()
+            assert await main_bot.restore_quote_snapshots_once(path) is True
+            return main_bot._snap_log.verify()
+
+        ok, count, err = _run(scenario())
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    finally:
+        release.set()
+        main_bot._snap_restore_loader = None
+        main_bot.set_quote_snapshot_mirror(None)
+        main_bot._snap_log = saved
+    assert ok, err
+    assert count == 3
+    assert [row["data"]["n"] for row in rows] == ["a", "b", "c"]
+    assert [row.get("chain_start") is True for row in rows] == [True, False, False]
+
+
+def test_append_failure_log_has_no_secret(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="etrade-bot")
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    saved = main_bot._snap_log
+    main_bot.init_quote_snapshot_log(path)
+
+    def explode(_data):
+        raise RuntimeError(
+            "https://api.etrade.com/v1/accounts/TESTACCTKEY123/orders.json"
+            "?accountIdKey=TESTACCTKEY123 oauth_token=\"sekret1234\""
+        )
+
+    monkeypatch.setattr(main_bot._snap_log, "append", explode)
+    try:
+        async def once():
+            return await main_bot.submit_quote_snapshot({"n": 1})
+
+        seq = _run(once())
+    finally:
+        main_bot._snap_log = saved
+    assert seq is None
+    assert "TESTACCTKEY123" not in caplog.text
+    assert "sekret1234" not in caplog.text
+    assert "https://api.etrade.com" not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+def test_live_build_signal_error_does_not_stop_the_scan(monkeypatch):
+    quotes = [
+        {"symbol": "AAA", "realtime": True, "quote_status": "REALTIME", "last": 10},
+        {"symbol": "BBB", "realtime": True, "quote_status": "REALTIME", "last": 20},
+    ]
+    dispatched = []
+
+    def evaluate(quote, _series, _cfg, _progress, _context):
+        return {
+            "ticker": quote["symbol"],
+            "qualifies": True,
+            "score": 1,
+            "shadow_eligible": False,
+            "book": {},
+            "setup": "orb",
+            "side": "long",
+            "rvol": 2.0,
+            "entry": 1.0,
+            "stop": 0.8,
+            "target": 1.4,
+            "ts": "2026-11-25T19:00:00+00:00",
+        }
+
+    def build(quote, cand, mode):
+        if quote["symbol"] == "AAA":
+            raise RuntimeError("build blew")
+        return {"ticker": cand["ticker"], "mode": mode}
+
+    async def dispatch(payload):
+        dispatched.append(payload["ticker"])
+        return {"status": "sent"}
+
+    async def fetch(_chunk):
+        return {}
+
+    monkeypatch.setattr(main_bot.scanner_mod, "parse_quotes", lambda _raw: quotes)
+    monkeypatch.setattr(main_bot.scanner_mod, "evaluate_quote", evaluate)
+    monkeypatch.setattr(main_bot.scanner_mod, "build_signal", build)
+    scan = main_bot.scanner_mod.Scanner(
+        main_bot.StateStore(None), fetch, dispatch, lambda: True, lambda: True,
+        lambda: _at(14, 0),
+    )
+    scan._config["mode"] = "live"
+    scan._config["universe"] = ["AAA", "BBB"]
+    _run(scan.scan_once())
+    assert dispatched == ["BBB"]
+
+
+def test_place_order_is_not_delayed_by_the_side_log_pool():
+    def block():
+        time.sleep(1.0)
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        busy = [
+            loop.run_in_executor(main_bot._SNAP_IO, block),
+            loop.run_in_executor(main_bot._SNAP_IO, block),
+        ]
+        await asyncio.sleep(0.05)
+
+        def place_fn(*_args, **_kwargs):
+            return {"ok": True}
+
+        started = time.monotonic()
+        await main_bot._etrade_call(place_fn, source="place_equity", idempotent=False)
+        elapsed = time.monotonic() - started
+        await asyncio.gather(*busy)
+        return elapsed
+
+    elapsed = _run(scenario())
+    assert elapsed < 0.5
+
