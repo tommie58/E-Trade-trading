@@ -705,6 +705,31 @@ def test_quote_age_uses_the_documented_quote_time():
     assert main_bot._quote_age_ms(None, "2026-11-25T20:30:00+00:00") is None
 
 
+# Module-level trade_ledger.record on main. CI checks out the PR without origin/main.
+_MAIN_LEDGER_RECORD = '''async def record(event: str, data: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """Append an event. Never raises — a ledger failure must not block trading.
+
+    Returns the appended record's seq, or None when the append did not land.
+    Callers that ignore the return value are unchanged.
+    """
+    try:
+        if _ledger is None:
+            logger.warning(f"ledger not initialised — dropped event '{event}'")
+            return None
+        rec = await _ledger.record(event, data)
+        seq = int(rec["seq"])
+        if _mirror is not None:
+            try:
+                await _mirror(seq, str(rec["hash"]), _canonical(rec))
+            except Exception as e:
+                logger.warning(f"ledger mirror write failed (non-fatal, {event}): {e}")
+        return seq
+    except Exception as e:
+        logger.error(f"ledger append failed ({event}): {e}")
+        return None
+'''
+
+
 def _module_record_source(text: str) -> str:
     marker = "async def record(event: str, data: Optional[Dict[str, Any]] = None) -> Optional[int]:"
     start = text.index(marker)
@@ -714,19 +739,15 @@ def _module_record_source(text: str) -> str:
         if line.startswith(("async def ", "def ", "class ")):
             break
         out.append(line)
-    return "".join(out)
+    return "".join(out).rstrip() + "\n"
 
 
 def test_core_ledger_record_is_the_direct_path():
-    import subprocess
     current = Path(main_bot.__file__).read_text(encoding="utf-8")
-    main_copy = subprocess.check_output(
-        ["git", "show", "origin/main:main_bot.py"], text=True,
-    )
     here = _module_record_source(current)
-    there = _module_record_source(main_copy)
-    assert here == there
+    assert here == _MAIN_LEDGER_RECORD
     assert "await _ledger.record(event, data)" in here
+    assert "Queue" not in here
     assert not hasattr(main_bot.trade_ledger, "_direct_record")
     assert not hasattr(main_bot.trade_ledger, "writer_counts")
 
