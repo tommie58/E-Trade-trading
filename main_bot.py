@@ -3442,7 +3442,11 @@ def parse_open_orders(orders_resp: Dict[str, Any], *, blank_as_open: bool = True
                 status = text or "UNKNOWN"
             try:
                 # E*TRADE stamps executedTime in epoch MILLISECONDS.
-                executed_ts = float(detail.get("executedTime") or 0) / 1000.0
+                # filledTime is the same clock when executedTime is absent.
+                raw_ts = detail.get("executedTime")
+                if raw_ts in (None, "", 0):
+                    raw_ts = detail.get("filledTime")
+                executed_ts = float(raw_ts or 0) / 1000.0
             except (TypeError, ValueError):
                 executed_ts = 0.0
             offset_value = trail_offset_from_order_detail(detail)
@@ -3909,6 +3913,7 @@ def plan_ghost_resolution(
             "kind": GHOST_CLOSED,
             "order_id": str(order.get("order_id") or ""),
             "exit_price": price,
+            "executed_ts": executed_ts if executed_ts > 0 else None,
             "basis": basis,
             # Only a STOP-type order has a trigger to slip from.
             # FIXED triggers only. A native trail's `stopPrice` is the trigger it
@@ -12033,15 +12038,27 @@ class Scanner:
                 # Shadows are recorded on the same real-time tape a live entry
                 # would need — a delayed print would bias the paper record.
                 if quote is not None and quote.get("realtime"):
+                    shadow_signal = None
                     try:
-                        await self.shadow(build_signal(quote, cand, "paper"), cand.get("book") or {})
+                        shadow_signal = build_signal(quote, cand, "paper")
+                        await self.shadow(shadow_signal, cand.get("book") or {})
                         cand["dispatch"] = "shadow-tracked (retired setup)"
                     except Exception as e:
                         logger.warning(f"shadow record failed for {cand['ticker']}: {e}")
+                    if shadow_signal is not None:
+                        await _note_entry_signal_snapshot(shadow_signal)
             if not cand["qualifies"]:
                 continue
             if cfg["mode"] != "live":
                 cand["dispatch"] = "shadow (not sent)"
+                shadow_quote = next((q for q in quotes if q["symbol"] == cand["ticker"]), None)
+                if shadow_quote is not None:
+                    try:
+                        await _note_entry_signal_snapshot(
+                            build_signal(shadow_quote, cand, "paper")
+                        )
+                    except Exception as e:
+                        logger.warning(f"shadow snapshot failed for {cand['ticker']}: {e}")
                 continue
             quote = next((q for q in quotes if q["symbol"] == cand["ticker"]), None)
             if quote is None:
@@ -12058,12 +12075,25 @@ class Scanner:
                     f"🔭 Scanner refused to dispatch {cand['ticker']} — E*TRADE quote status "
                     f"'{status}' is not real-time (accept the market data agreement to enable live scanning)"
                 )
+                try:
+                    await _note_entry_signal_snapshot(build_signal(
+                        quote, {**cand, "expiry": next_friday_expiry(self.now_et())}, "live",
+                    ))
+                except Exception as e:
+                    logger.warning(f"scanner snapshot failed for {cand['ticker']}: {e}")
                 continue
-            payload = build_signal(
-                quote,
-                {**cand, "expiry": next_friday_expiry(self.now_et())},
-                "live",
-            )
+            try:
+                payload = build_signal(
+                    quote,
+                    {**cand, "expiry": next_friday_expiry(self.now_et())},
+                    "live",
+                )
+            except Exception as e:
+                cand["dispatch"] = "error: signal"
+                logger.warning(
+                    f"scanner signal failed for {cand['ticker']}: {type(e).__name__}"
+                )
+                continue
             try:
                 result = await self.dispatch(payload)
                 verdict = str((result or {}).get("status") or "unknown")
@@ -15081,7 +15111,7 @@ from fastapi import FastAPI, HTTPException, Body, Query, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, validator, ValidationError
-from typing import Optional, Dict, Any, List, Sequence, Tuple
+from typing import Optional, Dict, Any, List, Sequence, Tuple, Callable, Awaitable
 import httpx
 import pyetrade
 import os
@@ -15096,8 +15126,11 @@ import uuid
 import asyncio
 import hashlib
 import hmac
+from concurrent.futures import ThreadPoolExecutor
 import contextvars
+import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime, date, time as dtime, timedelta, timezone
@@ -15445,7 +15478,10 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # /status positions_open is the open book with status, side, and qty.
 # Logs, alerts, and HTTP responses mask accountIdKey (**** + last 4).
 # Order routing still uses the real key.
-BOT_VERSION = "5.99.11-pro-day-trader"
+# 5.99.16 records each E*TRADE quote fetch (the app route and the decision
+# reads) as a scrubbed log line. Quote values, decisions, orders, and
+# routing are unchanged. Renumbered at merge.
+BOT_VERSION = "5.99.16-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -16266,6 +16302,7 @@ ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", "300"))
 # Immutable trade ledger — append-only, hash-chained JSONL (GET /ledger).
 TRADE_LEDGER_FILE = Path(os.getenv("TRADE_LEDGER_FILE", "trade_ledger.jsonl"))
+QUOTE_SNAPSHOT_FILE = Path(os.getenv("QUOTE_SNAPSHOT_FILE", "data/quote_snapshots.jsonl"))
 # Fast per-trade review list (Redis/memory) mirroring each position_closed
 # snapshot so GET /trades works even when Postgres study views are offline.
 TRADES_HISTORY_KEY = "trades:history"
@@ -22461,7 +22498,10 @@ async def get_quotes(symbols: str = Query(...)):
     try:
         # Exponential backoff covers throttles, 5xx AND the post-renewal 401s
         # the old hand-rolled fixed-sleep loop existed for.
-        raw = await _etrade_call(market.get_quote, symbol_list, resp_format="json", source="quote")
+        raw = await _etrade_call(
+            market.get_quote, symbol_list, resp_format="json",
+            source="quote", quote_log_as="/etrade/quote",
+        )
         normalized = normalize_quote_response(raw)
         judged = _record_quote_entitlement(normalized["quotes"])
         delayed = (judged or {}).get("delayed_symbols") or []
@@ -22475,6 +22515,51 @@ async def get_quotes(symbols: str = Query(...)):
         return {**normalized, "raw": raw} if DEBUG_QUOTES else normalized
     except Exception as e:
         raise HTTPException(500, detail=scrub_etrade_text(str(e)))
+
+
+@app.get("/etrade/quotes/log")
+async def etrade_quotes_log(
+    symbol: Optional[str] = Query(None),
+    since: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    kind: Optional[str] = Query(None),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Scrubbed E*TRADE quote ground truth, newest first.
+
+    Auth is fail-closed: a missing secret, a wrong secret, and an unset
+    WEBHOOK_SECRET are all 401. The read is rate-limited and `limit` cannot
+    exceed 1000. This route only reads the log.
+    """
+    if not _secrets_match(x_rork_secret, WEBHOOK_SECRET):
+        raise HTTPException(401, "invalid secret")
+    try:
+        allowed = _quote_log_allow_read()
+    except Exception:
+        raise HTTPException(429, "rate limit unavailable")
+    if not allowed:
+        raise HTTPException(429, "rate limit exceeded")
+    try:
+        limit_n = int(limit)
+    except (TypeError, ValueError):
+        raise HTTPException(422, "limit must be an integer")
+    if limit_n < 1 or limit_n > 1000:
+        raise HTTPException(422, "limit must be between 1 and 1000")
+    cutoff = None
+    if since is not None and str(since).strip():
+        try:
+            cutoff = _parse_quote_log_since(str(since))
+        except ValueError:
+            raise HTTPException(400, "since must be an ISO-8601 timestamp")
+    kind_text = kind.strip().lower() if isinstance(kind, str) else ""
+    try:
+        if kind_text == "snapshots":
+            records = await _snap_io(_read_quote_snapshot_rows, symbol, cutoff, limit_n)
+            return {"snapshots": records, "count": len(records), "limit": limit_n}
+        records = await _read_etrade_quote_log(symbol, cutoff, limit_n)
+    except Exception:
+        raise HTTPException(500, "quote log unreadable")
+    return {"quotes": records, "count": len(records), "limit": limit_n}
 
 
 @app.get("/etrade/option-quote")
@@ -23148,6 +23233,16 @@ def _ledger_table_sql() -> str:
     )
 
 
+def _quote_snapshot_table_sql() -> str:
+    """Side-log mirror. Not bot_ledger, so core ledger reads never see these rows."""
+    return (
+        f"CREATE TABLE IF NOT EXISTS {_bt('bot_quote_snapshots')} ("
+        "hash TEXT PRIMARY KEY, "
+        "seq BIGINT NOT NULL, "
+        "line TEXT NOT NULL)"
+    )
+
+
 class PgStatePersistence:
     """Duck-typed persistence adapter for StateStore's durable memory mode.
     All methods are best-effort from the caller's perspective — StateStore
@@ -23197,10 +23292,78 @@ async def _init_durable_state() -> Optional[PgStatePersistence]:
             await conn.execute(sql_text(_state_table_sql()))
             await conn.execute(sql_text(_ledger_table_sql()))
         _state_persistence = PgStatePersistence(engine)
-        return _state_persistence
     except Exception as e:
         logger.error(f"durable state init failed — falling back to plain memory: {e}")
         return None
+    await _ensure_quote_snapshot_table()
+    return _state_persistence
+
+
+async def _ensure_quote_snapshot_table() -> bool:
+    """Create the side-log table on its own. A failure here does not drop bot_ledger."""
+    if engine is None:
+        return False
+
+    async def _create() -> None:
+        async with engine.begin() as conn:
+            await conn.execute(sql_text(_quote_snapshot_table_sql()))
+
+    try:
+        await asyncio.wait_for(_create(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
+        return True
+    except Exception as exc:
+        logger.warning("quote snapshot table init failed (%s)", type(exc).__name__)
+        return False
+
+
+async def _quote_snapshot_mirror(seq: int, rec_hash: str, line: str) -> None:
+    """Mirror one side-log row into its own table."""
+    if engine is None:
+        return
+    async with engine.begin() as conn:
+        await conn.execute(
+            sql_text(
+                f"INSERT INTO {_bt('bot_quote_snapshots')} (hash, seq, line) "
+                "VALUES (:hash, :seq, :line) ON CONFLICT (hash) DO NOTHING"
+            ),
+            {"hash": rec_hash, "seq": int(seq), "line": line},
+        )
+
+
+async def _quote_snapshot_durable_count() -> Optional[int]:
+    if engine is None:
+        return None
+
+    async def _query() -> int:
+        async with engine.connect() as conn:
+            counted = (await conn.execute(
+                sql_text(f"SELECT COUNT(*) FROM {_bt('bot_quote_snapshots')}")
+            )).scalar()
+        return int(counted or 0)
+
+    try:
+        return await asyncio.wait_for(_query(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
+    except Exception as exc:
+        logger.warning("quote snapshot mirror count failed (%s)", type(exc).__name__)
+        return None
+
+
+async def _restore_quote_snapshots_from_db() -> None:
+    """Rebuild the side log when a redeploy wiped the local file. Never raises."""
+    global _snap_mirror_failures
+    if engine is None:
+        return
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                sql_text(f"SELECT line FROM {_bt('bot_quote_snapshots')} ORDER BY seq")
+            )
+            lines = [row[0] for row in result.fetchall()]
+        if lines:
+            restore_quote_snapshot_lines(QUOTE_SNAPSHOT_FILE, lines)
+    except Exception as exc:
+        _snap_mirror_failures += 1
+        logger.warning("quote snapshot restore failed (%s)", type(exc).__name__)
 
 
 async def _ledger_mirror(seq: int, rec_hash: str, line: str) -> None:
@@ -26433,12 +26596,2349 @@ def _is_retryable_error(e: Exception) -> bool:
     return any(marker in text for marker in _RETRYABLE_ERROR_MARKERS)
 
 
-def _sync_etrade_call(fn, *args, source: str = "etrade", **kwargs):
+# ==================== E*TRADE QUOTE GROUND TRUTH ====================
+# Read-only record of each market quote the bot actually fetched. The quote
+# dict that decisions and /etrade/quote return is not modified. Failures here
+# are swallowed. ETRADE_QUOTE_LOG_ENABLED defaults on because this is logging
+# only: set it to false/0/no/off to record nothing.
+ETRADE_QUOTE_LOG_PREFIX = "etrade_quote "
+ETRADE_QUOTE_LOG_KEY = "etrade:quote_log"
+ETRADE_QUOTE_LOG_CAP = 20000
+ETRADE_QUOTE_LOG_FIELDS = (
+    "source",
+    "symbol",
+    "option_symbol",
+    "bid",
+    "ask",
+    "last",
+    "open",
+    "previousClose",
+    "quoteStatus",
+    "realtime",
+    "dateTime",
+    "fetched_at",
+    "latency_ms",
+)
+# source= values already passed to the retry wrappers, used when a caller
+# does not pass quote_log_as. Order placement and token fetches are absent.
+_QUOTE_LOG_SOURCE_LABELS = {
+    "quote": "/etrade/quote",
+    "stop_reprice_quote": "_etrade_bid_ask",
+    "scanner_quote": "_scanner_fetch_etrade_quotes",
+    "option_chain": "option_chain",
+}
+_OPTION_QUOTE_RE = re.compile(
+    r"^(?P<root>[A-Za-z][A-Za-z0-9.]{0,10}):(?P<y>\d{4}):(?P<m>\d{1,2}):"
+    r"(?P<d>\d{1,2}):(?P<right>CALL|PUT):(?P<strike>\d+(?:\.\d+)?)$"
+)
+_QUOTE_LOG_MEMORY: deque = deque(maxlen=ETRADE_QUOTE_LOG_CAP)
+_QUOTE_LOG_SEEN: Dict[str, float] = {}
+_QUOTE_LOG_READS: deque = deque()
+_QUOTE_LOG_LOCK = threading.Lock()
+_QUOTE_LOG_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _etrade_quote_log_enabled() -> bool:
+    """Default true. Unset or blank stays on. false/0/no/off disable the log."""
+    raw = os.getenv("ETRADE_QUOTE_LOG_ENABLED")
+    if raw is None or not str(raw).strip():
+        return True
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _etrade_quote_log_interval_s() -> float:
+    """Minimum seconds between stored records for one symbol. Default 5."""
+    raw = os.getenv("ETRADE_QUOTE_LOG_MIN_INTERVAL_S", "5")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 5.0
+    if not math.isfinite(value) or value < 0:
+        return 5.0
+    return value
+
+
+def _etrade_quote_log_cap() -> int:
+    return ETRADE_QUOTE_LOG_CAP
+
+
+def _quote_log_read_per_min() -> int:
+    raw = os.getenv("ETRADE_QUOTE_LOG_READ_PER_MIN", "60")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 60
+    return max(1, min(value, 600))
+
+
+def _quote_log_secrets() -> List[str]:
+    """Live credentials to strip if a quote string ever contains one."""
+    found: List[str] = []
+    try:
+        candidates = [
+            _resolved_account_id_key,
+            _resolved_crypto_account_id_key,
+            os.getenv("ETRADE_ACCOUNT_ID"),
+            os.getenv("ETRADE_CONSUMER_KEY"),
+            os.getenv("ETRADE_CONSUMER_SECRET"),
+            CONSUMER_KEY,
+            CONSUMER_SECRET,
+            WEBHOOK_SECRET,
+        ]
+        tokens = _current_tokens if isinstance(_current_tokens, dict) else {}
+        candidates.extend(tokens.get(name) for name in ("oauth_token", "oauth_token_secret"))
+        for value in candidates:
+            if isinstance(value, str) and len(value) >= 4 and value not in found:
+                found.append(value)
+    except Exception:
+        return found
+    return found
+
+
+def _format_broker_time(value: Any) -> Optional[str]:
+    """Broker dateTime or epoch, as text that survives digit scrubbing."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return _epoch_to_iso(float(value))
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit() and len(text) in (10, 13):
+        converted = _epoch_to_iso(float(text))
+        return converted or text
+    return text
+
+
+def _epoch_to_iso(value: float) -> Optional[str]:
+    if not math.isfinite(value):
+        return None
+    n = float(value)
+    if n > 10_000_000_000:
+        n = n / 1000.0
+    if n < 1_000_000_000 or n > 10_000_000_000:
+        return None
+    try:
+        return datetime.fromtimestamp(n, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _broker_stamp(*values: Any) -> Optional[str]:
+    for value in values:
+        text = _format_broker_time(value)
+        if text:
+            return text
+    return None
+
+
+def _quote_log_finite(raw: Any) -> Optional[float]:
+    """A finite float, or None. Booleans and NaN/inf are not prices."""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def _quote_field_number(node: Any, *keys: str) -> Optional[float]:
+    if not isinstance(node, dict):
+        return None
+    for key in keys:
+        if key not in node:
+            continue
+        return _quote_log_finite(node.get(key))
+    return None
+
+
+def _split_option_symbol(raw: str) -> Optional[Tuple[str, str]]:
+    match = _OPTION_QUOTE_RE.match(str(raw).strip())
+    if not match:
+        return None
+    root = match.group("root").upper()
+    normalized = (
+        f"{root}:{int(match.group('y'))}:{int(match.group('m'))}:{int(match.group('d'))}:"
+        f"{match.group('right').upper()}:{float(match.group('strike')):g}"
+    )
+    return root, normalized
+
+
+def _built_option_symbol(root: Any, expiry: Any, right: Any, strike: Any) -> Optional[str]:
+    if not root:
+        return None
+    if hasattr(expiry, "strftime"):
+        exp = expiry.strftime("%Y-%m-%d")
+    else:
+        exp = str(expiry or "")[:10]
+    if len(exp) < 10:
+        return None
+    side = "PUT" if str(right or "").upper().startswith("P") else "CALL"
+    number = _quote_log_finite(strike)
+    if number is None:
+        return None
+    return f"{str(root).upper()}:{exp}:{side}:{number:g}"
+
+
+def _assemble_quote_record(
+    source: str,
+    symbol: str,
+    option_symbol: Optional[str],
+    bid: Optional[float],
+    ask: Optional[float],
+    last: Optional[float],
+    open_px: Optional[float],
+    previous: Optional[float],
+    quote_status: Optional[str],
+    broker_time: Optional[str],
+    latency_ms: int,
+    fetched_at: str,
+) -> Dict[str, Any]:
+    return {
+        "source": source,
+        "symbol": symbol,
+        "option_symbol": option_symbol,
+        "bid": bid,
+        "ask": ask,
+        "last": last,
+        "open": open_px,
+        "previousClose": previous,
+        "quoteStatus": quote_status,
+        "realtime": isinstance(quote_status, str) and quote_status in _REALTIME_QUOTE_STATUSES,
+        "dateTime": broker_time,
+        "fetched_at": fetched_at,
+        "latency_ms": latency_ms,
+    }
+
+
+def _requested_quote_symbols(args: tuple) -> List[str]:
+    if not args:
+        return []
+    first = args[0]
+    if isinstance(first, str):
+        return [first]
+    if isinstance(first, (list, tuple)):
+        return [str(item) for item in first if isinstance(item, str)]
+    return []
+
+
+def _records_from_equity_quotes(
+    source: str, payload: Dict[str, Any], args: tuple, latency_ms: int, fetched_at: str,
+) -> List[Dict[str, Any]]:
+    data = (payload.get("QuoteResponse") or {}).get("QuoteData")
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    option_by_root: Dict[str, str] = {}
+    for raw in _requested_quote_symbols(args):
+        occ = _exact_occ_symbol(raw)
+        if occ:
+            option_by_root.setdefault(_occ_root(occ), occ)
+            continue
+        split = _split_option_symbol(raw)
+        if split:
+            option_by_root.setdefault(split[0], split[1])
+    out: List[Dict[str, Any]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        all_q = entry.get("All") if isinstance(entry.get("All"), dict) else {}
+        product = entry.get("Product") if isinstance(entry.get("Product"), dict) else {}
+        raw_symbol = str(product.get("symbol") or entry.get("symbol") or "").strip()
+        if not raw_symbol:
+            continue
+        occ = _exact_occ_symbol(raw_symbol)
+        split = None if occ else _split_option_symbol(raw_symbol)
+        if occ:
+            symbol = _occ_root(occ)
+            option_symbol = occ
+        elif split:
+            symbol, option_symbol = split
+        else:
+            symbol = raw_symbol.upper()
+            option_symbol = option_by_root.get(symbol)
+        status = entry.get("quoteStatus")
+        status_text = None if status is None else str(status).upper().strip()
+        out.append(_assemble_quote_record(
+            source=source,
+            symbol=symbol,
+            option_symbol=option_symbol,
+            bid=_quote_field_number(all_q, "bid"),
+            ask=_quote_field_number(all_q, "ask"),
+            last=_quote_field_number(all_q, "lastTrade", "lastPrice", "last"),
+            open_px=_quote_field_number(all_q, "open"),
+            previous=_quote_field_number(all_q, "previousClose"),
+            quote_status=status_text,
+            broker_time=_broker_stamp(
+                entry.get("dateTime"), entry.get("dateTimeUTC"),
+                all_q.get("dateTime"), all_q.get("timeStamp"),
+            ),
+            latency_ms=latency_ms,
+            fetched_at=fetched_at,
+        ))
+    return out
+
+
+def _records_from_option_chain(
+    source: str, payload: Dict[str, Any], args: tuple, kwargs: Dict[str, Any],
+    latency_ms: int, fetched_at: str,
+) -> List[Dict[str, Any]]:
+    root = payload.get("OptionChainResponse")
+    if not isinstance(root, dict):
+        return []
+    underlying = args[0].strip().upper() if args and isinstance(args[0], str) else ""
+    expiry = kwargs.get("expiry_date") if isinstance(kwargs, dict) else None
+    chain_right = kwargs.get("chain_type") if isinstance(kwargs, dict) else None
+    chain_status = root.get("quoteType")
+    chain_status_text = None if chain_status is None else str(chain_status).upper().strip()
+    chain_time = _broker_stamp(root.get("dateTime"), root.get("timeStamp"), root.get("dateTimeUTC"))
+    pairs = root.get("OptionPair") or []
+    if isinstance(pairs, dict):
+        pairs = [pairs]
+    if not isinstance(pairs, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        for side in ("Call", "Put"):
+            leg = pair.get(side)
+            if not isinstance(leg, dict):
+                continue
+            leg_symbol = str(leg.get("symbol") or underlying or "").strip().upper()
+            if not leg_symbol:
+                continue
+            # Keep a broker OCC symbol byte-for-byte. Otherwise build the
+            # colon symbol from the leg's own root, expiry, right, and strike.
+            osi = leg.get("osiKey")
+            option_symbol = _exact_occ_symbol(osi) if isinstance(osi, str) else None
+            if option_symbol is None:
+                option_symbol = _built_option_symbol(
+                    leg_symbol,
+                    leg.get("expirationDate") or expiry,
+                    leg.get("optionType") or side or chain_right,
+                    leg.get("strikePrice"),
+                )
+            leg_status = leg.get("quoteStatus")
+            use_status = None if leg_status is None else str(leg_status).upper().strip()
+            if use_status is None:
+                use_status = chain_status_text
+            leg_time = _broker_stamp(leg.get("dateTime"), leg.get("timeStamp"), leg.get("dateTimeUTC"))
+            out.append(_assemble_quote_record(
+                source=source,
+                symbol=leg_symbol,
+                option_symbol=option_symbol,
+                bid=_quote_field_number(leg, "bid"),
+                ask=_quote_field_number(leg, "ask"),
+                last=_quote_field_number(leg, "lastPrice", "lastTrade", "last"),
+                open_px=_quote_field_number(leg, "open"),
+                previous=_quote_field_number(leg, "previousClose"),
+                quote_status=use_status,
+                broker_time=leg_time or chain_time,
+                latency_ms=latency_ms,
+                fetched_at=fetched_at,
+            ))
+    return out
+
+
+def _extract_etrade_quote_records(
+    source: str, payload: Any, args: tuple, kwargs: Dict[str, Any],
+    latency_ms: int, fetched_at: str,
+) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    if "QuoteResponse" in payload:
+        return _records_from_equity_quotes(source, payload, args, latency_ms, fetched_at)
+    if "OptionChainResponse" in payload:
+        return _records_from_option_chain(source, payload, args, kwargs, latency_ms, fetched_at)
+    return []
+
+
+# Identity fields are built from the symbol, the contract, the signal, or the
+# order id. They are not run through the 8-digit log scrub: that rule turns an
+# OCC strike and a numeric order id into "{redacted}".
+_QUOTE_IDENTITY_FIELDS = frozenset({"option_symbol", "order_id", "signal_key"})
+_OCC_SYMBOL_RE = re.compile(r"^[A-Z]{1,6} *\d{6}[CP]\d{8}$")
+
+
+def _exact_occ_symbol(raw: Any) -> Optional[str]:
+    """The OCC text as given, when it is an option symbol and not a URL."""
+    if not isinstance(raw, str) or not _OCC_SYMBOL_RE.match(raw):
+        return None
+    if "://" in raw or "/" in raw:
+        return None
+    return raw
+
+
+def _occ_root(occ: str) -> str:
+    match = re.match(r"^[A-Z]+", occ)
+    return match.group(0) if match else occ
+
+
+def _scrub_structured_text(text: str) -> str:
+    """URLs, OAuth, and known account-key values. Not the generic 8-digit rule."""
+    cleaned = str(text)
+    for secret in _quote_log_secrets():
+        if secret and len(secret) >= 4 and secret in cleaned:
+            cleaned = cleaned.replace(secret, "{acct}")
+    return _scrub_etrade_urls(cleaned)
+
+
+def _scrub_structured_value(value: Any) -> Any:
+    """Structured quote/snapshot JSON. Identity fields keep their digits."""
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _RESPONSE_KEY_FIELDS and isinstance(item, str):
+                out[key] = mask_account_key(item)
+            elif key in _RESPONSE_NUMBER_FIELDS and isinstance(item, str):
+                out[key] = mask_account_key(item)
+            elif key in _QUOTE_IDENTITY_FIELDS and isinstance(item, str):
+                # Built from the contract, the order, or the signal. A configured
+                # account id that happens to sit inside them is left as written.
+                out[key] = item
+            elif isinstance(item, str):
+                out[key] = _scrub_structured_text(item)
+            else:
+                out[key] = _scrub_structured_value(item)
+        return out
+    if isinstance(value, list):
+        return [_scrub_structured_value(item) for item in value]
+    if isinstance(value, str):
+        return _scrub_structured_text(value)
+    return value
+
+
+def _structured_quote_body(record: Dict[str, Any]) -> Dict[str, Any]:
+    body: Dict[str, Any] = {}
+    for key in ETRADE_QUOTE_LOG_FIELDS:
+        value = record.get(key)
+        if key in _QUOTE_IDENTITY_FIELDS and isinstance(value, str):
+            pass
+        elif isinstance(value, str):
+            value = _scrub_structured_text(value)
+        elif isinstance(value, float) and not math.isfinite(value):
+            value = None
+        body[key] = value
+    body["realtime"] = bool(body.get("realtime"))
+    return body
+
+
+def _format_etrade_quote_line(record: Dict[str, Any]) -> str:
+    """Stored quote record. The plain logger line is scrubbed separately."""
+    body = _structured_quote_body(record)
+    payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    line = ETRADE_QUOTE_LOG_PREFIX + payload
+    parsed = json.loads(payload)
+    if not isinstance(parsed, dict):
+        raise ValueError("quote log is not an object")
+    return line
+
+
+def _etrade_quote_log_line(line: str) -> str:
+    """What the process logger writes. Full #38 scrub, including 8-digit runs."""
+    try:
+        return scrub_etrade_text(line, secrets=_quote_log_secrets())
+    except Exception:
+        return line
+
+
+def _note_quote_log_loop() -> None:
+    global _QUOTE_LOG_LOOP
+    try:
+        _QUOTE_LOG_LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+
+def _observe_etrade_quote_fetch(
+    source: str,
+    quote_log_as: Optional[str],
+    args: tuple,
+    kwargs: Dict[str, Any],
+    payload: Any,
+    started: float,
+) -> None:
+    """Best-effort. Never raises. Does not mutate `payload`."""
+    try:
+        _observe_etrade_quote_fetch_inner(source, quote_log_as, args, kwargs, payload, started)
+    except Exception:
+        return
+
+
+def _observe_etrade_quote_fetch_inner(
+    source: str,
+    quote_log_as: Optional[str],
+    args: tuple,
+    kwargs: Dict[str, Any],
+    payload: Any,
+    started: float,
+) -> None:
+    if not _etrade_quote_log_enabled():
+        return
+    label = quote_log_as or _QUOTE_LOG_SOURCE_LABELS.get(str(source or ""))
+    if not label:
+        return
+    _note_quote_log_loop()
+    elapsed = time.perf_counter() - started
+    latency_ms = 0 if not math.isfinite(elapsed) or elapsed < 0 else int(round(elapsed * 1000.0))
+    fetched_at = _utcnow().isoformat()
+    records = _extract_etrade_quote_records(
+        str(label), payload, args, kwargs or {}, latency_ms, fetched_at,
+    )
+    interval = _etrade_quote_log_interval_s()
+    now = time.monotonic()
+    prepared: List[Tuple[str, str]] = []
+    for rec in records:
+        try:
+            line = _format_etrade_quote_line(rec)
+            parsed = json.loads(line[len(ETRADE_QUOTE_LOG_PREFIX):])
+        except Exception:
+            continue
+        sample = parsed.get("option_symbol") or parsed.get("symbol")
+        if not sample:
+            continue
+        prepared.append((str(sample).upper(), line))
+    if not prepared:
+        return
+    kept: List[str] = []
+    with _QUOTE_LOG_LOCK:
+        for key, line in prepared:
+            last = _QUOTE_LOG_SEEN.get(key)
+            if last is not None and (now - last) < interval:
+                continue
+            _QUOTE_LOG_SEEN[key] = now
+            _QUOTE_LOG_MEMORY.appendleft(line)
+            kept.append(line)
+        if len(_QUOTE_LOG_SEEN) > 4000:
+            cutoff = now - max(interval, 60.0)
+            for key, seen_at in list(_QUOTE_LOG_SEEN.items()):
+                if seen_at < cutoff:
+                    _QUOTE_LOG_SEEN.pop(key, None)
+    for line in kept:
+        try:
+            logger.info(_etrade_quote_log_line(line))
+        except Exception:
+            pass
+    _schedule_quote_log_redis(kept)
+
+
+def _schedule_quote_log_redis(lines: List[str]) -> None:
+    if not lines:
+        return
+    try:
+        if getattr(state, "redis", None) is None:
+            return
+        payload = list(lines)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = _QUOTE_LOG_LOOP
+            if loop is None or not loop.is_running():
+                return
+
+            def _kick(bound_loop=loop, bound_payload=payload):
+                try:
+                    bound_loop.create_task(_push_quote_log_redis(bound_payload))
+                except Exception:
+                    return
+
+            loop.call_soon_threadsafe(_kick)
+            return
+        loop.create_task(_push_quote_log_redis(payload))
+    except Exception:
+        return
+
+
+async def _push_quote_log_redis(lines: List[str]) -> None:
+    """Capped Redis list, same LPUSH+LTRIM shape as alerts:recent.
+
+    Used only when Redis is connected. The SQL mirror is not a telemetry
+    store, so a missing Redis client keeps the process deque and the logger
+    line and does not write this list through list_push_capped.
+    """
+    try:
+        if getattr(state, "redis", None) is None:
+            return
+        cap = _etrade_quote_log_cap()
+        for line in lines:
+            await state.list_push_capped(ETRADE_QUOTE_LOG_KEY, line, max_len=cap)
+    except Exception:
+        return
+
+
+def _quote_log_line_text(line: Any) -> Optional[str]:
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", "replace")
+    if not isinstance(line, str):
+        return None
+    return line
+
+
+def _parse_quote_log_line(line: Any) -> Optional[Dict[str, Any]]:
+    text = _quote_log_line_text(line)
+    if not text or not text.startswith(ETRADE_QUOTE_LOG_PREFIX):
+        return None
+    try:
+        parsed = json.loads(text[len(ETRADE_QUOTE_LOG_PREFIX):])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    try:
+        rec = _structured_quote_body(parsed)
+    except Exception:
+        return None
+    if not isinstance(rec, dict):
+        return None
+    return {key: rec.get(key) for key in ETRADE_QUOTE_LOG_FIELDS}
+
+
+def _parse_quote_log_since(value: str) -> datetime:
+    text = str(value).strip()
+    if not text:
+        raise ValueError("empty")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _record_fetched_at(rec: Dict[str, Any]) -> Optional[datetime]:
+    try:
+        return _parse_quote_log_since(str(rec.get("fetched_at") or ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _quote_log_symbol_match(rec: Dict[str, Any], symbol: Optional[str]) -> bool:
+    if symbol is None or not str(symbol).strip():
+        return True
+    want = str(symbol).strip().upper()
+    for key in ("symbol", "option_symbol"):
+        val = rec.get(key)
+        if isinstance(val, str) and val.strip().upper() == want:
+            return True
+    return False
+
+
+def _quote_log_allow_read() -> bool:
+    limit = _quote_log_read_per_min()
+    now = time.monotonic()
+    with _QUOTE_LOG_LOCK:
+        while _QUOTE_LOG_READS and now - _QUOTE_LOG_READS[0] >= 60.0:
+            _QUOTE_LOG_READS.popleft()
+        if len(_QUOTE_LOG_READS) >= limit:
+            return False
+        _QUOTE_LOG_READS.append(now)
+        return True
+
+
+async def _read_etrade_quote_log(
+    symbol: Optional[str], cutoff: Optional[datetime], limit_n: int,
+) -> List[Dict[str, Any]]:
+    with _QUOTE_LOG_LOCK:
+        local = list(_QUOTE_LOG_MEMORY)
+    remote: List[Any] = []
+    redis = getattr(state, "redis", None)
+    if redis is not None:
+        try:
+            remote = await redis.lrange(ETRADE_QUOTE_LOG_KEY, 0, _etrade_quote_log_cap() - 1)
+        except Exception:
+            remote = []
+    seen = set()
+    records: List[Dict[str, Any]] = []
+    for raw in list(local) + list(remote or []):
+        text = _quote_log_line_text(raw)
+        if text is None or text in seen:
+            continue
+        seen.add(text)
+        rec = _parse_quote_log_line(text)
+        if rec is None:
+            continue
+        if not _quote_log_symbol_match(rec, symbol):
+            continue
+        if cutoff is not None:
+            stamped = _record_fetched_at(rec)
+            if stamped is None or stamped < cutoff:
+                continue
+        records.append(rec)
+    records.sort(key=lambda rec: str(rec.get("fetched_at") or ""), reverse=True)
+    return records[:limit_n]
+
+
+def _snapshot_row_matches(rec: Dict[str, Any], symbol: Optional[str], cutoff: Optional[datetime]) -> Optional[Dict[str, Any]]:
+    data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+    body = _scrub_snapshot_value(data)
+    if not isinstance(body, dict):
+        return None
+    quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
+    if symbol is not None and str(symbol).strip():
+        want = str(symbol).strip().upper()
+        fields = [
+            quote.get("option_symbol"), quote.get("symbol"), body.get("option_symbol"),
+        ]
+        if not any(isinstance(val, str) and val.strip().upper() == want for val in fields):
+            return None
+    if cutoff is not None:
+        stamped = _record_fetched_at({"fetched_at": rec.get("ts")})
+        if stamped is None or stamped < cutoff:
+            return None
+    return {
+        "seq": rec.get("seq"),
+        "ts": rec.get("ts"),
+        "event": rec.get("event"),
+        "data": body,
+    }
+
+
+def _read_quote_snapshot_rows(
+    symbol: Optional[str], cutoff: Optional[datetime], limit_n: int,
+) -> List[Dict[str, Any]]:
+    """Newest snapshot rows from the side-log file, scrubbed the same way they were stored."""
+    log = _snap_log
+    if log is None or limit_n < 1 or not log.path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    with open(log.path, "r", encoding="utf-8") as handle:
+        lines = [line for line in handle if line.strip()]
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        row = _snapshot_row_matches(rec, symbol, cutoff)
+        if row is None:
+            continue
+        rows.append(row)
+        if len(rows) >= limit_n:
+            break
+    return rows
+
+
+# ==================== OPTION QUOTE SNAPSHOTS ====================
+# Ground truth around an entry signal. Offset 0 is the decision. Later
+# offsets are modeled exits (+15, +30, +60 min), replaced by today's flatten
+# (3:40 PM ET, 12:40 PM ET on a half day) when that clock comes first.
+# Read-only: enqueue and a quote fetch. No orders, positions, or stops.
+# OPTION_QUOTE_SNAPSHOT_MAX_PENDING caps queued fetches (default 200).
+OPTION_SNAPSHOT_OFFSETS_MIN = (15, 30, 60)
+_OPTION_SNAPSHOT_PENDING: Dict[Tuple[str, Any], Dict[str, Any]] = {}
+_OPTION_SNAPSHOT_SEEN: Dict[Tuple[str, Any], float] = {}
+_OPTION_SNAPSHOT_STOP_TOUCHED: Dict[str, None] = {}
+_LAST_QUOTE_STAMP: Dict[str, Dict[str, Any]] = {}
+_OPTION_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _option_snapshot_max_pending() -> int:
+    raw = os.getenv("OPTION_QUOTE_SNAPSHOT_MAX_PENDING", "200")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 200
+    if value < 1:
+        return 1
+    return min(value, 10000)
+
+
+def _flatten_deadline_et(signal_at: datetime) -> datetime:
+    """Today's hard flatten in ET: 15:40, or 12:40 on a half day."""
+    et = signal_at.astimezone(_ET_ZONE)
+    minute = _session_close_minute(et) - _flatten_lead_minutes()
+    if minute < 0 or minute >= 24 * 60:
+        minute = 15 * 60 + 40
+    hour, mins = divmod(int(minute), 60)
+    return et.replace(hour=hour, minute=mins, second=0, microsecond=0)
+
+
+def plan_option_snapshot_schedule(signal_at: datetime) -> List[Tuple[int, datetime]]:
+    """Modeled exits after `signal_at`. Offset 0 is not included.
+
+    Each of +15, +30, +60 is kept when it falls at or before the flatten.
+    The first offset that would land after the flatten is replaced by one
+    snapshot at the flatten, and later offsets are not queued.
+    """
+    if signal_at.tzinfo is None:
+        signal_at = signal_at.replace(tzinfo=timezone.utc)
+    signal_et = signal_at.astimezone(_ET_ZONE)
+    flatten = _flatten_deadline_et(signal_et)
+    planned: List[Tuple[int, datetime]] = []
+    seen_offsets = set()
+    for minutes in OPTION_SNAPSHOT_OFFSETS_MIN:
+        due = signal_et + timedelta(minutes=int(minutes))
+        if signal_et < flatten < due:
+            delta = int(round((flatten - signal_et).total_seconds() / 60.0))
+            delta = max(1, delta)
+            if delta not in seen_offsets:
+                planned.append((delta, flatten))
+                seen_offsets.add(delta)
+            break
+        if due > flatten:
+            break
+        if minutes not in seen_offsets:
+            planned.append((int(minutes), due))
+            seen_offsets.add(int(minutes))
+    return planned
+
+
+def _option_snapshot_spec(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Contract hint copied off the signal. Missing fields stay missing."""
+    ticker = str(payload.get("ticker") or "").upper().strip()
+    contract = payload.get("contract") if isinstance(payload.get("contract"), dict) else {}
+    expiry = contract.get("expiration") or payload.get("expiration_hint") or payload.get("expiry") or payload.get("expiration")
+    strike = contract.get("strike") if contract.get("strike") is not None else (
+        payload.get("strike_hint") if payload.get("strike_hint") is not None else payload.get("strike")
+    )
+    right = contract.get("right") or payload.get("option_right") or payload.get("call_put") or ""
+    option_symbol = None
+    if ticker and expiry and strike is not None and str(right).strip():
+        try:
+            option_symbol = _quote_symbol(ticker, {
+                "expiration": str(expiry)[:10],
+                "strike": float(strike),
+                "right": right,
+            })
+        except (TypeError, ValueError):
+            option_symbol = None
+        if option_symbol == ticker:
+            option_symbol = None
+    return {
+        "ticker": ticker or None,
+        "option_symbol": option_symbol,
+    }
+
+
+def _missing_option_quote(spec: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    symbol = None
+    if isinstance(spec, dict):
+        raw = spec.get("option_symbol")
+        symbol = str(raw) if raw else None
+    return {
+        "status": "missing",
+        "bid": None,
+        "ask": None,
+        "last": None,
+        "dateTime": None,
+        "option_symbol": symbol,
+    }
+
+
+def _scrub_snapshot_value(value: Any) -> Any:
+    """Ledger snapshot JSON. URLs and known keys only; OCC symbols stay intact."""
+    try:
+        return _scrub_structured_value(value)
+    except Exception:
+        return value
+
+
+def _trim_option_snapshot_seen() -> None:
+    cap = max(800, _option_snapshot_max_pending() * 4)
+    while len(_OPTION_SNAPSHOT_SEEN) > cap:
+        _OPTION_SNAPSHOT_SEEN.pop(next(iter(_OPTION_SNAPSHOT_SEEN)), None)
+
+
+_ET_QUOTE_CLOCK = re.compile(
+    r"^(\d{1,2}):(\d{2}):(\d{2})\s+([A-Za-z]{2,5})\s+(\d{1,2})-(\d{1,2})-(\d{4})$"
+)
+_ET_OFFSETS = {
+    "EST": -5, "EDT": -4, "CST": -6, "CDT": -5, "MST": -7, "MDT": -6,
+    "PST": -8, "PDT": -7, "UTC": 0, "GMT": 0,
+}
+
+
+def _parse_iso_utc(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_broker_quote_time(value: Any, broker_epoch: Any = None) -> Optional[datetime]:
+    """Clock from QuoteData.dateTime / dateTimeUTC. None when it will not parse."""
+    epoch_dt = None
+    if broker_epoch is not None and not isinstance(broker_epoch, bool):
+        iso = _epoch_to_iso(float(broker_epoch)) if isinstance(broker_epoch, (int, float)) else _epoch_to_iso(
+            float(broker_epoch) if str(broker_epoch).isdigit() else float("nan")
+        )
+        epoch_dt = _parse_iso_utc(iso) if iso else None
+    if epoch_dt is not None:
+        return epoch_dt
+    text = str(value or "").strip()
+    if not text:
+        return None
+    iso_dt = _parse_iso_utc(text)
+    if iso_dt is not None and "T" in text:
+        return iso_dt
+    match = _ET_QUOTE_CLOCK.match(text)
+    if not match:
+        return None
+    hour, minute, second, zone, month, day, year = match.groups()
+    offset = _ET_OFFSETS.get(zone.upper())
+    if offset is None:
+        return None
+    try:
+        local = datetime(
+            int(year), int(month), int(day), int(hour), int(minute), int(second),
+            tzinfo=timezone(timedelta(hours=offset)),
+        )
+    except ValueError:
+        return None
+    return local.astimezone(timezone.utc)
+
+
+def _quote_age_ms(date_time: Any, fetched_at: Any, broker_epoch: Any = None) -> Optional[int]:
+    """fetched_at minus the broker stamp, in milliseconds. None if either side is missing."""
+    fetched = _parse_iso_utc(fetched_at)
+    broker = _parse_broker_quote_time(date_time, broker_epoch)
+    if fetched is None or broker is None:
+        return None
+    return int(round((fetched - broker).total_seconds() * 1000.0))
+
+
+def _snapshot_dedupe_key(signal_key: str, offset_min: Any, offset_kind: str, order_id: Optional[str]) -> Tuple[str, Any]:
+    if offset_kind in {"entry", "modeled"}:
+        return (str(signal_key), int(offset_min))
+    ident = str(order_id or signal_key)
+    return (str(signal_key), f"{offset_kind}:{ident}")
+
+
+def _enqueue_option_snapshot(
+    signal_key: str,
+    offset_min: Any,
+    due: datetime,
+    spec: Dict[str, Any],
+    offset_kind: Optional[str] = None,
+    order_id: Optional[str] = None,
+    preset_quote: Optional[Dict[str, Any]] = None,
+    fill_time: Optional[str] = None,
+    fill_time_source: Optional[str] = None,
+) -> str:
+    """'queued', 'duplicate', or 'capped'. Does not fetch and does not await."""
+    kind = offset_kind or ("entry" if offset_min == 0 else "modeled")
+    key = _snapshot_dedupe_key(signal_key, offset_min, kind, order_id)
+    due_epoch = due.astimezone(timezone.utc).timestamp() if due.tzinfo else due.replace(
+        tzinfo=timezone.utc,
+    ).timestamp()
+    with _OPTION_SNAPSHOT_LOCK:
+        if key in _OPTION_SNAPSHOT_SEEN or key in _OPTION_SNAPSHOT_PENDING:
+            return "duplicate"
+        cap = _option_snapshot_max_pending()
+        if len(_OPTION_SNAPSHOT_PENDING) >= cap:
+            return "capped"
+        _OPTION_SNAPSHOT_PENDING[key] = {
+            "signal_key": str(signal_key),
+            "offset_min": offset_min,
+            "offset_kind": kind,
+            "order_id": None if order_id is None else str(order_id),
+            "due_epoch": due_epoch,
+            "spec": spec,
+            "preset_quote": preset_quote,
+            "fill_time": fill_time,
+            "fill_time_source": fill_time_source,
+        }
+        return "queued"
+
+
+async def _read_option_snapshot_quote(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """One read of the hinted contract. Any failure is a missing quote."""
+    missing = _missing_option_quote(spec)
+    symbol = spec.get("option_symbol") if isinstance(spec, dict) else None
+    if not symbol:
+        return missing
+    tokens = None
+    try:
+        tokens = load_tokens()
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot token read failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+        return missing
+    if not tokens:
+        return missing
+    if _order_path_in_flight():
+        missing["status"] = "deferred"
+        missing["_deferred"] = "order_in_flight"
+        return missing
+    try:
+        market = pyetrade.ETradeMarket(
+            CONSUMER_KEY, CONSUMER_SECRET,
+            tokens.get("oauth_token"), tokens.get("oauth_token_secret"),
+            dev=is_sandbox,
+        )
+        raw = await _etrade_call(
+            market.get_quote, [symbol], resp_format="json",
+            source="option_snapshot", quote_log_as="_option_quote_snapshot",
+        )
+        fetched_at = _utcnow().isoformat()
+        records = _records_from_equity_quotes(
+            "_option_quote_snapshot", raw if isinstance(raw, dict) else {},
+            ([symbol],), 0, fetched_at,
+        )
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot fetch failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+        return missing
+    if not records:
+        missing["_quote_time_source"] = "broker_unverified"
+        missing["_fetched_at"] = _utcnow().isoformat()
+        return missing
+    rec = records[0]
+    # QuoteData.dateTime / dateTimeUTC are documented as the quote time.
+    # A chain timeStamp is not that field, so a missing QuoteData stamp stays unverified.
+    source = "broker_quote" if rec.get("dateTime") else "broker_unverified"
+    fetched_at = rec.get("fetched_at") or _utcnow().isoformat()
+    if rec.get("bid") is None and rec.get("ask") is None and rec.get("last") is None:
+        missing["option_symbol"] = rec.get("option_symbol") or symbol
+        missing["dateTime"] = rec.get("dateTime")
+        missing["_quote_time_source"] = source if rec.get("dateTime") else "broker_unverified"
+        missing["_fetched_at"] = fetched_at
+        missing["_broker_epoch"] = rec.get("broker_epoch")
+        return missing
+    return {
+        "status": "ok",
+        "bid": rec.get("bid"),
+        "ask": rec.get("ask"),
+        "last": rec.get("last"),
+        "dateTime": rec.get("dateTime"),
+        "option_symbol": rec.get("option_symbol") or symbol,
+        "_quote_time_source": source,
+        "_fetched_at": fetched_at,
+        "_broker_epoch": rec.get("broker_epoch"),
+    }
+
+
+def _public_snapshot_quote(quote: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[int], str]:
+    """Drop internal stamp fields. Age uses the fetch time stored with the quote."""
+    raw = dict(quote or {})
+    source = raw.pop("_quote_time_source", None)
+    fetched_at = raw.pop("_fetched_at", None)
+    broker_epoch = raw.pop("_broker_epoch", None)
+    raw.pop("_deferred", None)
+    if source not in {"broker_quote", "broker_unverified"}:
+        source = "broker_quote" if raw.get("dateTime") else "broker_unverified"
+    age = _quote_age_ms(raw.get("dateTime"), fetched_at, broker_epoch)
+    if not raw.get("dateTime") and broker_epoch is None:
+        source = "broker_unverified"
+        age = None
+    return raw, age, source
+
+
+def _defer_snapshot_job(job: Dict[str, Any], reason: str) -> None:
+    """Put a fetch back on the pending list. No E*TRADE call."""
+    later = (_utcnow() + timedelta(seconds=_snapshot_min_delay_s())).timestamp()
+    key = _snapshot_dedupe_key(
+        str(job.get("signal_key") or ""),
+        job.get("offset_min"),
+        str(job.get("offset_kind") or ("entry" if job.get("offset_min") == 0 else "modeled")),
+        job.get("order_id"),
+    )
+    with _OPTION_SNAPSHOT_LOCK:
+        _OPTION_SNAPSHOT_SEEN.pop(key, None)
+        deferred = dict(job)
+        deferred["due_epoch"] = later
+        deferred["deferred"] = reason
+        if key not in _OPTION_SNAPSHOT_PENDING and len(_OPTION_SNAPSHOT_PENDING) < _option_snapshot_max_pending():
+            _OPTION_SNAPSHOT_PENDING[key] = deferred
+
+
+async def _write_option_snapshot_row(job: Dict[str, Any]) -> None:
+    spec = job.get("spec") if isinstance(job.get("spec"), dict) else {}
+    preset = job.get("preset_quote") if isinstance(job.get("preset_quote"), dict) else None
+    if preset is None and _order_path_in_flight():
+        try:
+            _defer_snapshot_job(job, "order_in_flight")
+        except Exception as e:
+            logger.warning(
+                "option quote snapshot defer failed: %s",
+                scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+            )
+        return
+    if preset is None and not _snapshot_fetch_allowed():
+        # Own budget. Put the job back later instead of calling E*TRADE.
+        try:
+            _defer_snapshot_job(job, "budget")
+        except Exception as e:
+            logger.warning(
+                "option quote snapshot defer failed: %s",
+                scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+            )
+        return
+    try:
+        quote = dict(preset) if preset is not None else await _read_option_snapshot_quote(spec)
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot read failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+        quote = _missing_option_quote(spec)
+    public, age_ms, time_source = _public_snapshot_quote(quote if isinstance(quote, dict) else {})
+    offset_min = job.get("offset_min")
+    body = _scrub_snapshot_value({
+        "event_type": "option_quote_snapshot",
+        "signal_key": str(job.get("signal_key") or ""),
+        "offset_min": offset_min,
+        "offset_kind": job.get("offset_kind") or ("entry" if offset_min == 0 else "modeled"),
+        "order_id": job.get("order_id"),
+        "status": public.get("status") or "missing",
+        "quote_age_ms": age_ms,
+        "quote_time_source": time_source,
+        "quote": public,
+    })
+    if body.get("offset_kind") == "exit_fill":
+        # The ledger `ts` stays the booking time. fill_time is the broker
+        # execution clock when the order poll already carried one.
+        body["fill_time"] = job.get("fill_time")
+        body["fill_time_source"] = job.get("fill_time_source") or "local_record"
+    try:
+        await submit_quote_snapshot(body)
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot side-log write failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+
+
+async def note_option_quote_snapshots(payload: Dict[str, Any], now: Optional[datetime] = None) -> None:
+    """Queue offset 0 and the modeled exits for one entry signal.
+
+    Returns without raising. The caller is not an order path; this function
+    does not place, cancel, or resize anything.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return
+        signal_key = _signal_key(payload)
+        spec = _scrub_snapshot_value(_option_snapshot_spec(payload))
+        if not isinstance(spec, dict):
+            spec = _option_snapshot_spec(payload)
+        signal_at = now or _utcnow()
+        outcome = _enqueue_option_snapshot(
+            signal_key, 0, signal_at + timedelta(seconds=_snapshot_min_delay_s()),
+            spec, offset_kind="entry",
+        )
+        if outcome == "capped":
+            logger.warning(
+                "option quote snapshot pending cap reached (%s) — not scheduling %s offset 0",
+                _option_snapshot_max_pending(), signal_key,
+            )
+        for offset_min, due in plan_option_snapshot_schedule(signal_at):
+            queued = _enqueue_option_snapshot(
+                signal_key, offset_min, due, spec, offset_kind="modeled",
+            )
+            if queued == "capped":
+                logger.warning(
+                    "option quote snapshot pending cap reached (%s) — not scheduling %s offset %s",
+                    _option_snapshot_max_pending(), signal_key, offset_min,
+                )
+                break
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot schedule failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+
+
+async def _option_snapshot_tick(now: Optional[datetime] = None) -> int:
+    """Write snapshots whose due time has arrived. Returns how many ran."""
+    clock = now or _utcnow()
+    if clock.tzinfo is None:
+        clock = clock.replace(tzinfo=timezone.utc)
+    epoch = clock.timestamp()
+    jobs: List[Dict[str, Any]] = []
+    with _OPTION_SNAPSHOT_LOCK:
+        for key, job in list(_OPTION_SNAPSHOT_PENDING.items()):
+            try:
+                due_epoch = float(job.get("due_epoch"))
+            except (TypeError, ValueError):
+                due_epoch = epoch
+            if due_epoch <= epoch:
+                _OPTION_SNAPSHOT_PENDING.pop(key, None)
+                _OPTION_SNAPSHOT_SEEN[key] = time.monotonic()
+                jobs.append(job)
+        _trim_option_snapshot_seen()
+    wrote = 0
+    for job in jobs:
+        try:
+            await _write_option_snapshot_row(job)
+            wrote += 1
+        except Exception as e:
+            logger.warning(
+                "option quote snapshot scheduler failed: %s",
+                scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+            )
+    return wrote
+
+
+async def _note_entry_signal_snapshot(payload: Dict[str, Any]) -> None:
+    """Entry-signal hook. Swallows every error."""
+    try:
+        await note_option_quote_snapshots(payload)
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot schedule failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+
+
+scanner_mod._note_entry_signal_snapshot = _note_entry_signal_snapshot
+
+
+def _position_signal_key(ticker: str, pos: Optional[dict], payload: Optional[dict]) -> str:
+    sig = (pos or {}).get("entry_signal") if isinstance((pos or {}).get("entry_signal"), dict) else {}
+    if not sig and isinstance(payload, dict) and payload.get("signal_id"):
+        sig = payload
+    if isinstance(sig, dict) and (sig.get("signal_id") or sig.get("ticker")):
+        try:
+            return _signal_key(sig)
+        except Exception:
+            pass
+    opened = str((pos or {}).get("ts") or "")
+    return f"pos:{str(ticker).upper()}:{opened}"
+
+
+def _snapshot_order_id(pos: Optional[dict], payload: Optional[dict]) -> Optional[str]:
+    for src in (payload, pos or {}):
+        if not isinstance(src, dict):
+            continue
+        for key in ("order_id", "close_order_id", "stop_order_id", "exit_order_id"):
+            val = src.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+    return None
+
+
+def _is_stop_close_reason(reason: Any) -> bool:
+    """A booked close that is a stop trigger or a stop fill.
+
+    Matched on the reason text. The reconciler's stop-fill set lives in a
+    bundled module and is not required here: those reasons all contain "stop".
+    """
+    return "stop" in str(reason or "").lower()
+
+
+def _spec_from_position(ticker: str, pos: Optional[dict], payload: Optional[dict]) -> Dict[str, Any]:
+    contract = (pos or {}).get("contract") if isinstance((pos or {}).get("contract"), dict) else {}
+    body = {
+        "ticker": ticker,
+        "contract": contract,
+        "option_right": contract.get("right") or (payload or {}).get("option_right"),
+        "expiration_hint": contract.get("expiration") or (payload or {}).get("expiration_hint"),
+        "strike_hint": (
+            contract.get("strike") if isinstance(contract, dict) and contract.get("strike") is not None
+            else (payload or {}).get("strike_hint")
+        ),
+    }
+    spec = _option_snapshot_spec(body)
+    scrubbed = _scrub_snapshot_value(spec)
+    return scrubbed if isinstance(scrubbed, dict) else spec
+
+
+_EXIT_FILL_TS: Dict[str, float] = {}
+
+
+def _remember_exit_fill_ts(order_id: Any, executed_ts: Any) -> None:
+    """Keep a fill clock the order-status poll already parsed. No new request."""
+    if order_id is None:
+        return
+    try:
+        ts = float(executed_ts)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(ts) or ts <= 0:
+        return
+    if ts > 10_000_000_000:
+        ts = ts / 1000.0
+    _EXIT_FILL_TS[str(order_id)] = ts
+
+
+def broker_fill_time_et(raw: Any) -> Optional[str]:
+    """E*TRADE executedTime / filledTime as an ET ISO timestamp. None if absent.
+
+    Values above 1e11 are epoch milliseconds, matching the order-list parser.
+    Smaller positive values are epoch seconds.
+    """
+    try:
+        ts = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ts) or ts <= 0:
+        return None
+    if ts > 10_000_000_000:
+        ts = ts / 1000.0
+    try:
+        stamped = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(_ET_ZONE)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return stamped.isoformat()
+
+
+def _exit_fill_clock(order_id: Optional[str], payload: Optional[dict]) -> Tuple[Optional[str], str]:
+    """(fill_time, fill_time_source) from clocks already on the poll or the payload."""
+    raw = None
+    if isinstance(payload, dict):
+        for key in ("executed_ts", "executedTime", "filledTime"):
+            if payload.get(key) not in (None, "", 0):
+                raw = payload.get(key)
+                break
+    if raw is None and order_id:
+        raw = _EXIT_FILL_TS.get(str(order_id))
+    et = broker_fill_time_et(raw)
+    if et:
+        return et, "broker_executed"
+    return None, "local_record"
+
+
+def _stop_touch_cap() -> int:
+    return max(200, _option_snapshot_max_pending() * 2)
+
+
+def _trim_stop_touched() -> None:
+    cap = _stop_touch_cap()
+    while len(_OPTION_SNAPSHOT_STOP_TOUCHED) > cap:
+        _OPTION_SNAPSHOT_STOP_TOUCHED.pop(next(iter(_OPTION_SNAPSHOT_STOP_TOUCHED)))
+
+
+def _clear_stop_touch(ticker: str, pos: Optional[dict]) -> None:
+    """Drop the once-key for a position that has closed."""
+    opened = ""
+    if isinstance(pos, dict):
+        opened = str(pos.get("ts") or "")
+    prefix = f"{str(ticker).upper()}|{opened}|"
+    with _OPTION_SNAPSHOT_LOCK:
+        doomed = [key for key in _OPTION_SNAPSHOT_STOP_TOUCHED if str(key).startswith(prefix)]
+        for key in doomed:
+            _OPTION_SNAPSHOT_STOP_TOUCHED.pop(key, None)
+
+
+def enqueue_exit_option_snapshot(
+    ticker: str, pos: Optional[dict], payload: Optional[dict],
+    close_reason: Optional[str], expired: bool = False,
+) -> None:
+    """Queue an exit_fill or stop_trigger snapshot. Sync: no quote fetch, no await."""
+    try:
+        _clear_stop_touch(ticker, pos)
+        if expired:
+            return
+        kind = "stop_trigger" if _is_stop_close_reason(close_reason) else "exit_fill"
+        signal_key = _position_signal_key(ticker, pos, payload)
+        spec = _spec_from_position(ticker, pos, payload)
+        order_id = _snapshot_order_id(pos, payload)
+        fill_time = None
+        fill_source = None
+        if kind == "exit_fill":
+            fill_time, fill_source = _exit_fill_clock(order_id, payload)
+        outcome = _enqueue_option_snapshot(
+            signal_key, None, _utcnow(), spec,
+            offset_kind=kind, order_id=order_id,
+            fill_time=fill_time, fill_time_source=fill_source,
+        )
+        if outcome == "capped":
+            logger.warning(
+                "option quote snapshot pending cap reached (%s) — not scheduling %s %s",
+                _option_snapshot_max_pending(), signal_key, kind,
+            )
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot enqueue failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+
+
+def _tracked_stop_level(pos: dict) -> Optional[float]:
+    contract = pos.get("contract") if isinstance(pos.get("contract"), dict) else {}
+    is_option = bool(contract.get("right"))
+    raw = pos.get("stop_premium") if is_option else pos.get("stop")
+    if raw is None:
+        raw = pos.get("trail")
+    try:
+        level = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(level) or level <= 0:
+        return None
+    return level
+
+
+def note_polled_stop_touch(ticker: str, pos: dict, bid: Any, ask: Any, mark: Any) -> None:
+    """First time the polled mark touches the tracked stop. Uses that quote; no new fetch."""
+    try:
+        if not isinstance(pos, dict):
+            return
+        stop = _tracked_stop_level(pos)
+        try:
+            mark_f = float(mark)
+        except (TypeError, ValueError):
+            return
+        if stop is None or not math.isfinite(mark_f) or mark_f <= 0:
+            return
+        contract = pos.get("contract") if isinstance(pos.get("contract"), dict) else {}
+        is_option = bool(contract.get("right"))
+        is_long = is_option or str(pos.get("action") or "BUY").upper() != "SELL"
+        touched = mark_f <= stop if is_long else mark_f >= stop
+        if not touched:
+            return
+        once = f"{str(ticker).upper()}|{pos.get('ts') or ''}|{pos.get('stop_order_id') or ''}"
+        with _OPTION_SNAPSHOT_LOCK:
+            if once in _OPTION_SNAPSHOT_STOP_TOUCHED:
+                return
+            _OPTION_SNAPSHOT_STOP_TOUCHED[once] = None
+            _trim_stop_touched()
+        spec = _spec_from_position(ticker, pos, {})
+        sym = _quote_symbol(ticker, contract) if contract.get("right") else str(ticker).upper()
+        stamp = _LAST_QUOTE_STAMP.get(sym) if isinstance(_LAST_QUOTE_STAMP.get(sym), dict) else {}
+        date_time = stamp.get("dateTime")
+        broker_epoch = stamp.get("dateTimeUTC")
+        source = "broker_quote" if (date_time or broker_epoch is not None) else "broker_unverified"
+        quote = {
+            "status": "ok",
+            "bid": float(bid) if isinstance(bid, (int, float)) and not isinstance(bid, bool) else None,
+            "ask": float(ask) if isinstance(ask, (int, float)) and not isinstance(ask, bool) else None,
+            "last": stamp.get("last"),
+            "dateTime": _format_broker_time(date_time) or _format_broker_time(broker_epoch),
+            "option_symbol": spec.get("option_symbol"),
+            "_quote_time_source": source,
+            "_fetched_at": stamp.get("fetched_at") or _utcnow().isoformat(),
+            "_broker_epoch": broker_epoch,
+        }
+        outcome = _enqueue_option_snapshot(
+            _position_signal_key(ticker, pos, {}), None, _utcnow(), spec,
+            offset_kind="stop_touch",
+            order_id=str(pos.get("stop_order_id")) if pos.get("stop_order_id") else None,
+            preset_quote=quote,
+        )
+        if outcome == "capped":
+            logger.warning(
+                "option quote snapshot pending cap reached (%s) — not scheduling stop_touch %s",
+                _option_snapshot_max_pending(), ticker,
+            )
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot stop-touch enqueue failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+
+
+def _snapshot_min_delay_s() -> float:
+    """Offset 0 waits at least 2s so it does not share the order-path quote call."""
+    raw = os.getenv("ETRADE_QUOTE_SNAPSHOT_MIN_DELAY_S", "2")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 2.0
+    if not math.isfinite(value) or value < 2.0:
+        return 2.0
+    return value
+
+
+def _snapshot_max_per_min() -> int:
+    raw = os.getenv("ETRADE_QUOTE_SNAPSHOT_MAX_PER_MIN", "30")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 30
+    return max(1, min(value, 600))
+
+
+def _snapshot_queue_max() -> int:
+    raw = os.getenv("QUOTE_SNAPSHOT_QUEUE_MAX", "500")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 500
+    return max(1, min(value, 100000))
+
+
+class QuoteSnapshotLog:
+    """Append-only hash chain for option quote snapshots. Not the trade ledger."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.corrupt_counts: Dict[str, int] = {}
+        self._write_lock = threading.Lock()
+        self._seq, self._prev_hash = self._load_tail()
+
+    def _note_corrupt(self, exc: BaseException) -> None:
+        kind = type(exc).__name__
+        self.corrupt_counts[kind] = self.corrupt_counts.get(kind, 0) + 1
+        logger.warning("quote snapshot log skipped a corrupt line (%s)", kind)
+
+    def _valid_record(self, line: bytes) -> Optional[Dict[str, Any]]:
+        try:
+            rec = json.loads(line.decode("utf-8"))
+            if not isinstance(rec, dict):
+                raise TypeError("not an object")
+            digest = rec.get("hash")
+            if not isinstance(digest, str) or not digest:
+                raise ValueError("missing hash")
+            int(rec.get("seq"))
+            return rec
+        except (json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
+            return None
+
+    def _repair_partial_tail(self) -> None:
+        """Drop a torn or invalid trailing line so the next append has a real predecessor."""
+        try:
+            if not self.path.exists():
+                return
+            data = self.path.read_bytes()
+        except OSError as exc:
+            self._note_corrupt(exc)
+            return
+        if not data:
+            return
+        end = len(data)
+        changed = False
+        if not data.endswith(b"\n"):
+            cut = data.rfind(b"\n")
+            end = 0 if cut < 0 else cut + 1
+            changed = True
+            self._note_corrupt(json.JSONDecodeError("partial line", "", 0))
+        while end > 0:
+            prev_nl = data.rfind(b"\n", 0, end - 1)
+            start = 0 if prev_nl < 0 else prev_nl + 1
+            piece = data[start:end].strip()
+            if not piece:
+                end = start
+                continue
+            rec = self._valid_record(piece)
+            if rec is not None:
+                break
+            self._note_corrupt(json.JSONDecodeError("invalid tail", "", 0))
+            end = start
+            changed = True
+        if not changed or end == len(data):
+            return
+        # Cut the torn bytes off. The valid prefix is not rewritten.
+        try:
+            os.truncate(self.path, end)
+        except OSError as exc:
+            self._note_corrupt(exc)
+
+    def _load_tail(self) -> Tuple[int, str]:
+        """Last valid record. A corrupt or partial tail does not rewind the chain to genesis."""
+        try:
+            self._repair_partial_tail()
+            if not self.path.exists():
+                return 0, "0" * 64
+            seq = 0
+            prev = "0" * 64
+            found = False
+            with open(self.path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if not isinstance(rec, dict):
+                            raise TypeError("not an object")
+                        digest = rec.get("hash")
+                        if not isinstance(digest, str) or not digest:
+                            raise ValueError("missing hash")
+                        seq = int(rec.get("seq"))
+                        prev = digest
+                        found = True
+                    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                        self._note_corrupt(exc)
+            if not found:
+                return 0, "0" * 64
+            return seq, prev
+        except OSError as exc:
+            self._note_corrupt(exc)
+            return 0, "0" * 64
+
+    def append(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Hash then write then advance the head. One append at a time, including across threads."""
+        with self._write_lock:
+            seq = self._seq + 1
+            prev = self._prev_hash
+            rec: Dict[str, Any] = {
+                "seq": seq,
+                "ts": _utcnow().isoformat(),
+                "event": "option_quote_snapshot",
+                "data": data or {},
+                "prev_hash": prev,
+            }
+            if prev == "0" * 64:
+                rec["chain_start"] = True
+            body = json.dumps(rec, sort_keys=True, default=str)
+            rec["hash"] = hashlib.sha256((prev + body).encode("utf-8")).hexdigest()
+            line = json.dumps(rec, sort_keys=True, default=str)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(self.path, "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except Exception:
+                # The line may already be on disk. Reload that tail instead of
+                # keeping a head the file has moved past, or rewinding past it.
+                self._repair_partial_tail()
+                self._seq, self._prev_hash = self._load_tail()
+                if self._seq == seq and self._prev_hash == rec["hash"]:
+                    return rec
+                raise
+            self._seq = seq
+            self._prev_hash = rec["hash"]
+            return rec
+
+    def reload_head(self) -> None:
+        """Match the in-memory head to the file after a restore or merge."""
+        with self._write_lock:
+            self._seq, self._prev_hash = self._load_tail()
+
+    def verify(self) -> Tuple[bool, int, Optional[str]]:
+        prev = "0" * 64
+        checked = 0
+        try:
+            if not self.path.exists():
+                return True, 0, None
+            with open(self.path, "r", encoding="utf-8") as handle:
+                for line_no, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if not isinstance(rec, dict):
+                            raise TypeError("not an object")
+                    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                        self._note_corrupt(exc)
+                        continue
+                    if str(rec.get("prev_hash")) == "0" * 64 and rec.get("chain_start") is not True:
+                        return False, checked, f"line {line_no}: genesis row missing chain_start"
+                    claimed = str(rec.pop("hash", ""))
+                    if str(rec.get("prev_hash")) != prev:
+                        return False, checked, f"line {line_no}: prev_hash broken"
+                    body = json.dumps(rec, sort_keys=True, default=str)
+                    if hashlib.sha256((str(rec.get("prev_hash")) + body).encode("utf-8")).hexdigest() != claimed:
+                        return False, checked, f"line {line_no}: hash mismatch"
+                    prev = claimed
+                    checked += 1
+            return True, checked, None
+        except OSError as exc:
+            self._note_corrupt(exc)
+            return False, checked, type(exc).__name__
+
+    def recent(self, count: int = 100) -> List[Dict[str, Any]]:
+        if count < 1 or not self.path.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        with open(self.path, "r", encoding="utf-8") as handle:
+            lines = [ln for ln in handle if ln.strip()]
+        for line in lines[-count:]:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return out
+
+
+_snap_log: Optional[QuoteSnapshotLog] = None
+_snap_q: Optional[asyncio.Queue] = None
+_snap_task: Optional[asyncio.Task] = None
+_snap_loop: Optional[asyncio.AbstractEventLoop] = None
+_snap_written = 0
+_snap_dropped = 0
+_snap_shutdown = False
+_SNAP_FETCHES: deque = deque()
+
+
+def init_quote_snapshot_log(path: Path) -> None:
+    global _snap_log
+    _snap_log = QuoteSnapshotLog(Path(path))
+
+
+def snapshot_writer_counts() -> Dict[str, int]:
+    return {"written": _snap_written, "dropped": _snap_dropped}
+
+
+_snap_mirror: Optional[Callable[[int, str, str], Awaitable[None]]] = None
+_snap_durable = 0
+_snap_durable_base = 0
+_snap_known_mirrored: set = set()
+_snap_mirror_failures = 0
+_snap_restore_failed = False
+_snap_restore_attempts = 0
+_snap_restore_settled = False
+_snap_restore_loader: Optional[Callable[[], Awaitable[List[str]]]] = None
+_snap_maintenance_task: Optional[asyncio.Task] = None
+_snap_chain_lock = asyncio.Lock()
+_SNAP_IO = ThreadPoolExecutor(max_workers=2, thread_name_prefix="quote-snapshot-io")
+_SNAPSHOT_MIRROR_TIMEOUT_S = 5.0
+_snap_hash_loader: Optional[Callable[[], Awaitable[set]]] = None
+_SNAPSHOT_RESTORE_BEFORE_APPEND = 3
+
+
+def set_quote_snapshot_mirror(fn: Optional[Callable[[int, str, str], Awaitable[None]]]) -> None:
+    """Install the durable mirror. Same shape as the trade ledger: (seq, hash, line)."""
+    global _snap_mirror
+    _snap_mirror = fn
+
+
+def quote_snapshot_log_status() -> Dict[str, Any]:
+    """On-disk chain length versus rows the durable mirror accepted."""
+    on_disk = 0
+    if _snap_log is not None:
+        try:
+            on_disk = max(0, int(_snap_log._seq))
+        except (TypeError, ValueError):
+            on_disk = 0
+    return {
+        "on_disk": on_disk,
+        "durable": int(_snap_durable),
+        "mirror_failures": int(_snap_mirror_failures),
+        "restore_failed": bool(_snap_restore_failed),
+        "restore_attempts": int(_snap_restore_attempts),
+    }
+
+
+def restore_quote_snapshot_lines(path: Path, lines: List[str]) -> int:
+    """Rebuild the side-log file from mirrored rows when the local file is empty.
+
+    A non-empty file is left alone. Core ledger files are not touched.
+    """
+    try:
+        target = Path(path)
+        if target.exists() and target.stat().st_size > 0:
+            return 0
+        payload = [ln for ln in lines if ln and str(ln).strip()]
+        if not payload:
+            return 0
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(payload) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        logger.info("quote snapshot log restored from durable mirror — %s record(s)", len(payload))
+        return len(payload)
+    except OSError as exc:
+        logger.warning("quote snapshot restore failed (%s)", type(exc).__name__)
+        return 0
+
+
+def _remember_mirrored(digest: str) -> None:
+    global _snap_durable
+    if not digest or digest in _snap_known_mirrored:
+        return
+    _snap_known_mirrored.add(digest)
+    _snap_durable = int(_snap_durable_base) + len(_snap_known_mirrored)
+
+
+def _snapshot_backfill_interval_s() -> float:
+    raw = os.getenv("QUOTE_SNAPSHOT_BACKFILL_S", "60")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 60.0
+    if not math.isfinite(value):
+        return 60.0
+    return min(3600.0, max(5.0, value))
+
+
+def _snapshot_lines_for_mirror(path: Path) -> List[Tuple[int, str, str]]:
+    """Valid side-log lines as (seq, hash, raw line). File IO, safe off the event loop."""
+    if not path.exists():
+        return []
+    rows: List[Tuple[int, str, str]] = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+                digest = rec.get("hash")
+                seq = rec.get("seq")
+                if not isinstance(digest, str) or not digest:
+                    raise ValueError("missing hash")
+                rows.append((int(seq), digest, raw))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+    return rows
+
+
+async def _push_snapshot_mirror(seq: int, digest: str, line: str) -> bool:
+    """One mirror write. A timeout or any other failure is counted and does not raise."""
+    global _snap_mirror_failures
+    fn = _snap_mirror
+    if fn is None:
+        return False
+    try:
+        await asyncio.wait_for(
+            fn(int(seq), str(digest), line),
+            timeout=_SNAPSHOT_MIRROR_TIMEOUT_S,
+        )
+    except Exception as exc:
+        _snap_mirror_failures += 1
+        logger.warning("quote snapshot mirror failed (%s)", type(exc).__name__)
+        return False
+    return True
+
+
+async def _mirror_snapshot_record(rec: Dict[str, Any]) -> None:
+    """Best-effort copy of one side-log row. A failure is counted and does not raise."""
+    if not isinstance(rec, dict):
+        return
+    digest = str(rec.get("hash") or "")
+    if not digest:
+        return
+    line = json.dumps(rec, sort_keys=True, default=str)
+    if await _push_snapshot_mirror(int(rec.get("seq") or 0), digest, line):
+        _remember_mirrored(digest)
+
+
+async def _durable_snapshot_hashes() -> Optional[set]:
+    """One query for the hashes already stored. None means the query failed."""
+    global _snap_mirror_failures
+    if _snap_hash_loader is not None:
+        try:
+            found = await asyncio.wait_for(_snap_hash_loader(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
+            return {str(item) for item in (found or set())}
+        except Exception as exc:
+            _snap_mirror_failures += 1
+            logger.warning("quote snapshot hash load failed (%s)", type(exc).__name__)
+            return None
+    if engine is None or _snap_mirror is not _quote_snapshot_mirror:
+        return set(_snap_known_mirrored)
+
+    async def _query() -> set:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                sql_text(f"SELECT hash FROM {_bt('bot_quote_snapshots')}")
+            )
+            return {str(row[0]) for row in result.fetchall() if row[0]}
+
+    try:
+        return await asyncio.wait_for(_query(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
+    except Exception as exc:
+        _snap_mirror_failures += 1
+        logger.warning("quote snapshot hash load failed (%s)", type(exc).__name__)
+        return None
+
+
+async def _push_snapshot_batch(rows: List[Tuple[int, str, str]]) -> None:
+    """Insert the missing lines in one database call."""
+    if not rows:
+        return
+    if _snap_mirror is _quote_snapshot_mirror and engine is not None and _snap_hash_loader is None:
+        params = [{"hash": digest, "seq": int(seq), "line": line} for seq, digest, line in rows]
+
+        async def _write() -> None:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    sql_text(
+                        f"INSERT INTO {_bt('bot_quote_snapshots')} (hash, seq, line) "
+                        "VALUES (:hash, :seq, :line) ON CONFLICT (hash) DO NOTHING"
+                    ),
+                    params,
+                )
+
+        await _write()
+        return
+    fn = _snap_mirror
+    if fn is None:
+        return
+    for seq, digest, line in rows:
+        await fn(int(seq), str(digest), line)
+
+
+async def backfill_quote_snapshots() -> int:
+    """Push on-disk lines the mirror does not have yet.
+
+    The file is read off the event loop. Hashes are loaded once, and only the
+    missing lines are sent, in one batch. An unanchored file is left alone so
+    a second genesis chain is not inserted beside the durable one.
+    """
+    global _snap_durable, _snap_durable_base
+    log = _snap_log
+    if log is None or _snap_mirror is None or _snap_restore_failed:
+        return 0
+    try:
+        rows = await _snap_io(_snapshot_lines_for_mirror, log.path)
+    except Exception as exc:
+        logger.warning("quote snapshot backfill failed (%s)", type(exc).__name__)
+        return 0
+    known = await _durable_snapshot_hashes()
+    if known is None:
+        return 0
+    missing = [row for row in rows if row[1] not in known]
+    if not missing:
+        return 0
+    try:
+        await asyncio.wait_for(_push_snapshot_batch(missing), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
+    except Exception as exc:
+        _snap_mirror_failures += 1
+        logger.warning("quote snapshot backfill failed (%s)", type(exc).__name__)
+        return 0
+    for _seq, digest, _line in missing:
+        _remember_mirrored(digest)
+    counted = await _quote_snapshot_durable_count()
+    if counted is not None:
+        _snap_durable_base = counted
+        _snap_known_mirrored.clear()
+        _snap_durable = counted
+    return len(missing)
+
+
+def _snapshot_chain_hash(prev: str, rec_without_hash: Dict[str, Any]) -> str:
+    body = json.dumps(rec_without_hash, sort_keys=True, default=str)
+    return hashlib.sha256((prev + body).encode("utf-8")).hexdigest()
+
+
+def _rechain_snapshot_line(seq: int, prev: str, data: Any, ts: str, event: str) -> str:
+    rec: Dict[str, Any] = {
+        "seq": seq,
+        "ts": ts,
+        "event": event,
+        "data": data if isinstance(data, dict) else {},
+        "prev_hash": prev,
+    }
+    rec["hash"] = _snapshot_chain_hash(prev, rec)
+    return json.dumps(rec, sort_keys=True, default=str)
+
+
+def _parsed_snapshot_lines(lines: List[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for line in lines:
+        raw = str(line or "").strip()
+        if not raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict) and isinstance(rec.get("hash"), str):
+            out.append(rec)
+    return out
+
+
+def _local_chain_collides(path: Path, db_records: List[Dict[str, Any]]) -> bool:
+    """True when the local file is a second genesis beside a non-empty mirror."""
+    if not db_records or not path.exists() or path.stat().st_size == 0:
+        return False
+    local = _parsed_snapshot_lines(_snapshot_lines_for_mirror_raw(path))
+    if not local:
+        return False
+    db_hashes = {str(rec.get("hash")) for rec in db_records}
+    first = local[0]
+    if str(first.get("hash")) == str(db_records[0].get("hash")):
+        return False
+    if str(first.get("prev_hash")) in db_hashes:
+        return False
+    return str(first.get("prev_hash")) == ("0" * 64)
+
+
+def _snapshot_lines_for_mirror_raw(path: Path) -> List[str]:
+    return [line for _seq, _digest, line in _snapshot_lines_for_mirror(path)]
+
+
+def _merge_snapshot_chains(path: Path, db_lines: List[str]) -> bool:
+    """Adopt the mirror chain, then re-link local-only rows after it. Holds the write lock."""
+    log = _snap_log
+    db_records = _parsed_snapshot_lines(db_lines)
+    if not db_records:
+        return False
+    local_lines = _snapshot_lines_for_mirror_raw(path) if path.exists() else []
+    local_records = _parsed_snapshot_lines(local_lines)
+    db_hashes = {str(rec.get("hash")) for rec in db_records}
+    tail_hash = str(db_records[-1].get("hash"))
+    try:
+        tail_seq = int(db_records[-1].get("seq"))
+    except (TypeError, ValueError):
+        return False
+    extra: List[str] = []
+    for rec in local_records:
+        if str(rec.get("hash")) in db_hashes:
+            continue
+        tail_seq += 1
+        line = _rechain_snapshot_line(
+            tail_seq, tail_hash, rec.get("data") if isinstance(rec.get("data"), dict) else {},
+            str(rec.get("ts") or _utcnow().isoformat()),
+            str(rec.get("event") or "option_quote_snapshot"),
+        )
+        extra.append(line)
+        built = json.loads(line)
+        tail_hash = str(built.get("hash"))
+    body = "\n".join([str(line).strip() for line in db_lines if str(line).strip()] + extra) + "\n"
+
+    def _write_merged() -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    if log is not None and log.path == path:
+        with log._write_lock:
+            _write_merged()
+            log._seq, log._prev_hash = log._load_tail()
+    else:
+        _write_merged()
+        if log is not None and log.path == path:
+            log.reload_head()
+    return True
+
+
+def reload_quote_snapshot_head() -> None:
+    if _snap_log is not None:
+        _snap_log.reload_head()
+
+
+async def _load_snapshot_mirror_lines() -> List[str]:
+    async def _fetch() -> List[str]:
+        if _snap_restore_loader is not None:
+            return list(await _snap_restore_loader())
+        if engine is None:
+            return []
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                sql_text(f"SELECT line FROM {_bt('bot_quote_snapshots')} ORDER BY seq")
+            )
+            return [row[0] for row in result.fetchall()]
+
+    return await asyncio.wait_for(_fetch(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
+
+
+def _apply_restored_snapshot_lines(path: Path, lines: List[str]) -> None:
+    payload = [str(line).strip() for line in lines if str(line or "").strip()]
+    if not payload:
+        return
+    if not path.exists() or path.stat().st_size == 0:
+        restore_quote_snapshot_lines(path, payload)
+        if _snap_log is not None and _snap_log.path == path:
+            _snap_log.reload_head()
+        return
+    if _local_chain_collides(path, _parsed_snapshot_lines(payload)):
+        _merge_snapshot_chains(path, payload)
+
+
+async def restore_quote_snapshots_once(path: Optional[Path] = None) -> bool:
+    """One restore attempt. Holds the chain until the SELECT and the file apply finish."""
+    global _snap_restore_attempts, _snap_restore_failed
+    _snap_restore_attempts += 1
+    target = Path(path) if path is not None else (
+        _snap_log.path if _snap_log is not None else QUOTE_SNAPSHOT_FILE
+    )
+    await _snap_chain_lock.acquire()
+    try:
+        try:
+            lines = await _load_snapshot_mirror_lines()
+        except Exception as exc:
+            _snap_restore_failed = True
+            logger.warning("quote snapshot restore failed (%s)", type(exc).__name__)
+            return False
+        try:
+            await _snap_io(_apply_restored_snapshot_lines, target, lines)
+        except Exception as exc:
+            _snap_restore_failed = True
+            logger.warning("quote snapshot restore failed (%s)", type(exc).__name__)
+            return False
+        _snap_restore_failed = False
+        return True
+    finally:
+        _snap_chain_lock.release()
+
+
+def _snap_io_invoke(job: Tuple[Any, Tuple[Any, ...]]) -> Any:
+    fn, args = job
+    return fn(*args)
+
+
+async def _snap_io(fn: Callable[..., Any], *args: Any) -> Any:
+    """Side-log file work on the dedicated pool, not the default executor."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_SNAP_IO, _snap_io_invoke, (fn, args))
+
+
+async def _quote_snapshot_restore_gate() -> bool:
+    """Wait until no restore holds the chain. 'Not failed' is not settled."""
+    if not _snap_chain_lock.locked():
+        # A restore may acquire between this check and the caller. Callers that
+        # append also take the lock, so this fast path is only a hint.
+        return True
+    try:
+        await asyncio.wait_for(_snap_chain_lock.acquire(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return False
+    _snap_chain_lock.release()
+    return True
+
+
+async def quote_snapshot_maintenance_worker() -> None:
+    """Background restore retry and backfill. Startup does not await this."""
+    while not _worker_stop:
+        try:
+            await restore_quote_snapshots_once()
+            if not _snap_restore_failed:
+                await backfill_quote_snapshots()
+        except Exception as exc:
+            logger.warning("quote snapshot maintenance failed (%s)", type(exc).__name__)
+        await asyncio.sleep(_snapshot_backfill_interval_s())
+
+
+async def boot_quote_snapshot_side_log(path: Optional[Path] = None) -> None:
+    """Open the side log off the loop and schedule restore plus backfill.
+
+    Returns without waiting for the database. A hung mirror cannot hold startup.
+    """
+    target = Path(path) if path is not None else QUOTE_SNAPSHOT_FILE
+    await _snap_io(init_quote_snapshot_log, target)
+    _start_snapshot_maintenance()
+
+
+def _start_snapshot_maintenance() -> None:
+    global _snap_maintenance_task
+    if _snap_maintenance_task is not None and not _snap_maintenance_task.done():
+        return
+    _snap_maintenance_task = asyncio.create_task(
+        quote_snapshot_maintenance_worker(), name="quote-snapshot-maintenance",
+    )
+
+
+def _snapshot_fetch_allowed() -> bool:
+    limit = _snapshot_max_per_min()
+    now = time.monotonic()
+    while _SNAP_FETCHES and now - _SNAP_FETCHES[0] >= 60.0:
+        _SNAP_FETCHES.popleft()
+    if len(_SNAP_FETCHES) >= limit:
+        return False
+    _SNAP_FETCHES.append(now)
+    return True
+
+
+def _snapshot_writer_died_text(exc: BaseException) -> str:
+    """Free-text alert only. Structured snapshot rows are scrubbed separately."""
+    try:
+        detail = scrub_etrade_text(str(exc), secrets=_quote_log_secrets())
+        detail = re.sub(r"https?://\S+", "[redacted]", detail)
+    except Exception:
+        detail = ""
+    return f"quote snapshot writer died and was restarted: {type(exc).__name__}: {detail}"
+
+
+async def _alert_snapshot_writer_death(exc: BaseException) -> None:
+    try:
+        await alerts.send(
+            "warning", "quote_snapshot_writer_died",
+            _snapshot_writer_died_text(exc),
+            dedupe_key="quote_snapshot_writer",
+        )
+    except Exception as e:
+        logger.warning(
+            "quote snapshot writer alert failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+
+
+def _on_snap_writer_done(task: asyncio.Task) -> None:
+    if _snap_shutdown:
+        return
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        return
+    logger.error("%s", _snapshot_writer_died_text(exc))
+    try:
+        task.get_loop().create_task(_alert_snapshot_writer_death(exc))
+    except Exception:
+        pass
+    if _snap_shutdown:
+        return
+    try:
+        task.get_loop().call_soon(_start_snapshot_consumer)
+    except Exception:
+        pass
+
+
+def _start_snapshot_consumer() -> None:
+    global _snap_task
+    loop = asyncio.get_running_loop()
+    if _snap_task is not None and not _snap_task.done():
+        return
+    _snap_task = loop.create_task(_snapshot_write_consumer(), name="quote-snapshot-writer")
+    _snap_task.add_done_callback(_on_snap_writer_done)
+
+
+def _abandon_snapshot_queue(queue: Optional[asyncio.Queue]) -> None:
+    """Complete leftovers from a queue this loop can no longer serve."""
+    global _snap_dropped
+    if queue is None:
+        return
+    while True:
+        try:
+            _body, fut = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        _snap_dropped += 1
+        if fut is not None and not fut.done():
+            try:
+                fut.set_result(None)
+            except Exception:
+                pass
+        try:
+            queue.task_done()
+        except ValueError:
+            pass
+
+
+def _ensure_snapshot_writer() -> asyncio.Queue:
+    global _snap_q, _snap_task, _snap_loop
+    loop = asyncio.get_running_loop()
+    if _snap_q is None or _snap_loop is not loop:
+        # A new loop cannot await the previous queue. Count those rows dropped.
+        if _snap_q is not None and _snap_loop is not loop:
+            _abandon_snapshot_queue(_snap_q)
+        _snap_q = asyncio.Queue(maxsize=_snapshot_queue_max())
+        _snap_loop = loop
+        _snap_task = None
+    if _snap_task is None or _snap_task.done():
+        _start_snapshot_consumer()
+    return _snap_q
+
+
+async def _snapshot_write_consumer() -> None:
+    """The only task that appends snapshot rows. Hash chaining stays here."""
+    global _snap_written, _snap_dropped
+    queue = _snap_q
+    while True:
+        item = await queue.get()
+        body, fut = item
+        try:
+            if _snap_log is None:
+                _snap_dropped += 1
+                if fut is not None and not fut.done():
+                    fut.set_result(None)
+            else:
+                held = False
+                try:
+                    await asyncio.wait_for(
+                        _snap_chain_lock.acquire(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S,
+                    )
+                    held = True
+                    rec = await asyncio.shield(_snap_io(_snap_log.append, body))
+                    _snap_written += 1
+                    await _mirror_snapshot_record(rec)
+                    if fut is not None and not fut.done():
+                        fut.set_result(rec.get("seq"))
+                except asyncio.TimeoutError:
+                    _snap_dropped += 1
+                    if fut is not None and not fut.done():
+                        fut.set_result(None)
+                finally:
+                    if held:
+                        _snap_chain_lock.release()
+        except asyncio.CancelledError:
+            queue.task_done()
+            raise
+        except Exception as e:
+            _snap_dropped += 1
+            logger.warning("quote snapshot append failed (%s)", type(e).__name__)
+            if fut is not None and not fut.done():
+                fut.set_result(None)
+            queue.task_done()
+        else:
+            queue.task_done()
+
+
+def _put_snapshot(body: Dict[str, Any], fut: Optional[asyncio.Future]) -> str:
+    global _snap_dropped
+    try:
+        queue = _ensure_snapshot_writer()
+        queue.put_nowait((body, fut))
+        return "queued"
+    except asyncio.QueueFull:
+        _snap_dropped += 1
+        if fut is not None and not fut.done():
+            fut.set_result(None)
+        return "dropped"
+
+
+async def submit_quote_snapshot(body: Dict[str, Any]) -> Optional[int]:
+    """Queue one snapshot row. Off-loop callers are scheduled or counted as dropped."""
+    global _snap_dropped
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = _QUOTE_LOG_LOOP
+        if loop is None or not loop.is_running():
+            _snap_dropped += 1
+            return None
+        def _schedule() -> None:
+            _put_snapshot(body, None)
+        try:
+            loop.call_soon_threadsafe(_schedule)
+        except Exception:
+            _snap_dropped += 1
+        return None
+    fut = loop.create_future()
+    if _put_snapshot(body, fut) == "dropped":
+        return None
+    return await fut
+
+
+async def flush_quote_snapshot_writer(timeout: float = 2.0) -> None:
+    """Join the side-log queue for at most `timeout` seconds, then cancel the writer."""
+    global _snap_shutdown
+    _snap_shutdown = True
+    task = _snap_task
+    queue = _snap_q
+    if task is None or task.done():
+        # The writer is already dead. Joining would wait out the timeout for
+        # items nobody is going to finish.
+        _snap_shutdown = False
+        return
+    if queue is not None:
+        try:
+            await asyncio.wait_for(queue.join(), timeout=max(0.0, float(timeout)))
+        except asyncio.TimeoutError:
+            pass
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _snap_shutdown = False
+
+
+async def option_snapshot_worker() -> None:
+    """Fire due snapshots. A tick that raises is logged and the loop continues."""
+    while not _worker_stop:
+        try:
+            await _option_snapshot_tick(_utcnow())
+        except Exception as e:
+            logger.warning(
+                "option quote snapshot scheduler failed: %s",
+                scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+            )
+        await asyncio.sleep(1.0)
+
+
+def _sync_etrade_call(fn, *args, source: str = "etrade", quote_log_as: Optional[str] = None, **kwargs):
     """Exponential-backoff wrapper for SYNC pyetrade calls running inside a
     worker thread (e.g. contract snapping) — blocking sleeps are fine there."""
+    started = time.perf_counter()
     for attempt in range(ETRADE_RETRY_ATTEMPTS):
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
         except Exception as e:
             if attempt >= ETRADE_RETRY_ATTEMPTS - 1 or not _is_retryable_error(e):
                 raise
@@ -26448,16 +28948,61 @@ def _sync_etrade_call(fn, *args, source: str = "etrade", **kwargs):
                 f"{scrub_etrade_text(str(e))} — retrying in {delay:.1f}s"
             )
             time.sleep(delay)
+        else:
+            try:
+                _observe_etrade_quote_fetch(source, quote_log_as, args, kwargs, result, started)
+            except Exception:
+                pass
+            return result
 
 
-async def _etrade_call(fn, *args, source: str = "etrade", idempotent: bool = True, **kwargs):
+_ORDER_PATH_INFLIGHT = 0
+
+
+async def _etrade_call(
+    fn, *args, source: str = "etrade", idempotent: bool = True,
+    quote_log_as: Optional[str] = None, **kwargs,
+):
     """Run a sync pyetrade call in a thread with exponential backoff + jitter.
     idempotent=False (order placement) executes EXACTLY once — a failed place
     may still have reached the broker, so a blind retry risks a double order
     (the reconciliation engine heals whatever state results)."""
+    started = time.perf_counter()
+    _note_quote_log_loop()
+    order_path = _is_order_path_source(source)
+    if order_path:
+        _enter_order_path()
+    try:
+        return await _etrade_call_body(fn, args, kwargs, source, idempotent, quote_log_as, started)
+    finally:
+        if order_path:
+            _leave_order_path()
+
+
+def _is_order_path_source(source: str) -> bool:
+    text = str(source or "")
+    return text.startswith("place_") or text == "cancel_order"
+
+
+def _order_path_in_flight() -> bool:
+    return _ORDER_PATH_INFLIGHT > 0
+
+
+def _enter_order_path() -> None:
+    global _ORDER_PATH_INFLIGHT
+    _ORDER_PATH_INFLIGHT += 1
+
+
+def _leave_order_path() -> None:
+    global _ORDER_PATH_INFLIGHT
+    if _ORDER_PATH_INFLIGHT > 0:
+        _ORDER_PATH_INFLIGHT -= 1
+
+
+async def _etrade_call_body(fn, args, kwargs, source, idempotent, quote_log_as, started):
     for attempt in range(ETRADE_RETRY_ATTEMPTS):
         try:
-            return await asyncio.to_thread(fn, *args, **kwargs)
+            result = await asyncio.to_thread(fn, *args, **kwargs)
         except Exception as e:
             # A 429 was never processed by the broker — safe to retry even for
             # non-idempotent calls (order placement). Anything else follows the
@@ -26471,6 +29016,12 @@ async def _etrade_call(fn, *args, source: str = "etrade", idempotent: bool = Tru
                 f"{scrub_etrade_text(str(e))} — retrying in {delay:.1f}s"
             )
             await asyncio.sleep(delay)
+        else:
+            try:
+                _observe_etrade_quote_fetch(source, quote_log_as, args, kwargs, result, started)
+            except Exception:
+                pass
+            return result
 
 
 # ==================== STOP GUARD ====================
@@ -27052,6 +29603,7 @@ async def _resolve_exit_fill(order_id, timeout_s: float = EXIT_FILL_TIMEOUT_SECO
                 if _filled_order_status(order.get("status")):
                     price = float(order.get("exec_price") or 0)
                     if price > 0:
+                        _remember_exit_fill_ts(order_id, order.get("executed_ts"))
                         return price
         except Exception as e:
             logger.warning(f"[CLOSE FILL] fill poll for order {order_id} failed: {e}")
@@ -27813,7 +30365,10 @@ async def _etrade_bid_ask(ticker: str, contract: Optional[dict] = None) -> Tuple
         sym = _quote_symbol(ticker, contract)
         # A failed fetch must not leave an older verdict describing no quote.
         _LAST_MARK_QUALITY.pop(sym, None)
-        resp = await _etrade_call(market.get_quote, [sym], resp_format="json", source="stop_reprice_quote")
+        resp = await _etrade_call(
+            market.get_quote, [sym], resp_format="json",
+            source="stop_reprice_quote", quote_log_as="_etrade_bid_ask",
+        )
         data = (((resp or {}).get("QuoteResponse") or {}).get("QuoteData")) or []
         if isinstance(data, dict):
             data = [data]
@@ -27830,6 +30385,15 @@ async def _etrade_bid_ask(ticker: str, contract: Optional[dict] = None) -> Tuple
                 q.get("quoteStatus"), q.get("dateTimeUTC"), time.time(),
                 max_age_seconds=MAX_MARK_AGE_SECONDS,
             )
+            # Side stamp for the snapshot log. The returned bid/ask are unchanged.
+            _LAST_QUOTE_STAMP[sym] = {
+                "bid": bid,
+                "ask": ask,
+                "last": _quote_log_finite(all_q.get("lastTrade")),
+                "dateTime": q.get("dateTime"),
+                "dateTimeUTC": q.get("dateTimeUTC"),
+                "fetched_at": _utcnow().isoformat(),
+            }
             return bid, ask
     except Exception as e:
         logger.warning(f"reprice quote failed for {ticker}: {e}")
@@ -31451,6 +34015,14 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         **_review,
     }
     ledger_seq = await trade_ledger.record("position_closed", close_data)
+    # Enqueue only. A snapshot fetch must not run before the close returns.
+    try:
+        enqueue_exit_option_snapshot(ticker, pos, payload, close_reason, expired_booked)
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot enqueue failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
     await _remember_trade_review(close_data, ledger_seq=ledger_seq)
     # Schedule 15/30-minute post-exit marks — a stop that was too tight shows
     # up as a recovery after the exit. Best-effort; never blocks the close.
@@ -32743,6 +35315,7 @@ def _best_expression_contract(market, symbol: str, spot: Any, vol_annual: Any,
                 market.get_option_chains, symbol, expiry_date=exp, chain_type=right,
                 strike_price_near=int(round(k)), no_of_strikes=10,
                 resp_format="json", source="option_chain",
+                quote_log_as="_best_expression_contract",
             )
         except Exception as e:
             logger.warning(f"best-expiry: {symbol} {exp} chain unreadable ({e}) — candidate dropped")
@@ -34135,6 +36708,7 @@ def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_
             no_of_strikes=10,
             resp_format="json",
             source="option_chain",
+            quote_log_as="_snap_option_contract",
         )
         pairs = (((chains or {}).get("OptionChainResponse") or {}).get("OptionPair")) or []
         if liquidity_out is not None:
@@ -36130,6 +38704,10 @@ async def _reconcile_record_close(ticker: str, pos: dict, resolution: dict) -> N
         return
     reason = f"fill_capture:{resolution.get('source') or 'unknown'}"
     broker_stop = resolution.get("stop_price")
+    if resolution.get("executed_ts"):
+        payload["executed_ts"] = resolution.get("executed_ts")
+    if resolution.get("order_id"):
+        payload["order_id"] = resolution.get("order_id")
     if str(resolution.get("basis") or "") == "premium":
         await _record_close(ticker, None, payload, exit_premium=exit_price, close_reason=reason,
                             stop_price=broker_stop)
@@ -36585,6 +39163,8 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     # Conservative mark: longs (and long options) trail off the BID, shorts
     # off the ASK — the trail only ratchets on prices we could actually exit at.
     mark = bid if (is_buy or is_option) else ask
+    # The quote this pass already polled. Sync enqueue; it does not fetch or write the position.
+    note_polled_stop_touch(ticker, pos, bid, ask, mark)
 
     # Live round-trip spread on the same basis as the mark. It floors the trail
     # distance so a wide chain (ARM at 10.85/11.75) is never stopped out by its
@@ -38630,7 +41210,10 @@ async def _scanner_fetch_etrade_quotes(symbols: List[str]) -> Dict[str, Any]:
         CONSUMER_KEY, CONSUMER_SECRET,
         tokens["oauth_token"], tokens["oauth_token_secret"], dev=is_sandbox,
     )
-    return await _etrade_call(market.get_quote, list(symbols), resp_format="json", source="scanner_quote")
+    return await _etrade_call(
+        market.get_quote, list(symbols), resp_format="json",
+        source="scanner_quote", quote_log_as="_scanner_fetch_etrade_quotes",
+    )
 
 
 async def _scanner_dispatch(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -38772,13 +41355,18 @@ async def start_worker():
     asyncio.create_task(entry_paths_worker())
     asyncio.create_task(exit_followup_worker())
     asyncio.create_task(chain_shadow_worker())
+    asyncio.create_task(option_snapshot_worker())
     await _start_scanner()
 
 
 # ==================== STARTUP ====================
 @app.on_event("startup")
 async def on_startup():
-    global state
+    global state, _QUOTE_LOG_LOOP
+    try:
+        _QUOTE_LOG_LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
     logger.info(f"Starting → {'SANDBOX' if is_sandbox else 'PRODUCTION'} | LIVE={LIVE_TRADING} | VERSION={BOT_VERSION}")
     # Database FIRST — it now backs durable state and the ledger mirror, so it
     # must exist before the StateStore hydrates and before the ledger restores.
@@ -38806,6 +41394,8 @@ async def on_startup():
     trade_ledger.init(TRADE_LEDGER_FILE)
     if persistence is not None:
         trade_ledger.set_mirror(_ledger_mirror)
+        set_quote_snapshot_mirror(_quote_snapshot_mirror)
+    await boot_quote_snapshot_side_log(QUOTE_SNAPSHOT_FILE)
     # Say out loud whether this process actually remembers anything. A ledger
     # that comes up empty is indistinguishable from a healthy one in the logs,
     # and it silently disarms the only mechanism that learns from past trades.
@@ -38925,6 +41515,7 @@ async def _announce_preflight() -> None:
 async def on_shutdown():
     global _worker_stop
     _worker_stop = True
+    await flush_quote_snapshot_writer(2.0)
     await _close_study_page_engine()
     await state.close()
 
@@ -39611,6 +42202,8 @@ async def process_signal(pd: dict, replay: bool = False) -> dict:
     take a shortcut around a risk gate. `replay=True` is only the parked-401
     path reclaiming a signal it already owns."""
     is_close = _is_close_payload(pd)
+    if not is_close:
+        await _note_entry_signal_snapshot(pd)
     mode = str(pd.get("mode") or "paper").lower()
     live_intent = _live_intent(mode)
 
@@ -39909,6 +42502,7 @@ async def status():
         "env": ENV,
         "live_trading": LIVE_TRADING,
         "version": BOT_VERSION,
+        "quote_snapshots": quote_snapshot_log_status(),
         "secret_configured": bool(WEBHOOK_SECRET),
         # Moved off public /healthz. The app reads the guardian here, with the secret.
         "guardian": await _guardian_snapshot(),
