@@ -36,6 +36,7 @@ def _isolate_snapshots():
     main_bot._snap_restore_attempts = 0
     main_bot._snap_restore_settled = False
     main_bot._snap_restore_loader = None
+    main_bot._snap_hash_loader = None
     yield
     main_bot._snap_shutdown = True
     main_bot._OPTION_SNAPSHOT_PENDING.clear()
@@ -1316,7 +1317,7 @@ def test_backfill_mirrors_a_row_the_live_mirror_missed(tmp_path, caplog):
         assert sorted(store) == [2]
         assert main_bot.quote_snapshot_log_status()["on_disk"] == 2
         pushed = _run(main_bot.backfill_quote_snapshots())
-        assert pushed == 2
+        assert pushed == 1
         assert sorted(store) == [1, 2]
         path.unlink()
         restored = main_bot.restore_quote_snapshot_lines(
@@ -1403,7 +1404,7 @@ def test_mirror_write_timeout_is_a_counted_failure(tmp_path):
         seq, elapsed = _run(once())
         status = main_bot.quote_snapshot_log_status()
     finally:
-        main_bot._SNAPSHOT_MIRROR_TIMEOUT_S = 2.0
+        main_bot._SNAPSHOT_MIRROR_TIMEOUT_S = 5.0
         main_bot.set_quote_snapshot_mirror(None)
         main_bot._snap_log = saved
     assert seq == 1
@@ -1458,4 +1459,137 @@ def test_quote_snapshot_table_init_is_isolated(monkeypatch, caplog):
     assert _run(main_bot._ensure_quote_snapshot_table()) is False
     assert "SECRETTOKEN99" not in caplog.text
     assert "RuntimeError" in caplog.text
+
+
+def test_verify_requires_a_genesis_marker(tmp_path):
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    log = main_bot.QuoteSnapshotLog(path)
+    log.append({"n": 1})
+    ok, count, err = log.verify()
+    assert ok, err
+    assert count == 1
+    rec = json.loads(path.read_text(encoding="utf-8"))
+    assert rec["chain_start"] is True
+    rec.pop("chain_start")
+    path.write_text(json.dumps(rec, sort_keys=True) + "\n", encoding="utf-8")
+    ok, count, err = log.verify()
+    assert ok is False
+    assert err is not None and "chain_start" in err
+
+
+def test_side_log_io_does_not_stall_the_loop(tmp_path, monkeypatch):
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    saved = main_bot._snap_log
+    real_fsync = main_bot.os.fsync
+
+    def slow_fsync(fd):
+        time.sleep(1.5)
+        return real_fsync(fd)
+
+    async def hung(*_args, **_kwargs):
+        await asyncio.sleep(30)
+        return []
+
+    monkeypatch.setattr(main_bot.os, "fsync", slow_fsync)
+    main_bot._snap_restore_loader = hung
+    main_bot.set_quote_snapshot_mirror(hung)
+    try:
+        async def scenario():
+            started = time.monotonic()
+            await main_bot.boot_quote_snapshot_side_log(path)
+            boot_s = time.monotonic() - started
+            lags = []
+            stop = {"go": True}
+
+            async def beat():
+                last = asyncio.get_running_loop().time()
+                while stop["go"]:
+                    await asyncio.sleep(0)
+                    now = asyncio.get_running_loop().time()
+                    lags.append(now - last)
+                    last = now
+
+            heart = asyncio.create_task(beat())
+            asyncio.create_task(main_bot.submit_quote_snapshot({"n": 1}))
+            await asyncio.sleep(0.25)
+            stop["go"] = False
+            await heart
+            task = main_bot._snap_maintenance_task
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            main_bot._snap_maintenance_task = None
+            return boot_s, max(lags) if lags else 1.0
+
+        boot_s, lag = _run(scenario())
+    finally:
+        main_bot._snap_restore_loader = None
+        main_bot.set_quote_snapshot_mirror(None)
+        main_bot._snap_log = saved
+    assert boot_s < 1.0
+    assert lag < 0.05
+
+
+def test_outage_retry_relinks_onto_one_chain(tmp_path):
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    saved = main_bot._snap_log
+    store = {}
+    db = {"up": True}
+
+    async def mirror(seq, digest, line):
+        if not db["up"]:
+            raise ConnectionError("db down")
+        store[digest] = (int(seq), line)
+
+    async def loader():
+        if not db["up"]:
+            raise ConnectionError("db down")
+        ordered = sorted(store.values(), key=lambda item: item[0])
+        return [line for _seq, line in ordered]
+
+    async def hashes():
+        if not db["up"]:
+            raise ConnectionError("db down")
+        return set(store)
+
+    main_bot._snap_restore_loader = loader
+    main_bot._snap_hash_loader = hashes
+    main_bot.init_quote_snapshot_log(path)
+    main_bot.set_quote_snapshot_mirror(mirror)
+    try:
+        async def scenario():
+            await main_bot.submit_quote_snapshot({"n": "a"})
+            await main_bot.submit_quote_snapshot({"n": "b"})
+            path.unlink()
+            main_bot.init_quote_snapshot_log(path)
+            db["up"] = False
+            assert await main_bot.restore_quote_snapshots_once(path) is False
+            assert main_bot.quote_snapshot_log_status()["restore_failed"] is True
+            await main_bot.submit_quote_snapshot({"n": "c"})
+            db["up"] = True
+            assert await main_bot.restore_quote_snapshots_once(path) is True
+            assert main_bot._snap_log._seq == 3
+            await main_bot.submit_quote_snapshot({"n": "d"})
+            await main_bot.backfill_quote_snapshots()
+            path.unlink()
+            assert await main_bot.restore_quote_snapshots_once(path) is True
+            return main_bot._snap_log.verify()
+
+        ok, count, err = _run(scenario())
+        rows = [
+            json.loads(line)["data"]["n"]
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    finally:
+        main_bot._snap_restore_loader = None
+        main_bot._snap_hash_loader = None
+        main_bot.set_quote_snapshot_mirror(None)
+        main_bot._snap_log = saved
+    assert ok, err
+    assert count == 4
+    assert rows == ["a", "b", "c", "d"]
 

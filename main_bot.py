@@ -28161,6 +28161,8 @@ class QuoteSnapshotLog:
                 "data": data or {},
                 "prev_hash": prev,
             }
+            if prev == "0" * 64:
+                rec["chain_start"] = True
             body = json.dumps(rec, sort_keys=True, default=str)
             rec["hash"] = hashlib.sha256((prev + body).encode("utf-8")).hexdigest()
             line = json.dumps(rec, sort_keys=True, default=str)
@@ -28204,6 +28206,8 @@ class QuoteSnapshotLog:
                     except (json.JSONDecodeError, TypeError, ValueError) as exc:
                         self._note_corrupt(exc)
                         continue
+                    if str(rec.get("prev_hash")) == "0" * 64 and rec.get("chain_start") is not True:
+                        return False, checked, f"line {line_no}: genesis row missing chain_start"
                     claimed = str(rec.pop("hash", ""))
                     if str(rec.get("prev_hash")) != prev:
                         return False, checked, f"line {line_no}: prev_hash broken"
@@ -28260,7 +28264,8 @@ _snap_restore_attempts = 0
 _snap_restore_settled = False
 _snap_restore_loader: Optional[Callable[[], Awaitable[List[str]]]] = None
 _snap_maintenance_task: Optional[asyncio.Task] = None
-_SNAPSHOT_MIRROR_TIMEOUT_S = 2.0
+_SNAPSHOT_MIRROR_TIMEOUT_S = 5.0
+_snap_hash_loader: Optional[Callable[[], Awaitable[set]]] = None
 _SNAPSHOT_RESTORE_BEFORE_APPEND = 3
 
 
@@ -28382,32 +28387,97 @@ async def _mirror_snapshot_record(rec: Dict[str, Any]) -> None:
         _remember_mirrored(digest)
 
 
-async def backfill_quote_snapshots() -> int:
-    """Push on-disk side-log lines that the live mirror missed. Idempotent.
+async def _durable_snapshot_hashes() -> Optional[set]:
+    """One query for the hashes already stored. None means the query failed."""
+    global _snap_mirror_failures
+    if _snap_hash_loader is not None:
+        try:
+            found = await asyncio.wait_for(_snap_hash_loader(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
+            return {str(item) for item in (found or set())}
+        except Exception as exc:
+            _snap_mirror_failures += 1
+            logger.warning("quote snapshot hash load failed (%s)", type(exc).__name__)
+            return None
+    if engine is None or _snap_mirror is not _quote_snapshot_mirror:
+        return set(_snap_known_mirrored)
 
-    The file read runs off the event loop. Rows already stored are a no-op
-    for the Postgres mirror (ON CONFLICT DO NOTHING).
+    async def _query() -> set:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                sql_text(f"SELECT hash FROM {_bt('bot_quote_snapshots')}")
+            )
+            return {str(row[0]) for row in result.fetchall() if row[0]}
+
+    try:
+        return await asyncio.wait_for(_query(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
+    except Exception as exc:
+        _snap_mirror_failures += 1
+        logger.warning("quote snapshot hash load failed (%s)", type(exc).__name__)
+        return None
+
+
+async def _push_snapshot_batch(rows: List[Tuple[int, str, str]]) -> None:
+    """Insert the missing lines in one database call."""
+    if not rows:
+        return
+    if _snap_mirror is _quote_snapshot_mirror and engine is not None and _snap_hash_loader is None:
+        params = [{"hash": digest, "seq": int(seq), "line": line} for seq, digest, line in rows]
+
+        async def _write() -> None:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    sql_text(
+                        f"INSERT INTO {_bt('bot_quote_snapshots')} (hash, seq, line) "
+                        "VALUES (:hash, :seq, :line) ON CONFLICT (hash) DO NOTHING"
+                    ),
+                    params,
+                )
+
+        await _write()
+        return
+    fn = _snap_mirror
+    if fn is None:
+        return
+    for seq, digest, line in rows:
+        await fn(int(seq), str(digest), line)
+
+
+async def backfill_quote_snapshots() -> int:
+    """Push on-disk lines the mirror does not have yet.
+
+    The file is read off the event loop. Hashes are loaded once, and only the
+    missing lines are sent, in one batch. An unanchored file is left alone so
+    a second genesis chain is not inserted beside the durable one.
     """
     global _snap_durable, _snap_durable_base
     log = _snap_log
-    if log is None or _snap_mirror is None:
+    if log is None or _snap_mirror is None or _snap_restore_failed:
         return 0
     try:
         rows = await asyncio.to_thread(_snapshot_lines_for_mirror, log.path)
     except Exception as exc:
         logger.warning("quote snapshot backfill failed (%s)", type(exc).__name__)
         return 0
-    pushed = 0
-    for seq, digest, line in rows:
-        if await _push_snapshot_mirror(seq, digest, line):
-            _remember_mirrored(digest)
-            pushed += 1
+    known = await _durable_snapshot_hashes()
+    if known is None:
+        return 0
+    missing = [row for row in rows if row[1] not in known]
+    if not missing:
+        return 0
+    try:
+        await asyncio.wait_for(_push_snapshot_batch(missing), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
+    except Exception as exc:
+        _snap_mirror_failures += 1
+        logger.warning("quote snapshot backfill failed (%s)", type(exc).__name__)
+        return 0
+    for _seq, digest, _line in missing:
+        _remember_mirrored(digest)
     counted = await _quote_snapshot_durable_count()
     if counted is not None:
         _snap_durable_base = counted
         _snap_known_mirrored.clear()
         _snap_durable = counted
-    return pushed
+    return len(missing)
 
 
 def _snapshot_chain_hash(prev: str, rec_without_hash: Dict[str, Any]) -> str:
@@ -28515,15 +28585,18 @@ def reload_quote_snapshot_head() -> None:
 
 
 async def _load_snapshot_mirror_lines() -> List[str]:
-    if _snap_restore_loader is not None:
-        return list(await _snap_restore_loader())
-    if engine is None:
-        return []
-    async with engine.connect() as conn:
-        result = await conn.execute(
-            sql_text(f"SELECT line FROM {_bt('bot_quote_snapshots')} ORDER BY seq")
-        )
-        return [row[0] for row in result.fetchall()]
+    async def _fetch() -> List[str]:
+        if _snap_restore_loader is not None:
+            return list(await _snap_restore_loader())
+        if engine is None:
+            return []
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                sql_text(f"SELECT line FROM {_bt('bot_quote_snapshots')} ORDER BY seq")
+            )
+            return [row[0] for row in result.fetchall()]
+
+    return await asyncio.wait_for(_fetch(), timeout=_SNAPSHOT_MIRROR_TIMEOUT_S)
 
 
 def _apply_restored_snapshot_lines(path: Path, lines: List[str]) -> None:
@@ -28553,7 +28626,9 @@ async def restore_quote_snapshots_once(path: Optional[Path] = None) -> bool:
         logger.warning("quote snapshot restore failed (%s)", type(exc).__name__)
         return False
     try:
-        _apply_restored_snapshot_lines(target, lines)
+        # File parse and the write lock stay off this task's thread only when
+        # the caller is the event loop: run them in a worker thread.
+        await asyncio.to_thread(_apply_restored_snapshot_lines, target, lines)
     except Exception as exc:
         _snap_restore_failed = True
         logger.warning("quote snapshot restore failed (%s)", type(exc).__name__)
@@ -28574,15 +28649,25 @@ async def _quote_snapshot_restore_gate() -> None:
 
 
 async def quote_snapshot_maintenance_worker() -> None:
-    """Background restore retry and backfill. Does not run on the order path."""
+    """Background restore retry and backfill. Startup does not await this."""
     while not _worker_stop:
         try:
-            if _snap_restore_failed:
-                await restore_quote_snapshots_once()
-            await backfill_quote_snapshots()
+            await restore_quote_snapshots_once()
+            if not _snap_restore_failed:
+                await backfill_quote_snapshots()
         except Exception as exc:
             logger.warning("quote snapshot maintenance failed (%s)", type(exc).__name__)
         await asyncio.sleep(_snapshot_backfill_interval_s())
+
+
+async def boot_quote_snapshot_side_log(path: Optional[Path] = None) -> None:
+    """Open the side log off the loop and schedule restore plus backfill.
+
+    Returns without waiting for the database. A hung mirror cannot hold startup.
+    """
+    target = Path(path) if path is not None else QUOTE_SNAPSHOT_FILE
+    await asyncio.to_thread(init_quote_snapshot_log, target)
+    _start_snapshot_maintenance()
 
 
 def _start_snapshot_maintenance() -> None:
@@ -41264,19 +41349,10 @@ async def on_startup():
     # then resume the hash chain and mirror every new record.
     await _restore_ledger_from_db()
     trade_ledger.init(TRADE_LEDGER_FILE)
-    await restore_quote_snapshots_once(QUOTE_SNAPSHOT_FILE)
-    init_quote_snapshot_log(QUOTE_SNAPSHOT_FILE)
     if persistence is not None:
         trade_ledger.set_mirror(_ledger_mirror)
         set_quote_snapshot_mirror(_quote_snapshot_mirror)
-        counted = await _quote_snapshot_durable_count()
-        if counted is not None:
-            global _snap_durable, _snap_durable_base
-            _snap_durable_base = counted
-            _snap_known_mirrored.clear()
-            _snap_durable = counted
-    await backfill_quote_snapshots()
-    _start_snapshot_maintenance()
+    await boot_quote_snapshot_side_log(QUOTE_SNAPSHOT_FILE)
     # Say out loud whether this process actually remembers anything. A ledger
     # that comes up empty is indistinguishable from a healthy one in the logs,
     # and it silently disarms the only mechanism that learns from past trades.
