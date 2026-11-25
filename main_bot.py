@@ -71,7 +71,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("etrade-bot.state")
@@ -2381,6 +2381,31 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("etrade-bot.alerts")
 
+# Set by main_bot once scrub_etrade_text exists. None until then: alerting
+# during import still delivers, and the log filter covers the line.
+_ALERT_SCRUB = None
+
+
+def _scrub_alert_text(message: str) -> str:
+    fn = _ALERT_SCRUB
+    if not callable(fn) or not message:
+        return message
+    try:
+        return str(fn(message))
+    except Exception:
+        return message
+
+
+def _scrub_alert_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        return _scrub_alert_text(value)
+    if isinstance(value, dict):
+        return {k: _scrub_alert_payload(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_alert_payload(v) for v in value]
+    return value
+
+
 ALERTS_RECENT_KEY = "alerts:recent"
 ALERTS_CONFIG_KEY = "alerts:config"
 ALERTS_LAST_DELIVERY_KEY = "alerts:last_delivery"
@@ -2509,10 +2534,10 @@ class AlertManager:
             "ts": _utcnow_iso(),
             "severity": severity,
             "event": event,
-            "message": str(message)[:1000],
+            "message": _scrub_alert_text(str(message))[:1000],
         }
         if data:
-            record["data"] = data
+            record["data"] = _scrub_alert_payload(data)
 
         # 0) Dedupe FIRST. It used to guard only the webhook, so a condition
         # re-detected on every 60s heartbeat still logged at ERROR and pushed a
@@ -2563,7 +2588,8 @@ class AlertManager:
         detail = ""
         try:
             import httpx  # lazy import — alerting must not hard-require httpx
-            text = text_override or (
+            text = (
+                _scrub_alert_text(text_override) if text_override else
                 f"[{record['severity'].upper()}] {record['event']}: {record['message']}"
             )
             # Discord rejects content over 2000 chars with a 400 — a long alert
@@ -15055,7 +15081,7 @@ from fastapi import FastAPI, HTTPException, Body, Query, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, validator, ValidationError
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Sequence, Tuple
 import httpx
 import pyetrade
 import os
@@ -15417,7 +15443,10 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # still fail-closes when the two disagree or the Massive side is missing
 # or stale. GET /pro-trader/report includes the gap in basis points.
 # /status positions_open is the open book with status, side, and qty.
-BOT_VERSION = "5.99.6-pro-day-trader"
+# Logs, alerts, and HTTP responses mask accountIdKey (**** + last 4).
+# Order routing still uses the real key.
+# 5.99.14 pages GET /ledger. No paging params still returns today's tail.
+BOT_VERSION = "5.99.14-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -21675,7 +21704,7 @@ async def etrade_auth_start():
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, detail=str(e))
+        raise HTTPException(500, detail=scrub_etrade_text(str(e)))
 
 
 def _classify_exchange_error(msg: str) -> Tuple[int, str]:
@@ -21782,8 +21811,8 @@ async def etrade_auth_complete(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Complete link failed: {e}")
-        raise HTTPException(500, detail=str(e))
+        logger.error(f"Complete link failed: {scrub_etrade_text(str(e))}")
+        raise HTTPException(500, detail=scrub_etrade_text(str(e)))
 
 
 @app.get("/etrade/account")
@@ -21976,8 +22005,8 @@ async def select_etrade_account(
             )
             resp = await _etrade_call(accounts_api.list_accounts, resp_format="json", source="select_account")
         except Exception as e:
-            logger.error(f"Account select failed to enumerate accounts: {e}")
-            raise HTTPException(502, f"Could not read your E*TRADE accounts: {e}")
+            logger.error(f"Account select failed to enumerate accounts: {scrub_etrade_text(str(e))}")
+            raise HTTPException(502, f"Could not read your E*TRADE accounts: {scrub_etrade_text(str(e))}")
         account_list = (((resp or {}).get("AccountListResponse") or {}).get("Accounts") or {}).get("Account") or []
         if isinstance(account_list, dict):
             account_list = [account_list]
@@ -22026,7 +22055,7 @@ async def select_etrade_account(
          f"({(matched or {}).get('accountDesc', 'n/a')}) from the app."
          if pin_value else
          "Trading account pin cleared — the bot will auto-select again."),
-        dedupe_key=f"acctpin:set:{pin_value or 'cleared'}",
+        dedupe_key=f"acctpin:set:{mask_account_key(pin_value) or 'cleared'}",
     )
 
     return {
@@ -22083,8 +22112,8 @@ async def select_etrade_crypto_account(
                 accounts_api.list_accounts, resp_format="json", source="select_crypto_account",
             )
         except Exception as e:
-            logger.error(f"Crypto account select failed to enumerate accounts: {e}")
-            raise HTTPException(502, f"Could not read your E*TRADE accounts: {e}")
+            logger.error(f"Crypto account select failed to enumerate accounts: {scrub_etrade_text(str(e))}")
+            raise HTTPException(502, f"Could not read your E*TRADE accounts: {scrub_etrade_text(str(e))}")
         account_list = (((resp or {}).get("AccountListResponse") or {}).get("Accounts") or {}).get("Account") or []
         if isinstance(account_list, dict):
             account_list = [account_list]
@@ -22130,7 +22159,7 @@ async def select_etrade_crypto_account(
          f"({(matched or {}).get('accountDesc', 'n/a')}) — crypto-only."
          if pin_value else
          "CRYPTO account pin cleared — env/auto-detect will choose again."),
-        dedupe_key=f"cryptopin:set:{pin_value or 'cleared'}",
+        dedupe_key=f"cryptopin:set:{mask_account_key(pin_value) or 'cleared'}",
     )
 
     return {
@@ -22446,7 +22475,7 @@ async def get_quotes(symbols: str = Query(...)):
         # Raw payload stays available for debugging without changing the contract.
         return {**normalized, "raw": raw} if DEBUG_QUOTES else normalized
     except Exception as e:
-        raise HTTPException(500, detail=str(e))
+        raise HTTPException(500, detail=scrub_etrade_text(str(e)))
 
 
 @app.get("/etrade/option-quote")
@@ -22495,7 +22524,7 @@ async def get_option_quote(
             _snap_option_contract, market, symbol, expiry, float(strike), call_put
         )
     except Exception as e:
-        raise HTTPException(500, detail=str(e))
+        raise HTTPException(500, detail=scrub_etrade_text(str(e)))
 
     quoted = real_bid > 0 and real_ask > 0 and real_ask >= real_bid
     body = {
@@ -23439,7 +23468,9 @@ async def _load_pinned_account() -> Optional[str]:
         return _pinned_account_id
     pinned = (raw or "").strip() or None
     if pinned != _pinned_account_id:
-        logger.info(f"Pinned trading account is now {pinned or 'unset (auto-select)'}")
+        logger.info(
+            f"Pinned trading account is now {mask_account_key(pinned) or 'unset (auto-select)'}"
+        )
         # A different pin invalidates this process's cached accountIdKey.
         global _resolved_account_id_key
         _resolved_account_id_key = None
@@ -23471,7 +23502,9 @@ async def _load_pinned_crypto_account() -> Optional[str]:
         return _pinned_crypto_account_id
     pinned = normalize_account_id(raw) or ((raw or "").strip() or None)
     if pinned != _pinned_crypto_account_id:
-        logger.info(f"Pinned CRYPTO account is now {pinned or 'unset (env/auto)'}")
+        logger.info(
+            f"Pinned CRYPTO account is now {mask_account_key(pinned) or 'unset (env/auto)'}"
+        )
         _resolved_crypto_account_id_key = None
     _pinned_crypto_account_id = pinned
     return _pinned_crypto_account_id
@@ -23541,7 +23574,7 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
                 break
         if not chosen:
             logger.warning(
-                f"⚠️ Pinned account {pinned} matches none of the {len(brokerage)} "
+                f"⚠️ Pinned account {mask_account_key(pinned)} matches none of the {len(brokerage)} "
                 f"brokerage account(s) — the pin is stale (account closed, crypto-only, "
                 f"or a different E*TRADE login is linked). Falling back."
             )
@@ -23593,10 +23626,10 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
     if pinned and source != "pinned":
         await alerts.send(
             "warning", "account_pin_stale",
-            f"Pinned account {pinned} is not among the {len(account_list)} linked "
+            f"Pinned account {mask_account_key(pinned)} is not among the {len(account_list)} linked "
             f"accounts — orders route to ****{acct_id[-4:] or '????'} instead. "
             f"Re-pick the account in the app.",
-            dedupe_key=f"acctpin:stale:{pinned}",
+            dedupe_key=f"acctpin:stale:{mask_account_key(pinned)}",
         )
     elif source == "pinned":
         # Deliberate in-app choice — nothing ambiguous to warn about.
@@ -23604,10 +23637,10 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
     elif target and not matched:
         await alerts.send(
             "warning", "account_binding_mismatch",
-            f"ETRADE_ACCOUNT_ID ({target}) matched none of {len(account_list)} linked accounts — "
+            f"ETRADE_ACCOUNT_ID ({mask_account_key(target)}) matched none of {len(account_list)} linked accounts — "
             f"orders will route to ****{acct_id[-4:] or '????'} ({chosen.get('accountDesc', 'n/a')}). "
             f"Fix ETRADE_ACCOUNT_ID or clear it to silence this.",
-            dedupe_key=f"acctbind:{target}:{acct_id}",
+            dedupe_key=f"acctbind:{mask_account_key(target)}:{mask_account_key(acct_id)}",
         )
     elif not target and len(account_list) > 1:
         await alerts.send(
@@ -23616,7 +23649,7 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
             f"orders route to the first ACTIVE one (****{acct_id[-4:] or '????'}, "
             f"{chosen.get('accountDesc', 'n/a')}). Pick the account in the app "
             f"(E*TRADE Account → Trading account) to pin it.",
-            dedupe_key=f"acctbind:unset:{acct_id}",
+            dedupe_key=f"acctbind:unset:{mask_account_key(acct_id)}",
         )
     return _resolved_account_id_key
 
@@ -23658,7 +23691,7 @@ async def _resolve_crypto_account_id_key(tokens: Dict[str, str]) -> str:
                 break
         if not chosen:
             logger.warning(
-                f"⚠️ Pinned CRYPTO account {pinned} matches no linked crypto "
+                f"⚠️ Pinned CRYPTO account {mask_account_key(pinned)} matches no linked crypto "
                 f"account — falling through to env/auto"
             )
     if not chosen and target:
@@ -23677,7 +23710,7 @@ async def _resolve_crypto_account_id_key(tokens: Dict[str, str]) -> str:
             # Env default may be set before the account is linked — fall back to
             # auto-detect rather than hard-failing every crypto path.
             logger.warning(
-                f"⚠️ ETRADE_CRYPTO_ACCOUNT_ID ({target}) matches none of the "
+                f"⚠️ ETRADE_CRYPTO_ACCOUNT_ID ({mask_account_key(target)}) matches none of the "
                 f"{len(account_list)} linked account(s) — falling back to auto-detect"
             )
     if not chosen:
@@ -24039,9 +24072,10 @@ def build_preflight(*,
     # The whitespace bug. Not blocking — the digits still resolve once cleaned —
     # but the env var stays wrong until someone edits it, and a silent repair
     # that never surfaces is how the next deploy inherits the same typo.
+    shown_account = mask_account_key(account_id_raw) if account_id_raw else None
     add("account_id_env", not account_id_repaired,
-        f"ETRADE_ACCOUNT_ID clean ({account_id_raw})" if account_id_raw else "ETRADE_ACCOUNT_ID unset (auto-select)",
-        (f"ETRADE_ACCOUNT_ID contained whitespace and was auto-repaired to '{account_id_raw}' for this "
+        f"ETRADE_ACCOUNT_ID clean ({shown_account})" if shown_account else "ETRADE_ACCOUNT_ID unset (auto-select)",
+        (f"ETRADE_ACCOUNT_ID contained whitespace and was auto-repaired to '{shown_account}' for this "
          f"process. Fix the env var itself — as stored it matches no account, and the bot falls back to "
          f"the first ACTIVE account, which on a multi-account login is not necessarily yours."))
 
@@ -26070,6 +26104,255 @@ async def check_risk_limits(is_close: bool = False) -> None:
         )
 
 
+# ==================== ACCOUNT REDACTION ====================
+# Same name and signature as etrade_async.scrub_etrade_text on
+# cursor/reconcile-etrade-404-3b51 (#36). This copy lives on the main module,
+# not inside that bundle, so the two definitions do not share lines. The body
+# is #36's, plus accountIdKey query redaction (_ACCT_KEY_QUERY).
+_ACCT_IN_PATH = re.compile(r"(/accounts/)([^/?#]+)")
+_LONG_DIGITS = re.compile(r"\d{8,}")
+_AUTH_HEADER = re.compile(r"(?i)authorization\s*[:=]\s*\S+")
+_OAUTH_PARAM = re.compile(
+    r"(?i)\b(oauth_[a-z0-9_]+|access_token|token_secret|consumer_secret)\s*[=:]\s*\"?[^\s\",}]+"
+)
+_ACCT_KEY_QUERY = re.compile(
+    r"(?i)(accountIdKey\s*=\s*)(?!\{acct\}|\{redacted\})([^&\s\"',}{]+)"
+)
+_RESPONSE_KEY_FIELDS = {
+    "accountIdKey", "account_id_key", "crypto_account_id_key", "resolved_account_id_key",
+}
+_RESPONSE_NUMBER_FIELDS = {
+    "accountId", "account_id", "resolved_account_id",
+    "pinned_account_id", "pinned_crypto_account_id",
+    "env_account_id", "env_crypto_account_id",
+}
+# The account screen returns the account number the app sends back to pin.
+# The opaque key is still masked on these paths.
+_ACCOUNT_PICKER_PATHS = {
+    "/etrade/account",
+    "/etrade/account/select",
+    "/etrade/crypto/account/select",
+}
+
+
+def _scrub_etrade_urls(text: str) -> str:
+    """Redact account path segments, accountIdKey query values, and OAuth material."""
+    cleaned = _ACCT_IN_PATH.sub(
+        lambda m: m.group(0) if m.group(2) == "{acct}" else m.group(1) + "{acct}",
+        text,
+    )
+    cleaned = _ACCT_KEY_QUERY.sub(r"\1{acct}", cleaned)
+    cleaned = _AUTH_HEADER.sub("Authorization: [redacted]", cleaned)
+    cleaned = _OAUTH_PARAM.sub(lambda m: m.group(1) + "=[redacted]", cleaned)
+    return cleaned
+
+
+def scrub_etrade_text(text: str, secrets: Optional[Sequence[str]] = None) -> str:
+    """Strip account ids, long digit runs, and OAuth material from a log line."""
+    cleaned = str(text or "")
+    for secret in secrets or ():
+        if secret and len(secret) >= 4:
+            cleaned = cleaned.replace(secret, "{acct}")
+    cleaned = _scrub_etrade_urls(cleaned)
+    cleaned = _LONG_DIGITS.sub("{redacted}", cleaned)
+    return cleaned
+
+
+def mask_account_key(value: Optional[str]) -> Optional[str]:
+    """**** plus the last 4 characters. None stays None. Already masked stays."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.startswith("****"):
+        return text
+    return "****" + text[-4:]
+
+
+def redact_http_payload(path: str, payload: Any) -> Any:
+    """Mask account keys (and, off the account picker, account numbers) in a JSON body.
+
+    Strings are also scrubbed for /v1/accounts/<key>/, accountIdKey=, and OAuth
+    header values. The in-memory key is not touched; this runs on the response.
+    """
+    mask_numbers = (path or "").rstrip("/") not in _ACCOUNT_PICKER_PATHS
+    return _redact_json_value(payload, mask_numbers=mask_numbers)
+
+
+def _redact_json_value(value: Any, *, mask_numbers: bool) -> Any:
+    if isinstance(value, dict):
+        is_binding = "resolved_account_id_key" in value or "resolved_last4" in value
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _RESPONSE_KEY_FIELDS and isinstance(item, str):
+                out[key] = mask_account_key(item)
+            elif mask_numbers and key in _RESPONSE_NUMBER_FIELDS and isinstance(item, str):
+                out[key] = mask_account_key(item)
+            elif is_binding and key in {"configured", "pinned"} and isinstance(item, str):
+                out[key] = mask_account_key(item)
+            elif isinstance(item, str):
+                out[key] = _scrub_etrade_urls(item)
+            else:
+                out[key] = _redact_json_value(item, mask_numbers=mask_numbers)
+        return out
+    if isinstance(value, list):
+        return [_redact_json_value(item, mask_numbers=mask_numbers) for item in value]
+    if isinstance(value, str):
+        return _scrub_etrade_urls(value)
+    return value
+
+
+class _EtradeLogRedactor(logging.Filter):
+    """Scrub account URLs and OAuth material on every log record.
+
+    The message keeps long digit runs (order ids, timestamps). Tracebacks do
+    not: logger.exception, exc_info, and stack_info are formatted and passed
+    through scrub_etrade_text, then exc_info is cleared so a handler cannot
+    print the raw traceback over the scrubbed text.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            rendered = record.getMessage()
+            cleaned = _scrub_etrade_urls(rendered)
+            if cleaned != rendered:
+                record.msg = cleaned
+                record.args = None
+        except Exception:
+            pass
+        if record.exc_info:
+            try:
+                formatted = logging.Formatter().formatException(record.exc_info)
+            except Exception:
+                formatted = record.exc_text or ""
+            record.exc_text = scrub_etrade_text(formatted)
+            record.exc_info = None
+        if record.exc_text:
+            record.exc_text = scrub_etrade_text(record.exc_text)
+        if record.stack_info:
+            record.stack_info = scrub_etrade_text(str(record.stack_info))
+        return True
+
+
+_ETRADE_LOG_REDACTOR = _EtradeLogRedactor()
+_ETRADE_HANDLER_PATCHED = False
+
+
+def _install_etrade_log_redactor() -> None:
+    global _ETRADE_HANDLER_PATCHED
+    seen = set()
+
+    def _arm(obj: logging.Logger) -> None:
+        if obj is None or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        if not any(isinstance(existing, _EtradeLogRedactor) for existing in obj.filters):
+            obj.addFilter(_ETRADE_LOG_REDACTOR)
+
+    def _arm_handler(hdlr) -> None:
+        if hdlr is None:
+            return
+        filters = getattr(hdlr, "filters", ())
+        if not any(isinstance(existing, _EtradeLogRedactor) for existing in filters):
+            hdlr.addFilter(_ETRADE_LOG_REDACTOR)
+
+    def _arm_logger(obj: logging.Logger) -> None:
+        _arm(obj)
+        for hdlr in list(getattr(obj, "handlers", ())):
+            _arm_handler(hdlr)
+
+    root = logging.getLogger()
+    _arm_logger(root)
+    for obj in list(logging.Logger.manager.loggerDict.values()):
+        if isinstance(obj, logging.Logger):
+            _arm_logger(obj)
+    # Created here if uvicorn has not configured logging yet. dictConfig may
+    # later replace logger filters; handlers added after this patch still
+    # receive the redactor.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        _arm_logger(logging.getLogger(name))
+
+    manager = logging.Logger.manager
+    original = getattr(manager, "_etrade_original_get_logger", None)
+    if original is None:
+        original = manager.getLogger
+        manager._etrade_original_get_logger = original
+
+        def _redacting_get_logger(name):
+            logger_obj = original(name)
+            if isinstance(logger_obj, logging.Logger):
+                _arm_logger(logger_obj)
+            return logger_obj
+
+        manager.getLogger = _redacting_get_logger
+
+    if not _ETRADE_HANDLER_PATCHED:
+        _orig_add_handler = logging.Logger.addHandler
+
+        def _arming_add_handler(self, hdlr):
+            _orig_add_handler(self, hdlr)
+            _arm_handler(hdlr)
+
+        logging.Logger.addHandler = _arming_add_handler
+        _ETRADE_HANDLER_PATCHED = True
+
+
+_install_etrade_log_redactor()
+alerts._ALERT_SCRUB = _scrub_etrade_urls
+
+
+async def _read_response_body(response) -> bytes:
+    """Bytes of a JSONResponse, or the stream BaseHTTPMiddleware hands upward."""
+    raw = getattr(response, "body", None)
+    if raw:
+        return raw.tobytes() if isinstance(raw, memoryview) else raw
+    iterator = getattr(response, "body_iterator", None)
+    if iterator is None:
+        return b""
+    chunks = []
+    async for chunk in iterator:
+        chunks.append(chunk.encode("utf-8") if isinstance(chunk, str) else chunk)
+    return b"".join(chunks)
+
+
+def _replace_response_body(response, raw: bytes) -> None:
+    async def _one_chunk():
+        yield raw
+
+    response.body_iterator = _one_chunk()
+    try:
+        response.body = raw
+    except Exception:
+        pass
+    response.headers["content-length"] = str(len(raw))
+
+
+@app.middleware("http")
+async def _redact_account_response(request: Request, call_next):
+    """Mask account keys on the way out. Internal routing state is unchanged."""
+    response = await call_next(request)
+    media = str(response.headers.get("content-type") or "")
+    if "application/json" not in media:
+        return response
+    raw = await _read_response_body(response)
+    if not raw:
+        _replace_response_body(response, raw)
+        return response
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
+        _replace_response_body(response, raw)
+        return response
+    path = request.url.path.rstrip("/") or "/"
+    redacted = redact_http_payload(path, payload)
+    encoded = raw if redacted == payload else json.dumps(
+        redacted, ensure_ascii=False, allow_nan=False, separators=(",", ":"), default=str,
+    ).encode("utf-8")
+    _replace_response_body(response, encoded)
+    return response
+
+
 # ==================== E*TRADE CALL BACKOFF ====================
 # Every E*TRADE API call goes through exponential backoff with jitter — the
 # raw async client retries inside etrade_async._request; the pyetrade paths
@@ -26162,8 +26445,8 @@ def _sync_etrade_call(fn, *args, source: str = "etrade", **kwargs):
                 raise
             delay = _backoff_delay(attempt, exact=_is_throttle(e))
             logger.warning(
-                f"E*TRADE {source} failed (attempt {attempt + 1}/{ETRADE_RETRY_ATTEMPTS}): {e} "
-                f"— retrying in {delay:.1f}s"
+                f"E*TRADE {source} failed (attempt {attempt + 1}/{ETRADE_RETRY_ATTEMPTS}): "
+                f"{scrub_etrade_text(str(e))} — retrying in {delay:.1f}s"
             )
             time.sleep(delay)
 
@@ -26185,8 +26468,8 @@ async def _etrade_call(fn, *args, source: str = "etrade", idempotent: bool = Tru
                 raise
             delay = _backoff_delay(attempt, exact=throttled)
             logger.warning(
-                f"E*TRADE {source} failed (attempt {attempt + 1}/{ETRADE_RETRY_ATTEMPTS}): {e} "
-                f"— retrying in {delay:.1f}s"
+                f"E*TRADE {source} failed (attempt {attempt + 1}/{ETRADE_RETRY_ATTEMPTS}): "
+                f"{scrub_etrade_text(str(e))} — retrying in {delay:.1f}s"
             )
             await asyncio.sleep(delay)
 
@@ -40225,19 +40508,807 @@ async def scanner_scan_now(
     return await scanner.scan_once()
 
 
-@app.get("/ledger")
-async def ledger_tail(count: int = Query(100, ge=1, le=500), verify: bool = Query(False)):
-    """Tail of the immutable trade ledger (newest first). Pass ?verify=true to
-    walk the FULL hash chain and prove no record was altered or removed."""
-    out: Dict[str, Any] = {"records": trade_ledger.tail(count)}
-    if _ledger_memory is not None:
-        out["memory"] = _ledger_memory
-    if verify:
-        ok, checked, err = trade_ledger.verify()
-        out["chain_ok"] = ok
-        out["chain_records_checked"] = checked
-        out["chain_error"] = err
+# GET /ledger paging. The ledger is the append-only JSONL file
+# (TRADE_LEDGER_FILE), not a Redis list, stream, or sorted set. Reads seek
+# to the window and stop after LEDGER_PAGE_SCAN_CAP lines. Nothing here
+# appends, trims, or rewrites that file.
+LEDGER_PAGE_DEFAULT_LIMIT = 500
+LEDGER_PAGE_MAX_LIMIT = 1000
+LEDGER_PAGE_SCAN_CAP = 8000
+LEDGER_PAGE_MAX_LINE = 1024 * 1024
+LEDGER_RATE_LIMIT = 30
+LEDGER_RATE_WINDOW_SECONDS = 60.0
+LEDGER_RATE_MAX_KEYS = 1024
+_LEDGER_CT = ZoneInfo("America/Chicago")
+_LEDGER_STRIP_FIELDS = frozenset({"accountId", "accountIdKey"})
+_LEDGER_EVENT_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_ledger_rate_hits: Dict[str, List[float]] = {}
+
+
+def _reset_ledger_rate_limit() -> None:
+    _ledger_rate_hits.clear()
+
+
+def _ledger_scrub_secrets() -> List[str]:
+    """Resolved routing keys. Used only as scrub needles, never logged."""
+    found: List[str] = []
+    for value in (_resolved_account_id_key, _resolved_crypto_account_id_key):
+        if isinstance(value, str) and len(value) >= 4 and value not in found:
+            found.append(value)
+    return found
+
+
+def _ledger_log_failure(where: str, exc: BaseException) -> None:
+    """Log a ledger read failure without an unscrubbed str(exc)."""
+    detail = scrub_etrade_text(str(exc), secrets=_ledger_scrub_secrets())
+    logger.warning("ledger %s failed: %s", where, detail)
+
+
+def _collect_ledger_secrets(value: Any, found: List[str]) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in _LEDGER_STRIP_FIELDS and isinstance(item, str) and len(item) >= 4:
+                if item not in found:
+                    found.append(item)
+            _collect_ledger_secrets(item, found)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_ledger_secrets(item, found)
+
+
+def _scrub_ledger_string(text: str, secrets: Sequence[str]) -> str:
+    """Same string scrub as the response middleware, plus known account keys.
+
+    URLs, `accountIdKey=` query values, and OAuth material go through
+    `_scrub_etrade_urls`. An opaque account key is removed wherever it
+    appears. An all-digit account number is removed only when it is the
+    entire value. The 8-digit pass in `scrub_etrade_text` is not applied,
+    so a hash or an OCC symbol keeps its digits.
+    """
+    cleaned = text
+    for secret in secrets:
+        if not secret or len(secret) < 4:
+            continue
+        if secret.isdigit():
+            if cleaned == secret:
+                cleaned = "{acct}"
+        else:
+            cleaned = cleaned.replace(secret, "{acct}")
+    return _scrub_etrade_urls(cleaned)
+
+
+def _redact_ledger_value(value: Any, secrets: Sequence[str]) -> Any:
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _LEDGER_STRIP_FIELDS:
+                continue
+            out[key] = _redact_ledger_value(item, secrets)
+        return out
+    if isinstance(value, list):
+        return [_redact_ledger_value(item, secrets) for item in value]
+    if isinstance(value, str):
+        return _scrub_ledger_string(value, secrets)
+    return value
+
+
+def _redact_ledger_payload(value: Any) -> Any:
+    secrets = _ledger_scrub_secrets()
+    _collect_ledger_secrets(value, secrets)
+    return _redact_ledger_value(value, secrets)
+
+
+def _prune_ledger_rate_keys(now: float) -> None:
+    """Drop expired clients, then the least recently used, down to 1024 keys."""
+    window = LEDGER_RATE_WINDOW_SECONDS
+    for key in list(_ledger_rate_hits):
+        fresh = [stamp for stamp in _ledger_rate_hits[key] if now - stamp < window]
+        if fresh:
+            _ledger_rate_hits[key] = fresh
+        else:
+            del _ledger_rate_hits[key]
+    overflow = len(_ledger_rate_hits) - LEDGER_RATE_MAX_KEYS
+    if overflow <= 0:
+        return
+    oldest = sorted(_ledger_rate_hits, key=lambda item: _ledger_rate_hits[item][-1])
+    for key in oldest[:overflow]:
+        del _ledger_rate_hits[key]
+
+
+def _enforce_ledger_rate_limit(request: Request) -> None:
+    """30 paging reads a minute per client host. The legacy tail is exempt.
+
+    Auth has already fail-closed. Expired keys are removed, and the table
+    never keeps more than LEDGER_RATE_MAX_KEYS clients.
+    """
+    now = time.monotonic()
+    _prune_ledger_rate_keys(now)
+    client = request.client
+    key = client.host if client is not None and client.host else "unknown"
+    hits = list(_ledger_rate_hits.get(key, ()))
+    if len(hits) >= LEDGER_RATE_LIMIT:
+        _ledger_rate_hits[key] = hits
+        raise HTTPException(status_code=429, detail="ledger rate limit exceeded")
+    hits.append(now)
+    _ledger_rate_hits[key] = hits
+
+
+def _paging_requested(*values: Optional[str]) -> bool:
+    return any(value is not None for value in values)
+
+
+def _parse_ledger_seq_param(name: str, raw: Optional[str]) -> Optional[int]:
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text.isdigit():
+        raise HTTPException(status_code=400, detail=f"{name} must be a non-negative integer")
+    return int(text)
+
+
+def _parse_ledger_limit(raw: Optional[str]) -> int:
+    if raw is None:
+        return LEDGER_PAGE_DEFAULT_LIMIT
+    text = raw.strip()
+    if not text.isdigit():
+        raise HTTPException(status_code=400, detail="limit must be an integer from 1 to 1000")
+    value = int(text)
+    if value < 1 or value > LEDGER_PAGE_MAX_LIMIT:
+        raise HTTPException(status_code=400, detail="limit must be an integer from 1 to 1000")
+    return value
+
+
+def _parse_ledger_event_types(raw: Optional[str]) -> Optional[frozenset]:
+    if raw is None:
+        return None
+    parts = [part.strip() for part in raw.split(",")]
+    if not parts or any(not part or _LEDGER_EVENT_NAME.fullmatch(part) is None for part in parts):
+        raise HTTPException(
+            status_code=400,
+            detail="event_type must be a comma-separated list of event names",
+        )
+    return frozenset(parts)
+
+
+def _parse_ledger_ct_bound(name: str, raw: Optional[str], *, is_end: bool) -> Optional[datetime]:
+    """UTC instant for a Central Time bound.
+
+    YYYY-MM-DD is a Chicago calendar day. `start` is that midnight inclusive.
+    `end` is the next Chicago midnight exclusive, so the named day is included.
+    A timestamp with an offset is that instant. A naive timestamp is Central Time.
+    """
+    if raw is None:
+        return None
+    text = raw.strip()
+    if len(text) == 10 and text[4:5] == "-" and text[7:8] == "-":
+        try:
+            day = date.fromisoformat(text)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be a CT date (YYYY-MM-DD) or timestamp",
+            )
+        if is_end:
+            day = day + timedelta(days=1)
+        return datetime(day.year, day.month, day.day, tzinfo=_LEDGER_CT).astimezone(timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name} must be a CT date (YYYY-MM-DD) or timestamp",
+        )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_LEDGER_CT)
+    return parsed.astimezone(timezone.utc)
+
+
+class _LedgerQuery:
+    __slots__ = ("since_seq", "before_seq", "limit", "event_types", "start", "end", "ascending")
+
+    def __init__(
+        self,
+        since_seq: Optional[int],
+        before_seq: Optional[int],
+        limit: int,
+        event_types: Optional[frozenset],
+        start: Optional[datetime],
+        end: Optional[datetime],
+    ) -> None:
+        self.since_seq = since_seq
+        self.before_seq = before_seq
+        self.limit = limit
+        self.event_types = event_types
+        self.start = start
+        self.end = end
+        self.ascending = since_seq is not None
+
+    def seq_before_ok(self, rec: Dict[str, Any]) -> bool:
+        """True when `seq` is strictly below `before_seq`. Seq follows append order."""
+        if self.before_seq is None:
+            return True
+        seq = _ledger_seq(rec)
+        return seq is not None and seq < self.before_seq
+
+    def seq_since_ok(self, rec: Dict[str, Any]) -> bool:
+        """True when `seq` is strictly above `since_seq`. Seq follows append order."""
+        if self.since_seq is None:
+            return True
+        seq = _ledger_seq(rec)
+        return seq is not None and seq > self.since_seq
+
+    def date_ok(self, rec: Dict[str, Any]) -> bool:
+        """True when `ts` is inside the Central Time window.
+
+        A timestamp that is out of order does not end the scan. The caller
+        skips the row and keeps reading.
+        """
+        if self.start is None and self.end is None:
+            return True
+        ts = _ledger_ts(rec)
+        if ts is None:
+            return False
+        if self.start is not None and ts < self.start:
+            return False
+        if self.end is not None and ts >= self.end:
+            return False
+        return True
+
+    def event_ok(self, rec: Dict[str, Any]) -> bool:
+        if self.event_types is None:
+            return True
+        return str(rec.get("event") or "") in self.event_types
+
+
+def _parse_ledger_query(
+    since_seq: Optional[str],
+    before_seq: Optional[str],
+    limit: Optional[str],
+    event_type: Optional[str],
+    start: Optional[str],
+    end: Optional[str],
+) -> _LedgerQuery:
+    since = _parse_ledger_seq_param("since_seq", since_seq)
+    before = _parse_ledger_seq_param("before_seq", before_seq)
+    if since is not None and before is not None and since >= before:
+        raise HTTPException(status_code=400, detail="since_seq must be less than before_seq")
+    start_at = _parse_ledger_ct_bound("start", start, is_end=False)
+    end_at = _parse_ledger_ct_bound("end", end, is_end=True)
+    if start_at is not None and end_at is not None and start_at >= end_at:
+        raise HTTPException(status_code=400, detail="start must be on or before end")
+    return _LedgerQuery(
+        since, before, _parse_ledger_limit(limit), _parse_ledger_event_types(event_type),
+        start_at, end_at,
+    )
+
+
+def _ledger_seq(rec: Dict[str, Any]) -> Optional[int]:
+    seq = rec.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        return None
+    if seq < 0:
+        return None
+    return seq
+
+
+def _ledger_ts(rec: Dict[str, Any]) -> Optional[datetime]:
+    raw = rec.get("ts")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_ledger_obj(raw: bytes) -> Optional[Dict[str, Any]]:
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        rec = json.loads(text.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    return rec
+
+
+def _line_at(handle, pos: int, size: int) -> Tuple[int, int, bytes]:
+    """Byte range of the line containing `pos`, and the line without its newline.
+
+    A line longer than LEDGER_PAGE_MAX_LINE is skipped (empty payload, end
+    moved past it) so one huge line cannot be loaded whole.
+    """
+    if size <= 0:
+        return 0, 0, b""
+    pos = min(max(pos, 0), size - 1)
+    start = pos
+    back_budget = LEDGER_PAGE_MAX_LINE
+    while start > 0 and (pos - start) < back_budget:
+        step = min(4096, start, back_budget - (pos - start))
+        if step <= 0:
+            break
+        handle.seek(start - step)
+        block = handle.read(step)
+        rel = block.rfind(b"\n")
+        if rel != -1:
+            start = start - step + rel + 1
+            break
+        start -= step
+    handle.seek(start)
+    buf = bytearray()
+    end = start
+    while end < size and len(buf) < LEDGER_PAGE_MAX_LINE:
+        block = handle.read(min(4096, size - end, LEDGER_PAGE_MAX_LINE - len(buf)))
+        if not block:
+            break
+        rel = block.find(b"\n")
+        if rel != -1:
+            buf.extend(block[:rel])
+            end += rel + 1
+            return start, end, bytes(buf)
+        buf.extend(block)
+        end += len(block)
+    if len(buf) >= LEDGER_PAGE_MAX_LINE:
+        while end < size:
+            block = handle.read(min(4096, size - end))
+            if not block:
+                break
+            rel = block.find(b"\n")
+            if rel != -1:
+                end += rel + 1
+                break
+            end += len(block)
+        return start, end, b""
+    return start, end, bytes(buf)
+
+
+def _readline_capped(handle, cap: int) -> Tuple[bytes, bool]:
+    """Next line without its newline, and whether EOF was reached on this read."""
+    buf = bytearray()
+    while len(buf) < cap:
+        chunk = handle.read(min(4096, cap - len(buf)))
+        if not chunk:
+            return bytes(buf), True
+        rel = chunk.find(b"\n")
+        if rel != -1:
+            buf.extend(chunk[:rel])
+            extra = len(chunk) - (rel + 1)
+            if extra:
+                handle.seek(handle.tell() - extra)
+            return bytes(buf), False
+        buf.extend(chunk)
+    while True:
+        chunk = handle.read(4096)
+        if not chunk:
+            return b"", True
+        rel = chunk.find(b"\n")
+        if rel != -1:
+            extra = len(chunk) - (rel + 1)
+            if extra:
+                handle.seek(handle.tell() - extra)
+            return b"", False
+
+
+def _empty_ledger_page() -> Dict[str, Any]:
+    return {
+        "records": [],
+        "next_before_seq": None,
+        "next_since_seq": None,
+        "has_more": False,
+    }
+
+
+def _finish_ledger_page(
+    included: List[Dict[str, Any]],
+    next_before: Optional[int],
+    next_since: Optional[int],
+    has_more: bool,
+) -> Dict[str, Any]:
+    return {
+        "records": included,
+        "next_before_seq": next_before,
+        "next_since_seq": next_since,
+        "has_more": has_more,
+    }
+
+
+def _newest_line_start(path: Path) -> Optional[int]:
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        _ledger_log_failure("stat", exc)
+        return None
+    if size <= 0:
+        return None
+    with open(path, "rb") as handle:
+        pos = size - 1
+        steps = 0
+        while pos >= 0 and steps < LEDGER_PAGE_SCAN_CAP:
+            steps += 1
+            start, _end, raw = _line_at(handle, pos, size)
+            if raw.strip():
+                return start
+            if start <= 0:
+                return None
+            pos = start - 1
+    return None
+
+
+def _seek_rightmost(path: Path, pred) -> Optional[int]:
+    """Line start of the newest record for which `pred` is true. Monotonic pred."""
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        _ledger_log_failure("stat", exc)
+        return None
+    if size <= 0:
+        return None
+    lo = 0
+    hi = size
+    best: Optional[int] = None
+    with open(path, "rb") as handle:
+        for _ in range(64):
+            if lo >= hi:
+                break
+            start, end, raw = _line_at(handle, (lo + hi) // 2, size)
+            if end <= lo:
+                break
+            rec = _parse_ledger_obj(raw)
+            if rec is not None and pred(rec):
+                best = start
+                if end >= hi:
+                    break
+                lo = end
+            else:
+                if start <= lo:
+                    break
+                hi = start
+    return best
+
+
+def _seek_leftmost(path: Path, pred) -> Optional[int]:
+    """Line start of the oldest record for which `pred` is true. Monotonic pred."""
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        _ledger_log_failure("stat", exc)
+        return None
+    if size <= 0:
+        return None
+    lo = 0
+    hi = size
+    best: Optional[int] = None
+    with open(path, "rb") as handle:
+        for _ in range(64):
+            if lo >= hi:
+                break
+            start, end, raw = _line_at(handle, (lo + hi) // 2, size)
+            if end <= lo:
+                break
+            rec = _parse_ledger_obj(raw)
+            if rec is not None and pred(rec):
+                best = start
+                if start <= lo:
+                    break
+                hi = start
+            else:
+                if end >= hi:
+                    break
+                lo = end
+    return best
+
+
+def _page_descending(path: Path, query: _LedgerQuery) -> Dict[str, Any]:
+    # Dates are not a seek key. A later line can carry an earlier timestamp,
+    # so the walk starts at the seq bound (or EOF) and filters `ts` as it goes.
+    if query.before_seq is None:
+        start = _newest_line_start(path)
+    else:
+        start = _seek_rightmost(path, query.seq_before_ok)
+    if start is None:
+        return _empty_ledger_page()
+    included: List[Dict[str, Any]] = []
+    oldest_included: Optional[int] = None
+    newest_included: Optional[int] = None
+    oldest_scanned: Optional[int] = None
+    extra = False
+    hit_cap = False
+    scanned = 0
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        _ledger_log_failure("stat", exc)
+        return _empty_ledger_page()
+    offset: Optional[int] = start
+    seen = set()
+    with open(path, "rb") as handle:
+        while offset is not None and offset >= 0:
+            if scanned >= LEDGER_PAGE_SCAN_CAP:
+                hit_cap = True
+                break
+            start_b, _end, raw = _line_at(handle, offset, size)
+            if start_b in seen:
+                break
+            seen.add(start_b)
+            scanned += 1
+            rec = _parse_ledger_obj(raw)
+            seq = _ledger_seq(rec) if rec is not None else None
+            if seq is not None:
+                oldest_scanned = seq
+            if rec is not None and seq is not None:
+                if not query.seq_since_ok(rec):
+                    break
+                if query.seq_before_ok(rec) and query.date_ok(rec) and query.event_ok(rec):
+                    if len(included) < query.limit:
+                        included.append(rec)
+                        newest_included = seq if newest_included is None else max(newest_included, seq)
+                        oldest_included = seq if oldest_included is None else min(oldest_included, seq)
+                    else:
+                        extra = True
+                        break
+            if start_b <= 0:
+                break
+            offset = start_b - 1
+    has_more = extra or hit_cap
+    next_before = oldest_included if extra or not has_more else oldest_scanned
+    if has_more and (
+        next_before is None
+        or (query.before_seq is not None and next_before >= query.before_seq)
+    ):
+        has_more = False
+    return _finish_ledger_page(included, next_before, newest_included, has_more)
+
+
+def _page_ascending(path: Path, query: _LedgerQuery) -> Dict[str, Any]:
+    start = _seek_leftmost(path, query.seq_since_ok)
+    if start is None:
+        return _empty_ledger_page()
+    included: List[Dict[str, Any]] = []
+    oldest_included: Optional[int] = None
+    newest_included: Optional[int] = None
+    newest_scanned: Optional[int] = None
+    extra = False
+    hit_cap = False
+    scanned = 0
+    with open(path, "rb") as handle:
+        handle.seek(start)
+        while True:
+            if scanned >= LEDGER_PAGE_SCAN_CAP:
+                hit_cap = True
+                break
+            raw, eof = _readline_capped(handle, LEDGER_PAGE_MAX_LINE)
+            if eof and not raw.strip():
+                break
+            scanned += 1
+            rec = _parse_ledger_obj(raw)
+            seq = _ledger_seq(rec) if rec is not None else None
+            if seq is not None:
+                newest_scanned = seq
+            if rec is not None and seq is not None:
+                if not query.seq_before_ok(rec):
+                    break
+                if query.seq_since_ok(rec) and query.date_ok(rec) and query.event_ok(rec):
+                    if len(included) < query.limit:
+                        included.append(rec)
+                        if oldest_included is None:
+                            oldest_included = seq
+                        newest_included = seq
+                    else:
+                        extra = True
+                        break
+            if eof:
+                break
+    has_more = extra or hit_cap
+    next_since = newest_included if extra or not has_more else newest_scanned
+    if has_more and (
+        next_since is None
+        or (query.since_seq is not None and next_since <= query.since_seq)
+    ):
+        has_more = False
+    return _finish_ledger_page(included, oldest_included, next_since, has_more)
+
+
+def _read_ledger_page(query: _LedgerQuery) -> Dict[str, Any]:
+    """One capped range read of the JSONL ledger. Never writes."""
+    path = _active_ledger_path()
+    if path is None or not path.is_file():
+        return _empty_ledger_page()
+    try:
+        if path.stat().st_size == 0:
+            return _empty_ledger_page()
+        if query.ascending:
+            return _page_ascending(path, query)
+        return _page_descending(path, query)
+    except OSError as exc:
+        _ledger_log_failure("page", exc)
+        return _empty_ledger_page()
+
+
+def _legacy_tail_records(count: int) -> List[Any]:
+    """Newest `count` non-empty lines, parsed. Same records as trade_ledger.tail.
+
+    Walks backward from EOF and stops after `count` non-empty lines, so the
+    default GET does not load the rest of the file.
+    """
+    path = _active_ledger_path()
+    if path is None or count <= 0 or not path.is_file():
+        return []
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            return []
+        lines: List[bytes] = []
+        with open(path, "rb") as handle:
+            offset = size - 1
+            seen = set()
+            while offset >= 0 and len(lines) < count:
+                start, _end, raw = _line_at(handle, offset, size)
+                if start in seen:
+                    break
+                seen.add(start)
+                if raw.strip():
+                    lines.append(raw)
+                if start <= 0:
+                    break
+                offset = start - 1
+    except OSError as exc:
+        _ledger_log_failure("tail", exc)
+        return []
+    out: List[Any] = []
+    for raw in lines:
+        try:
+            out.append(json.loads(raw.strip().decode("utf-8")))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            continue
     return out
+
+
+def _ledger_verify_readable() -> Tuple[bool, int, Optional[str], int]:
+    """Hash-chain check that skips a non-UTF-8 line instead of failing the read.
+
+    Same verdict as `trade_ledger.verify` on a file that decodes. A line that
+    is not UTF-8 increments `bad_lines` and is not a 500. The boot-time
+    `trade_ledger.verify` call is unchanged.
+    """
+    path = _active_ledger_path()
+    if path is None or not path.is_file():
+        return True, 0, None, 0
+    checked = 0
+    bad_lines = 0
+    prev = trade_ledger.GENESIS_HASH
+    try:
+        if path.stat().st_size <= 0:
+            return True, 0, None, 0
+        with open(path, "rb") as handle:
+            for line_no, raw in enumerate(handle, start=1):
+                if not raw.strip():
+                    continue
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    bad_lines += 1
+                    continue
+                try:
+                    rec = json.loads(text)
+                except json.JSONDecodeError:
+                    return False, checked, f"line {line_no}: unparseable", bad_lines
+                claimed = str(rec.pop("hash", ""))
+                if str(rec.get("prev_hash")) != prev:
+                    if str(rec.get("prev_hash")) != trade_ledger.GENESIS_HASH:
+                        return False, checked, f"line {line_no}: prev_hash broken", bad_lines
+                if trade_ledger._chain_hash(str(rec.get("prev_hash")), trade_ledger._canonical(rec)) != claimed:
+                    return False, checked, f"line {line_no}: hash mismatch (record altered)", bad_lines
+                prev = claimed
+                checked += 1
+    except OSError as exc:
+        _ledger_log_failure("verify", exc)
+        detail = scrub_etrade_text(str(exc), secrets=_ledger_scrub_secrets())
+        return False, checked, detail, bad_lines
+    return True, checked, None, bad_lines
+
+
+def _ledger_http_body(
+    records: List[Any],
+    verify: bool,
+    page: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {"records": [_redact_ledger_payload(rec) for rec in records]}
+    if page is not None:
+        body["next_before_seq"] = page["next_before_seq"]
+        body["next_since_seq"] = page["next_since_seq"]
+        body["has_more"] = page["has_more"]
+    if _ledger_memory is not None:
+        body["memory"] = _ledger_memory
+    if verify:
+        ok, checked, err, bad_lines = _ledger_verify_readable()
+        body["chain_ok"] = ok
+        body["chain_records_checked"] = checked
+        body["chain_error"] = (
+            None if err is None else scrub_etrade_text(str(err), secrets=_ledger_scrub_secrets())
+        )
+        body["bad_lines"] = bad_lines
+    return body
+
+
+@app.get("/ledger")
+async def ledger_tail(
+    request: Request,
+    count: int = Query(100, ge=1, le=500),
+    verify: bool = Query(False),
+    since_seq: Optional[str] = Query(None),
+    before_seq: Optional[str] = Query(None),
+    limit: Optional[str] = Query(None),
+    event_type: Optional[str] = Query(None),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+):
+    """Read the immutable trade ledger.
+
+    The file is append-only JSONL. This route only reads it. With no paging
+    params the body matches the historical tail: `records` is the newest
+    `count` lines (default 100, max 500), newest first, plus `memory` when
+    the boot verdict is set and the chain fields when `verify=true`.
+
+    Paging params (any one of them opts into a page):
+
+    * `since_seq` — exclusive. Records with seq greater than this, **oldest
+      first**. This is the only mode that is ascending.
+    * `before_seq` — exclusive. Records with seq less than this, **newest
+      first** (also the default order when `since_seq` is omitted).
+    * `limit` — page size, default 500, maximum 1000. Ignored on the legacy
+      tail; `count` is ignored once a paging param is present.
+    * `event_type` — comma-separated exact event names
+      (`position_opened,stop_updated`).
+    * `start` / `end` — Central Time dates (`YYYY-MM-DD`, inclusive) or
+      timestamps. Example for the Nov 11–18 2026 opens::
+
+        GET /ledger?event_type=position_opened&start=2026-11-11&end=2026-11-18
+
+    The page carries `next_before_seq`, `next_since_seq`, and `has_more`.
+    Cursors are exclusive. Follow `next_before_seq` as `before_seq` to walk
+    older, or `next_since_seq` as `since_seq` to walk newer. A request scans
+    at most LEDGER_PAGE_SCAN_CAP lines. `has_more` stays true when that cap
+    stops the scan before the seq window or the file boundary, so a date
+    filter does not assume timestamps increase with the file. The cursor
+    advances past the lines already examined.
+
+    `verify=true` walks the hash chain. A non-UTF-8 line is skipped and
+    counted in `bad_lines` instead of failing the request. That check is
+    separate from the page scan.
+
+    Auth is the X-Rork-Secret middleware (401 when the secret is unset or
+    wrong). Paging requests allow 30 a minute per client (429). The legacy
+    tail (no paging params) is not rate limited. `accountId` and
+    `accountIdKey` are removed. Other record strings are scrubbed the way
+    the response middleware scrubs them (account URLs, `accountIdKey=`
+    values, OAuth) plus a known account key. Digit runs in a hash or an
+    OCC symbol are left as written. Error text still goes through
+    `scrub_etrade_text`.
+    """
+    try:
+        if not _paging_requested(since_seq, before_seq, limit, event_type, start, end):
+            return await asyncio.to_thread(_ledger_http_body_legacy, count, verify)
+        _enforce_ledger_rate_limit(request)
+        query = _parse_ledger_query(since_seq, before_seq, limit, event_type, start, end)
+        page = await asyncio.to_thread(_read_ledger_page, query)
+        return _ledger_http_body(page["records"], verify, page)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _ledger_log_failure("read", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=scrub_etrade_text(str(exc), secrets=_ledger_scrub_secrets()),
+        )
+
+
+def _ledger_http_body_legacy(count: int, verify: bool) -> Dict[str, Any]:
+    return _ledger_http_body(_legacy_tail_records(count), verify, page=None)
 
 
 def _active_ledger_path() -> Optional[Path]:
@@ -40917,7 +41988,7 @@ async def arm_native_trail(
     try:
         result = await _arm_native_trail(ticker, offset)
     except Exception as e:
-        raise HTTPException(400, detail=str(e))
+        raise HTTPException(400, detail=scrub_etrade_text(str(e)))
     return {"status": "armed", **result}
 
 
