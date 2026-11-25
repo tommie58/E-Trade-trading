@@ -15410,9 +15410,10 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # armed does not wait on that lock.
 # 5.99.6 keeps those rules and closes the follow-ups above.
 # 5.99.12 adds SETUP_DISABLE_ENABLED, read on each entry (not at import).
-# Default false leaves every admit and every size unchanged. The list
-# matches the scanner's setup strings after normalize_setup (underscores
-# become spaces). "momentum" does not match "momentum fade".
+# Default false leaves every admit and every size unchanged. Setup ids are
+# the scanner's lowercase strings with spaces. The default shadow list is
+# breakdown, breakout, vwap rejection, and momentum. "momentum" does not
+# match "momentum fade".
 # HEAT_RESERVATION_ENABLED defaults on. Setting it false is the rollback:
 # heat is judged at fill time again.
 # The session VWAP stays the scanner's own samples. Each volume delta is
@@ -16471,7 +16472,9 @@ logger = logging.getLogger("etrade-bot")
 # underscores become spaces, so the env token vwap_rejection is "vwap rejection".
 # Match is exact on that string. "momentum" is not "momentum fade".
 # ---------------------------------------------------------------------------
-SETUP_DISABLE_LIST_DEFAULT = "breakdown,vwap_rejection,momentum"
+SETUP_DISABLE_LIST_DEFAULT = "breakdown,breakout,vwap rejection,momentum"
+SETUP_DISABLE_EVENT = "setup_disable_shadow"
+_SETUP_DISABLE_LEDGER_LOOKBACK = 4000
 SETUP_DISABLE_REASON = "setup_disabled"
 _KEPT_SETUP_CAP = frozenset({"momentum fade", "orb"})
 _SETUP_LIST_CHARS = re.compile(r"^[A-Za-z0-9, _-]*$")
@@ -16485,6 +16488,7 @@ _setup_disable_counts: Dict[str, Any] = {
 }
 _setup_disable_seen: set = set()
 _setup_disable_seen_order: List[str] = []
+_setup_disable_ledger_keys: set = set()
 _setup_disable_list_cache: Dict[str, Any] = {"key": None}
 
 
@@ -16813,10 +16817,194 @@ def commit_final_kept_setup_qty(
     return final
 
 
+def setup_disable_signal_key(payload: Any) -> str:
+    """One key per symbol, setup, and signal. A scan clock is not the signal.
+
+    `signal_id` is stable across scanner passes of the same idea. A bar
+    timestamp is next. The payload timestamp is only the last resort.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    symbol = str(payload.get("ticker") or "").upper().strip()
+    setup = canonical_setup_id(payload.get("setup"))
+    signal_id = str(payload.get("signal_id") or payload.get("client_signal_id") or "").strip()
+    bar = str(payload.get("bar_ts") or payload.get("bar") or "").strip()
+    stamp = signal_id or bar or str(payload.get("timestamp") or payload.get("ts") or "").strip()
+    return f"{symbol}|{setup}|{stamp}"
+
+
+def _setup_disable_side(payload: Dict[str, Any]) -> str:
+    right = str(payload.get("option_right") or payload.get("call_put") or "").upper()
+    if right.startswith("C"):
+        return "long"
+    if right.startswith("P"):
+        return "short"
+    action = str(payload.get("action") or "").upper()
+    if action in {"SELL", "SELL_SHORT", "SHORT"}:
+        return "short"
+    return "long"
+
+
+def _setup_disable_contract(payload: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(payload.get("ticker") or "").upper().strip()
+    right = str(payload.get("option_right") or payload.get("call_put") or "").upper()
+    strike = payload.get("strike") if payload.get("strike") is not None else payload.get("strike_hint")
+    expiry = payload.get("expiration_hint") or payload.get("expiry") or payload.get("expiration")
+    expiry_text = str(expiry)[:10] if expiry else None
+    occ = None
+    try:
+        if symbol and expiry_text and right and strike is not None:
+            occ = _occ_symbol(symbol, expiry_text, right, float(strike))
+    except Exception:
+        occ = None
+    return {"option_symbol": occ, "strike": strike, "expiry": expiry_text}
+
+
+def _setup_disable_quote(payload: Dict[str, Any]) -> Dict[str, Any]:
+    def pick(*keys: str) -> Any:
+        for key in keys:
+            if payload.get(key) is not None:
+                return payload.get(key)
+        return None
+
+    return {
+        "entry": pick("entry"),
+        "bid": pick("bid", "underlying_bid"),
+        "ask": pick("ask", "underlying_ask"),
+        "limit": pick("option_limit_price", "limit_price"),
+    }
+
+
+def _requested_setup_qty(payload: Dict[str, Any]) -> Optional[int]:
+    for key in ("option_contracts", "contracts", "quantity"):
+        value = payload.get(key)
+        if isinstance(value, bool) or value is None:
+            continue
+        try:
+            qty = int(value)
+        except (TypeError, ValueError):
+            continue
+        if qty > 0:
+            return qty
+    return None
+
+
+def _remember_ledger_signal_keys() -> None:
+    """Load durable signal keys. A read failure leaves the cache as it is."""
+    try:
+        rows = trade_ledger.recent(_SETUP_DISABLE_LEDGER_LOOKBACK)
+    except Exception:
+        return
+    for rec in rows or []:
+        if not isinstance(rec, dict) or rec.get("event") != SETUP_DISABLE_EVENT:
+            continue
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        key = str(data.get("signal_key") or "")
+        if key:
+            _setup_disable_ledger_keys.add(key)
+
+
+def ledger_setup_disable_counts() -> Optional[Dict[str, Any]]:
+    """Per-setup totals from the ledger. None when the ledger cannot be read."""
+    try:
+        rows = trade_ledger.recent(_SETUP_DISABLE_LEDGER_LOOKBACK)
+    except Exception:
+        return None
+    by_setup: Dict[str, Dict[str, int]] = {}
+    skipped = 0
+    would_skip = 0
+    for rec in rows or []:
+        if not isinstance(rec, dict) or rec.get("event") != SETUP_DISABLE_EVENT:
+            continue
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        setup = canonical_setup_id(data.get("setup")) or "unlabelled"
+        row = by_setup.setdefault(setup, {"skipped": 0, "would_skip": 0})
+        if data.get("enforced") is True:
+            row["skipped"] += 1
+            skipped += 1
+        else:
+            row["would_skip"] += 1
+            would_skip += 1
+    return {"skipped": skipped, "would_skip": would_skip, "by_setup": by_setup}
+
+
+def _blank_setup_counts(ids: Any, rows: Dict[str, Any]) -> Dict[str, Dict[str, int]]:
+    out: Dict[str, Dict[str, int]] = {}
+    names = set(ids)
+    names.update(key for key in rows if isinstance(key, str))
+    for name in sorted(names):
+        row = rows.get(name) if isinstance(rows.get(name), dict) else {}
+        out[name] = {
+            "skipped": int((row or {}).get("skipped") or 0),
+            "would_skip": int((row or {}).get("would_skip") or 0),
+        }
+    return out
+
+
+async def persist_setup_disable_decision(
+    payload: Any,
+    *,
+    quantity: Any,
+    enforced: bool,
+    quantity_basis: str,
+    path: str,
+) -> None:
+    """Append one shadow decision. Fail-open. One row per signal, not per scan.
+
+    The ledger is the durable copy. A second pass of the same symbol, setup,
+    and signal id does not write again, including after a restart.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return
+        setup = canonical_setup_id(payload.get("setup"))
+        if setup not in resolved_setup_disable_list()["ids"]:
+            return
+        key = setup_disable_signal_key(payload)
+        if not key or key.endswith("|"):
+            return
+        if key not in _setup_disable_ledger_keys:
+            _remember_ledger_signal_keys()
+        if key in _setup_disable_ledger_keys:
+            return
+        body = {
+            "setup": setup,
+            "symbol": str(payload.get("ticker") or "").upper(),
+            "side": _setup_disable_side(payload),
+            "would_be_contract": _setup_disable_contract(payload),
+            "would_be_quantity": quantity,
+            "quantity_basis": quantity_basis,
+            "entry_price": payload.get("entry"),
+            "quote": _setup_disable_quote(payload),
+            "enforced": bool(enforced),
+            "signal_key": key,
+            "path": path,
+        }
+        await trade_ledger.record(SETUP_DISABLE_EVENT, body)
+        _setup_disable_ledger_keys.add(key)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+
+
 def setup_disable_status() -> Dict[str, Any]:
-    """Read-only counters for /pro-trader/status. Does not change an order."""
+    """Read-only counters for /pro-trader/status. Does not change an order.
+
+    Session counts are this process. Ledger counts are one row per signal
+    and survive a restart. Each setup in the list is reported on its own.
+    """
     parsed = resolved_setup_disable_list()
     by_setup = _setup_disable_counts.get("by_setup") or {}
+    session_by = _blank_setup_counts(parsed["ids"], by_setup)
+    ledger = ledger_setup_disable_counts()
+    if ledger is None:
+        ledger_block: Dict[str, Any] = {"source": "unavailable", "by_setup": _blank_setup_counts(parsed["ids"], {})}
+    else:
+        ledger_block = {
+            "source": "ledger",
+            "skipped": ledger["skipped"],
+            "would_skip": ledger["would_skip"],
+            "by_setup": _blank_setup_counts(parsed["ids"], ledger["by_setup"]),
+        }
     return {
         "enabled": setup_disable_enabled(),
         "shadow": setup_disable_shadow(),
@@ -16831,11 +17019,8 @@ def setup_disable_status() -> Dict[str, Any]:
             "skipped": int(_setup_disable_counts.get("skipped") or 0),
             "would_skip": int(_setup_disable_counts.get("would_skip") or 0),
             "capped": int(_setup_disable_counts.get("capped") or 0),
-            "by_setup": {
-                key: {"skipped": int(row.get("skipped") or 0), "would_skip": int(row.get("would_skip") or 0)}
-                for key, row in sorted(by_setup.items())
-                if isinstance(row, dict)
-            },
+            "by_setup": session_by,
+            "ledger": ledger_block,
         },
         "read_only": True,
         "env_read": "each_entry",
@@ -16850,6 +17035,7 @@ def reset_setup_disable_state() -> None:
     _setup_disable_counts["by_setup"] = {}
     _setup_disable_seen.clear()
     _setup_disable_seen_order.clear()
+    _setup_disable_ledger_keys.clear()
     _setup_disable_list_cache.clear()
     _setup_disable_list_cache["key"] = None
 
@@ -20936,6 +21122,14 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
             dry_run=dry_run,
         )
         if disable_reason:
+            if not dry_run:
+                await persist_setup_disable_decision(
+                    p,
+                    quantity=_requested_setup_qty(p),
+                    enforced=True,
+                    quantity_basis="requested",
+                    path="scanner" if origin == DISPATCH_ORIGIN_SCANNER else "app",
+                )
             return False, [disable_reason]
 
     async def _risk_ref() -> float:
@@ -35312,6 +35506,10 @@ async def execute_live_order(payload: dict):
                         "setup_disabled cap skip ticker=%s setup=%s",
                         sym_u, canonical_setup_id(payload.get("setup")),
                     )
+                    await persist_setup_disable_decision(
+                        payload, quantity=0, enforced=setup_disable_enabled(),
+                        quantity_basis="after_sizing", path="entry",
+                    )
                     return {
                         "status": "refused",
                         "reason": "kept setup quantity below 1 contract",
@@ -35319,6 +35517,10 @@ async def execute_live_order(payload: dict):
                         "paper": True,
                     }
                 quantity = committed
+                await persist_setup_disable_decision(
+                    payload, quantity=quantity, enforced=setup_disable_enabled(),
+                    quantity_basis="after_sizing", path="entry",
+                )
                 # Per-contract cost = premium × 100 shares. Prefer the sanitized
                 # limit price (set from the real ask above); fall back to the
                 # raw ask for MARKET orders.
@@ -38786,6 +38988,13 @@ async def _scanner_dispatch(payload: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(payload, dict) and not _is_close_payload(payload):
         disable_reason = observe_setup_disable(payload, path="scanner")
         if disable_reason:
+            await persist_setup_disable_decision(
+                payload,
+                quantity=_requested_setup_qty(payload),
+                enforced=True,
+                quantity_basis="requested",
+                path="scanner",
+            )
             return {"status": "rejected", "reason": disable_reason, "code": "setup_disabled"}
     try:
         pd = WebhookPayload(**payload).dict()

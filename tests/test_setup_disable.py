@@ -183,7 +183,7 @@ def test_unparseable_env_falls_back_to_the_default_list(monkeypatch, caplog):
         parsed = main_bot.resolved_setup_disable_list()
     assert parsed["unparseable"] is True
     assert parsed["source"] == "default_fallback"
-    assert parsed["ids"] == frozenset({"breakdown", "vwap rejection", "momentum"})
+    assert parsed["ids"] == frozenset({"breakdown", "breakout", "vwap rejection", "momentum"})
     assert any("unparseable" in rec.message for rec in caplog.records)
     assert "breakdown;momentum" not in " ".join(rec.message for rec in caplog.records)
 
@@ -199,7 +199,10 @@ def test_status_exposes_read_only_counts(monkeypatch):
     assert block["env_read"] == "each_entry"
     assert block["counts"]["would_skip"] == 1
     assert "momentum fade" in block["known_setups"]
-    assert "vwap rejection" in block["list"]
+    assert set(block["list"]) == {"breakdown", "breakout", "vwap rejection", "momentum"}
+    for name in block["list"]:
+        assert name in block["counts"]["by_setup"]
+        assert set(block["counts"]["by_setup"][name]) == {"skipped", "would_skip"}
     assert block["kept_capped_at_1"] == ["momentum fade", "orb"]
     assert body["hard_rails"]["max_size_multiplier"] == 1.0
     dumped = str(block)
@@ -224,9 +227,20 @@ def test_close_is_not_skipped(monkeypatch):
 def test_default_list_uses_the_codes_setup_strings():
     main_bot.reset_setup_disable_state()
     parsed = main_bot.parse_setup_disable_list(None)
-    assert parsed["ids"] == frozenset({"breakdown", "vwap rejection", "momentum"})
+    assert parsed["ids"] == frozenset({"breakdown", "breakout", "vwap rejection", "momentum"})
     assert main_bot.canonical_setup_id("vwap_rejection") == main_bot.edge.normalize_setup("vwap_rejection")
     assert "momentum fade" not in parsed["ids"]
+    for name in (
+        "breakout", "breakdown", "vwap rejection", "vwap reclaim",
+        "momentum", "momentum fade", "mean reversion", "orb",
+    ):
+        assert main_bot.canonical_setup_id(name) == name
+    assert main_bot.judge_setup_disable(
+        "vwap reclaim", enabled=True, shadow=False, disabled=parsed["ids"],
+    ) == "allow"
+    assert main_bot.judge_setup_disable(
+        "mean reversion", enabled=True, shadow=False, disabled=parsed["ids"],
+    ) == "allow"
 
 
 def test_replay_script_matches_exact_setup_ids():
@@ -441,3 +455,91 @@ def test_flag_on_still_skips_when_the_counter_raises(monkeypatch, caplog):
     assert result["reason"] == "setup_disabled"
     text = " ".join(rec.message for rec in caplog.records)
     assert "999000111" not in text
+
+
+def test_default_list_is_configurable_subset(monkeypatch):
+    _reset(monkeypatch, items="breakdown,breakout")
+    parsed = main_bot.resolved_setup_disable_list()
+    assert parsed["ids"] == frozenset({"breakdown", "breakout"})
+    assert main_bot.judge_setup_disable(
+        "vwap rejection", enabled=True, shadow=False, disabled=parsed["ids"],
+    ) == "allow"
+    assert main_bot.judge_setup_disable(
+        "breakdown", enabled=True, shadow=False, disabled=parsed["ids"],
+    ) == "skip"
+    assert main_bot.judge_setup_disable(
+        "momentum fade", enabled=True, shadow=False, disabled=parsed["ids"],
+    ) == "allow"
+
+
+def test_shadow_ledger_records_one_row_per_signal(tmp_path):
+    saved = main_bot.trade_ledger._ledger
+    main_bot.reset_setup_disable_state()
+    main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    payload = {
+        "ticker": "FAKE",
+        "setup": "vwap rejection",
+        "action": "BUY",
+        "option_right": "CALL",
+        "strike": 100,
+        "expiration_hint": "2026-12-18",
+        "entry": 10.5,
+        "bid": 1.2,
+        "ask": 1.3,
+        "option_limit_price": 1.25,
+        "signal_id": "fake-signal-1",
+        "option_contracts": 3,
+    }
+
+    async def run():
+        await main_bot.persist_setup_disable_decision(
+            payload, quantity=3, enforced=False,
+            quantity_basis="after_sizing", path="entry",
+        )
+        await main_bot.persist_setup_disable_decision(
+            dict(payload, timestamp="2026-11-30T15:01:00+00:00"),
+            quantity=9, enforced=False, quantity_basis="after_sizing", path="entry",
+        )
+
+    try:
+        asyncio.run(run())
+        rows = [
+            rec for rec in main_bot.trade_ledger.recent(20)
+            if rec.get("event") == "setup_disable_shadow"
+        ]
+    finally:
+        main_bot.trade_ledger._ledger = saved
+        main_bot.reset_setup_disable_state()
+
+    assert len(rows) == 1
+    data = rows[0]["data"]
+    assert data["setup"] == "vwap rejection"
+    assert data["symbol"] == "FAKE"
+    assert data["side"] == "long"
+    assert data["enforced"] is False
+    assert data["would_be_quantity"] == 3
+    assert data["quantity_basis"] == "after_sizing"
+    assert data["would_be_contract"]["strike"] == 100
+    assert data["would_be_contract"]["expiry"] == "2026-12-18"
+    assert data["would_be_contract"]["option_symbol"].startswith("FAKE")
+    assert data["entry_price"] == 10.5
+    assert data["quote"]["bid"] == 1.2
+    assert data["quote"]["ask"] == 1.3
+    assert "account" not in str(data).lower()
+
+
+def test_shadow_ledger_failure_does_not_raise(monkeypatch):
+    _reset(monkeypatch, enabled="false", shadow="true")
+
+    async def boom(event, data=None):
+        raise RuntimeError("ledger down")
+
+    monkeypatch.setattr(main_bot.trade_ledger, "record", boom)
+
+    async def run():
+        await main_bot.persist_setup_disable_decision(
+            {"ticker": "FAKE", "setup": "breakout", "signal_id": "x", "action": "BUY"},
+            quantity=1, enforced=False, quantity_basis="after_sizing", path="entry",
+        )
+
+    asyncio.run(run())
