@@ -240,8 +240,8 @@ def test_slow_position_read_cannot_expire_the_lock_and_double_book(heat_store, m
 
     async def slow_positions():
         sleeps["n"] += 1
-        # The slow read is the one outside the lock. The decision re-reads
-        # inside the lock and must stay fast, or the 8s TTL can expire.
+        # This read is inside the lock. It is longer than the test TTL.
+        # The expired token must not write, so only one entry is reserved.
         if sleeps["n"] == 1:
             await asyncio.sleep(0.15)
         return {}

@@ -40,10 +40,10 @@ def _put(ticker: str) -> dict:
     }
 
 
-def _pos(entry, stop, qty=1):
+def _pos(entry, stop, qty=1, filled=None):
     return {
         "qty": qty,
-        "filled_qty": qty,
+        "filled_qty": qty if filled is None else filled,
         "contract": {"right": "PUT"},
         "entry_premium": entry,
         "stop_premium": stop,
@@ -79,13 +79,16 @@ def test_p1_booked_below_nominal_releases_on_fill(store):
     assert (110.0 + NOMINAL) / ACCT * 100.0 < 10.0
 
 
-def test_p1b_close_inside_ttl_releases_and_reentry_works(store):
+def test_p1b_close_within_ttl_recounts_full_plan(store):
+    """Stronger close: delete the position and do not call release again.
+
+    A full fill already dropped the row. Re-entry must not see phantom heat.
+    """
     async def scenario():
         await main_bot.admit_heat_reservation(_put("PLTR"), NOMINAL, ACCT)
         await store.set_position("PLTR", _pos(2.20, 1.10))
         await main_bot.settle_heat_reservation("PLTR")
         await store.delete_position("PLTR")
-        await main_bot.release_heat_reservation(ticker="PLTR", reason="close")
         reserved, _book = await main_bot.peek_reserved_exposure(await store.all_positions())
         again = await main_bot.admit_heat_reservation(_put("PLTR"), NOMINAL, ACCT)
         return reserved, again
@@ -93,23 +96,32 @@ def test_p1b_close_inside_ttl_releases_and_reentry_works(store):
     reserved, again = _run(scenario())
     assert reserved == pytest.approx(0.0)
     assert again["allowed"] and again["reserved"]
-    assert not any("already reserving" in reason for reason in again["reasons"])
+    assert not any("already reserving heat for PLTR" in reason for reason in again["reasons"])
 
 
 def test_p1_partial_fill_keeps_only_the_unfilled_fraction(store):
     async def scenario():
         payload = _put("PLTR")
-        payload["quantity"] = 2
-        await main_bot.admit_heat_reservation(payload, 200.0, 10_000.0)
-        await store.set_position("PLTR", _pos(2.0, 1.0, qty=1))
+        payload["quantity"] = 3
+        await main_bot.admit_heat_reservation(payload, 300.0, 10_000.0)
+        await store.set_position("PLTR", _pos(2.0, 1.0, qty=3, filled=1))
         await main_bot.settle_heat_reservation("PLTR")
-        rows = json.loads(await store.get(main_bot.HEAT_RESERVATIONS_KEY) or "[]")
-        return rows
+        after_settle = json.loads(await store.get(main_bot.HEAT_RESERVATIONS_KEY) or "[]")
+        await main_bot.sweep_heat_reservations()
+        after_one = json.loads(await store.get(main_bot.HEAT_RESERVATIONS_KEY) or "[]")
+        await main_bot.sweep_heat_reservations()
+        after_two = json.loads(await store.get(main_bot.HEAT_RESERVATIONS_KEY) or "[]")
+        return after_settle, after_one, after_two
 
-    rows = _run(scenario())
-    assert len(rows) == 1
-    assert rows[0]["qty"] == 1
-    assert rows[0]["risk_usd"] == pytest.approx(100.0)
+    after_settle, after_one, after_two = _run(scenario())
+    assert after_settle[0]["qty"] == 2
+    assert after_settle[0]["risk_usd"] == pytest.approx(200.0)
+    assert after_one[0]["qty"] == 2
+    assert after_one[0]["risk_usd"] == pytest.approx(200.0)
+    assert after_two[0]["qty"] == 2
+    assert after_two[0]["risk_usd"] == pytest.approx(200.0)
+    assert after_two[0]["applied_filled_qty"] == 1
+    assert after_two[0]["planned_qty"] == 3
 
 
 def test_p2_held_avgo_is_not_counted_twice_against_nvda(store):
@@ -219,22 +231,30 @@ def test_p5_settle_does_not_block_on_a_busy_lock(store, caplog):
     assert "does not wait" in caplog.text
 
 
-def test_p6_slow_book_read_cannot_admit_both_sides(store, monkeypatch):
+def test_p6_lock_ttl_expiry_lost_update(store, monkeypatch):
+    """Slow book read longer than the lock TTL. Only one entry may land."""
+    real_lock = store.lock
+
+    def short_heat_lock(name, ttl_ms=30_000, wait_timeout=10.0):
+        if name == "heat-reservation":
+            ttl_ms = 200
+        return real_lock(name, ttl_ms=ttl_ms, wait_timeout=wait_timeout)
+
+    monkeypatch.setattr(store, "lock", short_heat_lock)
     real_all = store.all_positions
     calls = {"n": 0}
 
     async def slow_all():
         calls["n"] += 1
         if calls["n"] == 1:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.4)
         return await real_all()
 
     monkeypatch.setattr(store, "all_positions", slow_all)
-    monkeypatch.setattr(main_bot, "HEAT_RESERVATION_LOCK_TTL_MS", 40)
 
     async def scenario():
         async def second():
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.25)
             return await main_bot.admit_heat_reservation(_put("PLTR"), 600.0, 10_000.0)
 
         results = await asyncio.gather(
@@ -247,6 +267,7 @@ def test_p6_slow_book_read_cannot_admit_both_sides(store, monkeypatch):
     results, rows = _run(scenario())
     assert sum(1 for row in results if row["reserved"]) == 1
     assert len(rows) == 1
+    assert not (results[0]["reserved"] and results[1]["reserved"])
 
 
 def test_p8_stale_snapshot_cannot_miss_a_fill(store):
