@@ -5,7 +5,6 @@ real account number, token, or RORK secret, and the tests never call E*TRADE.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 import traceback
 from datetime import date
@@ -55,11 +54,10 @@ def _blob(records) -> str:
     return "\n".join(parts)
 
 
-def _hash_id(raw: str) -> str:
-    return "h:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+OCC = "INTC  261127P00056000"
 
 
-def _row(tid, fee, symbol):
+def _row(tid, fee, symbol, commission=0):
     return {
         "transactionId": tid,
         "accountId": FAKE_ACCT,
@@ -67,16 +65,16 @@ def _row(tid, fee, symbol):
         "transactionDate": TXN_EPOCH,
         "postDate": POST_EPOCH,
         "amount": -10.5,
-        "description": f"Bought {FAKE_KEY} ref {FAKE_ACCT}",
-        "description2": f"https://api.etrade.com/v1/accounts/{FAKE_KEY}/transactions/{tid}.json",
+        "description": f"Bought {symbol}",
         "transactionType": "Bought",
-        "detailsURI": f"https://api.etrade.com/v1/accounts/{FAKE_KEY}/transactions/{tid}.json",
+        "detailsURI": f"https://api.etrade.com/v1/accounts/{FAKE_KEY}/transactions/1.json",
         "links": [{"href": f"/v1/accounts/{FAKE_KEY}/transactions"}],
         "brokerage": {
             "product": {"symbol": symbol, "securityType": "EQ"},
             "quantity": 2,
             "price": 3.5,
             "fee": fee,
+            "commission": commission,
             "settlementCurrency": "USD",
             "accountId": FAKE_ACCT,
             "accountIdKey": FAKE_KEY,
@@ -209,6 +207,7 @@ def http(monkeypatch, caplog):
     with TestClient(main_bot.app) as client:
         main_bot._current_tokens = {"oauth_token": "tok", "oauth_token_secret": "sec"}
         main_bot._resolved_account_id_key = FAKE_KEY
+        main_bot._pinned_account_id = FAKE_ACCT
         hits = {}
         _install_spies(monkeypatch, hits)
         caplog.clear()
@@ -330,7 +329,7 @@ def test_transaction_dates_are_validated(http, monkeypatch):
 def test_transactions_page_sum_fees_and_strip_account_ids(http, caplog):
     broker = _use(http, [
         {"TransactionListResponse": {
-            "Transaction": [_row(2128929910, 0.50, "AAPL")],
+            "Transaction": [_row(2128929910, 0.50, "AAPL", commission=0.15)],
             "next": "marker-2",
         }},
         {"TransactionListResponse": {
@@ -338,7 +337,7 @@ def test_transactions_page_sum_fees_and_strip_account_ids(http, caplog):
             "next": "marker-3",
         }},
         {"TransactionListResponse": {
-            "Transaction": [_row(FAKE_ACCT, 0.10, "IBM")],
+            "Transaction": [_row(FAKE_ACCT, 0.10, "IBM", commission=0.05)],
         }},
     ])
     caplog.clear()
@@ -350,7 +349,7 @@ def test_transactions_page_sum_fees_and_strip_account_ids(http, caplog):
     body = response.json()
     assert set(body) == {
         "ok", "bot_version", "start", "end", "timezone",
-        "count", "fee_total", "truncated", "transactions",
+        "count", "fee", "commission", "fee_total", "truncated", "transactions",
     }
     assert body["ok"] is True
     assert body["bot_version"] == "5.99.13-pro-day-trader"
@@ -358,7 +357,9 @@ def test_transactions_page_sum_fees_and_strip_account_ids(http, caplog):
     assert body["end"] == "2026-11-25"
     assert body["timezone"] == "America/Chicago"
     assert body["count"] == 3
-    assert body["fee_total"] == 0.85
+    assert body["fee"] == 0.85
+    assert body["commission"] == 0.20
+    assert body["fee_total"] == 1.05
     assert body["truncated"] is False
     first, second, third = body["transactions"]
     assert set(first) == {
@@ -366,11 +367,11 @@ def test_transactions_page_sum_fees_and_strip_account_ids(http, caplog):
         "description", "transactionType", "brokerage",
     }
     assert set(first["brokerage"]) == {
-        "symbol", "quantity", "price", "fee", "settlementCurrency",
+        "symbol", "quantity", "price", "fee", "commission", "settlementCurrency",
     }
     assert first["transactionId"] == 2128929910
-    assert second["transactionId"] == _hash_id(FAKE_KEY)
-    assert third["transactionId"] == _hash_id(FAKE_ACCT)
+    assert second["transactionId"] is None
+    assert third["transactionId"] is None
     assert first["transactionDate"] == CT_TXN
     assert first["postDate"] == CT_POST
     assert first["amount"] == -10.5
@@ -380,6 +381,7 @@ def test_transactions_page_sum_fees_and_strip_account_ids(http, caplog):
         "quantity": 2.0,
         "price": 3.5,
         "fee": 0.5,
+        "commission": 0.15,
         "settlementCurrency": "USD",
     }
     assert "marker-2" not in response.text
@@ -428,6 +430,8 @@ def test_empty_204_is_an_empty_list(http, caplog):
     body = response.json()
     assert body["transactions"] == []
     assert body["count"] == 0
+    assert body["fee"] == 0
+    assert body["commission"] == 0
     assert body["fee_total"] == 0
     assert body["truncated"] is False
     assert len(broker.calls) == 1
@@ -459,7 +463,9 @@ def test_auth_error_is_503_and_scrubbed(http, caplog):
     assert response.status_code == 503
     body = response.json()
     assert body["reason"] == "etrade_auth"
+    assert body["detail"] == "etrade_auth"
     assert "transactions" not in body
+    assert "Traceback" not in _blob(caplog.records)
     _assert_clean(response.text)
     _assert_clean(_blob(caplog.records))
     assert "E*TRADE transactions failed" in _blob(caplog.records)
@@ -486,7 +492,8 @@ def test_broker_error_is_502_not_an_empty_list(http, caplog):
     )
     assert response.status_code == 502
     body = response.json()
-    assert body["reason"] != "etrade_auth"
+    assert body["reason"] == "etrade_unavailable"
+    assert body["detail"] == "etrade_unavailable"
     assert "transactions" not in body
     assert "ok" not in body
     _assert_clean(response.text)
@@ -553,3 +560,112 @@ def test_route_write_is_visible_to_the_spy(http, monkeypatch):
     )
     assert response.status_code == 200
     assert http["hits"].get("state.set") == 1
+
+
+def test_occ_symbol_string_id_and_description_survive(http):
+    description = "opened " + OCC
+    string_id = "TXN-261127P00056000"
+    _use(http, [{"TransactionListResponse": {"Transaction": [
+        {
+            "transactionId": 12345678,
+            "transactionDate": TXN_EPOCH,
+            "amount": 1,
+            "description": description,
+            "transactionType": "Sold",
+            "brokerage": {
+                "product": {"symbol": OCC},
+                "quantity": 1,
+                "price": 0.56,
+                "settlementCurrency": "USD",
+            },
+        },
+        {
+            "transactionId": string_id,
+            "accountId": FAKE_ACCT,
+            "transactionDate": TXN_EPOCH,
+            "amount": 2,
+            "description": FAKE_ACCT,
+            "transactionType": "Bought",
+            "brokerage": {
+                "product": {"symbol": OCC},
+                "quantity": 1,
+                "price": 0.56,
+                "fee": 1.25,
+                "commission": 0.75,
+                "settlementCurrency": "USD",
+            },
+        },
+    ]}}])
+    response = http["client"].get(
+        "/etrade/transactions?start=2026-11-01&end=2026-11-25",
+        headers={"X-Rork-Secret": SECRET},
+    )
+    assert response.status_code == 200, response.text
+    plain, masked = response.json()["transactions"]
+    assert plain["transactionId"] == 12345678
+    assert plain["brokerage"]["symbol"] == OCC
+    assert plain["description"] == description
+    assert plain["brokerage"]["symbol"].encode("utf-8") == OCC.encode("utf-8")
+    assert plain["description"].encode("utf-8") == description.encode("utf-8")
+    assert masked["transactionId"] == string_id
+    assert masked["transactionId"].encode("utf-8") == string_id.encode("utf-8")
+    assert masked["brokerage"]["symbol"].encode("utf-8") == OCC.encode("utf-8")
+    assert masked["description"] == "****1111"
+    assert FAKE_ACCT not in response.text
+    assert FAKE_KEY not in response.text
+    assert "accountId" not in _walk_keys(response.json())
+    assert response.json()["fee"] == 1.25
+    assert response.json()["commission"] == 0.75
+    assert response.json()["fee_total"] == 2.0
+
+
+def test_uncached_list_accounts_failure_hides_bare_key_and_hint(http, caplog):
+    main_bot._resolved_account_id_key = None
+    main_bot._account_binding = {
+        "resolved_account_id_key": FAKE_KEY,
+        "resolved_account_id": FAKE_ACCT,
+        "pinned": FAKE_ACCT,
+    }
+
+    class _Boom:
+        async def list_accounts(self):
+            raise RuntimeError("lookup failed ?hint=" + FAKE_KEY + " " + FAKE_KEY)
+
+    http["holder"]["client"] = _Boom()
+    caplog.clear()
+    response = http["client"].get(
+        "/etrade/transactions?start=2026-11-01&end=2026-11-25",
+        headers={"X-Rork-Secret": SECRET},
+    )
+    assert response.status_code == 502
+    assert response.json()["reason"] == "etrade_unavailable"
+    assert response.json()["detail"] == "etrade_unavailable"
+    blob = _blob(caplog.records)
+    assert FAKE_KEY not in response.text
+    assert FAKE_ACCT not in response.text
+    assert FAKE_KEY not in blob
+    assert FAKE_ACCT not in blob
+    assert "Traceback" not in blob
+    assert "RuntimeError" in blob
+    assert main_bot._resolved_account_id_key is None
+    assert http["hits"] == {}
+
+
+def test_transaction_rate_limit_is_per_ip_and_evicts_idle_keys(monkeypatch):
+    clock = {"now": 5_000.0}
+    monkeypatch.setattr(main_bot, "_transactions_now", lambda: clock["now"])
+    monkeypatch.setattr(main_bot, "TRANSACTIONS_RATE_LIMIT", 6)
+    main_bot._reset_transactions_rate_limit()
+    try:
+        for _ in range(6):
+            assert main_bot._transactions_rate_allow("203.0.113.10") is True
+        assert main_bot._transactions_rate_allow("203.0.113.10") is False
+        assert main_bot._transactions_rate_allow("203.0.113.11") is True
+        assert "203.0.113.10" in main_bot._TXN_RATE_HITS
+        clock["now"] += 60
+        assert main_bot._transactions_rate_allow("203.0.113.12") is True
+        assert "203.0.113.10" not in main_bot._TXN_RATE_HITS
+        assert "203.0.113.11" not in main_bot._TXN_RATE_HITS
+        assert list(main_bot._TXN_RATE_HITS) == ["203.0.113.12"]
+    finally:
+        main_bot._reset_transactions_rate_limit()

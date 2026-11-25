@@ -15204,7 +15204,6 @@ import hashlib
 import hmac
 import contextvars
 import threading
-import traceback
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22679,12 +22678,22 @@ TRANSACTIONS_RATE_LIMIT = 6
 TRANSACTIONS_RATE_WINDOW_SECONDS = 60.0
 TRANSACTIONS_PAGE_CAP = 40
 TRANSACTIONS_PAGE_SIZE = 50
+# Idle client addresses are dropped. A flood of distinct addresses cannot grow
+# the map without bound: the oldest keys are evicted past this cap.
+_TXN_RATE_MAX_KEYS = 1024
 _TXN_RATE_LOCK = threading.Lock()
-_TXN_RATE_HITS: List[float] = []
+_TXN_RATE_HITS: Dict[str, List[float]] = {}
 _TXN_FORBIDDEN_RESPONSE_KEYS = {
     "accountId", "accountIdKey", "account_id", "account_id_key",
     "detailsURI", "detailsUri", "DetailsURI", "links",
 }
+# These strings keep their bytes. The 8-digit scrub in scrub_etrade_text
+# rewrites OCC symbols (INTC  261127P00056000) and string ids.
+_TXN_VERBATIM_FIELDS = {
+    "symbol", "description", "transactionId", "transactionType", "settlementCurrency",
+}
+_TXN_AUTH_REASON = "etrade_auth"
+_TXN_FAIL_REASON = "etrade_unavailable"
 
 
 def _reset_transactions_rate_limit() -> None:
@@ -22696,17 +22705,41 @@ def _transactions_now() -> float:
     return time.monotonic()
 
 
-def _transactions_rate_allow() -> bool:
-    """At most TRANSACTIONS_RATE_LIMIT hits per window, for this process."""
+def _transactions_client_ip(request: Request) -> str:
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None) if client else None
+    text = str(host or "").strip()
+    return text or "unknown"
+
+
+def _transactions_rate_allow(client_ip: str) -> bool:
+    """At most TRANSACTIONS_RATE_LIMIT hits per window for one client address.
+
+    Addresses with no hit inside the window are deleted. Past the cap, the
+    oldest remaining address is evicted.
+    """
     now = _transactions_now()
     window = float(TRANSACTIONS_RATE_WINDOW_SECONDS)
-    limit = int(TRANSACTIONS_RATE_LIMIT)
+    limit = max(0, int(TRANSACTIONS_RATE_LIMIT))
+    ident = str(client_ip or "").strip() or "unknown"
     with _TXN_RATE_LOCK:
-        fresh = [hit for hit in _TXN_RATE_HITS if now - hit < window]
-        _TXN_RATE_HITS[:] = fresh
-        if len(_TXN_RATE_HITS) >= max(0, limit):
+        for key, hits in list(_TXN_RATE_HITS.items()):
+            fresh = [hit for hit in hits if now - hit < window]
+            if fresh:
+                _TXN_RATE_HITS[key] = fresh
+            else:
+                _TXN_RATE_HITS.pop(key, None)
+        while len(_TXN_RATE_HITS) > _TXN_RATE_MAX_KEYS:
+            others = [key for key in _TXN_RATE_HITS if key != ident]
+            if not others:
+                break
+            oldest = min(others, key=lambda key: _TXN_RATE_HITS[key][0])
+            _TXN_RATE_HITS.pop(oldest, None)
+        hits = _TXN_RATE_HITS.get(ident, [])
+        if len(hits) >= limit:
             return False
-        _TXN_RATE_HITS.append(now)
+        hits.append(now)
+        _TXN_RATE_HITS[ident] = hits
         return True
 
 
@@ -22749,6 +22782,35 @@ def _transactions_auth_failure(exc: BaseException) -> bool:
     return _looks_like_auth_failure(exc)
 
 
+def _remember_secret(secrets: List[str], value: Any) -> None:
+    if isinstance(value, (dict, list)) or value is None:
+        return
+    text = str(value).strip()
+    if len(text) >= 4 and text not in secrets:
+        secrets.append(text)
+
+
+def _transaction_secret_set() -> List[str]:
+    """Pin, configured target, and any key already known in this process.
+
+    Exact-match only. This does not scrape the broker error for new secrets,
+    and it does not log the values.
+    """
+    secrets: List[str] = []
+    _remember_secret(secrets, _pinned_account_id)
+    _remember_secret(secrets, _pinned_crypto_account_id)
+    _remember_secret(secrets, TARGET_ACCOUNT_ID)
+    _remember_secret(secrets, TARGET_CRYPTO_ACCOUNT_ID)
+    _remember_secret(secrets, _resolved_account_id_key)
+    _remember_secret(secrets, _resolved_crypto_account_id_key)
+    for binding in (_account_binding, _crypto_account_binding):
+        if not isinstance(binding, dict):
+            continue
+        for field in ("pinned", "configured", "resolved_account_id", "resolved_account_id_key"):
+            _remember_secret(secrets, binding.get(field))
+    return secrets
+
+
 def _extend_account_secrets(text: str, secrets: List[str]) -> None:
     for match in _ACCT_IN_PATH.finditer(text or ""):
         token = match.group(2)
@@ -22760,51 +22822,41 @@ def _extend_account_secrets(text: str, secrets: List[str]) -> None:
             secrets.append(token)
 
 
-def _scrub_exc(exc: BaseException, secrets: Sequence[str]) -> str:
-    """Scrubbed exception text plus traceback. Never the raw str(e)."""
-    parts = [str(exc)]
-    body = getattr(exc, "body", None)
-    if body:
-        parts.append(str(body)[:800])
-    try:
-        if exc.__traceback__ is not None:
-            parts.append("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
-    except Exception:
-        pass
-    blob = "\n".join(parts)
-    bag = [item for item in secrets if item]
-    _extend_account_secrets(blob, bag)
-    return scrub_etrade_text(blob, secrets=bag)
+def _scrub_known(text: str, secrets: Sequence[str]) -> str:
+    """Replace known secret values and account URLs. No digit-run regex."""
+    cleaned = str(text or "")
+    ordered = sorted({item for item in secrets if item and len(item) >= 4}, key=len, reverse=True)
+    for secret in ordered:
+        cleaned = cleaned.replace(secret, "{acct}")
+    return _scrub_etrade_urls(cleaned)
+
+
+def _secret_exact(text: str, secrets: Sequence[str]) -> bool:
+    return any(bool(secret) and text == secret for secret in secrets)
 
 
 def _public_transaction_id(raw: Any, secrets: Sequence[str]) -> Any:
-    """Numeric broker ids stay integers.
+    """Keep broker ids. Omit one that is exactly a known account id or key.
 
-    An id is account-linked when it contains a known account key or account
-    number, or when it is not purely numeric (an opaque key has that shape).
-    Those are replaced with ``h:`` plus the first 16 hex chars of SHA-256.
-    The digest is not reversible. Integer ids skip ``scrub_etrade_text``,
-    which would redact an 8-digit run inside a string.
+    A short SHA-256 of an account number is reversible by guessing the number.
+    Quant Lab joins fees on the broker id, so an ordinary id is returned
+    unchanged (int or str, as the broker sent it) and an account-linked id is
+    left out rather than hashed.
     """
-    if raw is None:
+    if raw is None or isinstance(raw, bool):
         return None
+    if isinstance(raw, int):
+        if _secret_exact(str(raw), secrets):
+            return None
+        return raw
     text = str(raw).strip()
     if not text:
         return None
-    linked = not text.isdigit()
-    if not linked:
-        for secret in secrets:
-            if secret and secret in text:
-                linked = True
-                break
-    if linked or not text.isdigit():
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-        return "h:" + digest
-    try:
-        return int(text)
-    except ValueError:
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-        return "h:" + digest
+    if _secret_exact(text, secrets):
+        return None
+    if isinstance(raw, str):
+        return raw
+    return text
 
 
 def _epoch_to_ct_iso(value: Any) -> Optional[str]:
@@ -22884,6 +22936,11 @@ def _as_dict(value: Any) -> Dict[str, Any]:
     return {}
 
 
+def _txn_money(value: Any) -> float:
+    number = _txn_number(value)
+    return 0.0 if number is None else number
+
+
 def _brokerage_view(row: Dict[str, Any]) -> Dict[str, Any]:
     brok = _as_dict(row.get("brokerage") if row.get("brokerage") is not None else row.get("Brokerage"))
     product = _as_dict(brok.get("product") if brok.get("product") is not None else brok.get("Product"))
@@ -22895,7 +22952,8 @@ def _brokerage_view(row: Dict[str, Any]) -> Dict[str, Any]:
         "symbol": None if symbol is None else str(symbol),
         "quantity": _txn_number(brok.get("quantity")),
         "price": _txn_number(brok.get("price")),
-        "fee": _txn_number(brok.get("fee")),
+        "fee": _txn_money(brok.get("fee")),
+        "commission": _txn_money(brok.get("commission")),
         "settlementCurrency": None if currency is None else str(currency),
     }
 
@@ -22905,33 +22963,50 @@ def _normalize_transaction(row: Dict[str, Any], secrets: Sequence[str]) -> Dict[
     ttype = row.get("transactionType")
     if ttype is None:
         ttype = brok_raw.get("transactionType")
-    parts = []
-    for key in ("description", "description2"):
-        val = row.get(key)
-        if val:
-            parts.append(str(val))
+    description = row.get("description")
     return {
         "transactionId": _public_transaction_id(row.get("transactionId"), secrets),
         "transactionDate": _epoch_to_ct_iso(row.get("transactionDate")),
         "postDate": _epoch_to_ct_iso(row.get("postDate")),
         "amount": _txn_number(row.get("amount")),
-        "description": " ".join(parts),
+        "description": "" if description is None else str(description),
         "transactionType": None if ttype is None else str(ttype),
         "brokerage": _brokerage_view(row),
     }
 
 
-def _scrub_tree(value: Any, secrets: Sequence[str]) -> Any:
+def _mask_exact_account_value(value: str) -> str:
+    masked = mask_account_key(value)
+    return masked if masked is not None else ""
+
+
+def _scrub_tree(value: Any, secrets: Sequence[str], field: Optional[str] = None) -> Any:
+    """Redact account URLs and exact known account values.
+
+    Symbol, description, transactionId, and the other id strings are not run
+    through the 8-digit scrub. A known account number is masked only when the
+    whole value equals that number.
+    """
     if isinstance(value, str):
-        return scrub_etrade_text(value, secrets=secrets)
+        if _secret_exact(value, secrets):
+            if field == "transactionId":
+                return None
+            if field in _TXN_VERBATIM_FIELDS:
+                return _mask_exact_account_value(value)
+        if field in _TXN_VERBATIM_FIELDS:
+            return _scrub_etrade_urls(value)
+        if _secret_exact(value, secrets):
+            return _mask_exact_account_value(value)
+        return _scrub_etrade_urls(value)
     if isinstance(value, dict):
-        return {
-            key: _scrub_tree(item, secrets)
-            for key, item in value.items()
-            if key not in _TXN_FORBIDDEN_RESPONSE_KEYS
-        }
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _TXN_FORBIDDEN_RESPONSE_KEYS:
+                continue
+            out[key] = _scrub_tree(item, secrets, key)
+        return out
     if isinstance(value, list):
-        return [_scrub_tree(item, secrets) for item in value]
+        return [_scrub_tree(item, secrets, field) for item in value]
     return value
 
 
@@ -22939,15 +23014,17 @@ def _transactions_payload(
     start: date, end: date, raw_rows: List[dict], truncated: bool, secrets: Sequence[str],
 ) -> Dict[str, Any]:
     rows = []
-    fee_total = 0.0
+    fee_sum = 0.0
+    commission_sum = 0.0
     for row in raw_rows:
         if not isinstance(row, dict):
             continue
         norm = _normalize_transaction(row, secrets)
-        fee = norm["brokerage"]["fee"]
-        if fee is not None:
-            fee_total += fee
+        fee_sum += float(norm["brokerage"]["fee"])
+        commission_sum += float(norm["brokerage"]["commission"])
         rows.append(norm)
+    fee_rounded = round(fee_sum, 4)
+    commission_rounded = round(commission_sum, 4)
     body = {
         "ok": True,
         "bot_version": BOT_VERSION,
@@ -22955,7 +23032,9 @@ def _transactions_payload(
         "end": end.isoformat(),
         "timezone": "America/Chicago",
         "count": len(rows),
-        "fee_total": round(fee_total, 4),
+        "fee": fee_rounded,
+        "commission": commission_rounded,
+        "fee_total": round(fee_rounded + commission_rounded, 4),
         "truncated": bool(truncated),
         "transactions": rows,
     }
@@ -22977,10 +23056,12 @@ async def _transactions_account_key(tokens: Dict[str, str]) -> str:
         if raw_pin is not None:
             pinned = str(raw_pin).strip() or None
     except Exception as exc:
-        pin_secrets = [pinned] if pinned else []
+        pin_secrets = _transaction_secret_set()
+        _remember_secret(pin_secrets, pinned)
         logger.warning(
-            "transactions pin read failed: %s",
-            scrub_etrade_text(str(exc), secrets=pin_secrets),
+            "transactions pin read failed: %s: %s",
+            type(exc).__name__,
+            _scrub_known(str(exc), pin_secrets)[:500],
         )
     client = _raw_client(tokens)
     resp = await client.list_accounts()
@@ -23014,31 +23095,43 @@ async def _transactions_account_key(tokens: Dict[str, str]) -> str:
 
 
 def _transactions_error(exc: BaseException, secrets: Sequence[str]) -> JSONResponse:
-    scrubbed = _scrub_exc(exc, secrets) or "etrade_unavailable"
-    # The message is already scrubbed. exc_info would attach the raw frames;
-    # #38's filter scrubs URL-shaped tracebacks, and this line never hands it
-    # the unscrubbed text.
-    logger.error("E*TRADE transactions failed: %s", scrubbed[:4000])
+    """Fixed reason in the body. The log is the class plus a scrubbed message.
+
+    The body never echoes str(e) or a traceback. Known secrets are removed
+    from the log line by exact match, then account URLs are scrubbed. The
+    8-digit regex is not used.
+    """
+    bag = [item for item in secrets if item]
+    _extend_account_secrets(str(exc), bag)
+    body = getattr(exc, "body", None)
+    message = str(exc) if not body else str(exc) + " " + str(body)[:800]
+    logger.error(
+        "E*TRADE transactions failed: %s: %s",
+        type(exc).__name__,
+        _scrub_known(message, bag)[:500],
+    )
     if _transactions_auth_failure(exc):
         return JSONResponse(
             status_code=503,
-            content={"reason": "etrade_auth", "detail": scrubbed[:500]},
+            content={"reason": _TXN_AUTH_REASON, "detail": _TXN_AUTH_REASON},
         )
     return JSONResponse(
         status_code=502,
-        content={"reason": scrubbed[:300], "detail": scrubbed[:500]},
+        content={"reason": _TXN_FAIL_REASON, "detail": _TXN_FAIL_REASON},
     )
 
 
 @app.get("/etrade/transactions")
 async def get_etrade_transactions(
+    request: Request,
     start: Optional[str] = Query(None),
     end: Optional[str] = Query(None),
 ):
     """Read E*TRADE transactions. GET only.
 
     Auth is the process-wide ``X-Rork-Secret`` middleware (401, fail closed).
-    This handler allows at most 6 calls per minute per process (429).
+    This handler allows at most 6 calls per minute per client IP (429). Idle
+    addresses are evicted.
 
     Dates are ``YYYY-MM-DD``. ``start`` must be on or before ``end``, ``end``
     on or before today in America/Chicago, and the span at most 2 years
@@ -23047,17 +23140,20 @@ async def get_etrade_transactions(
     ``endDate`` as ``MMDDYYYY``, ``count`` 50, and marker paging capped at
     40 pages. HTTP 204 or an empty page is an empty list. An E*TRADE 401 or
     an expired token is 503 ``reason=etrade_auth``. Any other broker error is
-    502 with a scrubbed reason. An error is never returned as an empty list.
+    502 ``reason=etrade_unavailable``. Neither body includes the exception
+    text or a traceback. An error is never returned as an empty list.
 
-    ``transactionId`` stays an integer when it is purely numeric and does not
-    contain the account key or account number. Otherwise it is ``h:`` plus
-    the first 16 hex characters of SHA-256 (not reversible). Every string
-    field, error detail, and log line is passed through ``scrub_etrade_text``.
-    ``accountId``, ``accountIdKey``, ``detailsURI``, and links are omitted.
-    ``transactionDate`` and ``postDate`` are ISO-8601 in America/Chicago.
-    ``fee_total`` is the sum of brokerage fees. ``count`` is the row count.
+    ``transactionId`` is the broker value, unchanged, unless it is exactly a
+    known account id or account key, in which case it is omitted. Account
+    numbers are masked only on an exact match with the pin, the configured
+    target, or the binding. OCC symbols and descriptions are not passed
+    through the 8-digit scrub. ``accountId``, ``accountIdKey``, ``detailsURI``,
+    and links are omitted. ``transactionDate`` and ``postDate`` are ISO-8601
+    in America/Chicago. ``fee`` and ``commission`` are summed from the
+    brokerage object (missing is 0). ``fee_total`` is their sum. ``count`` is
+    the row count.
     """
-    if not _transactions_rate_allow():
+    if not _transactions_rate_allow(_transactions_client_ip(request)):
         raise HTTPException(429, "rate limit: at most 6 transaction reads per minute")
     try:
         if start is None or end is None or not str(start).strip() or not str(end).strip():
@@ -23080,7 +23176,7 @@ async def get_etrade_transactions(
             content={"reason": "etrade_auth", "detail": "E*TRADE account is not linked"},
         )
 
-    secrets: List[str] = []
+    secrets: List[str] = _transaction_secret_set()
     account_key = ""
     page: Dict[str, Any] = {"transactions": [], "pages": 0, "truncated": False}
     try:
@@ -23098,7 +23194,7 @@ async def get_etrade_transactions(
         if isinstance(fetched, dict):
             page = fetched
     except ValueError as exc:
-        raise HTTPException(400, scrub_etrade_text(str(exc), secrets=secrets)) from None
+        raise HTTPException(400, _scrub_known(str(exc), secrets)) from None
     except Exception as exc:
         if _http_status_of(exc) == 204:
             page = {"transactions": [], "pages": 0, "truncated": False}
@@ -23121,8 +23217,8 @@ async def get_etrade_transactions(
         secrets,
     )
     logger.info(
-        "served %s transactions fee_total=%s truncated=%s",
-        body["count"], body["fee_total"], body["truncated"],
+        "served %s transactions fee=%s commission=%s fee_total=%s truncated=%s",
+        body["count"], body["fee"], body["commission"], body["fee_total"], body["truncated"],
     )
     return body
 
