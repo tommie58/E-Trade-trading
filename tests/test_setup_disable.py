@@ -780,3 +780,249 @@ def test_slow_shadow_write_does_not_delay_the_handoff(monkeypatch):
 
     elapsed = asyncio.run(run())
     assert elapsed < 0.5
+
+
+def test_shadow_append_timeout_keeps_the_hash_chain(tmp_path):
+    """A 0.3s file write must not leave the next record unchained.
+
+    Four records are already chained. The old caller timeout cancelled the
+    append after the line landed, and verify() returned
+    (False, 5, 'line 6: prev_hash broken').
+    """
+    import time
+    saved = main_bot.trade_ledger._ledger
+    main_bot.reset_setup_disable_state()
+    main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    ledger = main_bot.trade_ledger._ledger
+    original = ledger._append_line
+
+    def slow(line):
+        if "setup_disable_shadow" in line:
+            time.sleep(0.3)
+        return original(line)
+
+    ledger._append_line = slow
+    payload = {
+        "ticker": "FAKE", "setup": "breakdown", "action": "BUY",
+        "option_right": "CALL", "signal_id": "chain-1",
+    }
+
+    async def run():
+        for i in range(4):
+            await main_bot.trade_ledger.record("seed", {"i": i})
+        main_bot.note_setup_disable_decision(
+            payload, quantity=1, enforced=False, quantity_basis="after_sizing",
+            path="entry", fresh_order=True,
+        )
+        await asyncio.sleep(0.6)
+        await main_bot.trade_ledger.record("heartbeat", {"n": 1})
+        if main_bot._shadow_queue is not None:
+            await asyncio.wait_for(main_bot._shadow_queue.join(), timeout=2)
+        return main_bot.trade_ledger.verify()
+
+    try:
+        ok, checked, err = asyncio.run(run())
+        rows = main_bot.trade_ledger.recent(20)
+        written = main_bot.setup_disable_status()["ledger"]["written"]
+    finally:
+        main_bot.trade_ledger._ledger = saved
+        main_bot.reset_setup_disable_state()
+    assert ok is True, (checked, err)
+    assert err is None
+    assert checked == 6
+    assert written == 1
+    assert [row["event"] for row in rows].count("setup_disable_shadow") == 1
+    assert rows[-1]["event"] == "heartbeat"
+
+
+def test_shadow_queue_counts_written_dropped_and_queued(monkeypatch):
+    _reset(monkeypatch, enabled="false", shadow="true")
+    monkeypatch.setattr(main_bot, "_SHADOW_LEDGER_QUEUE_MAX", 2)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    seen = []
+
+    async def blocked(event, data=None):
+        if event == main_bot.SETUP_DISABLE_EVENT:
+            seen.append((data or {}).get("signal_id"))
+            if not started.is_set():
+                started.set()
+                await release.wait()
+            return 1
+        return 99
+
+    monkeypatch.setattr(main_bot.trade_ledger, "record", blocked)
+
+    async def run():
+        main_bot.note_setup_disable_decision(
+            {"ticker": "FAKE", "setup": "breakdown", "action": "BUY", "signal_id": "q-0"},
+            quantity=1, enforced=False, quantity_basis="requested", path="entry",
+            fresh_order=True,
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        for i in range(1, 4):
+            main_bot.note_setup_disable_decision(
+                {"ticker": "FAKE", "setup": "breakdown", "action": "BUY", "signal_id": f"q-{i}"},
+                quantity=1, enforced=False, quantity_basis="requested", path="entry",
+                fresh_order=True,
+            )
+        mid = main_bot.setup_disable_status()["ledger"]
+        core = await main_bot.trade_ledger.record("heartbeat", {"ok": True})
+        release.set()
+        await asyncio.wait_for(main_bot._shadow_queue.join(), timeout=2)
+        return mid, core, main_bot.setup_disable_status()["ledger"], list(seen)
+
+    mid, core, done, wrote = asyncio.run(run())
+    assert mid["queued"] == 2
+    assert mid["dropped"] == 1
+    assert mid["written"] == 0
+    assert core == 99
+    assert done["written"] == 3
+    assert done["dropped"] == 1
+    assert "q-1" not in wrote
+    assert wrote[0] == "q-0"
+
+
+def test_account_id_substring_survives_the_written_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("ETRADE_ACCOUNT_ID", "00056000")
+    saved = main_bot.trade_ledger._ledger
+    main_bot.reset_setup_disable_state()
+    main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    occ = "FAKE  261218C00056000"
+    order_id = "OID-00056000"
+    signal_id = "sig-00056000"
+    signal_key = f"FAKE|breakdown|{signal_id}|1"
+
+    async def run():
+        seq = await main_bot._record_open(
+            "FAKE", 1, 56.0, 50.0, 70.0,
+            {"occ_symbol": occ, "right": "CALL", "strike": 56.0, "expiration": "2026-12-18"},
+            "BUY", "breakdown",
+            signal_id=signal_id, instrument="option", signal_key=signal_key,
+        )
+        main_bot.note_setup_disable_decision(
+            {
+                "ticker": "FAKE", "setup": "breakdown", "action": "BUY",
+                "option_right": "CALL", "strike": 56, "expiration_hint": "2026-12-18",
+                "signal_id": signal_id, "accountId": "00056000",
+            },
+            quantity=1, enforced=False, quantity_basis="after_sizing", path="scanner",
+            fresh_order=True, reserved=(1, signal_key),
+            outcome={
+                "order_id": order_id, "placement_status": "placed",
+                "position_opened_seq": seq,
+            },
+        )
+        await asyncio.wait_for(main_bot._shadow_queue.join(), timeout=2)
+        return seq
+
+    try:
+        seq = asyncio.run(run())
+        rows = main_bot.trade_ledger.recent(10)
+    finally:
+        main_bot.trade_ledger._ledger = saved
+        main_bot.reset_setup_disable_state()
+    opened = next(row["data"] for row in rows if row["event"] == "position_opened")
+    shadow = next(row["data"] for row in rows if row["event"] == "setup_disable_shadow")
+    assert opened["signal_key"] == signal_key
+    assert opened["contract"]["occ_symbol"] == occ
+    assert shadow["would_be_contract"]["option_symbol"] == occ
+    assert shadow["outcome"]["order_id"] == order_id
+    assert shadow["outcome"]["position_opened_seq"] == seq
+    assert shadow["signal_key"] == signal_key
+    assert "00056000" in occ and "00056000" in order_id and "00056000" in signal_key
+
+
+def test_shadow_redactor_drops_secret_keys_and_oauth_urls():
+    raw = {
+        "order_id": "OID-00056000",
+        "accountId": "00056000",
+        "accountIdKey": "KEY",
+        "oauth_token": "tok",
+        "oauth_token_secret": "sec",
+        "secret": "s",
+        "reason": "see https://api.example/oauth?oauth_token=SUPERSECRET",
+        "nested": {"oauth_token": "tok", "keep": "yes"},
+    }
+    out = main_bot._shadow_ledger_value(raw, set())
+    assert out["order_id"] == "OID-00056000"
+    for key in ("accountId", "accountIdKey", "oauth_token", "oauth_token_secret", "secret"):
+        assert key not in out
+    assert "oauth_token" not in out["nested"]
+    assert out["nested"]["keep"] == "yes"
+    assert "https://" not in out["reason"]
+    assert "SUPERSECRET" not in out["reason"]
+    assert "oauth_token" not in out["reason"]
+
+
+def test_scanner_signal_fills_underlying_source(monkeypatch):
+    import scanner
+    monkeypatch.setattr(scanner, "ITM_EXPRESSION", False)
+    _reset(monkeypatch)
+    candidate = {
+        "ticker": "FAKE", "side": "long", "entry": 101.25, "stop": 99.0,
+        "target": 110.0, "score": 70, "rvol": 2.0, "setup": "breakdown",
+        "ts": "2026-11-30T16:00:00+00:00",
+    }
+    payload = scanner.build_signal(
+        {"bid": 101.2, "ask": 101.3, "price_source": "massive"}, candidate, "live",
+    )
+    assert payload["underlying_source"] == "Massive"
+    row = main_bot.compose_setup_disable_row(
+        payload, quantity=1, enforced=False, quantity_basis="requested",
+        path="scanner", fresh_order=True,
+    )
+    assert row["underlying_source"] == "Massive"
+    assert row["underlying_price"] == 101.25
+
+
+def test_attempt_claim_failure_stays_fail_open(monkeypatch):
+    _reset(monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("claim broke")
+
+    monkeypatch.setattr(main_bot, "_claim_setup_disable_attempt", boom)
+    assert main_bot._reserve_setup_disable_attempt(
+        {"ticker": "FAKE", "setup": "breakdown", "action": "BUY", "signal_id": "x"}
+    ) is None
+
+
+def test_position_closed_copies_signal_key_and_open_seq(tmp_path, monkeypatch):
+    saved = main_bot.trade_ledger._ledger
+    main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    signal_key = "FAKE|breakdown|sig-close|1"
+
+    async def balance(*, dry_run=False):
+        return {"total": 100000.0, "available": 100000.0}
+
+    async def quiet(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main_bot, "_fetch_broker_balance", balance)
+    monkeypatch.setattr(main_bot.alerts, "send", quiet)
+
+    async def run():
+        seq = await main_bot._record_open(
+            "FAKECLOSE", 1, 10.0, 9.0, 12.0, None, "BUY", "breakdown",
+            signal_id="sig-close", instrument="equity", signal_key=signal_key,
+        )
+        stored = await main_bot.state.get_position("FAKECLOSE")
+        await main_bot._record_close(
+            "FAKECLOSE", 10.5, {"ticker": "FAKECLOSE", "action": "BUY"},
+            close_reason="close_fill",
+        )
+        return seq, stored
+
+    try:
+        seq, stored = asyncio.run(run())
+        closed = [
+            row["data"] for row in main_bot.trade_ledger.recent(10)
+            if row.get("event") == "position_closed"
+        ]
+    finally:
+        main_bot.trade_ledger._ledger = saved
+    assert stored["signal_key"] == signal_key
+    assert stored["opened_seq"] == seq
+    assert closed[-1]["signal_key"] == signal_key
+    assert closed[-1]["opened_seq"] == seq

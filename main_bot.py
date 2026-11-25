@@ -10191,6 +10191,7 @@ def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
             # Top-of-book size — the order-book imbalance feature (edge.py).
             "bid_size": num(all_q, "bidSize"),
             "ask_size": num(all_q, "askSize"),
+            "price_source": str(entry.get("source") or "").strip() or None,
         })
     return out
 
@@ -11384,6 +11385,15 @@ def build_signal(quote: Dict[str, Any], candidate: Dict[str, Any], mode: str) ->
         "source": "bot_scanner",
         "timestamp": candidate["ts"],
     }
+    raw_source = str(quote.get("price_source") or quote.get("source") or "").strip()
+    if raw_source:
+        lowered = raw_source.lower()
+        if lowered == "massive":
+            payload["underlying_source"] = "Massive"
+        elif lowered in {"etrade", "e*trade", "e-trade"}:
+            payload["underlying_source"] = "E*TRADE"
+        else:
+            payload["underlying_source"] = raw_source
     # The measured context the entry filter re-judges the thesis against —
     # and that rides into the ledger so validation can segment by regime.
     if isinstance(candidate.get("edge_features"), dict):
@@ -16841,7 +16851,11 @@ _SHADOW_SECRET_ENV = (
     "ETRADE_OAUTH_TOKEN", "ETRADE_OAUTH_TOKEN_SECRET",
 )
 _SHADOW_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
-_SHADOW_QUOTE_KEYS = ("bid", "ask", "mid", "spread_pct", "source", "quote_time", "quote_age_s")
+_SHADOW_QUOTE_KEYS = ("bid", "ask", "mid", "spread_pct", "source", "quote_time")
+_SHADOW_LEDGER_QUEUE_MAX = 256
+_shadow_queue: Optional[asyncio.Queue] = None
+_shadow_writer: Optional[asyncio.Task] = None
+_shadow_ledger_counts: Dict[str, int] = {"written": 0, "dropped": 0}
 _setup_disable_seeded = False
 _setup_disable_inflight: Dict[tuple, str] = {}
 _setup_disable_attempt_n: Dict[tuple, int] = {}
@@ -16894,7 +16908,27 @@ def _shadow_ledger_value(value: Any, secrets: set) -> Any:
 
 def _shadow_option_quote(option_quote: Any) -> Dict[str, Any]:
     raw = option_quote if isinstance(option_quote, dict) else {}
-    return {key: raw.get(key) for key in _SHADOW_QUOTE_KEYS}
+    out = {key: raw.get(key) for key in _SHADOW_QUOTE_KEYS}
+    age_ms = raw.get("quote_age_ms")
+    if age_ms is None and raw.get("quote_age_s") is not None:
+        try:
+            age_ms = round(float(raw["quote_age_s"]) * 1000.0, 3)
+        except (TypeError, ValueError):
+            age_ms = None
+    out["quote_age_ms"] = age_ms
+    return out
+
+
+def _underlying_source_label(raw: Any) -> Optional[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered == "massive":
+        return "Massive"
+    if lowered in {"etrade", "e*trade", "e-trade"}:
+        return "E*TRADE"
+    return text
 
 
 def setup_disable_signal_parts(payload: Any) -> Tuple[str, str, str]:
@@ -16941,6 +16975,19 @@ def _claim_setup_disable_attempt(payload: Dict[str, Any], *, fresh_order: bool) 
     if fresh_order:
         _setup_disable_closed_attempt.add(key)
     return n, key
+
+
+def _reserve_setup_disable_attempt(payload: Any) -> Optional[Tuple[int, str]]:
+    """Claim the shadow attempt. A failure here must not touch the order."""
+    try:
+        if not isinstance(payload, dict):
+            return None
+        if canonical_setup_id(payload.get("setup")) not in resolved_setup_disable_list()["ids"]:
+            return None
+        return _claim_setup_disable_attempt(payload, fresh_order=True)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+        return None
 
 
 def _option_type_and_direction(payload: Dict[str, Any], call_put: Any = None) -> Tuple[Optional[str], str]:
@@ -17175,7 +17222,7 @@ def _live_option_quote(pq: Any, massive_quote: Any) -> Dict[str, Any]:
         "spread_pct": spread_pct,
         "source": source_name,
         "quote_time": quote_time,
-        "quote_age_s": age,
+        "quote_age_ms": round(float(age) * 1000.0, 3) if isinstance(age, (int, float)) and math.isfinite(float(age)) else None,
     }
 
 
@@ -17268,7 +17315,9 @@ def compose_setup_disable_row(
             "option_quote": quote,
             "entry_price": payload.get("entry"),
             "underlying_price": underlying,
-            "underlying_source": payload.get("underlying_source") or features.get("price_source"),
+            "underlying_source": _underlying_source_label(
+                payload.get("underlying_source") or features.get("price_source") or payload.get("price_source")
+            ),
             "vol_regime": features.get("vol_regime") or regime.get("regime"),
             "regime_weight": regime.get("weight") if regime.get("weight") is not None else risk.get("weight"),
             "spy_gap_pct": context.get("spy_gap_pct") if context.get("spy_gap_pct") is not None else (payload.get("risk_context") or {}).get("spy_gap_pct") if isinstance(payload.get("risk_context"), dict) else None,
@@ -17348,19 +17397,82 @@ def note_setup_disable_decision(
         )
         if body is None:
             return
-
-        async def _run() -> None:
-            try:
-                await asyncio.wait_for(
-                    trade_ledger.record(SETUP_DISABLE_EVENT, body),
-                    timeout=0.1,
-                )
-            except Exception as exc:
-                _log_setup_disable_observer_error(exc)
-
-        asyncio.get_running_loop().create_task(_run())
+        _enqueue_shadow_row(body)
     except Exception as exc:
         _log_setup_disable_observer_error(exc)
+
+
+def _ensure_shadow_writer() -> asyncio.Queue:
+    """One consumer for shadow rows. Core ledger writes never enter this queue."""
+    global _shadow_queue, _shadow_writer
+    loop = asyncio.get_running_loop()
+    stale = (
+        _shadow_queue is None
+        or _shadow_writer is None
+        or _shadow_writer.done()
+        or _shadow_writer.get_loop() is not loop
+    )
+    if stale:
+        _shadow_queue = asyncio.Queue()
+        _shadow_writer = loop.create_task(_shadow_ledger_writer(_shadow_queue))
+    return _shadow_queue
+
+
+def _count_shadow_write(seq: Any) -> None:
+    if seq is None:
+        _shadow_ledger_counts["dropped"] += 1
+    else:
+        _shadow_ledger_counts["written"] += 1
+
+
+async def _shadow_ledger_writer(queue: asyncio.Queue) -> None:
+    """Append shadow rows one at a time.
+
+    The caller's wait is not this task. record() runs under a shield, so a
+    timeout on the order path cannot cancel the append or break the hash chain.
+    """
+    while True:
+        body = await queue.get()
+        try:
+            write = asyncio.create_task(trade_ledger.record(SETUP_DISABLE_EVENT, body))
+            try:
+                seq = await asyncio.shield(write)
+            except asyncio.CancelledError:
+                seq = await write
+                _count_shadow_write(seq)
+                raise
+            _count_shadow_write(seq)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _shadow_ledger_counts["dropped"] += 1
+            _log_setup_disable_observer_error(exc)
+        finally:
+            queue.task_done()
+
+
+def _enqueue_shadow_row(body: Dict[str, Any]) -> None:
+    """Hand a shadow row to the writer. A full queue drops the oldest shadow row."""
+    queue = _ensure_shadow_writer()
+    limit = max(1, int(_SHADOW_LEDGER_QUEUE_MAX))
+    while queue.qsize() >= limit:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        queue.task_done()
+        _shadow_ledger_counts["dropped"] += 1
+    queue.put_nowait(body)
+
+
+def _shadow_queue_depth() -> int:
+    queue = _shadow_queue
+    if queue is None:
+        return 0
+    try:
+        return int(queue.qsize())
+    except Exception:
+        return 0
 
 
 def setup_disable_status() -> Dict[str, Any]:
@@ -17389,6 +17501,11 @@ def setup_disable_status() -> Dict[str, Any]:
             "capped": int(_setup_disable_counts.get("capped") or 0),
             "by_setup": session_by,
         },
+        "ledger": {
+            "written": int(_shadow_ledger_counts.get("written") or 0),
+            "dropped": int(_shadow_ledger_counts.get("dropped") or 0),
+            "queued": _shadow_queue_depth(),
+        },
         "read_only": True,
         "env_read": "each_entry",
     }
@@ -17410,6 +17527,8 @@ def reset_setup_disable_state() -> None:
     _setup_disable_seeded = False
     _setup_disable_list_cache.clear()
     _setup_disable_list_cache["key"] = None
+    _shadow_ledger_counts["written"] = 0
+    _shadow_ledger_counts["dropped"] = 0
 
 app = FastAPI(title="E*TRADE Trading Bot")
 # No cross-origin browser access unless CORS_ORIGINS lists the origins.
@@ -31686,7 +31805,14 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
     }
     if signal_key:
         opened["signal_key"] = signal_key
-    return await trade_ledger.record("position_opened", opened)
+    seq = await trade_ledger.record("position_opened", opened)
+    if seq is not None:
+        position["opened_seq"] = seq
+        try:
+            await state.set_position(ticker, position)
+        except Exception as e:
+            logger.warning(f"[OPEN] {ticker} open seq not stamped on the position: {e}")
+    return seq
 
 
 def _mtf_parts(raw: Any) -> Tuple[Optional[int], Optional[int]]:
@@ -32147,6 +32273,12 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
         # visible without reconstructing Redis after the fact.
         **_review,
     }
+    _open_key = (pos or {}).get("signal_key")
+    if _open_key:
+        close_data["signal_key"] = _open_key
+    _opened_seq = (pos or {}).get("opened_seq")
+    if _opened_seq is not None:
+        close_data["opened_seq"] = _opened_seq
     ledger_seq = await trade_ledger.record("position_closed", close_data)
     await _remember_trade_review(close_data, ledger_seq=ledger_seq)
     # Schedule 15/30-minute post-exit marks — a stop that was too tight shows
@@ -35944,9 +36076,7 @@ async def execute_live_order(payload: dict):
                 # when the signal said SELL (bearish → long PUT). Recording the
                 # signal verb would flip `_entry_direction` to −1 and invert the
                 # premium P&L of every put exit.
-                shadow_reserved = None
-                if canonical_setup_id(payload.get("setup")) in resolved_setup_disable_list()["ids"]:
-                    shadow_reserved = _claim_setup_disable_attempt(payload, fresh_order=True)
+                shadow_reserved = _reserve_setup_disable_attempt(payload)
                 opened_seq = await _record_open(
                     str(symbol).upper(), quantity,
                     payload.get("entry"), payload.get("stop") or payload.get("stop_price"),
