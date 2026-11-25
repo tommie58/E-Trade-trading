@@ -15417,7 +15417,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # still fail-closes when the two disagree or the Massive side is missing
 # or stale. GET /pro-trader/report includes the gap in basis points.
 # /status positions_open is the open book with status, side, and qty.
-BOT_VERSION = "5.99.6-pro-day-trader"
+BOT_VERSION = "5.99.8-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -16238,8 +16238,11 @@ ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", "300"))
 # Immutable trade ledger — append-only, hash-chained JSONL (GET /ledger).
 TRADE_LEDGER_FILE = Path(os.getenv("TRADE_LEDGER_FILE", "trade_ledger.jsonl"))
-# Fast per-trade review list (Redis/memory) mirroring each position_closed
+# Fast per-trade review list (Redis/memory) mirroring each booked close
 # snapshot so GET /trades works even when Postgres study views are offline.
+# A take-profit or scheduled exit whose fill could not be priced never reaches
+# this list. GET /trades unions the ledger's realized close events so that
+# close is still visible.
 TRADES_HISTORY_KEY = "trades:history"
 TRADES_HISTORY_MAX = int(os.getenv("TRADES_HISTORY_MAX", "500"))
 # How far GET /trades (and the empty-list backfill) walk the ledger when
@@ -40284,28 +40287,20 @@ def _jsonl_tail_lines(path: Path, cap: int) -> List[bytes]:
     return lines
 
 
-def _review_row_from_ledger(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Booked position_closed payload plus ledger_seq / ledger_ts. None for
-    every other event. Same shape the old /trades fallback returned."""
-    if str(rec.get("event") or "") != "position_closed":
-        return None
-    data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
-    row = dict(data)
-    row["ledger_seq"] = rec.get("seq")
-    row["ledger_ts"] = rec.get("ts")
-    return row
-
-
 def ledger_review_rows(count: int, cap: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Newest-first position_closed rows, scanning at most `cap` ledger records.
+    """Newest-first realized closes, scanning at most `cap` ledger records.
 
-    Stops once `count` closes are in hand. A repeated seq|ledger_ts|ticker
-    keeps the newest copy. seq alone is not the identity: a chain restart
-    reuses seq, and two different closes that share it both stay. Default
-    cap is TRADES_LEDGER_FALLBACK_CAP (EDGE_LOOKBACK),
-    the same newest slice GET /learning/report reads, so a count of 500 reaches
-    the live closes that report counts. Worst case at that cap: buffer and
-    parse EDGE_LOOKBACK (default 3000) JSONL records from the end of the file.
+    position_closed is the booked row. take_profit_closed and the other
+    `*_closed` exit events are included when that close was never booked, and
+    dropped when a position_closed shares the same close id. shadow_closed is
+    not a live close. A repeated seq|ledger_ts|ticker keeps the newest copy.
+    seq alone is not the identity: a chain restart reuses seq, and two
+    different closes that share it both stay. Default cap is
+    TRADES_LEDGER_FALLBACK_CAP (EDGE_LOOKBACK), the same newest slice GET
+    /learning/report reads, so a count of 500 reaches the live closes that
+    report counts. Worst case at that cap: buffer and parse EDGE_LOOKBACK
+    (default 3000) JSONL records from the end of the file. Does not apply
+    sign corrections and does not write the ledger.
     """
     limit = TRADES_LEDGER_FALLBACK_CAP if cap is None else int(cap)
     want = int(count)
@@ -40315,27 +40310,16 @@ def ledger_review_rows(count: int, cap: Optional[int] = None) -> List[Dict[str, 
     if path is None:
         return []
     lines = _jsonl_tail_lines(path, limit)
-    out: List[Dict[str, Any]] = []
-    seen = set()
-    for raw in reversed(lines):
+    records: List[Dict[str, Any]] = []
+    for raw in lines:
         try:
             rec = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
             continue
-        if not isinstance(rec, dict):
-            continue
-        row = _review_row_from_ledger(rec)
-        if row is None:
-            continue
-        ident = pro_trader.review_identity(row)
-        if ident is not None:
-            if ident in seen:
-                continue
-            seen.add(ident)
-        out.append(row)
-        if len(out) >= want:
-            break
-    return out
+        if isinstance(rec, dict):
+            records.append(rec)
+    rows = pro_trader.reconcile_reports.build_realized_close_rows(records)
+    return rows[:want]
 
 
 def _parse_closed_at(value: Any) -> Optional[datetime]:
@@ -40482,17 +40466,20 @@ async def trades_review(
 ):
     """Per-trade review snapshots (newest first) for learning and forensics.
 
-    Prefers the Redis/memory review list stamped on every close; falls back to
-    `position_closed` rows in the immutable ledger when that list is empty
-    (e.g. after a cold boot before the backfill finishes). The fallback walks
-    newest-first until `count` closes are found, and never examines more than
-    TRADES_LEDGER_FALLBACK_CAP records (EDGE_LOOKBACK, default 3000 — the same
-    window as GET /learning/report). At that cap the cost is a tail read plus
-    at most 3000 JSON parses. Requires the webhook secret — these rows carry
-    fills, stops and P&L.
+    Prefers the Redis/memory review list stamped on every booked close, and
+    unions it with realized closes in the immutable ledger. A take-profit or
+    scheduled exit whose fill could not be read writes `take_profit_closed`
+    (or `{reason}_closed`) and no `position_closed`, so the review list never
+    received it. Those events are included here. A close id that already has
+    a position_closed — in the list or in the ledger — is not counted twice.
+    The ledger walk never examines more than TRADES_LEDGER_FALLBACK_CAP
+    records (EDGE_LOOKBACK, default 3000 — the same window as GET
+    /learning/report). At that cap the cost is a tail read plus at most 3000
+    JSON parses. Requires the webhook secret — these rows carry fills, stops
+    and P&L. Reporting only: no broker call and no P&L write.
     """
     await _require_control_auth(x_rork_secret, "/trades")
-    trades: List[Dict[str, Any]] = []
+    history: List[Dict[str, Any]] = []
     source = "history"
     try:
         raw_items = await state.list_range(TRADES_HISTORY_KEY, count)
@@ -40502,15 +40489,18 @@ async def trades_review(
             except (TypeError, json.JSONDecodeError):
                 continue
             if isinstance(parsed, dict):
-                trades.append(parsed)
+                history.append(parsed)
     except Exception as e:
         logger.warning("/trades history list unreadable: %s", type(e).__name__)
-    trades = pro_trader.dedupe_review_rows(trades)
-    if not trades:
+    history = pro_trader.dedupe_review_rows(history)
+    ledger_rows = await asyncio.to_thread(
+        ledger_review_rows, count, TRADES_LEDGER_FALLBACK_CAP,
+    )
+    if not history:
         source = "ledger"
-        trades = await asyncio.to_thread(
-            ledger_review_rows, count, TRADES_LEDGER_FALLBACK_CAP,
-        )
+        trades = ledger_rows
+    else:
+        trades = pro_trader.reconcile_reports.merge_trade_review(history, ledger_rows)
     return {
         "trades": trades[:count],
         "count": len(trades[:count]),
