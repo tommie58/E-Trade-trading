@@ -999,7 +999,8 @@ def test_append_sample_half_day_counts_until_1300_et(redis_scanner, monkeypatch)
 
     fields = _run(scenario())
     assert int(float(fields["count"])) == 1
-    assert float(fields["sum_pv"]) / float(fields["sum_v"]) == pytest.approx(110.0)
+    # Volume between 100 and 110 is priced at their average, not at 110 alone.
+    assert float(fields["sum_pv"]) / float(fields["sum_v"]) == pytest.approx(105.0)
     first = datetime.fromisoformat(fields["first_ts"])
     last = datetime.fromisoformat(fields["last_ts"])
     assert (first.astimezone(ET).hour, first.astimezone(ET).minute) == (9, 30)
@@ -1048,7 +1049,7 @@ def test_naive_and_zulu_stamps_are_utc_before_the_et_window():
     assert anchor is not None and anchor["count"] == 0
     for folded in (naive, zulu, aware):
         assert folded["count"] == 1
-        assert folded["sum_pv"] / folded["sum_v"] == pytest.approx(210.0)
+        assert folded["sum_pv"] / folded["sum_v"] == pytest.approx(205.0)
         last = datetime.fromisoformat(folded["last_ts"])
         assert last.astimezone(ET).hour == 14
         assert last.date() == datetime(2026, 11, 24, tzinfo=ET).date()

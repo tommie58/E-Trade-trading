@@ -4043,6 +4043,7 @@ async def reconcile_once(
                                      dedupe_key=f"fill_capture:{ticker}")
                     continue
             await state.delete_position(ticker)
+            await release_heat_reservation(ticker=str(ticker).upper(), reason="close")
             guard = guards.get(ticker)
             if guard and not guard.get("done"):
                 await state.update_guard(ticker, done=True, result="reconciled_ghost")
@@ -10140,33 +10141,56 @@ def _finite_number(raw: Any) -> Optional[float]:
     return value
 
 
+def _bracket_price(prev_price: Optional[float], price: float) -> Optional[float]:
+    """Price for the volume between two scanner samples.
+
+    The lone opening print has no bracket, so it does not price the volume
+    that follows it. Once a previous sample exists, the delta is the average
+    of the two sampled prices — not either endpoint alone.
+    """
+    if prev_price is None:
+        return None
+    weight = (float(prev_price) + float(price)) / 2.0
+    if not math.isfinite(weight) or weight <= 0:
+        return None
+    return weight
+
+
 def sampled_vwap(series: List[Dict[str, Any]]) -> Optional[float]:
-    """Volume-weighted average price built from the scanner's OWN samples,
-    weighting each observation by the volume traded since the previous one.
-    Returns None until at least two samples with a positive volume delta.
-    A NaN or infinite price never enters the average."""
+    """Volume-weighted average from the scanner's own samples.
+
+    Each volume delta is weighted by the average of the bracketing sample
+    prices. The first print only anchors volume and price. A NaN or
+    infinite price never enters the average. Massive is not an input.
+    """
     num = 0.0
     den = 0.0
     prev_vol: Optional[float] = None
+    prev_price: Optional[float] = None
     for sample in series:
         price = _finite_number(sample.get("last"))
         vol = sample.get("total_volume")
         if price is None:
             if sample.get("last") is not None:
                 prev_vol = None
+                prev_price = None
             continue
         if vol is None:
             prev_vol = None
+            prev_price = None
             continue
         vol_f = _finite_number(vol)
         if vol_f is None:
             prev_vol = None
+            prev_price = None
             continue
-        if prev_vol is not None and vol_f > prev_vol:
+        weight = _bracket_price(prev_price, price)
+        if prev_vol is not None and vol_f > prev_vol and weight is not None:
             delta = vol_f - prev_vol
-            num += price * delta
+            num += weight * delta
             den += delta
         prev_vol = vol_f
+        prev_price = price
     if den <= 0:
         return None
     vwap = num / den
@@ -10468,6 +10492,7 @@ def _acc_from_fields(fields: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "high": num("high"),
         "low": num("low"),
         "first_price": num("first_price"),
+        "last_price": num("last_price"),
     }
 
 
@@ -10481,7 +10506,7 @@ def _acc_to_fields(acc: Dict[str, Any]) -> Dict[str, str]:
     }
     if acc.get("first_ts"):
         out["first_ts"] = str(acc["first_ts"])
-    for name in ("high", "low", "first_price"):
+    for name in ("high", "low", "first_price", "last_price"):
         if acc.get(name) is not None:
             out[name] = repr(float(acc[name]))
     return out
@@ -10575,11 +10600,13 @@ def fold_session_sample(
     """Fold one regular-session sample. None when it is not today's RTH print.
 
     The stamp is converted to America/New_York before the 9:30/close test.
-    The delta matches ``sampled_vwap``: price times the volume added since the
-    previous counted sample. ``count`` increments only when that delta is
-    positive. Pre-open, after ``session_close_minute`` (half-day aware), a
-    future stamp, and a NaN or infinite price are not counted. The caller
-    stores the result under the sample's ET date.
+    The delta matches ``sampled_vwap``: the average of the previous sample
+    price and this one, times the volume added since the previous sample.
+    The first print stores ``last_price`` and does not enter the average.
+    ``count`` increments only when that delta is positive. Pre-open, after
+    ``session_close_minute`` (half-day aware), a future stamp, and a NaN or
+    infinite price are not counted. The caller stores the result under the
+    sample's ET date.
     """
     if not isinstance(sample, dict):
         return None
@@ -10604,14 +10631,23 @@ def fold_session_sample(
     vol = _finite_number(sample.get("total_volume"))
     if vol is None or vol < 0:
         acc["last_volume"] = None
+        acc["last_price"] = None
     else:
         prev = acc["last_volume"]
-        if prev is not None and vol > prev:
+        prev_price = acc.get("last_price")
+        weight = _bracket_price(prev_price, price)
+        # A seed or an older hash has volume and no saved price. Price the
+        # new shares at this tick instead of dropping them or borrowing the
+        # open print.
+        if weight is None and prev is not None:
+            weight = price
+        if prev is not None and vol > prev and weight is not None:
             delta = vol - prev
-            acc["sum_pv"] = float(acc["sum_pv"]) + price * delta
+            acc["sum_pv"] = float(acc["sum_pv"]) + weight * delta
             acc["sum_v"] = float(acc["sum_v"]) + delta
             acc["count"] = int(acc["count"]) + 1
         acc["last_volume"] = vol
+        acc["last_price"] = price
     return acc
 
 
@@ -10772,7 +10808,9 @@ def plan_session_vwap_seed(
     call and a hash that already holds the tail do not count those minutes
     again. A stale or gapped set is not applied. The returned fields keep
     ``last_volume`` so the next live print adds only the volume since that
-    anchor.
+    anchor. This does not replace a hash that already sampled the open.
+    The open sample is the scanner's own prices; Massive stays the
+    cross-check, not the sample.
     """
     skipped = {
         "applied": False, "reason": "not_needed", "bars_used": 0,
@@ -15276,7 +15314,39 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # the newest bar is already up to about two minutes old. GET /study
 # disposes its SQL pool on shutdown. An offset at the ledger cap returns
 # more=false and capped=true.
-BOT_VERSION = "5.99.4-pro-day-trader"
+# 5.99.5: heat is reserved when an entry is approved, under one lock, and
+# every later heat check — including assess_app_risk_gates — counts that
+# reservation. It is released on fill (the position then holds the risk —
+# no double count), on cancel, reject, expiry, or timeout, and the
+# unfilled remainder of a partial stays reserved until that order is done.
+# Each row stores the original planned quantity and how much fill has
+# already been applied. A settle or the placement sweep subtracts only
+# the new fill, so repeating the sweep does not shrink the remainder.
+# HEAT_RESERVATION_TTL_S defaults to the entry-fill timeout (20 minutes)
+# and is clamped at one hour. A fill releases by filled quantity, not by
+# comparing booked dollars with the nominal plan. A close releases the
+# reservation ids that were live when the release was deferred, not a
+# later re-entry on the same ticker. A restart drops only expired
+# reservations. A recovered job re-checks heat before it places: an app
+# job uses the app open-risk ceiling, a scanner job uses the portfolio
+# heat cap and the correlation gate. A lock that is busy for the whole
+# wait is logged and the job is not placed. A skipped try-lock settle or
+# release is retried by the placement-worker sweep, which does nothing
+# when the book and the retry lists are empty. The lock token is checked
+# again before the reservation write, so a book read that outlives the
+# lock cannot land a second entry. The settle after a stop is armed does
+# not wait on that lock.
+# HEAT_RESERVATION_ENABLED defaults on. Setting it false is the rollback:
+# heat is judged at fill time again.
+# The session VWAP stays the scanner's own samples. Each volume delta is
+# the average of the two bracketing sample prices, and the lone 9:30
+# print is only an anchor — it does not price the volume that follows it.
+# Massive regular-session minute VWAP stays the other side of the
+# cross-check. The gate does not copy Massive into the sample, and it
+# still fail-closes when the two disagree or the Massive side is missing
+# or stale. GET /pro-trader/report includes the gap in basis points.
+# /status positions_open is the open book with status, side, and qty.
+BOT_VERSION = "5.99.5-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -15754,6 +15824,10 @@ MAX_ROUND_TRIP_COST_PCT = float(os.getenv("MAX_ROUND_TRIP_COST_PCT", "12.0"))
 MIN_ENTRY_PREMIUM_USD = 0.5
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
 PORTFOLIO_HEAT_PCT = float(os.getenv("PORTFOLIO_HEAT_PCT", "6.0"))
+# Planned risk reserved at approval, before the fill books it. The key holds
+# every live reservation. Rows carry their own expiry; the key TTL is only
+# a backstop. Restart deletes the key (see on_startup).
+HEAT_RESERVATIONS_KEY = "heat:reservations"
 # ---- Per-trade concentration ----
 # The largest share of ONE day's risk budget a SINGLE entry may commit.
 #
@@ -16943,6 +17017,9 @@ async def ensure_index_session_vwap_seed(
             try:
                 key = scanner_mod.session_vwap_key(sym, day)
                 fields = await state.hash_get(key)
+                # A hash that already has the 9:30 print is the scanner's
+                # sample. Do not fetch Massive to overwrite it. The seed
+                # runs only for an empty or late start, throttled to 90s.
                 if not scanner_mod.session_vwap_needs_seed(fields, now_et):
                     continue
                 attempt_key = f"{day}:{sym}"
@@ -18152,12 +18229,817 @@ def assess_open_risk_ceiling(open_risk_usd: Any, new_risk_usd: Any, equity_usd: 
     return None
 
 
+def heat_reservation_enabled() -> bool:
+    """Default on. False restores fill-time heat (the 2026-11-25 race)."""
+    return _env_flag("HEAT_RESERVATION_ENABLED", "true")
+
+
+# The reservation lock covers only the read-modify-write of the reservation
+# list. Position reads happen before it is taken. 8s is longer than that
+# local write; it is not held across a broker read.
+HEAT_RESERVATION_LOCK_TTL_MS = 8_000
+HEAT_RESERVATION_LOCK_WAIT_S = 3.0
+
+
+def heat_reservation_ttl_s() -> float:
+    """How long an unfilled reservation holds heat. Bounded, default the entry timeout.
+
+    HEAT_RESERVATION_TTL_S overrides. Values above one hour are clamped.
+    A non-positive or unreadable value uses the entry-fill timeout.
+    """
+    default = float(max(60, int(ENTRY_FILL_TIMEOUT_MIN) * 60))
+    raw = os.getenv("HEAT_RESERVATION_TTL_S", "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value) or value <= 0:
+        return default
+    return min(value, 3600.0)
+
+
+def _heat_row_risk(row: Any) -> float:
+    if not isinstance(row, dict):
+        return 0.0
+    try:
+        value = float(row.get("risk_usd") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) and value > 0 else 0.0
+
+
+def active_heat_reservations(rows: Any, now: float) -> List[Dict[str, Any]]:
+    """Drop expired rows. A bad clock keeps the row (it still has a TTL on the key)."""
+    out: List[Dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            expiry = float(row.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if expiry > float(now):
+            out.append(row)
+    return out
+
+
+def reservation_exposure(
+    rows: Any,
+    positions: Optional[Dict[str, Any]],
+    now: float,
+) -> Tuple[float, List[Dict[str, Any]]]:
+    """Unbooked reserved risk, and correlation rows for that remainder.
+
+    A reservation is the planned risk. Once the position carries that many
+    dollars, the reservation adds nothing — the fill is not counted twice.
+    A partial fill leaves the difference reserved. That difference is the
+    unfilled remainder.
+    """
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for row in active_heat_reservations(rows, now):
+        ticker = str(row.get("ticker") or "").upper()
+        if not ticker:
+            continue
+        slot = grouped.setdefault(ticker, {"gross": 0.0, "net": 0.0, "direction": 1})
+        try:
+            applied = int(row.get("applied_filled_qty") or 0)
+        except (TypeError, ValueError):
+            applied = 0
+        # A fill delta already removed the filled contracts from risk_usd.
+        # Subtracting booked dollars again would shrink the resting remainder.
+        if applied > 0:
+            slot["net"] += _heat_row_risk(row)
+        else:
+            slot["gross"] += _heat_row_risk(row)
+        try:
+            direction = int(row.get("direction") or 0)
+        except (TypeError, ValueError):
+            direction = 0
+        if direction in (1, -1):
+            slot["direction"] = direction
+    total = 0.0
+    book: List[Dict[str, Any]] = []
+    held = positions if isinstance(positions, dict) else {}
+    for ticker, slot in grouped.items():
+        booked = 0.0
+        if ticker in held:
+            try:
+                booked = float(position_risk_usd(held[ticker]) or 0.0)
+            except Exception:
+                booked = 0.0
+        extra = float(slot["net"]) + max(0.0, float(slot["gross"]) - booked)
+        if extra <= 1e-9:
+            continue
+        total += extra
+        book.append({
+            "ticker": ticker,
+            "direction": 1 if int(slot["direction"]) >= 0 else -1,
+            "risk_usd": round(extra, 2),
+            "cluster": portfolio_risk.cluster_of(ticker),
+        })
+    return total, book
+
+
+def merge_book_rows(rows: Any) -> List[Dict[str, Any]]:
+    """One row per ticker. A held name plus its reservation is one name.
+
+    Dollars add. The cluster stack then cannot report AVGO/AVGO for a single
+    held AVGO.
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker") or "").upper()
+        if not ticker:
+            continue
+        try:
+            risk = float(row.get("risk_usd") or 0.0)
+        except (TypeError, ValueError):
+            risk = 0.0
+        if ticker not in merged:
+            merged[ticker] = {
+                "ticker": ticker,
+                "direction": 1 if int(row.get("direction") or 1) >= 0 else -1,
+                "risk_usd": 0.0,
+                "cluster": row.get("cluster"),
+            }
+            order.append(ticker)
+        merged[ticker]["risk_usd"] = round(merged[ticker]["risk_usd"] + max(0.0, risk), 2)
+        if row.get("cluster"):
+            merged[ticker]["cluster"] = row.get("cluster")
+    return [merged[ticker] for ticker in order]
+
+
+def portfolio_correlation_book(
+    positions: Any,
+    reserved_rows: Any,
+) -> List[Dict[str, Any]]:
+    """Held names plus reservations, one row per ticker.
+
+    Placement and admission both use this. Concatenating the two lists
+    counts a held ticker and its reservation as two names (AVGO/AVGO).
+    """
+    held = positions if isinstance(positions, dict) else {}
+    return merge_book_rows(
+        portfolio_risk.book_rows(held, position_risk_usd) + list(reserved_rows or [])
+    )
+
+
+def _position_filled_qty(pos: Any) -> int:
+    """Filled contracts only. A missing filled_qty is not a fill."""
+    if not isinstance(pos, dict) or pos.get("filled_qty") is None:
+        return 0
+    try:
+        qty = int(float(pos.get("filled_qty")))
+    except (TypeError, ValueError):
+        return 0
+    return qty if qty > 0 else 0
+
+
+def apply_fill_to_reservations(
+    rows: Any,
+    symbol: str,
+    filled_qty: int,
+    now: float,
+) -> List[Dict[str, Any]]:
+    """Apply only the new fill since the last settle or sweep.
+
+    The row stores the original ``planned_qty`` and ``original_risk_usd``.
+    ``applied_filled_qty`` is how much of that plan is already reflected in
+    ``qty`` and ``risk_usd``. A later pass with the same filled quantity is
+    a no-op, so a partial remainder cannot decay on the 0.5s sweep.
+    """
+    ticker = str(symbol or "").upper()
+    try:
+        filled_now = int(filled_qty or 0)
+    except (TypeError, ValueError):
+        filled_now = 0
+    if filled_now < 0:
+        filled_now = 0
+    kept: List[Dict[str, Any]] = []
+    for row in active_heat_reservations(rows, now):
+        if str(row.get("ticker") or "").upper() != ticker:
+            kept.append(row)
+            continue
+        try:
+            planned_qty = int(row.get("planned_qty") or row.get("qty") or 1)
+        except (TypeError, ValueError):
+            planned_qty = 1
+        if planned_qty < 1:
+            planned_qty = 1
+        try:
+            applied = int(row.get("applied_filled_qty") or 0)
+        except (TypeError, ValueError):
+            applied = 0
+        if applied < 0:
+            applied = 0
+        if applied > planned_qty:
+            applied = planned_qty
+        try:
+            if row.get("original_risk_usd") is None:
+                original = float(row.get("risk_usd") or 0.0)
+            else:
+                original = float(row.get("original_risk_usd") or 0.0)
+        except (TypeError, ValueError):
+            original = 0.0
+        if filled_now <= applied:
+            kept.append(row)
+            continue
+        if filled_now >= planned_qty:
+            continue
+        remain = planned_qty - filled_now
+        updated = dict(row)
+        updated["planned_qty"] = planned_qty
+        updated["original_risk_usd"] = round(original, 2)
+        updated["applied_filled_qty"] = filled_now
+        updated["qty"] = remain
+        updated["risk_usd"] = round(original * (remain / planned_qty), 2)
+        kept.append(updated)
+    return kept
+
+
+def _entry_contracts(payload: Any) -> int:
+    if not isinstance(payload, dict):
+        return 1
+    for key in ("quantity", "qty", "contracts"):
+        try:
+            qty = int(float(payload.get(key)))
+        except (TypeError, ValueError):
+            continue
+        if qty > 0:
+            return qty
+    return 1
+
+
+def judge_heat_admission(
+    positions: Optional[Dict[str, Any]],
+    reservations: Any,
+    payload: Dict[str, Any],
+    new_risk_usd: float,
+    account_usd: float,
+    now: float,
+    *,
+    regime: Any = None,
+    enforce_correlation: bool = True,
+    heat_cap_pct: Any = None,
+) -> Dict[str, Any]:
+    """Whether this planned risk still fits under the heat cap and the book.
+
+    Pure. The caller has already read positions. The reservation rows are the
+    ones just read under the lock. ``heat_cap_pct`` overrides the portfolio
+    cap for the app open-risk ceiling.
+    """
+    held = positions if isinstance(positions, dict) else {}
+    try:
+        open_risk = sum(float(position_risk_usd(pos) or 0.0) for pos in held.values())
+    except Exception:
+        open_risk = 0.0
+    reserved, extra_rows = reservation_exposure(reservations, held, now)
+    try:
+        new_risk = float(new_risk_usd or 0.0)
+    except (TypeError, ValueError):
+        new_risk = 0.0
+    if not math.isfinite(new_risk) or new_risk < 0:
+        new_risk = 0.0
+    try:
+        account = float(account_usd or 0.0)
+    except (TypeError, ValueError):
+        account = 0.0
+    if not math.isfinite(account) or account <= 0:
+        account = 1.0
+    ticker = str((payload or {}).get("ticker") or "").upper()
+    reasons: List[str] = []
+    active = active_heat_reservations(reservations, now)
+    if ticker and any(str(row.get("ticker") or "").upper() == ticker for row in active):
+        reasons.append(f"already reserving heat for {ticker}")
+    cap = PORTFOLIO_HEAT_PCT if heat_cap_pct is None else heat_cap_pct
+    try:
+        cap = float(cap)
+    except (TypeError, ValueError):
+        cap = float(PORTFOLIO_HEAT_PCT)
+    if not math.isfinite(cap) or cap <= 0:
+        cap = float(PORTFOLIO_HEAT_PCT)
+    heat = (open_risk + reserved + new_risk) / account * 100.0
+    if heat > cap + 1e-9:
+        reasons.append(f"portfolio heat {heat:.2f}% > {cap:g}%")
+    if enforce_correlation and ticker and not reasons:
+        try:
+            direction = portfolio_risk.payload_direction(payload or {})
+            book = portfolio_correlation_book(
+                held, [row for row in extra_rows if row["ticker"] != ticker],
+            )
+            corr = portfolio_risk.assess_correlation(
+                ticker, direction, new_risk, book, account,
+                live_policy("risk_per_trade_pct"), cap, regime,
+            )
+            if not corr["allowed"]:
+                reasons.extend(corr["reasons"])
+        except Exception as e:
+            reasons.append(f"correlation not judged ({type(e).__name__}) — entry not reserved")
+    return {
+        "allowed": not reasons,
+        "reasons": reasons,
+        "heat_pct": round(heat, 3),
+        "reserved_usd": round(reserved, 2),
+        "open_risk_usd": round(open_risk, 2),
+        "new_risk_usd": round(new_risk, 2),
+    }
+
+
+def heat_reservation_record(
+    payload: Dict[str, Any],
+    new_risk_usd: float,
+    now: float,
+    reservation_id: str,
+) -> Dict[str, Any]:
+    ticker = str((payload or {}).get("ticker") or "").upper()
+    try:
+        direction = int(portfolio_risk.payload_direction(payload or {}))
+    except Exception:
+        direction = 1
+    if direction not in (1, -1):
+        direction = 1
+    qty = _entry_contracts(payload)
+    risk = round(float(new_risk_usd or 0.0), 2)
+    return {
+        "id": str(reservation_id),
+        "ticker": ticker,
+        "direction": direction,
+        "risk_usd": risk,
+        "original_risk_usd": risk,
+        "qty": qty,
+        "planned_qty": qty,
+        "applied_filled_qty": 0,
+        "reserved_at": float(now),
+        "expires_at": float(now) + heat_reservation_ttl_s(),
+    }
+
+
+def release_heat_rows(
+    rows: Any,
+    now: float,
+    *,
+    reservation_id: Optional[str] = None,
+    ticker: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Drop one id, or every row for a ticker, and anything already expired."""
+    ident = str(reservation_id or "").strip()
+    symbol = str(ticker or "").upper().strip()
+    kept: List[Dict[str, Any]] = []
+    for row in active_heat_reservations(rows, now):
+        if ident and str(row.get("id") or "") == ident:
+            continue
+        if not ident and symbol and str(row.get("ticker") or "").upper() == symbol:
+            continue
+        kept.append(row)
+    return kept
+
+
+def release_heat_ids(
+    rows: Any,
+    now: float,
+    ids: Any,
+) -> List[Dict[str, Any]]:
+    """Drop only the reservation ids captured when a release was deferred."""
+    wanted = {str(item) for item in (ids or []) if item}
+    if not wanted:
+        return active_heat_reservations(rows, now)
+    kept: List[Dict[str, Any]] = []
+    for row in active_heat_reservations(rows, now):
+        if str(row.get("id") or "") in wanted:
+            continue
+        kept.append(row)
+    return kept
+
+
+def _deferred_release_ids(item: Any) -> List[str]:
+    """Ids to free. A ticker-only retry must not match a newer row."""
+    if not isinstance(item, dict):
+        return []
+    raw = item.get("ids")
+    if isinstance(raw, list):
+        return [str(one) for one in raw if one]
+    one = item.get("id")
+    return [str(one)] if one else []
+
+
+async def _read_heat_rows() -> List[Dict[str, Any]]:
+    if state is None:
+        return []
+    try:
+        raw = await state.get(HEAT_RESERVATIONS_KEY)
+    except Exception as e:
+        logger.warning(f"heat reservation read failed: {e}")
+        return []
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+async def _write_heat_rows(rows: List[Dict[str, Any]]) -> None:
+    if state is None:
+        return
+    if not rows:
+        try:
+            await state.delete(HEAT_RESERVATIONS_KEY)
+        except Exception as e:
+            logger.warning(f"heat reservation delete failed: {e}")
+        return
+    try:
+        await state.set(
+            HEAT_RESERVATIONS_KEY,
+            json.dumps(rows),
+            ex=int(heat_reservation_ttl_s()) + 30,
+        )
+    except Exception as e:
+        logger.warning(f"heat reservation write failed: {e}")
+        raise
+
+
+# Releases and settles that lost the try-lock. The sweep retries them.
+_heat_release_retry: List[Dict[str, Any]] = []
+_heat_settle_retry: List[str] = []
+
+
+async def _heat_lock_still_owned(lock) -> bool:
+    """True only while this token is the live lock value.
+
+    ``get`` drops an expired key, so a holder past the TTL cannot refresh
+    it and write over the next owner.
+    """
+    if state is None:
+        return False
+    try:
+        current = await state.get(lock.key)
+    except Exception:
+        return False
+    return current is not None and current == lock.token
+
+
+async def _with_heat_lock(mutate, *, wait: bool = True, refresh_positions: bool = False):
+    """Read-modify-write the reservation list.
+
+    ``mutate`` must not call the broker. When ``refresh_positions`` is set,
+    the book is read inside the lock, then ownership is checked again.
+    An expired token does not write.
+    """
+    if state is None:
+        raise LockNotAcquired("heat reservation store is not ready")
+    wait_s = HEAT_RESERVATION_LOCK_WAIT_S if wait else 0.0
+    lock = state.lock(
+        "heat-reservation",
+        ttl_ms=HEAT_RESERVATION_LOCK_TTL_MS,
+        wait_timeout=wait_s,
+    )
+    if wait:
+        await lock.acquire()
+    elif not await lock.try_acquire():
+        raise LockNotAcquired("heat reservation lock busy")
+    try:
+        now = time.time()
+        positions = None
+        if refresh_positions:
+            positions = await state.all_positions()
+        if not await _heat_lock_still_owned(lock):
+            raise LockNotAcquired("heat reservation lock expired")
+        if not await lock.extend(HEAT_RESERVATION_LOCK_TTL_MS):
+            raise LockNotAcquired("heat reservation lock expired")
+        rows = active_heat_reservations(await _read_heat_rows(), now)
+        if refresh_positions:
+            updated, result = mutate(rows, now, positions)
+        else:
+            updated, result = mutate(rows, now)
+        if not await _heat_lock_still_owned(lock):
+            raise LockNotAcquired("heat reservation lock expired")
+        await _write_heat_rows(active_heat_reservations(updated, now))
+        return result
+    finally:
+        await lock.release()
+
+
+async def peek_reserved_exposure(
+    positions: Optional[Dict[str, Any]],
+) -> Tuple[float, List[Dict[str, Any]]]:
+    """Reserved dollars and correlation rows. Empty when the flag is off."""
+    if not heat_reservation_enabled():
+        return 0.0, []
+    try:
+        rows = await _read_heat_rows()
+    except Exception:
+        return 0.0, []
+    return reservation_exposure(rows, positions, time.time())
+
+
+async def admit_heat_reservation(
+    payload: Dict[str, Any],
+    new_risk_usd: float,
+    account_usd: float,
+    *,
+    regime: Any = None,
+    positions: Optional[Dict[str, Any]] = None,
+    enforce_correlation: Optional[bool] = None,
+    heat_cap_pct: Any = None,
+) -> Dict[str, Any]:
+    """Reserve planned risk or refuse.
+
+    The book is read inside the lock. Before the write the lock token is
+    checked again, so a read that outlives the TTL cannot admit a second
+    entry on top of one that already landed.
+    """
+    if not heat_reservation_enabled():
+        return {"allowed": True, "reserved": False, "enabled": False, "reasons": []}
+    correlate = PORTFOLIO_RISK_ENABLED if enforce_correlation is None else enforce_correlation
+
+    def mutate(rows, now, fresh):
+        verdict = judge_heat_admission(
+            fresh, rows, payload, new_risk_usd, account_usd, now,
+            regime=regime, enforce_correlation=correlate, heat_cap_pct=heat_cap_pct,
+        )
+        if not verdict["allowed"]:
+            return rows, {**verdict, "reserved": False, "id": None}
+        ident = str(signal_identity(payload) or "").strip() or uuid.uuid4().hex
+        record = heat_reservation_record(payload, new_risk_usd, now, ident)
+        return rows + [record], {**verdict, "reserved": True, "id": ident}
+
+    try:
+        return await _with_heat_lock(mutate, refresh_positions=True)
+    except LockNotAcquired:
+        return {
+            "allowed": False, "reserved": False, "id": None,
+            "reasons": ["heat reservation lock busy — entry not queued"],
+        }
+
+
+async def release_heat_reservation(
+    reservation_id: Optional[str] = None,
+    ticker: Optional[str] = None,
+    *,
+    reason: str = "release",
+) -> None:
+    """Drop a reservation. A missing id is a no-op. Never raises into the caller."""
+    if not heat_reservation_enabled() or state is None:
+        return
+    if not reservation_id and not ticker:
+        return
+
+    def mutate(rows, now):
+        kept = release_heat_rows(
+            rows, now, reservation_id=reservation_id, ticker=ticker,
+        )
+        return kept, None
+
+    try:
+        await _with_heat_lock(mutate, wait=False)
+        return
+    except LockNotAcquired:
+        ids: List[str] = []
+        if reservation_id:
+            ids = [str(reservation_id)]
+        else:
+            symbol = str(ticker or "").upper()
+            try:
+                current = active_heat_reservations(await _read_heat_rows(), time.time())
+            except Exception:
+                current = []
+            ids = [
+                str(row.get("id"))
+                for row in current
+                if str(row.get("ticker") or "").upper() == symbol and row.get("id")
+            ]
+        _heat_release_retry.append({
+            "ids": ids,
+            "id": reservation_id,
+            "ticker": ticker,
+            "reason": reason,
+        })
+        logger.warning(
+            "[HEAT] reservation release deferred (%s) — sweep will retry",
+            reason,
+        )
+        return
+    except Exception as e:
+        logger.warning(f"heat reservation release failed ({reason}): {e}")
+
+
+async def settle_heat_reservation(ticker: str) -> None:
+    """Drop the reservation once the position carries its planned risk.
+
+    The position is read first. The lock is try-only, so a busy reservation
+    lock does not delay the caller. Stop arming calls this after the stop
+    is already armed. A skipped settle retries on the next tick; until then
+    the unfilled remainder stays reserved (planned minus booked).
+    """
+    symbol = str(ticker or "").upper()
+    if not symbol or not heat_reservation_enabled() or state is None:
+        return
+    try:
+        pos = await state.get_position(symbol)
+    except Exception as e:
+        logger.warning(f"heat reservation settle skipped for {symbol}: {e}")
+        return
+    filled = _position_filled_qty(pos)
+
+    def mutate(rows, now):
+        return apply_fill_to_reservations(rows, symbol, filled, now), None
+
+    try:
+        await _with_heat_lock(mutate, wait=False)
+    except LockNotAcquired:
+        if symbol not in _heat_settle_retry:
+            _heat_settle_retry.append(symbol)
+        logger.info(
+            "[HEAT] %s reservation settle deferred — stop arming does not wait",
+            symbol,
+        )
+    except Exception as e:
+        logger.warning(f"heat reservation settle failed for {symbol}: {e}")
+
+
+async def settle_heat_after_stop_armed(ticker: str) -> None:
+    """Settle heat only after the protective stop is armed.
+
+    The log line is the arming proof. The settle that follows does not
+    wait on the reservation lock.
+    """
+    symbol = str(ticker or "").upper()
+    logger.info("[STOP GUARD] %s protective stop is armed — heat settle will not delay it", symbol)
+    await settle_heat_reservation(symbol)
+
+
+async def finish_heat_attempt(payload: Optional[dict], status: str) -> None:
+    """Keep a queued reservation. Settle a placement. Release anything else."""
+    if not isinstance(payload, dict) or not heat_reservation_enabled():
+        return
+    kind = str(status or "")
+    if kind == "queued":
+        return
+    ticker = str(payload.get("ticker") or "").upper()
+    if kind == "success":
+        await settle_heat_reservation(ticker)
+        return
+    await release_heat_reservation(
+        payload.get("_heat_reservation_id"), reason=kind or "release",
+    )
+
+
+async def clear_heat_reservations(reason: str = "restart") -> None:
+    """Drop every reservation. Open positions are not touched.
+
+    Tests and an operator reset use this. Boot does not: a restart keeps
+    unexpired rows so a recovered order still holds its heat.
+    """
+    if state is None:
+        return
+    try:
+        await state.delete(HEAT_RESERVATIONS_KEY)
+        logger.info(f"heat reservations cleared ({reason})")
+    except Exception as e:
+        logger.warning(f"heat reservation clear failed ({reason}): {e}")
+
+
+async def drop_expired_heat_reservations(reason: str = "restart") -> None:
+    """Boot path. Expired rows go. Live reservations stay."""
+    if state is None or not heat_reservation_enabled():
+        return
+
+    def mutate(rows, now):
+        kept = active_heat_reservations(rows, now)
+        return kept, len(list(rows or [])) - len(kept)
+
+    try:
+        dropped = await _with_heat_lock(mutate)
+        logger.info("heat reservations kept (%s); expired dropped: %s", reason, dropped)
+    except Exception as e:
+        logger.warning(f"heat reservation expiry sweep failed ({reason}): {e}")
+
+
+async def sweep_heat_reservations() -> None:
+    """Retry settles and releases that lost the try-lock, and apply fills.
+
+    Idle when nothing is reserved and nothing is waiting: no lock, no write.
+    Only the retry items copied at the start are removed, so one appended
+    during the locked section stays for the next pass. A deferred release
+    frees the ids captured at deferral, not whatever row the ticker has now.
+    """
+    if state is None or not heat_reservation_enabled():
+        return
+    releases = list(_heat_release_retry)
+    settles = list(_heat_settle_retry)
+    if not releases and not settles:
+        try:
+            raw = await state.get(HEAT_RESERVATIONS_KEY)
+        except Exception:
+            raw = None
+        if not raw or raw == "[]":
+            return
+
+    def mutate(rows, now, positions):
+        kept = active_heat_reservations(rows, now)
+        for item in releases:
+            kept = release_heat_ids(kept, now, _deferred_release_ids(item))
+        symbols = {str(row.get("ticker") or "").upper() for row in kept}
+        symbols.update(str(sym or "").upper() for sym in settles)
+        held = positions if isinstance(positions, dict) else {}
+        for symbol in symbols:
+            if not symbol:
+                continue
+            pos = held.get(symbol)
+            if pos is None:
+                continue
+            kept = apply_fill_to_reservations(
+                kept, symbol, _position_filled_qty(pos), now,
+            )
+        return kept, None
+
+    try:
+        await _with_heat_lock(mutate, wait=False, refresh_positions=True)
+    except LockNotAcquired:
+        return
+    except Exception as e:
+        logger.warning(f"heat reservation sweep failed: {e}")
+        return
+    for item in releases:
+        for index, pending in enumerate(_heat_release_retry):
+            if pending is item:
+                _heat_release_retry.pop(index)
+                break
+    for item in settles:
+        for index, pending in enumerate(_heat_settle_retry):
+            if pending is item:
+                _heat_settle_retry.pop(index)
+                break
+
+
+async def ensure_queued_heat(payload: dict) -> Optional[str]:
+    """Re-check heat before a recovered or queued entry is placed.
+
+    A reservation that is still live is kept. One that a restart or a
+    missed settle dropped is admitted again. Refusal means do not place.
+    """
+    if not isinstance(payload, dict) or not heat_reservation_enabled():
+        return None
+    if _is_close_payload(payload):
+        return None
+    rid = str(payload.get("_heat_reservation_id") or "").strip()
+    now = time.time()
+    try:
+        rows = active_heat_reservations(await _read_heat_rows(), now)
+    except Exception:
+        rows = []
+    if rid and any(str(row.get("id") or "") == rid for row in rows):
+        return None
+    try:
+        account = await _risk_account_reference()
+    except Exception as e:
+        logger.warning(f"queued heat recheck account unreadable: {e}")
+        return "heat reservation recheck failed — entry not placed"
+    try:
+        nominal = float(account) * (float(live_policy("risk_per_trade_pct")) / 100.0)
+    except (TypeError, ValueError):
+        nominal = 0.0
+    actual = estimate_entry_risk_usd(payload) or 0.0
+    new_risk = max(nominal, float(actual or 0.0))
+    origin = str(payload.get(DISPATCH_ORIGIN_FIELD) or payload.get("origin") or "").strip().lower()
+    if origin == DISPATCH_ORIGIN_APP:
+        admission = await admit_heat_reservation(
+            payload, new_risk, account,
+            enforce_correlation=False,
+            heat_cap_pct=APP_MAX_OPEN_RISK_PCT,
+        )
+    else:
+        admission = await admit_heat_reservation(payload, new_risk, account)
+    if not admission.get("allowed", False):
+        reasons = [str(item) for item in (admission.get("reasons") or ["heat reservation refused"])]
+        if any("lock busy" in item for item in reasons):
+            logger.warning(
+                "[HEAT] requeued %s dropped — reservation lock busy",
+                str(payload.get("ticker") or "").upper(),
+            )
+        return "; ".join(reasons)
+    if admission.get("id"):
+        payload["_heat_reservation_id"] = admission["id"]
+    return None
+
+
 def assess_app_risk_gates(open_count: Any, realized_pnl_today_pct: Any, daily_loss_limit_pct: Any,
                           open_risk_usd: Any, new_risk_usd: Any, equity_usd: Any,
-                          max_positions: Any, max_open_risk_pct: Any) -> List[str]:
+                          max_positions: Any, max_open_risk_pct: Any,
+                          reserved_risk_usd: Any = 0) -> List[str]:
     """The three BOOK limits an app-origin entry meets in 5.82.1: max concurrent
     positions, total open risk, and the tripped daily loss limit. Returns the
     refusal reasons (empty = allowed). Same wording as the scanner gates.
+
+    ``reserved_risk_usd`` is planned heat already held for entries that are
+    not on the book yet. An app entry counts it, so it cannot pass a cap a
+    scanner reservation has already filled.
     Pure: no I/O, fully unit-testable."""
     reasons: List[str] = []
     try:
@@ -18173,7 +19055,17 @@ def assess_app_risk_gates(open_count: Any, realized_pnl_today_pct: Any, daily_lo
             reasons.append(f"max positions ({cap}) open")
     except (TypeError, ValueError):
         pass
-    heat = assess_open_risk_ceiling(open_risk_usd, new_risk_usd, equity_usd, max_open_risk_pct)
+    def _usd(v: Any) -> float:
+        try:
+            f = float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return f if math.isfinite(f) and f > 0 else 0.0
+
+    heat = assess_open_risk_ceiling(
+        _usd(open_risk_usd) + _usd(reserved_risk_usd),
+        new_risk_usd, equity_usd, max_open_risk_pct,
+    )
     if heat:
         reasons.append(heat)
     return reasons
@@ -18857,9 +19749,11 @@ async def _assess_portfolio_risk(
         risk_pct = live_policy("risk_per_trade_pct")
         nominal = account_ref * (risk_pct / 100.0)
         new_risk = max(nominal, estimate_entry_risk_usd(p) or 0.0)
+        _reserved_usd, reserved_rows = await peek_reserved_exposure(positions)
         corr = portfolio_risk.assess_correlation(
             p.get("ticker"), portfolio_risk.payload_direction(p), new_risk,
-            portfolio_risk.book_rows(positions, position_risk_usd), account_ref,
+            portfolio_correlation_book(positions, reserved_rows),
+            account_ref,
             risk_pct, PORTFOLIO_HEAT_PCT, sizing["regime"] or regime,
         )
         reasons.extend(corr["reasons"])
@@ -19491,18 +20385,37 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
         try:
             daily_a = await state.get_daily()
             positions_a = await state.all_positions()
+            reserved_a, _reserved_rows_a = await peek_reserved_exposure(positions_a)
+            account_a = await _risk_ref()
+            new_risk_a = estimate_entry_risk_usd(p) or 0.0
             blocked.extend(assess_app_risk_gates(
                 len(positions_a),
                 daily_a.get("realized_pnl_today_pct"),
                 live_policy("daily_loss_limit_pct"),
                 sum(position_risk_usd(x) for x in positions_a.values()),
-                estimate_entry_risk_usd(p),
-                await _risk_ref(),
+                new_risk_a,
+                account_a,
                 MAX_CONCURRENT_POSITIONS,
                 APP_MAX_OPEN_RISK_PCT,
+                reserved_a,
             ))
+            if (
+                not blocked and not dry_run and heat_reservation_enabled()
+                and not is_probe
+            ):
+                admission = await admit_heat_reservation(
+                    p, new_risk_a, account_a, positions=positions_a,
+                    enforce_correlation=False, heat_cap_pct=APP_MAX_OPEN_RISK_PCT,
+                )
+                if not admission.get("allowed", False):
+                    blocked.extend(admission.get("reasons") or ["heat reservation refused"])
+                elif admission.get("id"):
+                    p["_heat_reservation_id"] = admission["id"]
         except Exception as e:
             blocked.append(f"crypto book limits unreadable ({str(e)[:80]}) — entry refused")
+        if blocked and p.get("_heat_reservation_id"):
+            await release_heat_reservation(p.get("_heat_reservation_id"), reason="rejected")
+            p.pop("_heat_reservation_id", None)
         if blocked:
             logger.warning(f"CRYPTO — {ticker_c or 'entry'} refused: {' · '.join(blocked)}")
         else:
@@ -19556,19 +20469,35 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
             try:
                 daily_a = await state.get_daily()
                 positions_a = await state.all_positions()
+                reserved_a, _reserved_rows_a = await peek_reserved_exposure(positions_a)
+                account_a = await _risk_ref()
+                new_risk_a = estimate_entry_risk_usd(p) or 0.0
                 blocked.extend(assess_app_risk_gates(
                     len(positions_a),
                     daily_a.get("realized_pnl_today_pct"),
                     live_policy("daily_loss_limit_pct"),
                     sum(position_risk_usd(x) for x in positions_a.values()),
-                    estimate_entry_risk_usd(p),
-                    await _risk_ref(),
+                    new_risk_a,
+                    account_a,
                     MAX_CONCURRENT_POSITIONS,
                     APP_MAX_OPEN_RISK_PCT,
+                    reserved_a,
                 ))
+                if not blocked and not dry_run and heat_reservation_enabled() and not is_probe:
+                    admission = await admit_heat_reservation(
+                        p, new_risk_a, account_a, positions=positions_a,
+                        enforce_correlation=False, heat_cap_pct=APP_MAX_OPEN_RISK_PCT,
+                    )
+                    if not admission.get("allowed", False):
+                        blocked.extend(admission.get("reasons") or ["heat reservation refused"])
+                    elif admission.get("id"):
+                        p["_heat_reservation_id"] = admission["id"]
             except Exception as e:
                 blocked.append(f"app book limits unreadable ({str(e)[:80]}) — entry refused")
         blocked = await _fold(blocked)
+        if blocked and p.get("_heat_reservation_id"):
+            await release_heat_reservation(p.get("_heat_reservation_id"), reason="rejected")
+            p.pop("_heat_reservation_id", None)
         if blocked:
             logger.warning(f"📱 APP DECIDES — {ticker_m or 'entry'} refused: {' · '.join(blocked)}")
         else:
@@ -19769,11 +20698,14 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
     # What THIS entry actually risks, read from the contract in the payload.
     # None when unmeasurable; the nominal figure is the floor either way.
     actual_risk = estimate_entry_risk_usd(p)
+    heat_quote: Optional[Dict[str, float]] = None
     try:
         open_risk = sum(position_risk_usd(pos) for pos in open_positions.values())
         nominal_risk = account_ref * (live_policy("risk_per_trade_pct") / 100.0)
         new_risk = max(nominal_risk, actual_risk or 0.0)
-        heat = (open_risk + new_risk) / max(account_ref, 1) * 100.0
+        reserved_usd, _reserved_rows = await peek_reserved_exposure(open_positions)
+        heat = (open_risk + reserved_usd + new_risk) / max(account_ref, 1) * 100.0
+        heat_quote = {"new_risk": float(new_risk), "account": float(account_ref)}
         if heat > PORTFOLIO_HEAT_PCT:
             blocked.append(f"portfolio heat {heat:.2f}% > {PORTFOLIO_HEAT_PCT}%")
     except (TypeError, ValueError):
@@ -19831,7 +20763,44 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
     if floor["blocked"]:
         blocked.append(floor["reason"])
 
+    # HEAT RESERVATION — the check above can race. Two approvals can both
+    # read the book before either fill lands. The admit below re-reads the
+    # reservations under the lock and writes this entry's planned risk only
+    # if it still fits. A later fill converts it; a reject releases it.
+    if (
+        not blocked and not dry_run and heat_quote is not None
+        and heat_reservation_enabled() and not is_probe
+    ):
+        regime = None
+        try:
+            regime = (_payload_edge(p) or {}).get("vol_regime")
+        except Exception:
+            regime = None
+        try:
+            admission = await admit_heat_reservation(
+                p, heat_quote["new_risk"], heat_quote["account"], regime=regime,
+            )
+        except Exception as e:
+            logger.warning(f"heat reservation failed closed: {e}")
+            admission = {
+                "allowed": False,
+                "reasons": ["heat reservation unavailable — entry not queued"],
+            }
+        if not admission.get("allowed", False):
+            blocked.extend(admission.get("reasons") or ["heat reservation refused"])
+            logger.warning(
+                f"🔥 HEAT RESERVATION — {'; '.join(admission.get('reasons') or [])}"
+            )
+        elif admission.get("id"):
+            p["_heat_reservation_id"] = admission["id"]
+
     blocked = await _fold(blocked)
+    if blocked and p.get("_heat_reservation_id"):
+        # A later gate refused the entry. The reservation must not stay.
+        await release_heat_reservation(
+            p.get("_heat_reservation_id"), reason="rejected",
+        )
+        p.pop("_heat_reservation_id", None)
     return len(blocked) == 0, blocked
 
 
@@ -21481,6 +22450,10 @@ async def app_heartbeat(
                          if data.get("paper_reason") == "readiness_gates" else None),
         "app_version": str(data.get("app_version") or "") or None,
         "open_positions": data.get("open_positions"),
+        # The journal list. open_positions is a count and stays 0 when the
+        # app maps a missing status. positions_open is what the comparison
+        # uses when it is present.
+        "positions_open": data.get("positions_open") if isinstance(data.get("positions_open"), list) else None,
         "symbols": data.get("symbols") if isinstance(data.get("symbols"), list) else None,
         # CONTRACT-LEVEL BOOK (app 5.33+). `open_positions` is a count of
         # DISTINCT UNDERLYINGS, so two apps holding wildly different contract
@@ -28498,6 +29471,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 pos["stop_order_id"] = stop_info["order_id"]
                                 pos["filled_qty"] = filled
                                 await state.set_position(ticker, pos)
+                        await settle_heat_after_stop_armed(ticker)
                         guarded = filled
                     except Exception as e:
                         # The OLD stop was already cancelled above and the new one
@@ -28598,6 +29572,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 )
                                 await _finish_guard(ticker, "entry_chase_failed")
                                 await state.delete_position(ticker)
+                                await release_heat_reservation(ticker=ticker, reason="reject")
                                 await trade_ledger.record("entry_abandoned", {
                                     "ticker": ticker,
                                     "entry_order_id": guard.get("entry_order_id"),
@@ -28681,6 +29656,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                     else:
                         await _finish_guard(ticker, "stop_timeout_entry_cancelled")
                         await state.delete_position(ticker)
+                        await release_heat_reservation(ticker=ticker, reason="timeout")
                         await trade_ledger.record("stop_timeout_entry_cancelled", {
                             "ticker": ticker, "entry_order_id": guard.get("entry_order_id"),
                             "timeout_seconds": STOP_PLACEMENT_TIMEOUT_SECONDS,
@@ -28699,6 +29675,7 @@ async def _stop_guard_worker(ticker: str) -> None:
             if _entry_terminal_unfilled(status, filled):
                 await _finish_guard(ticker, f"entry_{status.lower()}_unfilled")
                 await state.delete_position(ticker)
+                await release_heat_reservation(ticker=ticker, reason="reject")
                 # Retract the optimistic open — this entry died unfilled, so no
                 # position ever existed and no outcome may be attributed to it.
                 await trade_ledger.record("entry_abandoned", {
@@ -28712,6 +29689,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                     await _cancel_order_safe(guard.get("entry_order_id"))
                     await _finish_guard(ticker, "entry_timeout_cancelled")
                     await state.delete_position(ticker)
+                    await release_heat_reservation(ticker=ticker, reason="timeout")
                     await trade_ledger.record("entry_abandoned", {
                         "ticker": ticker,
                         "entry_order_id": guard.get("entry_order_id"),
@@ -29762,6 +30740,7 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
     missing number. It is passed explicitly (never inferred from a falsy exit)
     so that an absent price can never masquerade as a total loss."""
     pos = await state.delete_position(ticker)
+    await release_heat_reservation(ticker=str(ticker).upper(), reason="close")
     # WHO WINS marker: a second closer (bot or app) arriving for this ticker
     # inside RECENT_CLOSE_STANDDOWN_SECONDS stands down. Best effort.
     try:
@@ -30173,8 +31152,10 @@ async def _book_partial_stop_fill(
     pos["partial_exits"] = int(pos.get("partial_exits") or 0) + 1
     if remaining > 0:
         await state.set_position(ticker, pos)
+        await settle_heat_reservation(ticker)
     else:
         await state.delete_position(ticker)
+        await release_heat_reservation(ticker=str(ticker).upper(), reason="close")
 
     await trade_ledger.record("partial_stop_fill", {
         "ticker": ticker,
@@ -33915,6 +34896,7 @@ async def execute_live_order(payload: dict):
                         f"(risk {risk_pct:.1f}% of {fill_ref:.2f}, basis={stop_basis}, "
                         f"tier={placement['tier']}, entry order={entry_order_id})"
                     )
+                    await settle_heat_after_stop_armed(str(symbol).upper())
                     if placement["tier"] == "backstop":
                         logger.info(
                             f"[EXIT AUTHORITY] {symbol} — {placement['reason']}; "
@@ -34010,6 +34992,7 @@ async def execute_live_order(payload: dict):
                         await state.delete_position(symbol)
                     except Exception:
                         pass
+                    await release_heat_reservation(ticker=str(symbol).upper(), reason="close")
                     await _defer_close_to_reconciler(symbol, close_order_id,
                                                      "crypto close placed — fill sync deferred")
                 logger.info(f"✅ LIVE CRYPTO CLOSE SUCCESS: SELL {symbol}")
@@ -34494,10 +35477,18 @@ async def _run_queued_job(raw: str) -> None:
     sig_key = _signal_key(pd)
     mode = str(pd.get("mode") or "paper").lower()
     live_intent = _live_intent(mode)
+    if live_intent and not _is_close_payload(pd):
+        refusal = await ensure_queued_heat(pd)
+        if refusal:
+            await state.set(sig_key, "rejected", ex=86400)
+            await _record_dispatch_verdict(pd, "rejected", refusal)
+            logger.warning(f"queued heat recheck refused {pd.get('ticker')}: {refusal}")
+            return
     try:
         result = await execute_live_order(pd)
         inner_status = str(result.get("status") or "processed")
         await state.set(sig_key, inner_status, ex=86400)
+        await finish_heat_attempt(pd, inner_status)
         await _record_dispatch_verdict(
             pd,
             "placed" if inner_status == "success" else inner_status,
@@ -34505,6 +35496,7 @@ async def _run_queued_job(raw: str) -> None:
         )
     except Exception as e:
         err = str(e)
+        await release_heat_reservation(pd.get("_heat_reservation_id"), reason="error")
         # Same disconnect→relink recovery the direct path has: a signal that
         # failed ONLY because the session died is parked and replayed on relink
         # instead of being silently lost.
@@ -34560,6 +35552,7 @@ async def _recover_processing_queue() -> None:
 async def placement_worker():
     while not _worker_stop:
         try:
+            await sweep_heat_reservations()
             if state.is_distributed:
                 job = await state.lmove_fifo(QUEUE_KEY, PROCESSING_KEY)
                 if job:
@@ -37353,6 +38346,10 @@ async def on_startup():
         _last_pnl_migration = {"status": "error", "error": str(e)}
         logger.error(f"[PNL-MIGRATION] failed (non-fatal, will retry next boot): {e}")
     _last_pnl_repair = await _repair_daily_pnl()
+    # Keep unexpired heat reservations across a restart. Expired ones drop.
+    # A recovered job re-checks heat before it places, so a wiped row cannot
+    # skip the cap.
+    await drop_expired_heat_reservations("restart")
     # STARTUP RECONCILIATION — blocking broker→Redis sync BEFORE the placement
     # worker starts, so no order is ever placed against stale cold-start state.
     await _startup_reconcile()
@@ -37557,24 +38554,107 @@ APP_LINK_STALE_SECONDS = 210
 APP_HEARTBEAT_TTL_SECONDS = 86_400
 
 
+_CLOSED_JOURNAL_STATUSES = frozenset({
+    "closed", "cancelled", "canceled", "expired", "flat",
+})
+
+
+def _journal_status_open(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    status = str(row.get("status") or "open").strip().lower()
+    return status not in _CLOSED_JOURNAL_STATUSES
+
+
+def _positions_open_count(raw: Any) -> Optional[int]:
+    """Count of open rows in a positions_open list. None when the list is absent.
+
+    A closed or cancelled row is not an open position. Side is not a filter:
+    a long put is short exposure and still an open journal row.
+    """
+    if not isinstance(raw, list) or not raw:
+        return None
+    seen = False
+    count = 0
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        seen = True
+        if _journal_status_open(row):
+            count += 1
+    return count if seen else None
+
+
+def positions_open_view(tracked: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The bot book as the list the app journal maps. Reporting only.
+
+    Each row has status ``open``, an explicit side, and a qty. The dict on
+    ``open_positions`` has no status field; a journal that keeps only
+    status=open rows otherwise counts zero.
+    """
+    rows: List[Dict[str, Any]] = []
+    for ticker, pos in sorted((tracked or {}).items()):
+        if not isinstance(pos, dict):
+            continue
+        contract = pos.get("contract") if isinstance(pos.get("contract"), dict) else {}
+        right = str(contract.get("right") or "").upper()
+        action = str(pos.get("action") or "BUY").upper()
+        bought = action not in {"SELL", "SELL_SHORT", "SHORT", "SELL_OPEN"}
+        # A bought option is a long contract. Direction is separate so a
+        # long put is bearish exposure, not a short position.
+        if right in {"PUT", "CALL"}:
+            side = "long" if bought else "short"
+            if right == "PUT":
+                direction = "bearish" if bought else "bullish"
+            else:
+                direction = "bullish" if bought else "bearish"
+        else:
+            side = "long" if bought else "short"
+            direction = "bullish" if side == "long" else "bearish"
+        qty = pos.get("filled_qty")
+        if qty is None:
+            qty = pos.get("qty")
+        row = {
+            "symbol": str(ticker).upper(),
+            "qty": qty,
+            "side": side,
+            "direction": direction,
+            "instrument": pos.get("instrument") or ("option" if right else "equity"),
+            "status": "open",
+        }
+        if right in {"PUT", "CALL"}:
+            row["right"] = right.lower()
+        rows.append(row)
+    return rows
+
+
 def _parse_app_legs(raw: Any) -> Dict[str, Optional[int]]:
     """The app's open book as {SYMBOL: contracts}, contracts None when unknown.
 
     A leg whose size the app never recorded maps to None, and one unknown leg
     makes the whole underlying unknown: summing it as zero would invent a
-    shortfall and report a mismatch that is really missing data.
+    shortfall and report a mismatch that is really missing data. ``ticker``
+    and ``underlying`` are accepted as the symbol. ``contracts`` and
+    ``quantity`` are accepted as the size. A closed status is not a leg.
     """
     if not isinstance(raw, list):
         return {}
     grouped: Dict[str, List[Optional[int]]] = {}
     for leg in raw:
-        if not isinstance(leg, dict):
+        if not isinstance(leg, dict) or not _journal_status_open(leg):
             continue
-        symbol = str(leg.get("symbol") or "").strip().upper()
+        symbol = str(
+            leg.get("symbol") or leg.get("ticker") or leg.get("underlying") or ""
+        ).strip().upper()
         if not symbol:
             continue
+        qty_raw = leg.get("qty")
+        if qty_raw is None:
+            qty_raw = leg.get("contracts")
+        if qty_raw is None:
+            qty_raw = leg.get("quantity")
         try:
-            qty = int(float(leg["qty"])) if leg.get("qty") is not None else None
+            qty = int(float(qty_raw)) if qty_raw is not None else None
         except (TypeError, ValueError, KeyError):
             qty = None
         grouped.setdefault(symbol, []).append(qty if (qty or 0) > 0 else None)
@@ -37888,16 +38968,23 @@ def assess_app_link(
                 "severity": "warning",
                 "detail": contract_detail,
             })
-        elif not app_legs and app_positions is not None and app_positions != open_count:
-            # Legacy app: a bare count is all it sends, so a bare count is all
-            # that can be compared. Never run this alongside the contract
-            # comparison — it would double-report the same disagreement.
-            out["divergences"].append({
-                "kind": "position_mismatch",
-                "severity": "warning",
-                "detail": (f"The app journals {app_positions} open position(s); the bot's book "
-                           f"holds {open_count}."),
-            })
+        elif not app_legs:
+            # positions_open is the journal list. A legacy count of 0 does
+            # not override a list that actually names open rows. A closed
+            # status is not counted. Side is not a filter.
+            journal = _positions_open_count(heartbeat.get("positions_open"))
+            if journal is None:
+                journal = app_positions
+            if journal is not None and journal != open_count:
+                # Legacy app: a bare count is all it sends, so a bare count is all
+                # that can be compared. Never run this alongside the contract
+                # comparison — it would double-report the same disagreement.
+                out["divergences"].append({
+                    "kind": "position_mismatch",
+                    "severity": "warning",
+                    "detail": (f"The app journals {journal} open position(s); the bot's book "
+                               f"holds {open_count}."),
+                })
         if armed is False and open_count > 0 and not killed:
             out["divergences"].append({
                 "kind": "armed_mismatch",
@@ -38092,6 +39179,7 @@ async def process_signal(pd: dict, replay: bool = False) -> dict:
         if app_decides_entry(pd.get(DISPATCH_ORIGIN_FIELD), is_close, APP_DECIDES):
             pass
         elif not await state.set(cooldown_key, "1", ex=TICKER_COOLDOWN_MINUTES * 60, nx=True):
+            await release_heat_reservation(pd.get("_heat_reservation_id"), reason="cooldown")
             await state.set(sig_key, "cooldown", ex=86400)
             await _record_dispatch_verdict(pd, "cooldown", "ticker_in_cooldown")
             return {"status": "cooldown", "reason": "ticker_in_cooldown", "signal_id": sig_key}
@@ -38110,6 +39198,7 @@ async def process_signal(pd: dict, replay: bool = False) -> dict:
         await state.set(sig_key, str(result.get("status") or "processed"), ex=86400)
         inner_status = str(result.get("status") or "processed")
         inner_reason = str(result.get("reason") or "") if inner_status != "success" else ""
+        await finish_heat_attempt(pd, inner_status)
         await _record_dispatch_verdict(
             pd,
             "placed" if inner_status == "success" else inner_status,
@@ -38120,7 +39209,10 @@ async def process_signal(pd: dict, replay: bool = False) -> dict:
         err = str(e)
         # A 401 here means the E*TRADE session died between dispatch and
         # placement (the disconnect→relink gap). Park the signal so the relink
-        # replays it instead of silently losing the trade.
+        # replays it instead of silently losing the trade. Release the
+        # reservation so the replay can admit again instead of colliding
+        # with its own hold.
+        await release_heat_reservation(pd.get("_heat_reservation_id"), reason="error")
         if live_intent and _is_auth_error(err):
             await _park_signal(pd)
             await state.set(sig_key, "parked", ex=86400)
@@ -38333,6 +39425,9 @@ async def status():
         },
         "market_open": _is_market_open(),
         "open_positions": await state.all_positions(),
+        # Same book, as a list with status/side/qty. The app journal maps
+        # this. Reporting only — it does not change a position or a stop.
+        "positions_open": positions_open_view(await state.all_positions()),
         # Which rulebook each open position follows (app_decides vs legacy_bot).
         "exit_rules": summarize_exit_rules(await state.all_positions(), APP_DECIDES),
         "stop_guards": await state.all_guards(),
@@ -38698,6 +39793,47 @@ def _report_ledger_window(count: int) -> List[dict]:
     return apply_pnl_sign_corrections(records)
 
 
+async def index_vwap_gate_measurement() -> Dict[str, Any]:
+    """Basis-point gap the CALL gate is using. No Massive fetch.
+
+    ``gap_bps`` is session VWAP versus the cached regular-session minute
+    VWAP, the same difference that fail-closes a CALL when it exceeds
+    VWAP_CROSSCHECK_MAX_BPS. A missing or stale minute VWAP stays
+    unmeasured. This does not open the gate.
+    """
+    now_et = _utcnow().astimezone(_ET_ZONE)
+    indexes: List[Dict[str, Any]] = []
+    for sym in _index_observe_symbols():
+        view = _cached_minute_vwap_view(sym, now_et)
+        resolved: Dict[str, Any] = {
+            "measured": False, "vwap": None, "reason": "today_samples_insufficient",
+        }
+        try:
+            if state is not None:
+                resolved = await scanner_mod.read_session_vwap(state, sym, now_et)
+        except Exception:
+            resolved = {
+                "measured": False, "vwap": None, "reason": "today_samples_insufficient",
+            }
+        checked = _crosscheck_today_vwap(resolved, view)
+        indexes.append({
+            "symbol": sym,
+            "session_vwap": resolved.get("vwap") if resolved.get("measured") else None,
+            "massive_minute_vwap_rth": view.get("vwap"),
+            "massive_rth_age_seconds": view.get("age_seconds"),
+            "gap_bps": checked.get("diff_bps"),
+            "gate_reason": None if checked.get("measured") else checked.get("reason"),
+            "measured": bool(checked.get("measured")),
+        })
+    return {
+        "mode": "fail_closed",
+        "available": True,
+        "max_gap_bps": vwap_crosscheck_max_bps(),
+        "max_age_s": vwap_crosscheck_max_age_s(),
+        "indexes": indexes,
+    }
+
+
 async def _pro_trader_report_payload() -> Dict[str, Any]:
     decisions: List[Dict[str, Any]] = []
     records: List[Dict[str, Any]] = []
@@ -38765,6 +39901,16 @@ async def _pro_trader_report_payload() -> Dict[str, Any]:
     except Exception as e:
         logger.warning(f"chain shadow report unreadable: {type(e).__name__}")
         report["chain_shadow"] = chain_shadow_report([])
+    try:
+        report["call_index_vwap"] = await index_vwap_gate_measurement()
+    except Exception as e:
+        logger.warning(f"index vwap gap unreadable: {type(e).__name__}")
+        report["call_index_vwap"] = {
+            "mode": "fail_closed",
+            "available": False,
+            "max_gap_bps": vwap_crosscheck_max_bps(),
+            "indexes": [],
+        }
     return report
 
 
