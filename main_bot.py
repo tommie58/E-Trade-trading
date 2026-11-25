@@ -26508,8 +26508,20 @@ async def _redact_account_response(request: Request, call_next):
     if not raw:
         _replace_response_body(response, raw)
         return response
+
+    def _give_back(exc: BaseException) -> None:
+        try:
+            kind = scrub_etrade_text(type(exc).__name__)
+        except Exception:
+            kind = "Exception"
+        logger.warning("response redaction failed (%s)", kind)
+        _replace_response_body(response, raw)
+
     try:
         payload = json.loads(raw)
+    except RecursionError as exc:
+        _give_back(exc)
+        return response
     except (json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
         _replace_response_body(response, raw)
         return response
@@ -26525,12 +26537,7 @@ async def _redact_account_response(request: Request, call_next):
         ).encode("utf-8")
         _replace_response_body(response, encoded)
     except Exception as exc:
-        try:
-            kind = scrub_etrade_text(type(exc).__name__)
-        except Exception:
-            kind = "Exception"
-        logger.warning("response redaction failed (%s)", kind)
-        _replace_response_body(response, raw)
+        _give_back(exc)
     return response
 
 

@@ -442,12 +442,14 @@ def test_nan_beside_a_masked_field_returns_the_original_body(monkeypatch, caplog
 
 def test_deeply_nested_body_returns_the_original_body(monkeypatch, caplog):
     # redact walks one Python frame per object. Past the recursion limit
-    # (about 900 once the request stack is counted; 1000 from a shallow call)
-    # that used to 500 after the endpoint had already produced a body.
-    node = {"accountIdKey": "TESTACCTKEY123"}
-    for _ in range(1000):
-        node = {"n": node}
-    raw = json.dumps(node).encode()
+    # (about 900 once the request stack is counted) that used to 500 after
+    # the endpoint had already produced a body. The bytes are built without
+    # json.dumps so the test itself does not recurse.
+    raw = (
+        b'{"n":' * 1000
+        + b'{"accountIdKey":"TESTACCTKEY123"}'
+        + b'}' * 1000
+    )
     caplog.set_level(logging.WARNING, logger="etrade-bot")
     response = _probe(monkeypatch, "/__redact_probe_deep", raw)
     assert response.status_code == 200
