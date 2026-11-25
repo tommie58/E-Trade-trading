@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import io
 import json
 import logging
 
 import pytest
+import requests
 from fastapi.testclient import TestClient
 
 import main_bot
@@ -161,6 +163,94 @@ def test_async_client_logger_scrubs_the_account_path(caplog):
     assert FAKE_KEY not in blob
     assert "sekret1234" not in blob
     assert "/v1/accounts/{acct}/orders.json" in blob
+
+
+def _account_http_error() -> requests.HTTPError:
+    url = (
+        "https://api.etrade.com/v1/accounts/TESTACCTKEY123/orders.json"
+        "?accountIdKey=TESTACCTKEY123"
+    )
+    response = requests.Response()
+    response.status_code = 500
+    response.reason = "Server Error"
+    response.url = url
+    return requests.HTTPError(
+        f"500 Server Error: Server Error for url: {url}",
+        response=response,
+    )
+
+
+def _formatted_handler_output(logger_name: str, emit) -> str:
+    """What a handler actually writes, including traceback and stack."""
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    log = logging.getLogger(logger_name)
+    previous = log.level
+    log.setLevel(logging.DEBUG)
+    log.addHandler(handler)
+    try:
+        emit(log)
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(previous)
+    return stream.getvalue()
+
+
+def _assert_formatted_traceback_hides_the_key(text: str) -> None:
+    assert "Traceback (most recent call last):" in text
+    assert FAKE_KEY not in text
+    assert "/v1/accounts/{acct}/" in text
+
+
+def test_logger_exception_scrubs_requests_httperror_traceback():
+    def emit(log):
+        try:
+            raise _account_http_error()
+        except requests.HTTPError:
+            log.exception("broker call failed")
+
+    text = _formatted_handler_output("etrade-bot.redact-exception", emit)
+    _assert_formatted_traceback_hides_the_key(text)
+    assert "broker call failed" in text
+
+
+def test_exc_info_scrubs_requests_httperror_traceback():
+    def emit(log):
+        try:
+            raise _account_http_error()
+        except requests.HTTPError:
+            log.error("broker call failed", exc_info=True)
+
+    text = _formatted_handler_output("etrade-bot.redact-exc-info", emit)
+    _assert_formatted_traceback_hides_the_key(text)
+    assert "broker call failed" in text
+
+
+def test_uvicorn_error_logger_scrubs_the_traceback():
+    def emit(log):
+        try:
+            raise _account_http_error()
+        except requests.HTTPError:
+            log.exception("Exception in ASGI application")
+
+    text = _formatted_handler_output("uvicorn.error", emit)
+    _assert_formatted_traceback_hides_the_key(text)
+    assert "Exception in ASGI application" in text
+
+
+def test_stack_info_scrubs_the_account_url():
+    def emit(log):
+        log.warning(
+            "calling https://api.etrade.com/v1/accounts/TESTACCTKEY123/orders.json",
+            stack_info=True,
+        )
+
+    text = _formatted_handler_output("etrade-bot.redact-stack", emit)
+    assert "Stack (most recent call last):" in text
+    assert FAKE_KEY not in text
+    assert "/v1/accounts/{acct}/" in text
 
 
 def test_status_masks_the_resolved_key_and_keeps_it_internally(monkeypatch):

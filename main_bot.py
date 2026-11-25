@@ -26205,39 +26205,73 @@ def _redact_json_value(value: Any, *, mask_numbers: bool) -> Any:
 class _EtradeLogRedactor(logging.Filter):
     """Scrub account URLs and OAuth material on every log record.
 
-    Long digit runs are left alone here so order ids and timestamps stay.
-    Exception text that goes through scrub_etrade_text still drops them.
+    The message keeps long digit runs (order ids, timestamps). Tracebacks do
+    not: logger.exception, exc_info, and stack_info are formatted and passed
+    through scrub_etrade_text, then exc_info is cleared so a handler cannot
+    print the raw traceback over the scrubbed text.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             rendered = record.getMessage()
+            cleaned = _scrub_etrade_urls(rendered)
+            if cleaned != rendered:
+                record.msg = cleaned
+                record.args = None
         except Exception:
-            return True
-        cleaned = _scrub_etrade_urls(rendered)
-        if cleaned != rendered:
-            record.msg = cleaned
-            record.args = None
+            pass
+        if record.exc_info:
+            try:
+                formatted = logging.Formatter().formatException(record.exc_info)
+            except Exception:
+                formatted = record.exc_text or ""
+            record.exc_text = scrub_etrade_text(formatted)
+            record.exc_info = None
+        if record.exc_text:
+            record.exc_text = scrub_etrade_text(record.exc_text)
+        if record.stack_info:
+            record.stack_info = scrub_etrade_text(str(record.stack_info))
         return True
 
 
 _ETRADE_LOG_REDACTOR = _EtradeLogRedactor()
+_ETRADE_HANDLER_PATCHED = False
 
 
 def _install_etrade_log_redactor() -> None:
+    global _ETRADE_HANDLER_PATCHED
     seen = set()
 
     def _arm(obj: logging.Logger) -> None:
-        if id(obj) in seen:
+        if obj is None or id(obj) in seen:
             return
         seen.add(id(obj))
         if not any(isinstance(existing, _EtradeLogRedactor) for existing in obj.filters):
             obj.addFilter(_ETRADE_LOG_REDACTOR)
 
-    _arm(logging.getLogger())
-    for name, obj in list(logging.Logger.manager.loggerDict.items()):
+    def _arm_handler(hdlr) -> None:
+        if hdlr is None:
+            return
+        filters = getattr(hdlr, "filters", ())
+        if not any(isinstance(existing, _EtradeLogRedactor) for existing in filters):
+            hdlr.addFilter(_ETRADE_LOG_REDACTOR)
+
+    def _arm_logger(obj: logging.Logger) -> None:
+        _arm(obj)
+        for hdlr in list(getattr(obj, "handlers", ())):
+            _arm_handler(hdlr)
+
+    root = logging.getLogger()
+    _arm_logger(root)
+    for obj in list(logging.Logger.manager.loggerDict.values()):
         if isinstance(obj, logging.Logger):
-            _arm(obj)
+            _arm_logger(obj)
+    # Created here if uvicorn has not configured logging yet. dictConfig may
+    # later replace logger filters; handlers added after this patch still
+    # receive the redactor.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        _arm_logger(logging.getLogger(name))
+
     manager = logging.Logger.manager
     original = getattr(manager, "_etrade_original_get_logger", None)
     if original is None:
@@ -26247,10 +26281,20 @@ def _install_etrade_log_redactor() -> None:
         def _redacting_get_logger(name):
             logger_obj = original(name)
             if isinstance(logger_obj, logging.Logger):
-                _arm(logger_obj)
+                _arm_logger(logger_obj)
             return logger_obj
 
         manager.getLogger = _redacting_get_logger
+
+    if not _ETRADE_HANDLER_PATCHED:
+        _orig_add_handler = logging.Logger.addHandler
+
+        def _arming_add_handler(self, hdlr):
+            _orig_add_handler(self, hdlr)
+            _arm_handler(hdlr)
+
+        logging.Logger.addHandler = _arming_add_handler
+        _ETRADE_HANDLER_PATCHED = True
 
 
 _install_etrade_log_redactor()
