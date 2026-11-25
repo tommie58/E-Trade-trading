@@ -275,8 +275,14 @@ def test_cadence_default_is_main_90s_elapsed(monkeypatch):
     monkeypatch.setenv("BAR_PULL_ALIGNED_60S", "true")
     assert dq.aggs_pull_interval_s() == 60
     assert dq.aggs_alignment_active() is True
+    assert dq.AGGS_ALIGN_AFTER_CLOSE_S == 5
     last = datetime(2026, 11, 24, 12, 1, 40, tzinfo=ET).timestamp()
     assert dq.agg_pull_due(now.timestamp(), last, 60, True, now) is True
+    at_open = datetime(2026, 11, 24, 12, 2, 0, tzinfo=ET)
+    pulled_at_boundary = datetime(2026, 11, 24, 12, 1, 0, tzinfo=ET).timestamp()
+    assert dq.agg_pull_due(at_open.timestamp(), pulled_at_boundary, 60, True, at_open) is False
+    at_five = datetime(2026, 11, 24, 12, 2, 5, tzinfo=ET)
+    assert dq.agg_pull_due(at_five.timestamp(), pulled_at_boundary, 60, True, at_five) is True
     early = datetime(2026, 11, 24, 12, 2, 3, tzinfo=ET)
     last_early = datetime(2026, 11, 24, 12, 1, 6, tzinfo=ET).timestamp()
     assert dq.agg_pull_due(early.timestamp(), last_early, 60, True, early) is False
@@ -641,6 +647,36 @@ def test_admitted_open_survives_a_shadow_verdict_failure(monkeypatch, caplog, tm
     assert "super-secret-token" not in caplog.text
 
 
+def test_vwap_log_line_has_last_verdict_and_raw_age(caplog):
+    import logging
+    _ok_feeds()
+    caplog.set_level(logging.INFO, logger="etrade-bot.data-quality")
+    dq.note_vwap("SPY", {
+        "sampled_vwap": 714.64,
+        "gate_vwap": 714.64,
+        "bar_vwap": 714.10,
+        "bar_age_s": 65.1,
+        "bar_age_s_raw": 65.123456789,
+        "bar_count": 4,
+        "last": 716.25,
+        "configured_source": "sampled",
+    })
+    lines = [rec.getMessage() for rec in caplog.records if rec.getMessage().startswith("[DATA QUALITY] vwap")]
+    assert lines
+    line = lines[-1]
+    assert "last=716.2500" in line
+    assert "bar_verdict=above" in line
+    assert "bar_age_s=65.123456789" in line
+    age = line.split("bar_age_s=", 1)[1].split()[0]
+    assert float(age) == pytest.approx(65.123456789, abs=1e-12)
+    assert age != "65.1"
+    lowered = line.lower()
+    assert "account" not in lowered
+    assert "bearer" not in lowered
+    assert "api_key" not in lowered
+    assert "secret" not in lowered
+
+
 def test_enforcement_stale_bar_vwap_fails_closed_without_sampled(monkeypatch):
     monkeypatch.setenv("VWAP_SOURCE", "bars")
     _ok_feeds()
@@ -664,20 +700,21 @@ def test_enforcement_stale_bar_vwap_fails_closed_without_sampled(monkeypatch):
     assert reason is not None and "fail closed" in reason
 
 
-def test_two_bar_confirm_ignores_a_single_spike_and_does_not_clamp():
+def test_real_move_confirmed_is_two_bars_and_not_a_lone_bad_print():
     bars = []
     for minute in range(40, 60):
         bars.append(_bar(11, minute, vw=633.95, vol=10000, open_=633.90, high=634.10, low=633.80, close=634.00))
     bars.append(_bar(12, 1, vw=634.05, vol=12000, open_=633.90, high=648.00, low=633.80, close=634.00))
     bars.append(_bar(12, 2, vw=634.00, vol=10000, open_=634.00, high=634.10, low=633.80, close=634.00))
-    alone = dq.confirmed_bad_ticks(bars, "QQQ")
-    assert alone["confirmed_count"] == 0
+    alone = dq.real_move_confirmed(bars, "QQQ")
+    assert alone["real_move_count"] == 0
     assert bars[-2]["h"] == pytest.approx(648.0)
     bars[-1]["h"] = 648.0
-    pair = dq.confirmed_bad_ticks(bars, "QQQ")
-    assert pair["confirmed_count"] == 1
-    assert pair["confirmed"][0]["high"] == pytest.approx(648.0)
+    pair = dq.real_move_confirmed(bars, "QQQ")
+    assert pair["real_move_count"] == 2
+    assert all(item["real_move_confirmed"] is True for item in pair["real_moves"])
     assert bars[-2]["h"] == pytest.approx(648.0)
+    assert bars[-1]["h"] == pytest.approx(648.0)
 
 
 def test_refresh_mismatch_warns_and_does_not_log_the_key(monkeypatch, caplog):
@@ -737,5 +774,5 @@ def test_status_exposes_the_shadow_block(monkeypatch):
     assert shadow["call_budget"]["proposal_requests_per_hour"] == 120
     assert shadow["entitlement"]["bars"]["status"] == "no_data"
     assert shadow["bad_ticks_flagged"] == 0
-    assert shadow["bad_tick_confirmed"] == 0
+    assert shadow["real_move_confirmed"] == 0
     assert shadow["iv_check"]["iv"] is None

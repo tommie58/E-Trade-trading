@@ -36,8 +36,9 @@ _AUTH_REASONS = frozenset({"unauthorized", "forbidden", "not_configured"})
 DEFAULT_AGGS_PULL_INTERVAL_S = 90.0
 # Opt-in. Quant Lab measured this cadence stale 0% of the time, versus 16.2% at 90s.
 ALIGNED_PULL_INTERVAL_S = 60.0
-# Minute boundary (second 0) when BAR_PULL_ALIGNED_60S is on.
-AGGS_ALIGN_AFTER_CLOSE_S = 0
+# Flag-gated only. About 5s after the minute closes. A pull at :00 is often
+# stale because the completed bar is published about 1.5s late.
+AGGS_ALIGN_AFTER_CLOSE_S = 5
 # Newest completed bar older than this is not fresh enough to drive the gate.
 BAR_VWAP_STALE_S = 150.0
 # Bad-tick: wick beyond the body, versus the median true range of the prior bars.
@@ -73,8 +74,8 @@ def _fresh_state() -> Dict[str, Any]:
         "gaps": {},
         "bad_tick_ids": {},
         "bad_tick_details": [],
-        "bad_tick_confirmed_ids": {},
-        "bad_tick_confirmed_details": [],
+        "real_move_ids": {},
+        "real_move_details": [],
         "symbol_iv": {},
         "agg_requests": {},
         "bars_feed": _feed("unmeasured"),
@@ -155,7 +156,8 @@ def bar_pull_aligned_60s() -> bool:
     """60s minute-boundary pull. Read on each refresh check. Default off.
 
     Off restores main's 90s elapsed throttle, so the SPY/QQQ bar pull does
-    not add requests. On uses a 60s interval locked to the minute boundary.
+    not add requests. On uses a 60s interval anchored about 5s after the
+    minute closes.
     """
     raw = os.getenv("BAR_PULL_ALIGNED_60S", "false")
     return str(raw if raw is not None else "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -187,6 +189,15 @@ def aggs_alignment_active(interval_s: Optional[float] = None) -> bool:
         return False
     interval = aggs_pull_interval_s() if interval_s is None else float(interval_s)
     return interval <= ALIGNED_PULL_INTERVAL_S
+
+
+def _fmt_raw_seconds(value: Any) -> str:
+    """Unrounded seconds. Missing stays ``none`` so the log field is always there."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "none"
+    if not math.isfinite(float(value)):
+        return "none"
+    return format(float(value), ".12g")
 
 
 def _fmt(value: Any) -> str:
@@ -245,7 +256,7 @@ def diff_bps(candidate: Any, baseline: Any) -> Optional[float]:
 
 
 def _latest_anchor(now_et: datetime, align_s: int = AGGS_ALIGN_AFTER_CLOSE_S) -> datetime:
-    """Most recent minute boundary (second 0) that is not in the future."""
+    """Most recent HH:MM:05 that is not in the future. Used only when aligned."""
     anchor = now_et.replace(second=int(align_s), microsecond=0)
     if now_et < anchor:
         anchor -= timedelta(minutes=1)
@@ -263,9 +274,8 @@ def agg_pull_due(
 
     ``last_epoch`` <= 0 is the first pull and is always due, so a restart
     does not wait for the next minute. The default path is
-    ``elapsed >= 90``. ``BAR_PULL_ALIGNED_60S`` also requires that the latest
-    minute boundary is strictly after the last pull, so a minute produces
-    one request.
+    ``elapsed >= 90``. ``BAR_PULL_ALIGNED_60S`` waits until about 5s after
+    the minute closes, and the latest :05 anchor must be after the last pull.
     """
     try:
         now = float(now_epoch)
@@ -281,6 +291,10 @@ def agg_pull_due(
         return False
     if not align:
         return True
+    # Hold a wake that lands in the first few seconds. The bar that just
+    # closed is often not published yet.
+    if now_et.second < AGGS_ALIGN_AFTER_CLOSE_S:
+        return False
     anchor = _latest_anchor(now_et)
     return last < anchor.timestamp() - 1e-6
 
@@ -561,6 +575,7 @@ def completed_rth_vwap(
             "last_bar_epoch": last_epoch,
             "last_bar_ts": last_dt.isoformat(),
             "age_seconds": round(age, 1),
+            "age_seconds_raw": age,
             "sum_vw_v": numerator,
             "sum_v": denominator,
         }
@@ -736,11 +751,11 @@ def filter_bad_ticks(
     return {"bars": clean, "flagged": flagged, "flagged_count": len(flagged)}
 
 
-def confirmed_bad_ticks(bars: Optional[Sequence[Any]], symbol: Any = "") -> Dict[str, Any]:
-    """Shadow-only two-bar confirm. A bar counts only if the next bar also deviates.
+def real_move_confirmed(bars: Optional[Sequence[Any]], symbol: Any = "") -> Dict[str, Any]:
+    """Shadow-only. Two consecutive deviant bars are a real move, not a bad print.
 
-    This does not clamp, drop, or replace a bar. Callers log the count and
-    leave the series alone.
+    A lone spike, including a one-bar bad print, is not confirmed. Nothing
+    here clamps, drops, or replaces a bar.
     """
     report = filter_bad_ticks(bars, symbol)
     deviant = set()
@@ -766,13 +781,19 @@ def confirmed_bad_ticks(bars: Optional[Sequence[Any]], symbol: Any = "") -> Dict
         ordered.append((round(float(stamp), 3), bar))
     ordered.sort(key=lambda item: item[0])
     confirmed: List[Dict[str, Any]] = []
-    for index, (stamp, _bar) in enumerate(ordered[:-1]):
-        nxt = ordered[index + 1][0]
-        if stamp in deviant and nxt in deviant:
-            item = dict(by_ts[stamp])
-            item["confirmed_by_next"] = True
-            confirmed.append(item)
-    return {"confirmed": confirmed, "confirmed_count": len(confirmed)}
+    for index, (stamp, _bar) in enumerate(ordered):
+        if stamp not in deviant:
+            continue
+        neighbor = (
+            (index > 0 and ordered[index - 1][0] in deviant)
+            or (index + 1 < len(ordered) and ordered[index + 1][0] in deviant)
+        )
+        if not neighbor:
+            continue
+        item = dict(by_ts[stamp])
+        item["real_move_confirmed"] = True
+        confirmed.append(item)
+    return {"real_moves": confirmed, "real_move_count": len(confirmed)}
 
 
 def series_for_extremes(bars: Optional[Sequence[Any]], symbol: Any = "") -> Dict[str, Any]:
@@ -1123,18 +1144,22 @@ def publish_vwap_row(symbol: str, choice: Dict[str, Any]) -> Dict[str, Any]:
     bar = _price((choice or {}).get("bar_vwap")) if measured else None
     sampled = _price((choice or {}).get("sampled_vwap")) if measured else None
     diff = diff_bps(bar, sampled) if measured else None
-    last = _price((choice or {}).get("last"))
-    if measured and last is not None and bar is not None:
-        bar_verdict = "above" if last + 1e-9 >= bar else "below"
+    compare = _price((choice or {}).get("last"))
+    bar_for_verdict = _price((choice or {}).get("bar_vwap"))
+    if compare is not None and bar_for_verdict is not None:
+        bar_verdict = "above" if compare + 1e-9 >= bar_for_verdict else "below"
     else:
         bar_verdict = "unmeasured"
+    raw_age = _finite((choice or {}).get("bar_age_s_raw"))
     iv = iv_field(sym)
     return {
         "symbol": sym,
         "status": gate["status"],
         "reason": gate["reason"],
         "bar_vwap": bar,
+        "last": compare,
         "bar_verdict": bar_verdict,
+        "bar_age_seconds_raw": raw_age,
         "sampled_vwap": sampled,
         "diff_bps": diff,
         "live_gate_vwap": _price((choice or {}).get("gate_vwap")),
@@ -1167,15 +1192,17 @@ def note_vwap(symbol: str, choice: Dict[str, Any]) -> None:
             state["max_abs_vwap_diff_bps"] = round(magnitude, 2)
     state["symbols"][sym] = row
     logger.info(
-        "[DATA QUALITY] vwap %s status=%s reason=%s bar=%s sampled=%s diff_bps=%s live_gate=%s bar_age_s=%s",
+        "[DATA QUALITY] vwap %s status=%s reason=%s bar=%s last=%s bar_verdict=%s bar_age_s=%s sampled=%s diff_bps=%s live_gate=%s",
         sym,
         row["status"],
         row["reason"],
         _fmt(row.get("bar_vwap")),
+        _fmt(row.get("last")),
+        row.get("bar_verdict"),
+        _fmt_raw_seconds(row.get("bar_age_seconds_raw")),
         _fmt(row.get("sampled_vwap")),
         row.get("diff_bps"),
         _fmt(row.get("live_gate_vwap")),
-        row.get("bar_age_seconds"),
     )
 
 
@@ -1263,12 +1290,12 @@ def note_bad_ticks(symbol: str, flagged: Sequence[Dict[str, Any]]) -> None:
     state["bad_tick_details"] = details[-20:]
 
 
-def note_bad_tick_confirmed(symbol: str, confirmed: Sequence[Dict[str, Any]]) -> None:
-    """Record two-bar confirmations. Logging only. Nothing here changes a bar."""
+def note_real_move_confirmed(symbol: str, confirmed: Sequence[Dict[str, Any]]) -> None:
+    """Record two-bar real moves. Logging only. Nothing here changes a bar."""
     sym = str(symbol or "").upper().strip() or "?"
     state = _state()
-    seen = set(state["bad_tick_confirmed_ids"].get(sym) or [])
-    details: List[Dict[str, Any]] = list(state.get("bad_tick_confirmed_details") or [])
+    seen = set(state["real_move_ids"].get(sym) or [])
+    details: List[Dict[str, Any]] = list(state.get("real_move_details") or [])
     added = 0
     for item in confirmed or []:
         if not isinstance(item, dict):
@@ -1289,13 +1316,13 @@ def note_bad_tick_confirmed(symbol: str, confirmed: Sequence[Dict[str, Any]]) ->
             "field": item.get("field"),
             "high": item.get("high"),
             "low": item.get("low"),
-            "confirmed_by_next": True,
+            "real_move_confirmed": True,
         })
-    state["bad_tick_confirmed_ids"][sym] = sorted(seen)
-    state["bad_tick_confirmed_details"] = details[-20:]
+    state["real_move_ids"][sym] = sorted(seen)
+    state["real_move_details"] = details[-20:]
     if added:
         logger.info(
-            "[DATA QUALITY] bad tick confirmed symbol=%s count=%s",
+            "[DATA QUALITY] real move confirmed symbol=%s count=%s",
             sym, len(seen),
         )
 
@@ -1351,8 +1378,8 @@ def call_budget(symbols: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         "note": (
             "One GET per symbol per pull. Unset BAR_PULL_ALIGNED_60S keeps "
             "main's 90s elapsed throttle (about 48–80/hour for SPY+QQQ, "
-            "ceiling 80/hour). The flag on is 60s on the minute boundary, "
-            "about 120/hour for SPY+QQQ. AGGS_INCREMENTAL_MERGE defaults "
+            "ceiling 80/hour). The flag on is 60s, about 5s after the minute "
+            "closes, about 120/hour for SPY+QQQ. AGGS_INCREMENTAL_MERGE defaults "
             "off: every pull is the full session day. The session VWAP seed "
             "is a separate fetch and stops once the open is stored."
         ),
@@ -1360,14 +1387,14 @@ def call_budget(symbols: Optional[Sequence[str]] = None) -> Dict[str, Any]:
 
 
 def _publish_bad_ticks(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Single-bar count and the two-bar confirm count. IV does not clear them."""
+    """Single-bar count and the two-bar real-move count. IV does not clear them."""
     flagged = sum(len(ids) for ids in (state.get("bad_tick_ids") or {}).values())
-    confirmed = sum(len(ids) for ids in (state.get("bad_tick_confirmed_ids") or {}).values())
+    confirmed = sum(len(ids) for ids in (state.get("real_move_ids") or {}).values())
     return {
         "bad_ticks_flagged": int(flagged),
         "bad_tick_details": list(state.get("bad_tick_details") or []),
-        "bad_tick_confirmed": int(confirmed),
-        "bad_tick_confirmed_details": list(state.get("bad_tick_confirmed_details") or []),
+        "real_move_confirmed": int(confirmed),
+        "real_move_details": list(state.get("real_move_details") or []),
     }
 
 
@@ -1433,8 +1460,8 @@ def shadow_status() -> Dict[str, Any]:
         "gap_fallback_missing": int(state.get("gap_fallback_missing") or 0),
         "bad_ticks_flagged": ticks["bad_ticks_flagged"],
         "bad_tick_details": ticks["bad_tick_details"],
-        "bad_tick_confirmed": ticks["bad_tick_confirmed"],
-        "bad_tick_confirmed_details": ticks["bad_tick_confirmed_details"],
+        "real_move_confirmed": ticks["real_move_confirmed"],
+        "real_move_details": ticks["real_move_details"],
         "iv_check": iv,
         "agg_requests": per_symbol,
         "entitlement": {

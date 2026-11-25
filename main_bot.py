@@ -17452,6 +17452,7 @@ def _note_data_quality_vwap(row: Dict[str, Any], resolved: Dict[str, Any], now_e
         source=data_quality.vwap_source_flag(),
     )
     choice["last"] = row.get("last")
+    choice["bar_age_s_raw"] = view.get("age_seconds_raw")
     # Enforcement (VWAP_SOURCE=bars) fail-closes when the bar VWAP is stale
     # or missing. The sampled value stays off the gate. Default sampled
     # does not enter this branch.
@@ -17844,8 +17845,8 @@ async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> No
 
     The scanner loop calls this during the session. /status may call it too.
     The CALL gate does not. The default is main's elapsed 90s throttle, one
-    full-day GET per symbol. ``BAR_PULL_ALIGNED_60S`` uses 60s on the minute
-    boundary. Timeout is 3s. This does not use MassiveClient._get, so a 401,
+    full-day GET per symbol. ``BAR_PULL_ALIGNED_60S`` uses 60s, about 5s
+    after the minute closes. Timeout is 3s. This does not use MassiveClient._get, so a 401,
     403, or 429 cannot change auth_status or feed health. A timeout or a bad
     response leaves the previous
     slot in place and records ``error``. A response with no positive
@@ -17955,8 +17956,8 @@ async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> No
                     try:
                         extremes = data_quality.series_for_extremes(merged, sym)
                         data_quality.note_bad_ticks(sym, extremes.get("flagged") or [])
-                        confirmed = data_quality.confirmed_bad_ticks(merged, sym)
-                        data_quality.note_bad_tick_confirmed(sym, confirmed.get("confirmed") or [])
+                        confirmed = data_quality.real_move_confirmed(merged, sym)
+                        data_quality.note_real_move_confirmed(sym, confirmed.get("real_moves") or [])
                     except Exception:
                         extremes = {"flagged_count": 0}
                         logger.debug("bad tick shadow skipped for %s", sym)
