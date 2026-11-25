@@ -12041,6 +12041,8 @@ class Scanner:
             try:
                 result = await self.dispatch(payload)
                 verdict = str((result or {}).get("status") or "unknown")
+                if str((result or {}).get("reason") or "") == "setup_disabled":
+                    verdict = "setup_disabled"
             except Exception as e:
                 verdict = f"error: {str(e)[:120]}"
                 logger.error(f"scanner dispatch failed for {cand['ticker']}: {e}")
@@ -15407,6 +15409,10 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # and never frees every row on the ticker. The settle after a stop is
 # armed does not wait on that lock.
 # 5.99.6 keeps those rules and closes the follow-ups above.
+# 5.99.12 adds SETUP_DISABLE_ENABLED, read on each entry (not at import).
+# Default false leaves every admit and every size unchanged. The list
+# matches the scanner's setup strings after normalize_setup (underscores
+# become spaces). "momentum" does not match "momentum fade".
 # HEAT_RESERVATION_ENABLED defaults on. Setting it false is the rollback:
 # heat is judged at fill time again.
 # The session VWAP stays the scanner's own samples. Each volume delta is
@@ -15417,7 +15423,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # still fail-closes when the two disagree or the Massive side is missing
 # or stale. GET /pro-trader/report includes the gap in basis points.
 # /status positions_open is the open book with status, side, and qty.
-BOT_VERSION = "5.99.6-pro-day-trader"
+BOT_VERSION = "5.99.12-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -16456,6 +16462,339 @@ def _utcnow() -> datetime:
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("etrade-bot")
+
+# ---------------------------------------------------------------------------
+# Setup disable (5.99.12). Read on every entry. Flag off does not change
+# an admit or a size. Shadow (default on while the flag is off) counts
+# would-have-skipped candidates and does not block.
+# Identifiers are the scanner / thesis strings after edge.normalize_setup:
+# underscores become spaces, so the env token vwap_rejection is "vwap rejection".
+# Match is exact on that string. "momentum" is not "momentum fade".
+# ---------------------------------------------------------------------------
+SETUP_DISABLE_LIST_DEFAULT = "breakdown,vwap_rejection,momentum"
+SETUP_DISABLE_REASON = "setup_disabled"
+_KEPT_SETUP_CAP = frozenset({"momentum fade", "orb"})
+_SETUP_LIST_CHARS = re.compile(r"^[A-Za-z0-9, _-]*$")
+_SETUP_DISABLE_TRUE = {"true", "1", "yes", "on"}
+_SETUP_DISABLE_FALSE = {"false", "0", "no", "off"}
+_setup_disable_counts: Dict[str, Any] = {
+    "skipped": 0,
+    "would_skip": 0,
+    "capped": 0,
+    "by_setup": {},
+}
+_setup_disable_seen: set = set()
+_setup_disable_seen_order: List[str] = []
+_setup_disable_list_cache: Dict[str, Any] = {"key": None}
+
+
+def canonical_setup_id(label: Any) -> str:
+    """Same folding as edge.normalize_setup. Exact, not a substring.
+
+    'vwap_rejection' and 'VWAP rejection' both become 'vwap rejection'.
+    'momentum_fade' becomes 'momentum fade', which is not 'momentum'.
+    """
+    text = str(label or "").strip().lower().replace("_", " ")
+    text = text.replace("+ adx", "").replace("+adx", "")
+    return " ".join(text.split())
+
+
+def known_setup_ids() -> frozenset:
+    """Setup strings the thesis table and the no-thesis list actually use."""
+    found = set()
+    for thesis in edge.THESES.values():
+        for alias in thesis.get("setups") or ():
+            canon = canonical_setup_id(alias)
+            if canon:
+                found.add(canon)
+    for alias in getattr(edge, "NO_THESIS_SETUPS", ()):
+        canon = canonical_setup_id(alias)
+        if canon:
+            found.add(canon)
+    return frozenset(found)
+
+
+def _env_bool(name: str) -> Optional[bool]:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    text = str(raw).strip().lower()
+    if text in _SETUP_DISABLE_TRUE:
+        return True
+    if text in _SETUP_DISABLE_FALSE:
+        return False
+    return None
+
+
+def setup_disable_enabled() -> bool:
+    """True only when SETUP_DISABLE_ENABLED is explicitly on. Default false.
+
+    An unreadable value stays off, so a bad env does not start skipping.
+    Read at call time. A process that already has the new environment
+    applies it on the next entry. Railway loads env vars by restarting
+    the service; that restart is not a new image.
+    """
+    return _env_bool("SETUP_DISABLE_ENABLED") is True
+
+
+def setup_disable_shadow() -> bool:
+    """Count would-be skips without blocking.
+
+    Unset follows the flag: true while the flag is off, false while it is
+    on. An explicit true/false wins either way. When the flag is on, a
+    skip still blocks even if shadow is also true.
+    """
+    flag = _env_bool("SETUP_DISABLE_SHADOW")
+    if flag is None:
+        return not setup_disable_enabled()
+    return flag
+
+
+def parse_setup_disable_list(raw: Any) -> Dict[str, Any]:
+    """Parse a comma-separated list into canonical setup ids.
+
+    None means the default list (the variable is unset), not a parse error.
+    A value with characters other than letters, digits, comma, space,
+    underscore, or hyphen is unparseable and the caller uses the default.
+    A token that is not a known setup id is dropped. It does not reject
+    the rest of the list.
+    """
+    known = known_setup_ids()
+    default_ids, _default_warnings, default_ignored = _tokenize_setup_list(
+        SETUP_DISABLE_LIST_DEFAULT, known,
+    )
+    if raw is None:
+        return {
+            "ids": default_ids,
+            "warnings": [],
+            "ignored": [],
+            "unparseable": False,
+            "source": "default",
+        }
+    if not isinstance(raw, str) or not _SETUP_LIST_CHARS.match(raw):
+        return {
+            "ids": default_ids,
+            "warnings": ["SETUP_DISABLE_LIST is unparseable; using the default list"],
+            "ignored": [],
+            "unparseable": True,
+            "source": "default_fallback",
+        }
+    ids, warnings, ignored = _tokenize_setup_list(raw, known)
+    return {
+        "ids": ids,
+        "warnings": warnings,
+        "ignored": ignored,
+        "unparseable": False,
+        "source": "env",
+    }
+
+
+def _tokenize_setup_list(raw: str, known: frozenset) -> Tuple[frozenset, List[str], List[str]]:
+    ids: List[str] = []
+    warnings: List[str] = []
+    ignored: List[str] = []
+    for part in str(raw).split(","):
+        token = part.strip()
+        if not token:
+            continue
+        canon = canonical_setup_id(token)
+        if canon not in known:
+            ignored.append(token)
+            warnings.append(f"setup disable list ignored unknown name {token!r}")
+            continue
+        if canon not in ids:
+            ids.append(canon)
+    return frozenset(ids), warnings, ignored
+
+
+def resolved_setup_disable_list() -> Dict[str, Any]:
+    """Current list. Re-read when the env value changes. Warnings once per value."""
+    raw = os.getenv("SETUP_DISABLE_LIST")
+    key = raw if isinstance(raw, str) or raw is None else ("bad-type", type(raw).__name__)
+    cached = _setup_disable_list_cache.get("key")
+    if cached == key and "parsed" in _setup_disable_list_cache:
+        return _setup_disable_list_cache["parsed"]
+    parsed = parse_setup_disable_list(raw if isinstance(raw, str) or raw is None else raw)
+    for message in parsed["warnings"]:
+        logger.warning(message)
+    _setup_disable_list_cache["key"] = key
+    _setup_disable_list_cache["parsed"] = parsed
+    return parsed
+
+
+def judge_setup_disable(
+    setup: Any,
+    *,
+    enabled: Any = None,
+    shadow: Any = None,
+    disabled: Any = None,
+) -> str:
+    """'skip', 'shadow', or 'allow'. Exact canonical match. Pure if args are passed.
+
+    'skip' wins when enabled is true, including when shadow is also true.
+    """
+    if enabled is None:
+        enabled = setup_disable_enabled()
+    if shadow is None:
+        shadow = setup_disable_shadow()
+    if disabled is None:
+        disabled = resolved_setup_disable_list()["ids"]
+    canon = canonical_setup_id(setup)
+    if not canon or canon not in disabled:
+        return "allow"
+    if enabled:
+        return "skip"
+    if shadow:
+        return "shadow"
+    return "allow"
+
+
+def _setup_disable_cycle(payload: Dict[str, Any]) -> str:
+    ts = str(payload.get("timestamp") or payload.get("ts") or "").strip()
+    if ts:
+        return ts
+    now = _utcnow().astimezone(_ET_ZONE)
+    return now.strftime("%Y-%m-%dT%H:%M")
+
+
+def _setup_disable_remember(key: str) -> bool:
+    """True the first time this candidate is seen in this cycle."""
+    if key in _setup_disable_seen:
+        return False
+    _setup_disable_seen.add(key)
+    _setup_disable_seen_order.append(key)
+    if len(_setup_disable_seen_order) > 4000:
+        drop = _setup_disable_seen_order.pop(0)
+        _setup_disable_seen.discard(drop)
+    return True
+
+
+def _bump_setup_count(canon: str, field: str) -> None:
+    _setup_disable_counts[field] = int(_setup_disable_counts.get(field) or 0) + 1
+    by_setup = _setup_disable_counts["by_setup"]
+    row = by_setup.get(canon)
+    if not isinstance(row, dict):
+        row = {"skipped": 0, "would_skip": 0}
+        by_setup[canon] = row
+    row[field] = int(row.get(field) or 0) + 1
+
+
+def observe_setup_disable(payload: Any, *, path: str, dry_run: bool = False) -> Optional[str]:
+    """Return setup_disabled when this entry must be skipped. Otherwise None.
+
+    Shadow logs and counts once per candidate per cycle and does not block.
+    A dry run reports a skip and does not touch the counters, so /explain
+    does not look like a live candidate.
+    """
+    if not isinstance(payload, dict) or _is_close_payload(payload):
+        return None
+    verdict = judge_setup_disable(payload.get("setup"))
+    if verdict == "allow":
+        return None
+    if dry_run:
+        return SETUP_DISABLE_REASON if verdict == "skip" else None
+    canon = canonical_setup_id(payload.get("setup"))
+    ticker = str(payload.get("ticker") or "").upper()
+    cycle = _setup_disable_cycle(payload)
+    key = f"{ticker}|{canon}|{cycle}|{verdict}"
+    if not _setup_disable_remember(key):
+        return SETUP_DISABLE_REASON if verdict == "skip" else None
+    if verdict == "skip":
+        _bump_setup_count(canon, "skipped")
+        logger.warning(
+            "setup_disabled path=%s ticker=%s setup=%s cycle=%s",
+            path, ticker, canon, cycle,
+        )
+        return SETUP_DISABLE_REASON
+    _bump_setup_count(canon, "would_skip")
+    logger.info(
+        "setup_disabled shadow path=%s ticker=%s setup=%s cycle=%s",
+        path, ticker, canon, cycle,
+    )
+    return None
+
+
+def cap_kept_setup_quantity(setup: Any, quantity: Any, *, enabled: Any = None) -> Any:
+    """Cap momentum fade and orb at 1 contract when the flag is on.
+
+    Flag off returns quantity unchanged. Never increases a size. A fraction
+    below 1 floors to 0 so a later check can skip it. Values above 1 floor
+    to 1, not to the next contract.
+    """
+    if enabled is None:
+        enabled = setup_disable_enabled()
+    if not enabled:
+        return quantity
+    if canonical_setup_id(setup) not in _KEPT_SETUP_CAP:
+        return quantity
+    if isinstance(quantity, bool) or not isinstance(quantity, (int, float)):
+        return quantity
+    if isinstance(quantity, float) and not math.isfinite(quantity):
+        return quantity
+    floored = math.floor(quantity)
+    if floored > 1:
+        return 1
+    if floored < quantity:
+        return int(floored)
+    return quantity
+
+
+def apply_kept_setup_cap(setup: Any, quantity: Any, *, ticker: str = "", cycle: str = "") -> Any:
+    """Entry-path cap. Counts and logs only when the size actually drops."""
+    capped = cap_kept_setup_quantity(setup, quantity)
+    if capped == quantity or not setup_disable_enabled():
+        return quantity
+    canon = canonical_setup_id(setup)
+    name = str(ticker or "").upper()
+    key = f"cap|{name}|{canon}|{cycle}"
+    if _setup_disable_remember(key):
+        _setup_disable_counts["capped"] = int(_setup_disable_counts.get("capped") or 0) + 1
+        logger.warning(
+            "setup_disabled cap path=entry ticker=%s setup=%s qty=%s -> %s",
+            name, canon, quantity, capped,
+        )
+    return capped
+
+
+def setup_disable_status() -> Dict[str, Any]:
+    """Read-only counters for /pro-trader/status. Does not change an order."""
+    parsed = resolved_setup_disable_list()
+    by_setup = _setup_disable_counts.get("by_setup") or {}
+    return {
+        "enabled": setup_disable_enabled(),
+        "shadow": setup_disable_shadow(),
+        "reason": SETUP_DISABLE_REASON,
+        "list": sorted(parsed["ids"]),
+        "list_source": parsed["source"],
+        "known_setups": sorted(known_setup_ids()),
+        "kept_capped_at_1": sorted(_KEPT_SETUP_CAP),
+        "unparseable_env": bool(parsed["unparseable"]),
+        "ignored_unknown": list(parsed["ignored"]),
+        "counts": {
+            "skipped": int(_setup_disable_counts.get("skipped") or 0),
+            "would_skip": int(_setup_disable_counts.get("would_skip") or 0),
+            "capped": int(_setup_disable_counts.get("capped") or 0),
+            "by_setup": {
+                key: {"skipped": int(row.get("skipped") or 0), "would_skip": int(row.get("would_skip") or 0)}
+                for key, row in sorted(by_setup.items())
+                if isinstance(row, dict)
+            },
+        },
+        "read_only": True,
+        "env_read": "each_entry",
+    }
+
+
+def reset_setup_disable_state() -> None:
+    """Clear counters, the once-per-cycle log, and the parsed-list cache."""
+    _setup_disable_counts["skipped"] = 0
+    _setup_disable_counts["would_skip"] = 0
+    _setup_disable_counts["capped"] = 0
+    _setup_disable_counts["by_setup"] = {}
+    _setup_disable_seen.clear()
+    _setup_disable_seen_order.clear()
+    _setup_disable_list_cache.clear()
+    _setup_disable_list_cache["key"] = None
 
 app = FastAPI(title="E*TRADE Trading Bot")
 # No cross-origin browser access unless CORS_ORIGINS lists the origins.
@@ -20532,6 +20871,16 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
 
     `dry_run` is keyword-only and defaults False. Only /explain passes True.
     The live path calls the same helpers with no extra arguments."""
+    if not _is_close_payload(p):
+        origin = str(p.get(DISPATCH_ORIGIN_FIELD) or "").strip().lower()
+        disable_reason = observe_setup_disable(
+            p,
+            path="scanner" if origin == DISPATCH_ORIGIN_SCANNER else "app",
+            dry_run=dry_run,
+        )
+        if disable_reason:
+            return False, [disable_reason]
+
     async def _risk_ref() -> float:
         if dry_run:
             return await _risk_account_reference(dry_run=True)
@@ -34103,6 +34452,10 @@ async def execute_live_order(payload: dict):
             # before an order could ever be placed.
             sym_u = str(symbol).upper()
             if not is_exit:
+                quantity = apply_kept_setup_cap(
+                    payload.get("setup"), quantity, ticker=sym_u,
+                    cycle=str(payload.get("timestamp") or payload.get("ts") or ""),
+                )
                 quantity = _apply_learning_weight(sym_u, quantity, learning_ctx)
                 quantity = _apply_risk_weight(sym_u, quantity, risk_ctx)
                 quantity, pt_block = _apply_pro_trader_size(sym_u, quantity, payload)
@@ -38355,6 +38708,13 @@ async def _scanner_dispatch(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Send a scanner candidate down the SAME pipeline as a webhook signal.
     The payload is validated with the identical model first, so a malformed
     scanner signal fails here instead of reaching the broker."""
+    # Skip before process_signal so a disabled setup does not claim the
+    # day's signal id. The next scan is a new cycle and can log again.
+    # Shadow returns None and falls through unchanged.
+    if isinstance(payload, dict) and not _is_close_payload(payload):
+        disable_reason = observe_setup_disable(payload, path="scanner")
+        if disable_reason:
+            return {"status": "rejected", "reason": disable_reason, "code": "setup_disabled"}
     try:
         pd = WebhookPayload(**payload).dict()
     except ValidationError as e:
@@ -39980,6 +40340,7 @@ def _pro_trader_status_payload(trades_today: Any = None) -> Dict[str, Any]:
     rails["flatten_et"] = _flatten_et_label(close)
     body["hard_rails"] = rails
     body["session_phase"] = _pro_session_phase(minute, close)
+    body["setup_disable"] = setup_disable_status()
     return body
 
 
