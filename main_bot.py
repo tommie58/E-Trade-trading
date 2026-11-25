@@ -18229,6 +18229,35 @@ def _park_shadow_row(body: Dict[str, Any], fut: Optional[asyncio.Future]) -> boo
     return True
 
 
+def _resolve_shadow_future_dropped(fut: Optional[asyncio.Future]) -> None:
+    """Mark a waiter dropped. A stored exception is retrieved so it is not logged later."""
+    if fut is None:
+        return
+    if fut.cancelled():
+        return
+    if fut.done():
+        try:
+            fut.exception()
+        except Exception:
+            pass
+        return
+    try:
+        fut.set_result(None)
+    except asyncio.InvalidStateError:
+        pass
+
+
+def _drop_parked_shadow_rows() -> int:
+    """Count every parked row as dropped, release its waiter, and clear the list."""
+    dropped = 0
+    while _shadow_parked:
+        _body, fut = _shadow_parked.pop(0)
+        _shadow_ledger_counts["dropped"] += 1
+        dropped += 1
+        _resolve_shadow_future_dropped(fut)
+    return dropped
+
+
 def _ensure_shadow_relink() -> None:
     global _shadow_relink_task
     try:
@@ -18298,7 +18327,41 @@ async def _shadow_ledger_writer() -> None:
         body, fut = await queue.get()
         seq = None
         parked = False
+        accounted = False
+        work = None
         _shadow_inflight += 1
+        loop = asyncio.get_running_loop()
+
+        def _apply_append(rec: Optional[Dict[str, Any]]) -> None:
+            nonlocal accounted, seq
+            if accounted:
+                return
+            accounted = True
+            if rec:
+                _shadow_ledger_counts["written"] += 1
+                seq = rec.get("seq")
+                line = json.dumps(rec, sort_keys=True, default=str)
+                if fut is not None and not fut.done():
+                    fut.set_result(seq)
+                try:
+                    loop.create_task(_mirror_shadow_line(int(seq or 0), str(rec.get("hash") or ""), line))
+                except RuntimeError:
+                    pass
+            else:
+                _shadow_ledger_counts["dropped"] += 1
+                _resolve_shadow_future_dropped(fut)
+
+        def _on_append_done(cf_fut) -> None:
+            rec = None
+            try:
+                rec = cf_fut.result()
+            except BaseException:
+                rec = None
+            try:
+                loop.call_soon_threadsafe(_apply_append, rec)
+            except RuntimeError:
+                _apply_append(rec)
+
         try:
             log = _shadow_log
             if _shadow_restore_pending():
@@ -18306,25 +18369,35 @@ async def _shadow_ledger_writer() -> None:
                 parked = _park_shadow_row(body, fut)
             elif log is None:
                 _shadow_ledger_counts["dropped"] += 1
+                _resolve_shadow_future_dropped(fut)
             else:
                 ready = await _wait_shadow_restore()
                 log = _shadow_log
                 if not ready or log is None:
                     parked = _park_shadow_row(body, fut)
                 else:
-                    rec = await _shadow_io(_append_shadow_after_restore, log, body)
+                    work = _shadow_io_executor.submit(_append_shadow_after_restore, log, body)
+                    rec = await asyncio.wrap_future(work)
                     if rec is None:
                         parked = _park_shadow_row(body, fut)
                     else:
+                        accounted = True
                         _shadow_ledger_counts["written"] += 1
                         seq = rec.get("seq")
                         line = json.dumps(rec, sort_keys=True, default=str)
                         await _mirror_shadow_line(int(seq or 0), str(rec.get("hash") or ""), line)
-            if not parked and fut is not None and not fut.done():
-                fut.set_result(seq)
+                        if fut is not None and not fut.done():
+                            fut.set_result(seq)
         except asyncio.CancelledError:
-            if seq is None and not parked:
-                _shadow_ledger_counts["dropped"] += 1
+            if not parked and not accounted:
+                if work is not None and not work.done():
+                    # Cancelling the task cancels the wrapper, not a write already running.
+                    work.add_done_callback(_on_append_done)
+                elif work is not None:
+                    _on_append_done(work)
+                else:
+                    _shadow_ledger_counts["dropped"] += 1
+                    _resolve_shadow_future_dropped(fut)
             queue.task_done()
             raise
         except Exception as exc:
@@ -18378,7 +18451,7 @@ async def drain_shadow_queue(timeout: float = _SHADOW_SHUTDOWN_DRAIN_S) -> int:
     queue = _shadow_queue
     writer = _shadow_writer
     if queue is None:
-        return 0
+        return _drop_parked_shadow_rows()
     # A writer that died and was replaced is not a live drain. Don't sit out the budget.
     dead = writer is None or writer.done() or _shadow_writer_restarted
     wait = 0.0 if dead else max(0.0, float(timeout))
@@ -18399,6 +18472,7 @@ async def drain_shadow_queue(timeout: float = _SHADOW_SHUTDOWN_DRAIN_S) -> int:
         queue.task_done()
         _shadow_ledger_counts["dropped"] += 1
         dropped += 1
+    dropped += _drop_parked_shadow_rows()
     return dropped
 
 
@@ -40911,6 +40985,8 @@ async def _cancel_shadow_maintenance() -> None:
             pending.append(task)
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
+    # Cancel puts an in-flight relink row back onto the parked list. Count it here.
+    _drop_parked_shadow_rows()
 
 
 async def _shutdown_shadow_pool() -> None:

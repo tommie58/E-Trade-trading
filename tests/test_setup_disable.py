@@ -2212,3 +2212,94 @@ def test_shutdown_cancels_the_shadow_writer():
         main_bot._shadow_writer = None
         main_bot.reset_setup_disable_state()
     assert done is True
+
+
+def _park_rows(n):
+    loop = asyncio.get_running_loop()
+    futs = []
+    for i in range(n):
+        fut = loop.create_future()
+        assert main_bot._park_shadow_row({"signal_id": str(i)}, fut) is True
+        futs.append(fut)
+    return futs
+
+
+def test_shutdown_counts_rows_still_parked():
+    """Parked rows are dropped on the full shutdown path and on drain alone."""
+    async def full():
+        main_bot.reset_setup_disable_state()
+        main_bot._shadow_restore_begin()
+        futs = _park_rows(5)
+        await main_bot._shutdown_shadow_side_log()
+        status = main_bot.setup_disable_status()["ledger"]
+        return status["written"], status["dropped"], len(main_bot._shadow_parked), all(
+            fut.done() and fut.result() is None for fut in futs
+        )
+
+    async def drain_only():
+        main_bot.reset_setup_disable_state()
+        main_bot._shadow_restore_begin()
+        futs = _park_rows(3)
+        await main_bot.drain_shadow_queue()
+        status = main_bot.setup_disable_status()["ledger"]
+        task = main_bot._shadow_relink_task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        main_bot._drop_parked_shadow_rows()
+        return status["written"] + status["dropped"], len(futs), all(fut.done() for fut in futs)
+
+    try:
+        written, dropped, left, resolved = asyncio.run(full())
+        drain_accounted, drain_n, drain_resolved = asyncio.run(drain_only())
+    finally:
+        main_bot._shadow_parked.clear()
+        main_bot.reset_setup_disable_state()
+    assert written + dropped == 5
+    assert left == 0
+    assert resolved is True
+    assert drain_accounted == drain_n
+    assert drain_resolved is True
+
+
+def test_inflight_shadow_write_counts_written_when_it_lands(tmp_path, monkeypatch):
+    import time
+    main_bot.reset_setup_disable_state()
+    _open_shadow(tmp_path)
+    real = os.fsync
+    started = __import__("threading").Event()
+
+    def slow(fd):
+        started.set()
+        time.sleep(0.4)
+        return real(fd)
+
+    monkeypatch.setattr(main_bot.os, "fsync", slow)
+
+    async def run():
+        task = asyncio.create_task(main_bot.persist_setup_disable_decision(
+            {"ticker": "FAKE", "setup": "breakdown", "action": "BUY", "signal_id": "inflight"},
+            quantity=1, enforced=False, quantity_basis="after_sizing", path="entry",
+            fresh_order=True, outcome={"order_id": "1", "placement_status": "placed"},
+        ))
+        for _ in range(50):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+        writer = main_bot._shadow_writer
+        writer.cancel()
+        await asyncio.gather(writer, return_exceptions=True)
+        await asyncio.sleep(0.6)
+        rows = main_bot.read_setup_disable_shadow(5)
+        status = main_bot.setup_disable_status()["ledger"]
+        await _cancel_shadow_tasks()
+        return rows, status["written"], status["dropped"]
+
+    try:
+        rows, written, dropped = asyncio.run(run())
+    finally:
+        main_bot.reset_setup_disable_state()
+    assert len(rows) == 1
+    assert written == 1
+    assert dropped == 0
