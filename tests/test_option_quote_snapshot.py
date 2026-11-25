@@ -29,7 +29,13 @@ def _isolate_snapshots():
     main_bot._ORDER_PATH_INFLIGHT = 0
     main_bot.set_quote_snapshot_mirror(None)
     main_bot._snap_durable = 0
+    main_bot._snap_durable_base = 0
+    main_bot._snap_known_mirrored.clear()
     main_bot._snap_mirror_failures = 0
+    main_bot._snap_restore_failed = False
+    main_bot._snap_restore_attempts = 0
+    main_bot._snap_restore_settled = False
+    main_bot._snap_restore_loader = None
     yield
     main_bot._snap_shutdown = True
     main_bot._OPTION_SNAPSHOT_PENDING.clear()
@@ -1219,12 +1225,13 @@ def test_partial_tail_is_repaired_on_load(tmp_path):
     path = Path(tmp_path) / "quote_snapshots.jsonl"
     log = main_bot.QuoteSnapshotLog(path)
     first = log.append({"n": 1})
+    prefix = path.read_bytes()
     with path.open("ab") as handle:
         handle.write(b'{"seq": 2, "partial"')
     reloaded = main_bot.QuoteSnapshotLog(path)
     assert reloaded._seq == 1
     assert reloaded._prev_hash == first["hash"]
-    assert b"partial" not in path.read_bytes()
+    assert path.read_bytes() == prefix
     second = reloaded.append({"n": 2})
     ok, count, err = reloaded.verify()
     assert ok, err
@@ -1255,6 +1262,7 @@ def test_side_log_mirrors_and_restores_after_a_wipe(tmp_path, caplog):
         assert [row[0] for row in rows] == [1, 2]
         assert main_bot.quote_snapshot_log_status() == {
             "on_disk": 2, "durable": 2, "mirror_failures": 0,
+            "restore_failed": False, "restore_attempts": 0,
         }
         path.unlink()
         restored = main_bot.restore_quote_snapshot_lines(path, [row[2] for row in rows])
@@ -1282,4 +1290,172 @@ def test_side_log_mirrors_and_restores_after_a_wipe(tmp_path, caplog):
     mirror_src = __import__("inspect").getsource(main_bot._quote_snapshot_mirror)
     assert "bot_quote_snapshots" in mirror_src
     assert "bot_ledger" not in mirror_src
+
+
+def test_backfill_mirrors_a_row_the_live_mirror_missed(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="etrade-bot")
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    saved = main_bot._snap_log
+    store = {}
+    fail = {"left": 1}
+
+    async def mirror(seq, digest, line):
+        if fail["left"]:
+            fail["left"] -= 1
+            raise RuntimeError("mirror once SECRETTOKEN99")
+        store[seq] = line
+
+    main_bot.init_quote_snapshot_log(path)
+    main_bot.set_quote_snapshot_mirror(mirror)
+    try:
+        async def write_two():
+            await main_bot.submit_quote_snapshot({"n": 1})
+            await main_bot.submit_quote_snapshot({"n": 2})
+
+        _run(write_two())
+        assert sorted(store) == [2]
+        assert main_bot.quote_snapshot_log_status()["on_disk"] == 2
+        pushed = _run(main_bot.backfill_quote_snapshots())
+        assert pushed == 2
+        assert sorted(store) == [1, 2]
+        path.unlink()
+        restored = main_bot.restore_quote_snapshot_lines(
+            path, [store[seq] for seq in sorted(store)],
+        )
+        assert restored == 2
+        main_bot.init_quote_snapshot_log(path)
+        ok, count, err = main_bot._snap_log.verify()
+    finally:
+        main_bot.set_quote_snapshot_mirror(None)
+        main_bot._snap_log = saved
+    assert ok, err
+    assert count == 2
+    assert "SECRETTOKEN99" not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+def test_restore_after_a_down_database_keeps_one_chain(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="etrade-bot")
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    saved = main_bot._snap_log
+    prior = main_bot.QuoteSnapshotLog(path)
+    prior.append({"n": "old"})
+    prior.append({"n": "older"})
+    db_lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    path.unlink()
+    db = {"up": False, "lines": db_lines}
+
+    async def loader():
+        if not db["up"]:
+            raise ConnectionError("db down SECRETTOKEN99")
+        return list(db["lines"])
+
+    main_bot._snap_restore_loader = loader
+    main_bot.init_quote_snapshot_log(path)
+    try:
+        assert _run(main_bot.restore_quote_snapshots_once(path)) is False
+        assert main_bot.quote_snapshot_log_status()["restore_failed"] is True
+        assert main_bot.quote_snapshot_log_status()["restore_attempts"] >= 1
+
+        async def write_new():
+            await main_bot.submit_quote_snapshot({"n": "new"})
+            await main_bot.submit_quote_snapshot({"n": "newer"})
+
+        _run(write_new())
+        mid = main_bot.quote_snapshot_log_status()
+        assert mid["restore_failed"] is True
+        assert mid["on_disk"] == 2
+        db["up"] = True
+        assert _run(main_bot.restore_quote_snapshots_once(path)) is True
+        ok, count, err = main_bot._snap_log.verify()
+        rows = [
+            json.loads(line)["data"]["n"]
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    finally:
+        main_bot._snap_restore_loader = None
+        main_bot._snap_log = saved
+    assert ok, err
+    assert count == 4
+    assert rows == ["old", "older", "new", "newer"]
+    assert "SECRETTOKEN99" not in caplog.text
+    assert "ConnectionError" in caplog.text
+    assert main_bot.quote_snapshot_log_status()["restore_failed"] is False
+
+
+def test_mirror_write_timeout_is_a_counted_failure(tmp_path):
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    saved = main_bot._snap_log
+    main_bot._SNAPSHOT_MIRROR_TIMEOUT_S = 0.2
+
+    async def slow(seq, digest, line):
+        await asyncio.sleep(2)
+
+    main_bot.init_quote_snapshot_log(path)
+    main_bot.set_quote_snapshot_mirror(slow)
+    try:
+        async def once():
+            started = time.monotonic()
+            seq = await main_bot.submit_quote_snapshot({"n": 1})
+            return seq, time.monotonic() - started
+
+        seq, elapsed = _run(once())
+        status = main_bot.quote_snapshot_log_status()
+    finally:
+        main_bot._SNAPSHOT_MIRROR_TIMEOUT_S = 2.0
+        main_bot.set_quote_snapshot_mirror(None)
+        main_bot._snap_log = saved
+    assert seq == 1
+    assert elapsed < 1.0
+    assert status["mirror_failures"] == 1
+    assert status["on_disk"] == 1
+
+
+def test_flush_does_not_wait_when_the_writer_is_dead(tmp_path):
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    saved = main_bot._snap_log
+    main_bot.init_quote_snapshot_log(path)
+    try:
+        async def scenario():
+            await main_bot.submit_quote_snapshot({"n": 0})
+            task = main_bot._snap_task
+            task.remove_done_callback(main_bot._on_snap_writer_done)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            fut = asyncio.get_running_loop().create_future()
+            main_bot._snap_q.put_nowait(({"n": 9}, fut))
+            started = time.monotonic()
+            await main_bot.flush_quote_snapshot_writer(2.0)
+            return time.monotonic() - started
+
+        elapsed = _run(scenario())
+    finally:
+        main_bot._snap_log = saved
+    assert elapsed < 0.4
+
+
+def test_quote_snapshot_table_init_is_isolated(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="etrade-bot")
+
+    class _Conn:
+        async def execute(self, *_args, **_kwargs):
+            raise RuntimeError("create failed SECRETTOKEN99")
+
+    class _Begin:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class _Engine:
+        def begin(self):
+            return _Begin()
+
+    monkeypatch.setattr(main_bot, "engine", _Engine())
+    assert _run(main_bot._ensure_quote_snapshot_table()) is False
+    assert "SECRETTOKEN99" not in caplog.text
+    assert "RuntimeError" in caplog.text
 
