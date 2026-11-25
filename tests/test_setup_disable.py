@@ -1745,7 +1745,7 @@ def test_shadow_backfill_does_not_stall_the_event_loop(tmp_path, monkeypatch):
         await main_bot.prepare_setup_disable_shadow(path)
         startup = asyncio.get_running_loop().time() - started
         log = main_bot._shadow_log
-        append_task = asyncio.create_task(asyncio.to_thread(log.append, {"signal_id": "lag"}))
+        append_task = asyncio.create_task(main_bot._shadow_io(log.append, {"signal_id": "lag"}))
         lags = []
         for _ in range(8):
             mark = asyncio.get_running_loop().time()
@@ -1764,3 +1764,126 @@ def test_shadow_backfill_does_not_stall_the_event_loop(tmp_path, monkeypatch):
         main_bot.reset_setup_disable_state()
     assert startup < 1.0
     assert lag < 0.05
+
+
+def test_append_during_restore_stays_on_one_chain(tmp_path, monkeypatch):
+    """A row accepted while restore is held must link onto that chain, not a second genesis."""
+    main_bot.reset_setup_disable_state()
+    main_bot._shadow_mirrored_hashes.clear()
+    monkeypatch.setattr(main_bot, "_shadow_restore_delays", (0.0, 0.0, 0.0))
+    path = tmp_path / "setup_disable_shadow.jsonl"
+    core_path = tmp_path / "core.jsonl"
+    saved_state = main_bot.state
+    saved_ledger = main_bot.trade_ledger._ledger
+    main_bot.state = main_bot.StateStore(None)
+    main_bot.trade_ledger.init(core_path)
+    durable = []
+
+    async def mirror(seq, rec_hash, line):
+        durable.append(line)
+
+    main_bot.set_shadow_mirror(mirror)
+    payload = {"ticker": "FAKE", "setup": "breakdown", "action": "BUY", "signal_id": "race"}
+
+    async def open_once():
+        reserved = main_bot._reserve_setup_disable_attempt(payload)
+        await main_bot._record_open(
+            "FAKE", 1, 10.0, 9.0, 12.0, None, "BUY", "breakdown",
+            signal_id="race", instrument="equity", signal_key=reserved[1],
+        )
+        await main_bot.persist_setup_disable_decision(
+            payload, quantity=1, enforced=False, quantity_basis="after_sizing",
+            path="entry", fresh_order=True, reserved=reserved,
+            outcome={"order_id": reserved[1], "placement_status": "placed"},
+        )
+        return reserved[1]
+
+    async def scenario():
+        _open_shadow(tmp_path)
+        first = await open_once()
+        second = await open_once()
+        path.unlink()
+        hold = asyncio.Event()
+        started = asyncio.Event()
+
+        async def loader():
+            started.set()
+            await hold.wait()
+            return list(durable)
+
+        main_bot._shadow_line_loader = loader
+        prepare_task = asyncio.create_task(main_bot.prepare_setup_disable_shadow(path))
+        await started.wait()
+        third_task = asyncio.create_task(open_once())
+        for _ in range(50):
+            if main_bot._shadow_inflight:
+                break
+            await asyncio.sleep(0.01)
+        assert not path.exists()
+        held = list(durable)
+        hold.set()
+        third = await third_task
+        await prepare_task
+        rows = await main_bot.read_setup_disable_shadow_async(10)
+        chains = {}
+        for row in rows:
+            chains.setdefault(row.get("chain_id"), []).append(row)
+        core_keys = [
+            row["data"].get("signal_key")
+            for row in main_bot.trade_ledger.recent(10)
+            if row.get("event") == "position_opened"
+        ]
+        path.unlink()
+        restored = main_bot.restore_shadow_lines(path, _unique_lines(durable))
+        main_bot.init_setup_disable_shadow_log(path)
+        side_ok = main_bot._shadow_log.verify()
+        core_ok = main_bot.trade_ledger.verify()
+        await _cancel_shadow_tasks()
+        return first, second, third, held, rows, chains, core_keys, restored, side_ok, core_ok
+
+    try:
+        first, second, third, held, rows, chains, core_keys, restored, side_ok, core_ok = asyncio.run(scenario())
+    finally:
+        main_bot._shadow_accepting = False
+        main_bot._shadow_line_loader = None
+        main_bot.set_shadow_mirror(None)
+        main_bot.state = saved_state
+        main_bot.trade_ledger._ledger = saved_ledger
+        main_bot.reset_setup_disable_state()
+    assert len(held) == 2
+    assert len(chains) == 1
+    chain_rows = next(iter(chains.values()))
+    assert sum(1 for row in chain_rows if row.get("restart") is True) == 1
+    assert [row["seq"] for row in chain_rows] == [1, 2, 3]
+    assert chain_rows[2]["prev_hash"] == chain_rows[1]["hash"]
+    assert {first, second, third} == set(core_keys)
+    assert len(core_keys) == len(set(core_keys)) == 3
+    assert main_bot._shadow_boot_nonce in third
+    assert restored == 3
+    assert side_ok[0] is True, side_ok
+    assert core_ok[0] is True, core_ok
+    assert side_ok[1] == 3
+
+
+def test_order_call_is_not_blocked_by_shadow_io():
+    """Side-log workers are not the pool an order call uses."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    def busy():
+        time.sleep(1.0)
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=2, thread_name_prefix="order-pool"))
+        filling = [asyncio.create_task(main_bot._shadow_io(busy)) for _ in range(2)]
+        await asyncio.sleep(0.05)
+        started = time.perf_counter()
+        placed = await main_bot._etrade_call(lambda: "placed", source="place_order", idempotent=False)
+        elapsed = time.perf_counter() - started
+        await asyncio.gather(*filling)
+        return placed, elapsed
+
+    placed, elapsed = asyncio.run(run())
+    assert placed == "placed"
+    assert elapsed < 0.3
