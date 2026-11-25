@@ -16876,6 +16876,9 @@ _shadow_mirrored_hashes: set = set()
 _shadow_backfill_task: Optional[asyncio.Task] = None
 _shadow_restore_task: Optional[asyncio.Task] = None
 _shadow_relink_task: Optional[asyncio.Task] = None
+_shadow_boot_task: Optional[asyncio.Task] = None
+_shadow_table_task: Optional[asyncio.Task] = None
+_shadow_count_task: Optional[asyncio.Task] = None
 # Side-log file work stays off the pool _etrade_call and trade_ledger.record share.
 _shadow_io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="shadow-io")
 _shadow_chain_lock = threading.Lock()
@@ -16885,6 +16888,7 @@ _shadow_restore_depth = 0
 _shadow_parked: List[Tuple[Dict[str, Any], Optional[asyncio.Future]]] = []
 _SHADOW_DB_TIMEOUT_S = 5.0
 _SHADOW_RESTORE_RETRY_S = 5.0
+_SHADOW_POOL_SHUTDOWN_S = 1.0
 _SHADOW_BACKFILL_INTERVAL_S = 60.0
 _shadow_ledger_counts: Dict[str, int] = {
     "written": 0, "dropped": 0, "on_disk": 0, "durable": 0, "mirror_failed": 0,
@@ -17473,6 +17477,7 @@ class SetupDisableShadowLog:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self._lock = threading.Lock()
+        self.chain_anchors: Dict[str, Dict[str, Any]] = {}
         self.partial_truncated = self._repair_partial_tail()
         self._seq, self._prev_hash, self.chain_id = self._load_tail()
 
@@ -17509,24 +17514,36 @@ class SetupDisableShadowLog:
         return removed
 
     def _load_tail(self) -> Tuple[int, str]:
+        self.chain_anchors = {}
         try:
             if not self.path.exists():
                 return 0, "0" * 64, uuid.uuid4().hex[:12]
-            last = ""
+            anchors: Dict[str, Dict[str, Any]] = {}
+            last_rec: Optional[Dict[str, Any]] = None
             with open(self.path, "r", encoding="utf-8") as handle:
                 for line in handle:
-                    if line.strip():
-                        try:
-                            json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        last = line
-            if not last:
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    last_rec = rec
+                    cid = str(rec.get("chain_id") or "")
+                    slot = anchors.setdefault(cid, {"rows": 0, "tail": ""})
+                    slot["rows"] = int(slot["rows"]) + 1
+                    slot["tail"] = str(rec.get("hash") or "")
+            self.chain_anchors = anchors
+            if not last_rec:
                 return 0, "0" * 64, uuid.uuid4().hex[:12]
-            rec = json.loads(last)
-            chain = str(rec.get("chain_id") or "") or uuid.uuid4().hex[:12]
-            return int(rec.get("seq") or 0), str(rec.get("hash") or ("0" * 64)), chain
+            # A file written before chain_id existed stays one legacy chain.
+            return (
+                int(last_rec.get("seq") or 0),
+                str(last_rec.get("hash") or ("0" * 64)),
+                str(last_rec.get("chain_id") or ""),
+            )
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            self.chain_anchors = {}
             return 0, "0" * 64, uuid.uuid4().hex[:12]
 
     def _reload_tail(self) -> None:
@@ -17569,10 +17586,23 @@ class SetupDisableShadowLog:
                 # write() returned, so the line is on disk. fsync can fail
                 # without dropping the row. The head now matches the file.
             _shadow_ledger_counts["on_disk"] = self._seq
+            cid = str(self.chain_id or "")
+            anchors = dict(self.chain_anchors or {})
+            slot = dict(anchors.get(cid) or {"rows": 0, "tail": ""})
+            slot["rows"] = int(slot.get("rows") or 0) + 1
+            slot["tail"] = rec["hash"]
+            anchors[cid] = slot
+            self.chain_anchors = anchors
             return rec
 
     def verify(self) -> Tuple[bool, int, Optional[str]]:
-        """Check each chain_id on its own. A genesis row must be marked restart."""
+        """Check each chain_id on its own.
+
+        Rows with no chain_id are one legacy chain, and that chain's first row
+        may omit restart. Every later genesis row, and every genesis row that
+        carries a chain_id, must set restart. A missing marker means the tail
+        of a segment was deleted.
+        """
         genesis = "0" * 64
         try:
             if not self.path.exists():
@@ -17588,11 +17618,12 @@ class SetupDisableShadowLog:
             for chain_id in sorted(groups):
                 prev = genesis
                 rows = sorted(groups[chain_id], key=lambda rec: int(rec.get("seq") or 0))
-                for rec in rows:
+                legacy = chain_id == ""
+                for index, rec in enumerate(rows):
                     claimed = str(rec.pop("hash", ""))
                     prev_link = str(rec.get("prev_hash"))
                     if prev_link == genesis:
-                        if rec.get("restart") is not True:
+                        if rec.get("restart") is not True and not (legacy and index == 0):
                             return False, checked, (
                                 f"chain {chain_id or 'legacy'} seq {rec.get('seq')}: restart missing"
                             )
@@ -17625,12 +17656,22 @@ class SetupDisableShadowLog:
         return out
 
 
+def _install_shadow_log(log: "SetupDisableShadowLog") -> None:
+    global _shadow_log
+    _shadow_log = log
+    _shadow_ledger_counts["on_disk"] = int(log._seq)
+    _shadow_ledger_counts["partial_truncated"] = int(log.partial_truncated)
+
+
 def init_setup_disable_shadow_log(path: Path) -> None:
     """Point the side log at `path`. Does not touch the trade ledger."""
-    global _shadow_log
-    _shadow_log = SetupDisableShadowLog(Path(path))
-    _shadow_ledger_counts["on_disk"] = int(_shadow_log._seq)
-    _shadow_ledger_counts["partial_truncated"] = int(_shadow_log.partial_truncated)
+    _install_shadow_log(SetupDisableShadowLog(Path(path)))
+
+
+async def init_setup_disable_shadow_log_async(path: Path) -> None:
+    """Open the side log on the side-log pool. A large file must not stall the loop."""
+    log = await _shadow_io(SetupDisableShadowLog, Path(path))
+    _install_shadow_log(log)
 
 
 def set_shadow_mirror(fn: Optional[Any]) -> None:
@@ -18012,7 +18053,7 @@ async def _shadow_restore_retry(path: Path) -> None:
                 delay = min(delay * 2.0, 60.0)
                 continue
             _shadow_restore_failed = False
-            init_setup_disable_shadow_log(path)
+            await init_setup_disable_shadow_log_async(path)
             await _reseed_shadow_attempts()
             _start_shadow_backfill_now()
             return
@@ -18031,41 +18072,71 @@ def _start_shadow_restore_retry(path: Path) -> None:
     _shadow_restore_task = loop.create_task(_shadow_restore_retry(path), name="setup-disable-shadow-restore")
 
 
-async def prepare_setup_disable_shadow(path: Path) -> None:
-    """Restore, backfill, then leave seeding to the caller.
-
-    Three tries span about five seconds. They do not run on the order path.
-    A failure stays visible and keeps retrying. Keys minted while degraded
-    carry this boot's nonce.
-    """
+async def _prepare_shadow_body(path: Path) -> None:
+    """Restore and seed. The caller holds the restore gate."""
     global _shadow_restore_failed, _shadow_restore_attempts, _shadow_nonce_for_boot
     ok = False
-    _shadow_restore_begin()
-    try:
-        for delay in _shadow_restore_delays:
-            if delay:
-                await asyncio.sleep(delay)
-            _shadow_restore_attempts += 1
-            try:
-                await _restore_shadow_once(path)
-                ok = True
-                break
-            except Exception as exc:
-                _log_setup_disable_observer_error(exc)
-        _shadow_restore_failed = not ok
-        if not ok:
-            _shadow_nonce_for_boot = True
-        init_setup_disable_shadow_log(path)
-        if ok:
-            await _reseed_shadow_attempts()
-    finally:
-        _shadow_restore_end()
+    for delay in _shadow_restore_delays:
+        if delay:
+            await asyncio.sleep(delay)
+        _shadow_restore_attempts += 1
+        try:
+            await _restore_shadow_once(path)
+            ok = True
+            break
+        except Exception as exc:
+            _log_setup_disable_observer_error(exc)
+    _shadow_restore_failed = not ok
+    if not ok:
+        _shadow_nonce_for_boot = True
+    await init_setup_disable_shadow_log_async(path)
+    if ok:
+        await _reseed_shadow_attempts()
+    else:
+        await _shadow_io(seed_setup_disable_from_ledger)
     if engine is not None and _shadow_mirror is None:
         set_shadow_mirror(_shadow_postgres_mirror)
     if _shadow_restore_failed:
         _start_shadow_restore_retry(path)
     _start_shadow_backfill_now()
     _start_shadow_backfill_loop()
+
+
+async def prepare_setup_disable_shadow(path: Path) -> None:
+    """Restore, backfill, then leave seeding to the caller.
+
+    Three tries span about five seconds. They do not run on the order path.
+    A failure stays visible and keeps retrying. Keys minted while degraded
+    carry this boot's nonce. Startup uses start_setup_disable_shadow so a
+    hung database does not hold the process open.
+    """
+    _shadow_restore_begin()
+    try:
+        await _prepare_shadow_body(path)
+    finally:
+        _shadow_restore_end()
+
+
+def start_setup_disable_shadow(path: Path) -> None:
+    """Schedule restore, the shadow schema is separate. Returns immediately."""
+    global _shadow_boot_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _shadow_boot_task is not None and not _shadow_boot_task.done():
+        return
+    _shadow_restore_begin()
+    _shadow_boot_task = loop.create_task(_shadow_boot(path), name="setup-disable-shadow-boot")
+
+
+async def _shadow_boot(path: Path) -> None:
+    try:
+        await _prepare_shadow_body(path)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+    finally:
+        _shadow_restore_end()
 
 
 def read_setup_disable_shadow(count: int = 100) -> List[Dict[str, Any]]:
@@ -18325,7 +18396,9 @@ def setup_disable_status() -> Dict[str, Any]:
 
     Counts live in memory. Startup seeds them once from the ledger tail.
     A status poll does not re-read the ledger. Each setup in the list is
-    reported on its own, including a zero.
+    reported on its own, including a zero. ``chain_anchors`` is the per-chain
+    row count and tail hash from the last open or append, so a truncated tail
+    is visible without scanning the file again.
     """
     parsed = resolved_setup_disable_list()
     by_setup = _setup_disable_counts.get("by_setup") or {}
@@ -18359,6 +18432,14 @@ def setup_disable_status() -> Dict[str, Any]:
             "partial_truncated": int(_shadow_ledger_counts.get("partial_truncated") or 0),
             "restore_failed": bool(_shadow_restore_failed),
             "restore_attempts": int(_shadow_restore_attempts),
+            # In memory from the last load or append. A poll does not rescan the file.
+            # A truncated tail shows up as a lower rows count and an older tail hash.
+            "chain_anchors": {
+                str(chain_id): {"rows": int(slot.get("rows") or 0), "tail": str(slot.get("tail") or "")}
+                for chain_id, slot in (
+                    getattr(_shadow_log, "chain_anchors", {}) or {}
+                ).items()
+            },
         },
         "read_only": True,
         "env_read": "each_entry",
@@ -25130,6 +25211,62 @@ _state_persistence: Optional[PgStatePersistence] = None
 _study_views: Optional[Dict[str, Any]] = None
 
 
+def _schedule_shadow_schema() -> None:
+    """Create the side-log table in the background. A failure cannot change core init."""
+    global _shadow_table_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _shadow_table_task is not None and not _shadow_table_task.done():
+        return
+    _shadow_table_task = loop.create_task(_ensure_shadow_schema(), name="setup-disable-shadow-schema")
+
+
+async def _ensure_shadow_schema() -> None:
+    if engine is None:
+        return
+    try:
+        async def _create() -> None:
+            async with engine.begin() as conn:
+                await conn.execute(sql_text(_shadow_ledger_table_sql()))
+                await conn.execute(sql_text(
+                    f"ALTER TABLE {_bt('bot_shadow_ledger')} ADD COLUMN IF NOT EXISTS chain_id TEXT"
+                ))
+
+        await asyncio.wait_for(_create(), timeout=_SHADOW_DB_TIMEOUT_S)
+    except Exception as shadow_err:
+        logger.error("shadow ledger table init failed (%s)", type(shadow_err).__name__)
+
+
+def _schedule_shadow_count() -> None:
+    """Count side-log rows in the background. The core mirror count is untouched."""
+    global _shadow_count_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _shadow_count_task is not None and not _shadow_count_task.done():
+        return
+    _shadow_count_task = loop.create_task(_count_shadow_ledger(), name="setup-disable-shadow-count")
+
+
+async def _count_shadow_ledger() -> None:
+    if engine is None:
+        return
+    try:
+        async def _query() -> int:
+            async with engine.connect() as conn:
+                return int((await conn.execute(
+                    sql_text(f"SELECT COUNT(*) FROM {_bt('bot_shadow_ledger')}")
+                )).scalar() or 0)
+
+        counted = await asyncio.wait_for(_query(), timeout=_SHADOW_DB_TIMEOUT_S)
+        _shadow_ledger_counts["durable"] = max(int(_shadow_ledger_counts.get("durable") or 0), counted)
+    except Exception as exc:
+        logger.warning("shadow ledger count unavailable (%s)", type(exc).__name__)
+
+
 async def _init_durable_state() -> Optional[PgStatePersistence]:
     """Create the durable-state tables and return the adapter — None when the
     DB is unavailable (the store then falls back to plain memory, loudly)."""
@@ -25138,27 +25275,17 @@ async def _init_durable_state() -> Optional[PgStatePersistence]:
         logger.warning("durable state unavailable — no database engine")
         return None
     try:
-        async def _create_core() -> None:
-            async with engine.begin() as conn:
-                await conn.execute(sql_text(_state_table_sql()))
-                await conn.execute(sql_text(_ledger_table_sql()))
-
-        await asyncio.wait_for(_create_core(), timeout=_SHADOW_DB_TIMEOUT_S)
+        async with engine.begin() as conn:
+            await conn.execute(sql_text(_state_table_sql()))
+            await conn.execute(sql_text(_ledger_table_sql()))
+        _state_persistence = PgStatePersistence(engine)
         try:
-            async def _create_shadow() -> None:
-                async with engine.begin() as conn:
-                    await conn.execute(sql_text(_shadow_ledger_table_sql()))
-                    await conn.execute(sql_text(
-                        f"ALTER TABLE {_bt('bot_shadow_ledger')} ADD COLUMN IF NOT EXISTS chain_id TEXT"
-                    ))
-
-            await asyncio.wait_for(_create_shadow(), timeout=_SHADOW_DB_TIMEOUT_S)
+            _schedule_shadow_schema()
         except Exception as shadow_err:
             logger.error("shadow ledger table init failed (%s)", type(shadow_err).__name__)
-        _state_persistence = PgStatePersistence(engine)
         return _state_persistence
     except Exception as e:
-        logger.error("durable state init failed — falling back to plain memory (%s)", type(e).__name__)
+        logger.error(f"durable state init failed — falling back to plain memory: {e}")
         return None
 
 
@@ -25372,18 +25499,13 @@ async def _announce_ledger_memory() -> None:
         state_rows: Optional[int] = None
         if engine is not None:
             try:
-                async def _count_mirror() -> Tuple[int, int]:
-                    async with engine.connect() as conn:
-                        mirrored_n = int((await conn.execute(
-                            sql_text(f"SELECT COUNT(*) FROM {_bt('bot_ledger')}"))).scalar() or 0)
-                        state_n = int((await conn.execute(
-                            sql_text(f"SELECT COUNT(*) FROM {_bt('bot_state')}"))).scalar() or 0)
-                    return mirrored_n, state_n
-
-                mirrored, state_rows = await asyncio.wait_for(
-                    _count_mirror(), timeout=_SHADOW_DB_TIMEOUT_S)
+                async with engine.connect() as conn:
+                    mirrored = int((await conn.execute(
+                        sql_text(f"SELECT COUNT(*) FROM {_bt('bot_ledger')}"))).scalar() or 0)
+                    state_rows = int((await conn.execute(
+                        sql_text(f"SELECT COUNT(*) FROM {_bt('bot_state')}"))).scalar() or 0)
             except Exception as e:
-                logger.warning("ledger memory: mirror count unavailable (%s)", type(e).__name__)
+                logger.warning(f"ledger memory: mirror count unavailable ({e})")
         _, local_records, _ = trade_ledger.verify()
         verdict = plan_ledger_memory(
             db_configured=bool(DATABASE_URL),
@@ -25412,6 +25534,10 @@ async def _announce_ledger_memory() -> None:
             )
         else:
             logger.info(f"[ledger] {verdict['message']}")
+        try:
+            _schedule_shadow_count()
+        except Exception as exc:
+            logger.warning("shadow ledger count unavailable (%s)", type(exc).__name__)
     except Exception as e:
         logger.error(f"ledger memory check failed (non-fatal): {e}")
 
@@ -40630,8 +40756,7 @@ async def on_startup():
     ))
     if engine is not None:
         set_shadow_mirror(_shadow_postgres_mirror)
-    await prepare_setup_disable_shadow(shadow_path)
-    await _shadow_io(seed_setup_disable_from_ledger)
+    start_setup_disable_shadow(shadow_path)
     # Say out loud whether this process actually remembers anything. A ledger
     # that comes up empty is indistinguishable from a healthy one in the logs,
     # and it silently disarms the only mechanism that learns from past trades.
@@ -40747,14 +40872,53 @@ async def _announce_preflight() -> None:
         logger.warning(f"preflight report failed (non-fatal): {e}")
 
 
+async def _cancel_shadow_maintenance() -> None:
+    """Stop restore, backfill, schema, and count tasks. The flush has already run."""
+    pending = []
+    for task in (
+        _shadow_backfill_task,
+        _shadow_restore_task,
+        _shadow_relink_task,
+        _shadow_boot_task,
+        _shadow_table_task,
+        _shadow_count_task,
+    ):
+        if task is not None and not task.done():
+            task.cancel()
+            pending.append(task)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _shutdown_shadow_pool() -> None:
+    """Stop the side-log workers. A stuck fsync does not hold shutdown open."""
+    global _shadow_io_executor
+    executor = _shadow_io_executor
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(executor.shutdown, True, cancel_futures=True),
+            timeout=_SHADOW_POOL_SHUTDOWN_S,
+        )
+    except Exception as exc:
+        logger.warning("shadow pool shutdown failed (%s)", type(exc).__name__)
+    if _shadow_io_executor is executor:
+        _shadow_io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="shadow-io")
+
+
+async def _shutdown_shadow_side_log() -> None:
+    try:
+        await drain_shadow_queue()
+    except Exception as exc:
+        logger.warning("shadow queue drain failed (%s)", type(exc).__name__)
+    await _cancel_shadow_maintenance()
+    await _shutdown_shadow_pool()
+
+
 @app.on_event("shutdown")
 async def on_shutdown():
     global _worker_stop
     _worker_stop = True
-    try:
-        await drain_shadow_queue()
-    except Exception as e:
-        logger.warning(f"shadow queue drain failed: {e}")
+    await _shutdown_shadow_side_log()
     await _close_study_page_engine()
     await state.close()
 

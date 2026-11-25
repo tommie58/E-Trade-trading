@@ -1887,3 +1887,175 @@ def test_order_call_is_not_blocked_by_shadow_io():
     placed, elapsed = asyncio.run(run())
     assert placed == "placed"
     assert elapsed < 0.3
+
+
+def _shadow_line(seq, payload, prev="0" * 64, chain_id="", restart=None):
+    rec = {
+        "seq": seq,
+        "ts": "2026-11-30T16:00:00+00:00",
+        "event": "setup_disable_shadow",
+        "data": payload,
+        "prev_hash": prev,
+    }
+    if chain_id:
+        rec["chain_id"] = chain_id
+    if restart is True or (restart is None and prev == "0" * 64 and chain_id):
+        rec["restart"] = True
+    body = json.dumps(rec, sort_keys=True)
+    rec["hash"] = hashlib.sha256((prev + body).encode("utf-8")).hexdigest()
+    return json.dumps(rec, sort_keys=True), rec["hash"]
+
+
+def test_legacy_chain_without_restart_verifies(tmp_path):
+    first, prev = _shadow_line(1, {"signal_key": "OLD|breakdown|s|1"}, chain_id="")
+    second, _tail = _shadow_line(2, {"signal_key": "OLD|breakdown|s|2"}, prev=prev, chain_id="")
+    path = tmp_path / "legacy.jsonl"
+    path.write_text(first + "\n" + second + "\n", encoding="utf-8")
+    log = main_bot.SetupDisableShadowLog(path)
+    ok, checked, err = log.verify()
+    assert ok is True, err
+    assert checked == 2
+    broken, _h = _shadow_line(3, {"signal_key": "OLD|breakdown|s|3"}, chain_id="")
+    path.write_text(first + "\n" + second + "\n" + broken + "\n", encoding="utf-8")
+    reopened = main_bot.SetupDisableShadowLog(path)
+    bad, _checked, reason = reopened.verify()
+    assert bad is False
+    assert "restart missing" in reason
+
+
+def test_slow_core_connect_still_returns_postgres_state():
+    """A 6s first connect must not fall back to plain memory."""
+    import time
+
+    class _Result:
+        def scalar(self):
+            return 0
+
+    class _Conn:
+        async def execute(self, *args, **kwargs):
+            return _Result()
+
+        async def __aenter__(self):
+            await asyncio.sleep(6)
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _Engine:
+        def begin(self):
+            return _Conn()
+
+        def connect(self):
+            return _Conn()
+
+    saved_engine = main_bot.engine
+    saved_state = main_bot._state_persistence
+
+    async def run():
+        main_bot.engine = _Engine()
+        started = time.perf_counter()
+        result = await main_bot._init_durable_state()
+        elapsed = time.perf_counter() - started
+        task = main_bot._shadow_table_task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return result, elapsed
+
+    try:
+        result, elapsed = asyncio.run(run())
+    finally:
+        main_bot.engine = saved_engine
+        main_bot._state_persistence = saved_state
+        main_bot._shadow_table_task = None
+    assert isinstance(result, main_bot.PgStatePersistence)
+    assert elapsed > 5.5
+    assert elapsed < 8
+
+
+def test_shadow_boot_does_not_block_startup(tmp_path, monkeypatch):
+    main_bot.reset_setup_disable_state()
+    monkeypatch.setattr(main_bot, "_shadow_restore_delays", (0.0, 0.0, 0.0))
+    path = tmp_path / "setup_disable_shadow.jsonl"
+
+    async def hung():
+        await asyncio.Event().wait()
+
+    main_bot._shadow_line_loader = hung
+
+    async def run():
+        started = asyncio.get_running_loop().time()
+        main_bot.start_setup_disable_shadow(path)
+        elapsed = asyncio.get_running_loop().time() - started
+        await asyncio.sleep(0.05)
+        pending = main_bot._shadow_restore_pending()
+        await _cancel_shadow_tasks()
+        return elapsed, pending
+
+    try:
+        elapsed, pending = asyncio.run(run())
+    finally:
+        main_bot._shadow_line_loader = None
+        main_bot._shadow_boot_task = None
+        main_bot.reset_setup_disable_state()
+    assert elapsed < 0.5
+    assert pending is True
+
+
+def test_shadow_log_opens_off_the_loop(tmp_path):
+    import threading
+    seen = []
+    real = main_bot.SetupDisableShadowLog
+
+    def spy(path):
+        seen.append(threading.current_thread().name)
+        return real(path)
+
+    async def run():
+        main_bot.SetupDisableShadowLog = spy
+        try:
+            await main_bot.init_setup_disable_shadow_log_async(tmp_path / "setup_disable_shadow.jsonl")
+        finally:
+            main_bot.SetupDisableShadowLog = real
+
+    asyncio.run(run())
+    assert seen and seen[0].startswith("shadow-io")
+
+
+def test_status_chain_anchor_tracks_the_loaded_tail(tmp_path):
+    main_bot.reset_setup_disable_state()
+    _open_shadow(tmp_path)
+    main_bot._shadow_log.append({"signal_id": "anchor"})
+    status = main_bot.setup_disable_status()["ledger"]["chain_anchors"]
+    assert status
+    slot = next(iter(status.values()))
+    assert slot["rows"] == 1
+    assert slot["tail"] == main_bot._shadow_log._prev_hash
+    main_bot.reset_setup_disable_state()
+
+
+def test_shadow_drain_log_uses_the_exception_type(monkeypatch, caplog):
+    import logging
+
+    async def boom():
+        raise RuntimeError("https://db.example/secret")
+
+    async def hang():
+        await asyncio.Event().wait()
+
+    async def run():
+        main_bot._shadow_boot_task = asyncio.create_task(hang())
+        monkeypatch.setattr(main_bot, "drain_shadow_queue", boom)
+        with caplog.at_level(logging.WARNING, logger="etrade-bot"):
+            await main_bot._shutdown_shadow_side_log()
+        return main_bot._shadow_boot_task.done()
+
+    try:
+        done = asyncio.run(run())
+    finally:
+        main_bot._shadow_boot_task = None
+        main_bot.reset_setup_disable_state()
+    assert done is True
+    assert "RuntimeError" in caplog.text
+    assert "https://" not in caplog.text
