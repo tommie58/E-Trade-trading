@@ -295,8 +295,8 @@ def test_session_sampled_vwap_drops_prior_day_and_gate_does_not_keep_full_series
     now = datetime(2026, 11, 24, 10, 40, tzinfo=ET)
     full = main_bot.scanner_mod.sampled_vwap(series)
     today = main_bot.scanner_mod.sampled_vwap(main_bot.scanner_mod.session_series(series, now))
-    assert full == pytest.approx(138.5714)
-    assert today == pytest.approx(210.0)
+    assert full == pytest.approx(133.5714)
+    assert today == pytest.approx(205.0)
     assert full != pytest.approx(today)
 
     class Scan:

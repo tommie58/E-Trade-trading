@@ -177,6 +177,89 @@ def test_restart_drops_reservations_and_keeps_open_risk(heat_store):
     assert admitted["heat_pct"] == pytest.approx(6.0)
 
 
+def test_app_and_scanner_entries_cannot_both_pass_the_cap(heat_store):
+    """A scanner reservation counts in the app open-risk gate, and the reverse."""
+
+    def _call(ticker: str) -> dict:
+        payload = _put(ticker)
+        payload["option_right"] = "CALL"
+        payload["signal_id"] = f"app:{ticker}"
+        return payload
+
+    async def scenario():
+        scanner, app = await asyncio.gather(
+            main_bot.admit_heat_reservation(
+                _put("TSLA"), 600.0, 10_000.0, regime="stressed",
+            ),
+            main_bot.admit_heat_reservation(
+                _call("AAPL"), 600.0, 10_000.0,
+                enforce_correlation=False, heat_cap_pct=10.0,
+            ),
+        )
+        return scanner, app
+
+    scanner, app = _run(scenario())
+    admitted = [row for row in (scanner, app) if row["reserved"]]
+    refused = [row for row in (scanner, app) if not row["allowed"]]
+    assert len(admitted) == 1
+    assert len(refused) == 1
+    assert any("portfolio heat" in reason or "open risk" in reason for reason in refused[0]["reasons"])
+    reasons = main_bot.assess_app_risk_gates(
+        0, 0.0, 20.0, 0.0, 600.0, 10_000.0, 5, 10.0, reserved_risk_usd=600.0,
+    )
+    assert any("open risk" in reason for reason in reasons)
+    clear = main_bot.assess_app_risk_gates(
+        0, 0.0, 20.0, 0.0, 600.0, 10_000.0, 5, 10.0, reserved_risk_usd=0.0,
+    )
+    assert clear == []
+
+
+def test_settle_does_not_wait_when_the_reservation_lock_is_held(heat_store, caplog):
+    caplog.set_level("INFO", logger="etrade-bot")
+
+    async def held():
+        lock = heat_store.lock("heat-reservation", ttl_ms=8_000, wait_timeout=0.0)
+        await lock.acquire()
+        try:
+            started = time.monotonic()
+            # A different task, so the lock is not re-entered.
+            await asyncio.create_task(main_bot.settle_heat_after_stop_armed("TSLA"))
+            return time.monotonic() - started
+        finally:
+            await lock.release()
+
+    elapsed = _run(held())
+    assert elapsed < 0.3
+    text = caplog.text
+    assert "protective stop is armed" in text
+    assert "does not wait" in text
+
+
+def test_slow_position_read_cannot_expire_the_lock_and_double_book(heat_store, monkeypatch):
+    sleeps = {"n": 0}
+
+    async def slow_positions():
+        sleeps["n"] += 1
+        await asyncio.sleep(0.15)
+        return {}
+
+    monkeypatch.setattr(heat_store, "all_positions", slow_positions)
+    monkeypatch.setattr(main_bot, "HEAT_RESERVATION_LOCK_TTL_MS", 40)
+
+    async def scenario():
+        results = await asyncio.gather(*[
+            main_bot.admit_heat_reservation(_put(ticker), 600.0, 10_000.0, regime="stressed")
+            for ticker in ("TSLA", "AAPL")
+        ])
+        raw = await heat_store.get(main_bot.HEAT_RESERVATIONS_KEY)
+        return results, json.loads(raw)
+
+    results, rows = _run(scenario())
+    assert sleeps["n"] == 2
+    assert sum(1 for row in results if row["reserved"]) == 1
+    assert len(rows) == 1
+
+
 def test_flag_off_does_not_reserve(heat_store, monkeypatch):
     monkeypatch.setenv("HEAT_RESERVATION_ENABLED", "false")
 

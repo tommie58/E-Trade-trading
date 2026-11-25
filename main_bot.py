@@ -10140,33 +10140,56 @@ def _finite_number(raw: Any) -> Optional[float]:
     return value
 
 
+def _bracket_price(prev_price: Optional[float], price: float) -> Optional[float]:
+    """Price for the volume between two scanner samples.
+
+    The lone opening print has no bracket, so it does not price the volume
+    that follows it. Once a previous sample exists, the delta is the average
+    of the two sampled prices — not either endpoint alone.
+    """
+    if prev_price is None:
+        return None
+    weight = (float(prev_price) + float(price)) / 2.0
+    if not math.isfinite(weight) or weight <= 0:
+        return None
+    return weight
+
+
 def sampled_vwap(series: List[Dict[str, Any]]) -> Optional[float]:
-    """Volume-weighted average price built from the scanner's OWN samples,
-    weighting each observation by the volume traded since the previous one.
-    Returns None until at least two samples with a positive volume delta.
-    A NaN or infinite price never enters the average."""
+    """Volume-weighted average from the scanner's own samples.
+
+    Each volume delta is weighted by the average of the bracketing sample
+    prices. The first print only anchors volume and price. A NaN or
+    infinite price never enters the average. Massive is not an input.
+    """
     num = 0.0
     den = 0.0
     prev_vol: Optional[float] = None
+    prev_price: Optional[float] = None
     for sample in series:
         price = _finite_number(sample.get("last"))
         vol = sample.get("total_volume")
         if price is None:
             if sample.get("last") is not None:
                 prev_vol = None
+                prev_price = None
             continue
         if vol is None:
             prev_vol = None
+            prev_price = None
             continue
         vol_f = _finite_number(vol)
         if vol_f is None:
             prev_vol = None
+            prev_price = None
             continue
-        if prev_vol is not None and vol_f > prev_vol:
+        weight = _bracket_price(prev_price, price)
+        if prev_vol is not None and vol_f > prev_vol and weight is not None:
             delta = vol_f - prev_vol
-            num += price * delta
+            num += weight * delta
             den += delta
         prev_vol = vol_f
+        prev_price = price
     if den <= 0:
         return None
     vwap = num / den
@@ -10468,6 +10491,7 @@ def _acc_from_fields(fields: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "high": num("high"),
         "low": num("low"),
         "first_price": num("first_price"),
+        "last_price": num("last_price"),
     }
 
 
@@ -10481,7 +10505,7 @@ def _acc_to_fields(acc: Dict[str, Any]) -> Dict[str, str]:
     }
     if acc.get("first_ts"):
         out["first_ts"] = str(acc["first_ts"])
-    for name in ("high", "low", "first_price"):
+    for name in ("high", "low", "first_price", "last_price"):
         if acc.get(name) is not None:
             out[name] = repr(float(acc[name]))
     return out
@@ -10575,11 +10599,13 @@ def fold_session_sample(
     """Fold one regular-session sample. None when it is not today's RTH print.
 
     The stamp is converted to America/New_York before the 9:30/close test.
-    The delta matches ``sampled_vwap``: price times the volume added since the
-    previous counted sample. ``count`` increments only when that delta is
-    positive. Pre-open, after ``session_close_minute`` (half-day aware), a
-    future stamp, and a NaN or infinite price are not counted. The caller
-    stores the result under the sample's ET date.
+    The delta matches ``sampled_vwap``: the average of the previous sample
+    price and this one, times the volume added since the previous sample.
+    The first print stores ``last_price`` and does not enter the average.
+    ``count`` increments only when that delta is positive. Pre-open, after
+    ``session_close_minute`` (half-day aware), a future stamp, and a NaN or
+    infinite price are not counted. The caller stores the result under the
+    sample's ET date.
     """
     if not isinstance(sample, dict):
         return None
@@ -10604,14 +10630,23 @@ def fold_session_sample(
     vol = _finite_number(sample.get("total_volume"))
     if vol is None or vol < 0:
         acc["last_volume"] = None
+        acc["last_price"] = None
     else:
         prev = acc["last_volume"]
-        if prev is not None and vol > prev:
+        prev_price = acc.get("last_price")
+        weight = _bracket_price(prev_price, price)
+        # A seed or an older hash has volume and no saved price. Price the
+        # new shares at this tick instead of dropping them or borrowing the
+        # open print.
+        if weight is None and prev is not None:
+            weight = price
+        if prev is not None and vol > prev and weight is not None:
             delta = vol - prev
-            acc["sum_pv"] = float(acc["sum_pv"]) + price * delta
+            acc["sum_pv"] = float(acc["sum_pv"]) + weight * delta
             acc["sum_v"] = float(acc["sum_v"]) + delta
             acc["count"] = int(acc["count"]) + 1
         acc["last_volume"] = vol
+        acc["last_price"] = price
     return acc
 
 
@@ -10764,36 +10799,23 @@ def plan_session_vwap_seed(
     now_et: Optional[datetime],
     *,
     max_age_s: float = 300.0,
-    replace: bool = False,
 ) -> Dict[str, Any]:
-    """Fold regular-session minute bars into the session hash.
+    """Fold regular-session minute bars into a hash that started late.
 
     Bars before 9:30 ET are left out, and so is the minute that is still
-    forming. Without ``replace``, bars already covered by ``first_ts`` are
-    left out, so a second call and a hash that already holds the tail do
-    not count those minutes again. ``replace`` is the other case: the hash
-    already has a 9:30 print, so the prefix seed would skip it, but that
-    print is a scanner snapshot rather than the minute-bar VWAP. The sums
-    are rebuilt from the completed regular-session bars. A hash already
-    within 1 bp of those bars is left alone. A stale or gapped set is not
-    applied. The returned fields keep ``last_volume`` when the live anchor
-    is at or after the last completed bar, so the next print adds only new
-    volume.
+    forming. Bars already covered by ``first_ts`` are left out, so a second
+    call and a hash that already holds the tail do not count those minutes
+    again. A stale or gapped set is not applied. The returned fields keep
+    ``last_volume`` so the next live print adds only the volume since that
+    anchor. This does not replace a hash that already sampled the open.
+    The open sample is the scanner's own prices; Massive stays the
+    cross-check, not the sample.
     """
     skipped = {
         "applied": False, "reason": "not_needed", "bars_used": 0,
         "vwap": None, "fields": None,
     }
-    if not isinstance(now_et, datetime):
-        return skipped
-    needs = session_vwap_needs_seed(fields, now_et)
-    # replace=True is only the already-at-the-open hash. An empty or late
-    # hash stays on the prefix seed so a tail already folded is not rebuilt
-    # on top of itself.
-    if replace:
-        if needs:
-            return skipped
-    elif not needs:
+    if not isinstance(now_et, datetime) or not session_vwap_needs_seed(fields, now_et):
         return skipped
     now = _as_et(now_et)
     open_m = _SESSION_OPEN_MIN
@@ -10842,18 +10864,11 @@ def plan_session_vwap_seed(
         skipped["reason"] = "stale"
         return skipped
 
-    prior = _acc_from_fields(fields)
-    if replace:
-        # Rebuild from the minute bars. Adding them onto the sparse sums
-        # would count the open twice.
-        acc = _acc_from_fields(None)
-        cutoff = None
-    else:
-        acc = prior
-        cutoff = None
-        first = _sample_clock({"ts": acc.get("first_ts")}) if acc.get("first_ts") else None
-        if first is not None and first.date() == now.date():
-            cutoff = first.hour * 60 + first.minute
+    acc = _acc_from_fields(fields)
+    cutoff: Optional[int] = None
+    first = _sample_clock({"ts": acc.get("first_ts")}) if acc.get("first_ts") else None
+    if first is not None and first.date() == now.date():
+        cutoff = first.hour * 60 + first.minute
     selected = [bar for bar in usable if cutoff is None or bar["minute"] < cutoff]
     if not selected or selected[0]["minute"] != open_m:
         skipped["reason"] = "incomplete"
@@ -10891,28 +10906,9 @@ def plan_session_vwap_seed(
     if vwap is None or not math.isfinite(vwap) or vwap <= 0:
         skipped["reason"] = "incomplete"
         return skipped
-    if replace:
-        old_v = None
-        if float(prior["sum_v"]) > 0:
-            old_v = float(prior["sum_pv"]) / float(prior["sum_v"])
-        if (
-            old_v is not None and old_v > 0 and math.isfinite(old_v)
-            and abs(vwap - old_v) / old_v * 10000.0 <= 1.0
-        ):
-            skipped["reason"] = "not_needed"
-            return skipped
-        last_bar = datetime.fromtimestamp(selected[-1]["epoch"], timezone.utc).astimezone(_VWAP_ET)
-        prior_last = _sample_clock({"ts": prior.get("last_ts")}) if prior.get("last_ts") else None
-        if (
-            prior_last is not None
-            and prior_last >= last_bar
-            and prior.get("last_volume") is not None
-        ):
-            acc["last_volume"] = prior["last_volume"]
-            acc["last_ts"] = prior["last_ts"]
     return {
         "applied": True,
-        "reason": "rebased" if replace else "seeded",
+        "reason": "seeded",
         "bars_used": len(selected),
         "vwap": round(vwap, 4),
         "fields": _acc_to_fields(acc),
@@ -15318,22 +15314,23 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # disposes its SQL pool on shutdown. An offset at the ledger cap returns
 # more=false and capped=true.
 # 5.99.5: heat is reserved when an entry is approved, under one lock, and
-# every later heat and correlation check counts that reservation. It is
-# released on fill (the position then holds the risk — no double count),
-# on cancel, reject, expiry, or timeout, and the unfilled remainder of a
-# partial is what stays reserved until that order is done. A bounded TTL
-# and a restart both drop reservations so a crashed order cannot block
-# the book. HEAT_RESERVATION_ENABLED defaults on. Setting it false is the
-# rollback: heat is judged at fill time again, which is the race that let
-# gross heat reach 10.844% against a 10% cap on 2026-11-25.
-# The SPY/QQQ session VWAP is rebased onto fresh Massive regular-session
-# minute bars even when a scanner print already covers the 9:30 minute.
-# That print used to make the seed skip (not_needed) and leave a sparse
-# sample ~42 bps under the RTH VWAP, so the CALL gate failed closed on
-# crosscheck_gap_bps. A stale or missing minute read still does not write,
-# and the gate stays fail-closed. GET /pro-trader/report includes the
-# gap in basis points. /status positions_open is the open book with an
-# explicit status, side, and qty so the app journal is not stuck at 0.
+# every later heat check — including assess_app_risk_gates — counts that
+# reservation. It is released on fill (the position then holds the risk —
+# no double count), on cancel, reject, expiry, or timeout, and the
+# unfilled remainder of a partial stays reserved until that order is done.
+# HEAT_RESERVATION_TTL_S defaults to the entry-fill timeout (20 minutes)
+# and is clamped at one hour. A restart also drops reservations. The
+# settle after a stop is armed does not wait on that lock.
+# HEAT_RESERVATION_ENABLED defaults on. Setting it false is the rollback:
+# heat is judged at fill time again.
+# The session VWAP stays the scanner's own samples. Each volume delta is
+# the average of the two bracketing sample prices, and the lone 9:30
+# print is only an anchor — it does not price the volume that follows it.
+# Massive regular-session minute VWAP stays the other side of the
+# cross-check. The gate does not copy Massive into the sample, and it
+# still fail-closes when the two disagree or the Massive side is missing
+# or stale. GET /pro-trader/report includes the gap in basis points.
+# /status positions_open is the open book with status, side, and qty.
 BOT_VERSION = "5.99.5-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
@@ -17004,10 +17001,12 @@ async def ensure_index_session_vwap_seed(
         for sym in names:
             try:
                 key = scanner_mod.session_vwap_key(sym, day)
-                # A 9:30 scanner print used to skip the seed (not_needed).
-                # That print is not the RTH minute VWAP (2026-11-25 SPY:
-                # sample 700.38 vs Massive RTH 703.44). Always fetch, and
-                # rebase when the bars are fresh. The throttle is 90s.
+                fields = await state.hash_get(key)
+                # A hash that already has the 9:30 print is the scanner's
+                # sample. Do not fetch Massive to overwrite it. The seed
+                # runs only for an empty or late start, throttled to 90s.
+                if not scanner_mod.session_vwap_needs_seed(fields, now_et):
+                    continue
                 attempt_key = f"{day}:{sym}"
                 last_attempt = float(_vwap_seed_attempt_at.get(attempt_key) or 0)
                 if time.time() - last_attempt < _VWAP_SEED_RETRY_S:
@@ -17028,20 +17027,17 @@ async def ensure_index_session_vwap_seed(
                     continue
                 try:
                     fields = await state.hash_get(key)
-                    needs = scanner_mod.session_vwap_needs_seed(fields, now_et)
                     # Newest completed minute is already ~60–120s old.
                     # VWAP_CROSSCHECK_MAX_AGE_S below ~120s marks it stale.
                     plan = scanner_mod.plan_session_vwap_seed(
                         fields, bars, now_et,
                         max_age_s=vwap_crosscheck_max_age_s(),
-                        replace=not needs,
                     )
                     if not plan.get("applied") or not isinstance(plan.get("fields"), dict):
                         _vwap_seed_attempt_at[attempt_key] = time.time()
-                        if str(plan.get("reason") or "") != "not_needed":
-                            _log_vwap_seed(
-                                sym, 0, None, str(plan.get("reason") or "incomplete"),
-                            )
+                        _log_vwap_seed(
+                            sym, 0, None, str(plan.get("reason") or "incomplete"),
+                        )
                         continue
                     await state.hash_set(
                         key, plan["fields"], scanner_mod.SESSION_VWAP_TTL_S,
@@ -17049,8 +17045,7 @@ async def ensure_index_session_vwap_seed(
                 finally:
                     await lock.release()
                 _log_vwap_seed(
-                    sym, int(plan.get("bars_used") or 0), plan.get("vwap"),
-                    "rebased" if str(plan.get("reason")) == "rebased" else "seeded",
+                    sym, int(plan.get("bars_used") or 0), plan.get("vwap"), "seeded",
                 )
             except Exception:
                 _log_vwap_seed(sym, 0, None, "fetch_failed")
@@ -18224,6 +18219,13 @@ def heat_reservation_enabled() -> bool:
     return _env_flag("HEAT_RESERVATION_ENABLED", "true")
 
 
+# The reservation lock covers only the read-modify-write of the reservation
+# list. Position reads happen before it is taken. 8s is longer than that
+# local write; it is not held across a broker read.
+HEAT_RESERVATION_LOCK_TTL_MS = 8_000
+HEAT_RESERVATION_LOCK_WAIT_S = 3.0
+
+
 def heat_reservation_ttl_s() -> float:
     """How long an unfilled reservation holds heat. Bounded, default the entry timeout.
 
@@ -18339,10 +18341,13 @@ def judge_heat_admission(
     *,
     regime: Any = None,
     enforce_correlation: bool = True,
+    heat_cap_pct: Any = None,
 ) -> Dict[str, Any]:
     """Whether this planned risk still fits under the heat cap and the book.
 
-    Pure. The caller holds the reservation lock and passes the rows it just read.
+    Pure. The caller has already read positions. The reservation rows are the
+    ones just read under the lock. ``heat_cap_pct`` overrides the portfolio
+    cap for the app open-risk ceiling.
     """
     held = positions if isinstance(positions, dict) else {}
     try:
@@ -18367,9 +18372,16 @@ def judge_heat_admission(
     active = active_heat_reservations(reservations, now)
     if ticker and any(str(row.get("ticker") or "").upper() == ticker for row in active):
         reasons.append(f"already reserving heat for {ticker}")
+    cap = PORTFOLIO_HEAT_PCT if heat_cap_pct is None else heat_cap_pct
+    try:
+        cap = float(cap)
+    except (TypeError, ValueError):
+        cap = float(PORTFOLIO_HEAT_PCT)
+    if not math.isfinite(cap) or cap <= 0:
+        cap = float(PORTFOLIO_HEAT_PCT)
     heat = (open_risk + reserved + new_risk) / account * 100.0
-    if heat > float(PORTFOLIO_HEAT_PCT) + 1e-9:
-        reasons.append(f"portfolio heat {heat:.2f}% > {PORTFOLIO_HEAT_PCT}%")
+    if heat > cap + 1e-9:
+        reasons.append(f"portfolio heat {heat:.2f}% > {cap:g}%")
     if enforce_correlation and ticker and not reasons:
         try:
             direction = portfolio_risk.payload_direction(payload or {})
@@ -18378,7 +18390,7 @@ def judge_heat_admission(
             ]
             corr = portfolio_risk.assess_correlation(
                 ticker, direction, new_risk, book, account,
-                live_policy("risk_per_trade_pct"), PORTFOLIO_HEAT_PCT, regime,
+                live_policy("risk_per_trade_pct"), cap, regime,
             )
             if not corr["allowed"]:
                 reasons.extend(corr["reasons"])
@@ -18475,16 +18487,29 @@ async def _write_heat_rows(rows: List[Dict[str, Any]]) -> None:
         raise
 
 
-async def _with_heat_lock(mutate):
-    """Read-modify-write the reservation list. The lock is the heat check."""
+async def _with_heat_lock(mutate, *, wait: bool = True):
+    """Read-modify-write the reservation list.
+
+    ``mutate`` must not read the broker or the network. Positions are loaded
+    before this lock is taken. The lock TTL only has to cover the local
+    reservation read and write.
+    """
     if state is None:
         raise LockNotAcquired("heat reservation store is not ready")
-    lock = state.lock("heat-reservation", ttl_ms=8_000, wait_timeout=3.0)
-    await lock.acquire()
+    wait_s = HEAT_RESERVATION_LOCK_WAIT_S if wait else 0.0
+    lock = state.lock(
+        "heat-reservation",
+        ttl_ms=HEAT_RESERVATION_LOCK_TTL_MS,
+        wait_timeout=wait_s,
+    )
+    if wait:
+        await lock.acquire()
+    elif not await lock.try_acquire():
+        raise LockNotAcquired("heat reservation lock busy")
     try:
         now = time.time()
         rows = active_heat_reservations(await _read_heat_rows(), now)
-        updated, result = await mutate(rows, now)
+        updated, result = mutate(rows, now)
         await _write_heat_rows(active_heat_reservations(updated, now))
         return result
     finally:
@@ -18510,16 +18535,26 @@ async def admit_heat_reservation(
     account_usd: float,
     *,
     regime: Any = None,
+    positions: Optional[Dict[str, Any]] = None,
+    enforce_correlation: Optional[bool] = None,
+    heat_cap_pct: Any = None,
 ) -> Dict[str, Any]:
-    """Reserve planned risk or refuse. Holds the heat lock across the check and the write."""
+    """Reserve planned risk or refuse.
+
+    Open positions are read before the lock. The lock covers the reservation
+    list only, so a slow book read cannot expire it and let a second entry
+    through.
+    """
     if not heat_reservation_enabled():
         return {"allowed": True, "reserved": False, "enabled": False, "reasons": []}
-
-    async def mutate(rows, now):
+    if positions is None:
         positions = await state.all_positions()
+    correlate = PORTFOLIO_RISK_ENABLED if enforce_correlation is None else enforce_correlation
+
+    def mutate(rows, now):
         verdict = judge_heat_admission(
             positions, rows, payload, new_risk_usd, account_usd, now,
-            regime=regime, enforce_correlation=PORTFOLIO_RISK_ENABLED,
+            regime=regime, enforce_correlation=correlate, heat_cap_pct=heat_cap_pct,
         )
         if not verdict["allowed"]:
             return rows, {**verdict, "reserved": False, "id": None}
@@ -18548,7 +18583,7 @@ async def release_heat_reservation(
     if not reservation_id and not ticker:
         return
 
-    async def mutate(rows, now):
+    def mutate(rows, now):
         kept = release_heat_rows(
             rows, now, reservation_id=reservation_id, ticker=ticker,
         )
@@ -18563,32 +18598,53 @@ async def release_heat_reservation(
 async def settle_heat_reservation(ticker: str) -> None:
     """Drop the reservation once the position carries its planned risk.
 
-    Until then the unfilled remainder stays reserved (planned minus booked).
+    The position is read first. The lock is try-only, so a busy reservation
+    lock does not delay the caller. Stop arming calls this after the stop
+    is already armed. A skipped settle retries on the next tick; until then
+    the unfilled remainder stays reserved (planned minus booked).
     """
     symbol = str(ticker or "").upper()
     if not symbol or not heat_reservation_enabled() or state is None:
         return
+    try:
+        pos = await state.get_position(symbol)
+    except Exception as e:
+        logger.warning(f"heat reservation settle skipped for {symbol}: {e}")
+        return
+    try:
+        booked = float(position_risk_usd(pos) or 0.0) if pos else 0.0
+    except Exception:
+        booked = 0.0
 
-    async def mutate(rows, now):
-        positions = await state.all_positions()
-        pos = positions.get(symbol) if isinstance(positions, dict) else None
-        try:
-            booked = float(position_risk_usd(pos) or 0.0) if pos else 0.0
-        except Exception:
-            booked = 0.0
+    def mutate(rows, now):
         planned = sum(
             _heat_row_risk(row) for row in rows
             if str(row.get("ticker") or "").upper() == symbol
         )
         if planned > 0 and booked + 1e-6 >= planned:
-            kept = release_heat_rows(rows, now, ticker=symbol)
-            return kept, None
+            return release_heat_rows(rows, now, ticker=symbol), None
         return rows, None
 
     try:
-        await _with_heat_lock(mutate)
+        await _with_heat_lock(mutate, wait=False)
+    except LockNotAcquired:
+        logger.info(
+            "[HEAT] %s reservation settle deferred — stop arming does not wait",
+            symbol,
+        )
     except Exception as e:
         logger.warning(f"heat reservation settle failed for {symbol}: {e}")
+
+
+async def settle_heat_after_stop_armed(ticker: str) -> None:
+    """Settle heat only after the protective stop is armed.
+
+    The log line is the arming proof. The settle that follows does not
+    wait on the reservation lock.
+    """
+    symbol = str(ticker or "").upper()
+    logger.info("[STOP GUARD] %s protective stop is armed — heat settle will not delay it", symbol)
+    await settle_heat_reservation(symbol)
 
 
 async def finish_heat_attempt(payload: Optional[dict], status: str) -> None:
@@ -18625,10 +18681,15 @@ async def clear_heat_reservations(reason: str = "restart") -> None:
 
 def assess_app_risk_gates(open_count: Any, realized_pnl_today_pct: Any, daily_loss_limit_pct: Any,
                           open_risk_usd: Any, new_risk_usd: Any, equity_usd: Any,
-                          max_positions: Any, max_open_risk_pct: Any) -> List[str]:
+                          max_positions: Any, max_open_risk_pct: Any,
+                          reserved_risk_usd: Any = 0) -> List[str]:
     """The three BOOK limits an app-origin entry meets in 5.82.1: max concurrent
     positions, total open risk, and the tripped daily loss limit. Returns the
     refusal reasons (empty = allowed). Same wording as the scanner gates.
+
+    ``reserved_risk_usd`` is planned heat already held for entries that are
+    not on the book yet. An app entry counts it, so it cannot pass a cap a
+    scanner reservation has already filled.
     Pure: no I/O, fully unit-testable."""
     reasons: List[str] = []
     try:
@@ -18644,7 +18705,17 @@ def assess_app_risk_gates(open_count: Any, realized_pnl_today_pct: Any, daily_lo
             reasons.append(f"max positions ({cap}) open")
     except (TypeError, ValueError):
         pass
-    heat = assess_open_risk_ceiling(open_risk_usd, new_risk_usd, equity_usd, max_open_risk_pct)
+    def _usd(v: Any) -> float:
+        try:
+            f = float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return f if math.isfinite(f) and f > 0 else 0.0
+
+    heat = assess_open_risk_ceiling(
+        _usd(open_risk_usd) + _usd(reserved_risk_usd),
+        new_risk_usd, equity_usd, max_open_risk_pct,
+    )
     if heat:
         reasons.append(heat)
     return reasons
@@ -19964,18 +20035,37 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
         try:
             daily_a = await state.get_daily()
             positions_a = await state.all_positions()
+            reserved_a, _reserved_rows_a = await peek_reserved_exposure(positions_a)
+            account_a = await _risk_ref()
+            new_risk_a = estimate_entry_risk_usd(p) or 0.0
             blocked.extend(assess_app_risk_gates(
                 len(positions_a),
                 daily_a.get("realized_pnl_today_pct"),
                 live_policy("daily_loss_limit_pct"),
                 sum(position_risk_usd(x) for x in positions_a.values()),
-                estimate_entry_risk_usd(p),
-                await _risk_ref(),
+                new_risk_a,
+                account_a,
                 MAX_CONCURRENT_POSITIONS,
                 APP_MAX_OPEN_RISK_PCT,
+                reserved_a,
             ))
+            if (
+                not blocked and not dry_run and heat_reservation_enabled()
+                and not is_probe
+            ):
+                admission = await admit_heat_reservation(
+                    p, new_risk_a, account_a, positions=positions_a,
+                    enforce_correlation=False, heat_cap_pct=APP_MAX_OPEN_RISK_PCT,
+                )
+                if not admission.get("allowed", False):
+                    blocked.extend(admission.get("reasons") or ["heat reservation refused"])
+                elif admission.get("id"):
+                    p["_heat_reservation_id"] = admission["id"]
         except Exception as e:
             blocked.append(f"crypto book limits unreadable ({str(e)[:80]}) — entry refused")
+        if blocked and p.get("_heat_reservation_id"):
+            await release_heat_reservation(p.get("_heat_reservation_id"), reason="rejected")
+            p.pop("_heat_reservation_id", None)
         if blocked:
             logger.warning(f"CRYPTO — {ticker_c or 'entry'} refused: {' · '.join(blocked)}")
         else:
@@ -20029,19 +20119,35 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
             try:
                 daily_a = await state.get_daily()
                 positions_a = await state.all_positions()
+                reserved_a, _reserved_rows_a = await peek_reserved_exposure(positions_a)
+                account_a = await _risk_ref()
+                new_risk_a = estimate_entry_risk_usd(p) or 0.0
                 blocked.extend(assess_app_risk_gates(
                     len(positions_a),
                     daily_a.get("realized_pnl_today_pct"),
                     live_policy("daily_loss_limit_pct"),
                     sum(position_risk_usd(x) for x in positions_a.values()),
-                    estimate_entry_risk_usd(p),
-                    await _risk_ref(),
+                    new_risk_a,
+                    account_a,
                     MAX_CONCURRENT_POSITIONS,
                     APP_MAX_OPEN_RISK_PCT,
+                    reserved_a,
                 ))
+                if not blocked and not dry_run and heat_reservation_enabled() and not is_probe:
+                    admission = await admit_heat_reservation(
+                        p, new_risk_a, account_a, positions=positions_a,
+                        enforce_correlation=False, heat_cap_pct=APP_MAX_OPEN_RISK_PCT,
+                    )
+                    if not admission.get("allowed", False):
+                        blocked.extend(admission.get("reasons") or ["heat reservation refused"])
+                    elif admission.get("id"):
+                        p["_heat_reservation_id"] = admission["id"]
             except Exception as e:
                 blocked.append(f"app book limits unreadable ({str(e)[:80]}) — entry refused")
         blocked = await _fold(blocked)
+        if blocked and p.get("_heat_reservation_id"):
+            await release_heat_reservation(p.get("_heat_reservation_id"), reason="rejected")
+            p.pop("_heat_reservation_id", None)
         if blocked:
             logger.warning(f"📱 APP DECIDES — {ticker_m or 'entry'} refused: {' · '.join(blocked)}")
         else:
@@ -29015,7 +29121,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 pos["stop_order_id"] = stop_info["order_id"]
                                 pos["filled_qty"] = filled
                                 await state.set_position(ticker, pos)
-                        await settle_heat_reservation(ticker)
+                        await settle_heat_after_stop_armed(ticker)
                         guarded = filled
                     except Exception as e:
                         # The OLD stop was already cancelled above and the new one
@@ -34431,13 +34537,13 @@ async def execute_live_order(payload: dict):
                         pos_rec["trail_mode"] = trailing_engine.normalize_trail_mode(
                             payload.get("trail_mode"))
                         await state.set_position(str(symbol).upper(), pos_rec)
-                        await settle_heat_reservation(str(symbol).upper())
                     risk_pct = ((fill_ref - resting_premium) / fill_ref * 100.0) if fill_ref > 0 else 0.0
                     logger.info(
                         f"[STOP GUARD] option guard armed for {symbol} at premium {resting_premium:.2f} "
                         f"(risk {risk_pct:.1f}% of {fill_ref:.2f}, basis={stop_basis}, "
                         f"tier={placement['tier']}, entry order={entry_order_id})"
                     )
+                    await settle_heat_after_stop_armed(str(symbol).upper())
                     if placement["tier"] == "backstop":
                         logger.info(
                             f"[EXIT AUTHORITY] {symbol} — {placement['reason']}; "
