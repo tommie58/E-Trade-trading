@@ -1023,6 +1023,130 @@ def test_position_closed_copies_signal_key_and_open_seq(tmp_path, monkeypatch):
     finally:
         main_bot.trade_ledger._ledger = saved
     assert stored["signal_key"] == signal_key
-    assert stored["opened_seq"] == seq
+    assert "opened_seq" not in stored
     assert closed[-1]["signal_key"] == signal_key
     assert closed[-1]["opened_seq"] == seq
+    assert signal_key not in main_bot._opened_seq_by_signal
+
+
+def test_open_ledger_write_does_not_restore_a_deleted_position(tmp_path):
+    import time
+    saved_ledger = main_bot.trade_ledger._ledger
+    saved_state = main_bot.state
+    main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    store = main_bot.StateStore(None)
+    main_bot.state = store
+    ledger = main_bot.trade_ledger._ledger
+    original = ledger._append_line
+
+    def slow(line):
+        if "position_opened" in line:
+            time.sleep(0.3)
+        return original(line)
+
+    ledger._append_line = slow
+
+    async def run():
+        async def delete_soon():
+            await asyncio.sleep(0.1)
+            await store.delete_position("FAKE")
+
+        task = asyncio.create_task(delete_soon())
+        await main_bot._record_open(
+            "FAKE", 1, 10.0, 9.0, 12.0, None, "BUY", "breakdown",
+            signal_id="gone", instrument="equity", signal_key="FAKE|breakdown|gone|1",
+        )
+        await task
+        return await store.get_position("FAKE")
+
+    try:
+        left = asyncio.run(run())
+    finally:
+        main_bot.trade_ledger._ledger = saved_ledger
+        main_bot.state = saved_state
+    assert left is None
+
+
+def test_open_ledger_write_does_not_clobber_a_concurrent_stop(tmp_path):
+    import time
+    saved_ledger = main_bot.trade_ledger._ledger
+    saved_state = main_bot.state
+    main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    store = main_bot.StateStore(None)
+    main_bot.state = store
+    ledger = main_bot.trade_ledger._ledger
+    original = ledger._append_line
+
+    def slow(line):
+        if "position_opened" in line:
+            time.sleep(0.3)
+        return original(line)
+
+    ledger._append_line = slow
+
+    async def run():
+        async def stamp_stop():
+            await asyncio.sleep(0.1)
+            current = await store.get_position("FAKE")
+            current["stop_order_id"] = "STOP-1"
+            await store.set_position("FAKE", current)
+
+        task = asyncio.create_task(stamp_stop())
+        await main_bot._record_open(
+            "FAKE", 1, 10.0, 9.0, 12.0, None, "BUY", "breakdown",
+            signal_id="stop", instrument="equity", signal_key="FAKE|breakdown|stop|1",
+        )
+        await task
+        return await store.get_position("FAKE")
+
+    try:
+        left = asyncio.run(run())
+    finally:
+        main_bot.trade_ledger._ledger = saved_ledger
+        main_bot.state = saved_state
+    assert left["stop_order_id"] == "STOP-1"
+    assert "opened_seq" not in left
+
+
+def test_shutdown_drain_counts_leftover_shadow_rows_as_dropped(monkeypatch):
+    _reset(monkeypatch, enabled="false", shadow="true")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked(event, data=None):
+        if event == main_bot.SETUP_DISABLE_EVENT:
+            if not started.is_set():
+                started.set()
+                await release.wait()
+            return 1
+        return 1
+
+    monkeypatch.setattr(main_bot.trade_ledger, "record", blocked)
+
+    async def run():
+        main_bot.note_setup_disable_decision(
+            {"ticker": "FAKE", "setup": "breakdown", "action": "BUY", "signal_id": "d-0"},
+            quantity=1, enforced=False, quantity_basis="requested", path="entry",
+            fresh_order=True,
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        for i in range(1, 3):
+            main_bot.note_setup_disable_decision(
+                {"ticker": "FAKE", "setup": "breakdown", "action": "BUY", "signal_id": f"d-{i}"},
+                quantity=1, enforced=False, quantity_basis="requested", path="entry",
+                fresh_order=True,
+            )
+        dropped = await main_bot.drain_shadow_queue()
+        status = main_bot.setup_disable_status()["ledger"]
+        release.set()
+        if main_bot._shadow_queue is not None:
+            await asyncio.wait_for(main_bot._shadow_queue.join(), timeout=2)
+        return dropped, status
+
+    try:
+        dropped, status = asyncio.run(run())
+    finally:
+        main_bot.reset_setup_disable_state()
+    assert dropped == 2
+    assert status["dropped"] == 2
+    assert status["queued"] == 0

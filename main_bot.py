@@ -16853,9 +16853,16 @@ _SHADOW_SECRET_ENV = (
 _SHADOW_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _SHADOW_QUOTE_KEYS = ("bid", "ask", "mid", "spread_pct", "source", "quote_time")
 _SHADOW_LEDGER_QUEUE_MAX = 256
+# Same 100ms the order path used to wait. Shutdown may spend it draining
+# shadow rows. It is not a wait on order placement.
+_SHADOW_SHUTDOWN_DRAIN_S = 0.1
 _shadow_queue: Optional[asyncio.Queue] = None
 _shadow_writer: Optional[asyncio.Task] = None
+_shadow_accepting = True
 _shadow_ledger_counts: Dict[str, int] = {"written": 0, "dropped": 0}
+_OPENED_SEQ_MAX = 512
+_opened_seq_by_signal: Dict[str, int] = {}
+_opened_seq_order: List[str] = []
 _setup_disable_seeded = False
 _setup_disable_inflight: Dict[tuple, str] = {}
 _setup_disable_attempt_n: Dict[tuple, int] = {}
@@ -17453,6 +17460,9 @@ async def _shadow_ledger_writer(queue: asyncio.Queue) -> None:
 
 def _enqueue_shadow_row(body: Dict[str, Any]) -> None:
     """Hand a shadow row to the writer. A full queue drops the oldest shadow row."""
+    if not _shadow_accepting:
+        _shadow_ledger_counts["dropped"] += 1
+        return
     queue = _ensure_shadow_writer()
     limit = max(1, int(_SHADOW_LEDGER_QUEUE_MAX))
     while queue.qsize() >= limit:
@@ -17463,6 +17473,34 @@ def _enqueue_shadow_row(body: Dict[str, Any]) -> None:
         queue.task_done()
         _shadow_ledger_counts["dropped"] += 1
     queue.put_nowait(body)
+
+
+async def drain_shadow_queue() -> int:
+    """Drop shadow rows still queued after the 100ms shutdown budget.
+
+    An append already inside trade_ledger.record is left alone. Rows that
+    will not be written are counted as dropped so a restart does not orphan
+    them silently.
+    """
+    global _shadow_accepting
+    _shadow_accepting = False
+    queue = _shadow_queue
+    if queue is None:
+        return 0
+    try:
+        await asyncio.wait_for(queue.join(), timeout=_SHADOW_SHUTDOWN_DRAIN_S)
+    except (asyncio.TimeoutError, Exception):
+        pass
+    dropped = 0
+    while True:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        queue.task_done()
+        _shadow_ledger_counts["dropped"] += 1
+        dropped += 1
+    return dropped
 
 
 def _shadow_queue_depth() -> int:
@@ -17529,6 +17567,10 @@ def reset_setup_disable_state() -> None:
     _setup_disable_list_cache["key"] = None
     _shadow_ledger_counts["written"] = 0
     _shadow_ledger_counts["dropped"] = 0
+    global _shadow_accepting
+    _shadow_accepting = True
+    _opened_seq_by_signal.clear()
+    _opened_seq_order.clear()
 
 app = FastAPI(title="E*TRADE Trading Bot")
 # No cross-origin browser access unless CORS_ORIGINS lists the origins.
@@ -31729,6 +31771,30 @@ async def exit_followup_worker():
         await asyncio.sleep(max(15, EXIT_FOLLOWUP_WORKER_SECONDS))
 
 
+def _remember_opened_seq(signal_key: Optional[str], seq: Optional[int]) -> None:
+    """Remember which ledger seq opened this signal. Not written onto the position."""
+    if not signal_key or seq is None:
+        return
+    key = str(signal_key)
+    if key not in _opened_seq_by_signal:
+        _opened_seq_order.append(key)
+    _opened_seq_by_signal[key] = int(seq)
+    while len(_opened_seq_order) > _OPENED_SEQ_MAX:
+        old = _opened_seq_order.pop(0)
+        _opened_seq_by_signal.pop(old, None)
+
+
+def _take_opened_seq(signal_key: Optional[str]) -> Optional[int]:
+    """Pop the open seq for a close. Missing stays missing."""
+    if not signal_key:
+        return None
+    key = str(signal_key)
+    seq = _opened_seq_by_signal.pop(key, None)
+    if key in _opened_seq_order:
+        _opened_seq_order.remove(key)
+    return seq
+
+
 async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Optional[float],
                        target: Optional[float], contract: Optional[dict],
                        action: str = "BUY", setup: Optional[str] = None,
@@ -31806,12 +31872,9 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
     if signal_key:
         opened["signal_key"] = signal_key
     seq = await trade_ledger.record("position_opened", opened)
-    if seq is not None:
-        position["opened_seq"] = seq
-        try:
-            await state.set_position(ticker, position)
-        except Exception as e:
-            logger.warning(f"[OPEN] {ticker} open seq not stamped on the position: {e}")
+    # The seq stays in memory. Writing the position again here would put back
+    # a row deleted during the append, or erase a stop saved while it ran.
+    _remember_opened_seq(signal_key, seq)
     return seq
 
 
@@ -32276,9 +32339,8 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
     _open_key = (pos or {}).get("signal_key")
     if _open_key:
         close_data["signal_key"] = _open_key
-    _opened_seq = (pos or {}).get("opened_seq")
-    if _opened_seq is not None:
-        close_data["opened_seq"] = _opened_seq
+    # Missing after a restart stays null. Do not guess a seq from the ledger.
+    close_data["opened_seq"] = _take_opened_seq(_open_key)
     ledger_seq = await trade_ledger.record("position_closed", close_data)
     await _remember_trade_review(close_data, ledger_seq=ledger_seq)
     # Schedule 15/30-minute post-exit marks — a stop that was too tight shows
@@ -39824,6 +39886,10 @@ async def _announce_preflight() -> None:
 async def on_shutdown():
     global _worker_stop
     _worker_stop = True
+    try:
+        await drain_shadow_queue()
+    except Exception as e:
+        logger.warning(f"shadow queue drain failed: {e}")
     await _close_study_page_engine()
     await state.close()
 
