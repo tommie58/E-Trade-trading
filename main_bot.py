@@ -7875,6 +7875,22 @@ def index_gap_context(
         vendor_change_pct=quote.get("change_close_pct"),
         max_trust_pct=max_trust_pct,
     )
+    # Shadow official gap. Default GAP_SOURCE=current returns this verdict
+    # unchanged. snapshot re-runs the same verifier on day.o and prevDay.c.
+    try:
+        import pro_trader.data_quality as _dq
+        verdict = _dq.apply_gap_source(
+            quote, verdict,
+            lambda o, c: verify_opening_gap(
+                o, c,
+                last=quote.get("last"), high=quote.get("high"), low=quote.get("low"),
+                vendor_change=quote.get("change_close"),
+                vendor_change_pct=quote.get("change_close_pct"),
+                max_trust_pct=max_trust_pct,
+            ),
+        )
+    except Exception:
+        pass
     spread = _quote_spread_pct(quote.get("bid"), quote.get("ask"))
     return {
         "spy_gap_pct": verdict["gap_pct"] if verdict["verified"] else None,
@@ -10188,6 +10204,16 @@ def parse_quotes(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
             "massive_day_vwap_reason": massive_day_vwap_reason,
             "massive_minute_vw": massive_minute_vw,
             "massive_minute_vw_reason": massive_minute_vw_reason,
+            # Present only when the feed attached the snapshot prints.
+            # Absent on an E*TRADE quote, so the gap shadow stays quiet.
+            **(
+                {"massive_official_open": entry.get("massive_official_open")}
+                if "massive_official_open" in entry else {}
+            ),
+            **(
+                {"massive_official_prev_close": entry.get("massive_official_prev_close")}
+                if "massive_official_prev_close" in entry else {}
+            ),
             # Top-of-book size — the order-book imbalance feature (edge.py).
             "bid_size": num(all_q, "bidSize"),
             "ask_size": num(all_q, "askSize"),
@@ -11054,6 +11080,19 @@ def read_tape(
         vendor_change=quote.get("change_close"),
         vendor_change_pct=quote.get("change_close_pct"),
     )
+    try:
+        import pro_trader.data_quality as _dq
+        gap_verdict = _dq.apply_gap_source(
+            quote, gap_verdict,
+            lambda o, c: risk_mod.verify_opening_gap(
+                o, c,
+                last=quote.get("last"), high=quote.get("high"), low=quote.get("low"),
+                vendor_change=quote.get("change_close"),
+                vendor_change_pct=quote.get("change_close_pct"),
+            ),
+        )
+    except Exception:
+        pass
     gap = gap_verdict["gap_pct"] if gap_verdict["verified"] else None
     change_open = pct_change(px, quote.get("open"))
     pace = volume_pace(today, quote, now_et)
@@ -11442,6 +11481,19 @@ def build_risk_context(quote: Dict[str, Any], quotes_by_symbol: Dict[str, Any]) 
         vendor_change=quote.get("change_close"),
         vendor_change_pct=quote.get("change_close_pct"),
     )
+    try:
+        import pro_trader.data_quality as _dq
+        name_gap = _dq.apply_gap_source(
+            quote, name_gap,
+            lambda o, c: risk_mod.verify_opening_gap(
+                o, c,
+                last=quote.get("last"), high=quote.get("high"), low=quote.get("low"),
+                vendor_change=quote.get("change_close"),
+                vendor_change_pct=quote.get("change_close_pct"),
+            ),
+        )
+    except Exception:
+        pass
     return risk_mod.sanitize_risk_context({
         "gap_pct": name_gap["gap_pct"] if name_gap["verified"] else None,
         "spy_range_pct": round(spy_range, 3) if spy_range is not None else None,
@@ -13989,6 +14041,11 @@ def snapshot_to_quote_data(
         "massive_day_vwap_label": DAY_VW_LABEL,
         "massive_minute_vw": minute_obs["value"],
         "massive_minute_vw_reason": minute_obs["reason"],
+        # Official session open and prior close, straight off the snapshot.
+        # Not copied into All.open. The gap shadow reads these. A first
+        # 1-minute bar open is never written here.
+        "massive_official_open": _num(day.get("o")),
+        "massive_official_prev_close": _num(prev.get("c")),
     }
 
 
@@ -15417,7 +15474,11 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # still fail-closes when the two disagree or the Massive side is missing
 # or stale. GET /pro-trader/report includes the gap in basis points.
 # /status positions_open is the open book with status, side, and qty.
-BOT_VERSION = "5.99.6-pro-day-trader"
+# 5.99.17-pro-day-trader is the shadow data-quality proposal: bar VWAP,
+# agg cadence, bad-tick filter, and the official snapshot gap are logged
+# beside the current inputs. Defaults leave the CALL gate on
+# session_sampled and fail-closed. Renumbered at merge.
+BOT_VERSION = "5.99.17-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -16039,6 +16100,7 @@ def call_index_vwap_gate_status() -> Dict[str, Any]:
 # Pro Day Trader realignment. Shadow classifies and records verdicts without
 # changing an order. Active may only block or scale size down.
 import pro_trader
+import pro_trader.data_quality as data_quality
 from pro_trader.regime import session_phase as _pro_session_phase
 from pro_trader.risk import flatten_et_label as _flatten_et_label
 
@@ -17139,17 +17201,127 @@ async def ensure_index_session_vwap_seed(
         logger.debug("index vwap seed skipped")
 
 
+_DATA_QUALITY_PROBE_TIMEOUT_S = 3.0
+
+
+def _log_data_quality_entitlement() -> None:
+    """Warning-level entitlement line. Fields are status and reason only."""
+    fields = data_quality.entitlement_warning_fields()
+    logger.warning(
+        "[DATA QUALITY] entitlement session=%s bars=%s bars_reason=%s iv=%s iv_reason=%s",
+        fields.get("session"),
+        fields.get("bars"),
+        fields.get("bars_reason"),
+        fields.get("iv"),
+        fields.get("iv_reason"),
+    )
+
+
+async def _data_quality_probe_get(path: str, params: Dict[str, Any]):
+    """One Massive GET for the entitlement probe.
+
+    The path and the key stay in this function. Callers log only the
+    classified status. A transport failure is ``error`` and the exception
+    text is dropped, because httpx puts the request target in the message.
+    """
+    if not massive.enabled():
+        return 0, None, "not_configured"
+    headers = {"Authorization": f"Bearer {massive.api_key()}"}
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=_DATA_QUALITY_PROBE_TIMEOUT_S) as client:
+            resp = await asyncio.wait_for(
+                client.get(
+                    f"{massive.BASE_URL}{path}",
+                    params=params,
+                    headers=headers,
+                ),
+                timeout=_DATA_QUALITY_PROBE_TIMEOUT_S,
+            )
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = None
+        return int(getattr(resp, "status_code", 0) or 0), payload, None
+    except Exception:
+        return 0, None, "error"
+
+
+async def probe_data_quality_entitlement(*, force: bool = False) -> Dict[str, Any]:
+    """Startup and once-per-ET-session check that bars and IV are usable.
+
+    Does not place an order and does not touch the quote client's health.
+    A missing key, a 401, a 403, an empty body, or a stale print is
+    ``no_data``. The same ET date does not probe again unless ``force``.
+    """
+    now_et = _utcnow().astimezone(_ET_ZONE)
+    day = now_et.date().isoformat()
+    already = data_quality.entitlement_session()
+    bars_now = data_quality.bars_feed()
+    if (
+        not force
+        and already == day
+        and bars_now.get("reason") != "unmeasured"
+    ):
+        return data_quality.entitlement_warning_fields()
+    probed_at = datetime.now(timezone.utc).isoformat()
+    if not massive.enabled():
+        data_quality.note_bars_feed(
+            {"status": data_quality.SHADOW_NO_DATA, "reason": "not_configured"},
+            session=day, probed_at=probed_at,
+        )
+        data_quality.note_iv_feed(
+            {"status": data_quality.SHADOW_NO_DATA, "reason": "iv_not_configured"},
+            session=day, probed_at=probed_at,
+        )
+        _log_data_quality_entitlement()
+        return data_quality.entitlement_warning_fields()
+    code, payload, err = await _data_quality_probe_get(
+        f"/v2/aggs/ticker/SPY/range/1/minute/{day}/{day}",
+        {"adjusted": "true", "sort": "desc", "limit": 50},
+    )
+    if err == "not_configured":
+        bars = {"status": data_quality.SHADOW_NO_DATA, "reason": "not_configured"}
+    elif err == "error" or code == 0:
+        bars = {"status": data_quality.SHADOW_NO_DATA, "reason": "error"}
+    else:
+        bars = data_quality.classify_aggs_payload(payload, now_et, status_code=code)
+    data_quality.note_bars_feed(bars, session=day, probed_at=probed_at)
+    if bars.get("status") == data_quality.SHADOW_OK:
+        data_quality.note_symbol_bars("SPY", bars)
+    iv_code, iv_payload, iv_err = await _data_quality_probe_get(
+        "/v3/snapshot/options/SPY",
+        {"contract_type": "call", "limit": 5},
+    )
+    if iv_err == "not_configured":
+        iv = {"status": data_quality.SHADOW_NO_DATA, "reason": "iv_not_configured"}
+    elif iv_err == "error" or iv_code == 0:
+        iv = {"status": data_quality.SHADOW_NO_DATA, "reason": "iv_error"}
+    else:
+        iv = data_quality.classify_iv_payload(
+            iv_payload, now_et.timestamp(), status_code=iv_code,
+        )
+    data_quality.note_iv_feed(iv, session=day, probed_at=probed_at)
+    _log_data_quality_entitlement()
+    return data_quality.entitlement_warning_fields()
+
+
 async def index_session_vwap_seed_worker() -> None:
     """Retry the session VWAP seed off the CALL gate.
 
     The first pass is the awaited startup seed. This loop waits one retry
     interval, then tries again until shutdown. A missing seed leaves the
-    gate fail-closed.
+    gate fail-closed. Once per ET date it also re-checks Massive bars and
+    IV entitlement. That probe does not fetch quotes for the gate.
     """
     while not _worker_stop:
         await asyncio.sleep(_VWAP_SEED_RETRY_S)
         if _worker_stop:
             return
+        try:
+            await probe_data_quality_entitlement()
+        except Exception:
+            logger.warning("[DATA QUALITY] entitlement probe failed kind=session")
         try:
             await ensure_index_session_vwap_seed()
         except Exception:
@@ -17197,6 +17369,10 @@ async def _index_vwap_quotes(
         quotes = []
     by_sym = {str(q.get("symbol") or "").upper(): q for q in quotes if isinstance(q, dict)}
     now_et = _utcnow().astimezone(_ET_ZONE)
+    try:
+        data_quality.note_evaluation()
+    except Exception:
+        logger.debug("data quality evaluation count skipped")
     out: List[Dict[str, Any]] = []
     for sym in syms:
         row = dict(by_sym.get(sym) or {"symbol": sym})
@@ -17224,8 +17400,91 @@ async def _index_vwap_quotes(
         row["gate_vwap_verdict"] = side
         row["gate_vwap_samples"] = resolved.get("samples")
         row["gate_vwap_crosscheck_bps"] = checked.get("diff_bps")
+        try:
+            _note_data_quality_vwap(row, resolved, now_et)
+        except Exception:
+            logger.debug("data quality shadow skipped for %s", sym)
         out.append(row)
     return out
+
+
+def _cached_completed_bar_vwap(symbol: str, now_et: datetime) -> Dict[str, Any]:
+    """Completed-bar RTH VWAP from the bars already stored on the agg cache.
+
+    Does not fetch. A cache row that only has a VWAP number (no bars) is
+    missing, which the bars source treats as a fallback.
+    """
+    empty = {"vwap": None, "age_seconds": None, "bar_count": 0, "last_bar_epoch": None}
+    key = _minute_vwap_cache_key(symbol, now_et.date().isoformat())
+    row = _minute_vwap_cache.get(key)
+    bars = row.get("bars") if isinstance(row, dict) else None
+    if not isinstance(bars, list) or not bars:
+        return empty
+    try:
+        close_m = scanner_mod.session_close_minute(now_et)
+        return data_quality.completed_rth_vwap(
+            bars, now_et,
+            open_minute=scanner_mod._SESSION_OPEN_MIN,
+            close_minute=close_m,
+        )
+    except Exception:
+        logger.debug("completed bar vwap unreadable for %s", symbol)
+        return empty
+
+
+def _note_data_quality_vwap(row: Dict[str, Any], resolved: Dict[str, Any], now_et: datetime) -> None:
+    """Log sampled and bar VWAP. Replace the gate input only for a fresh bars source.
+
+    Default VWAP_SOURCE=sampled returns without writing the row. A bars
+    selection that is stale or missing leaves the sampled row, including a
+    fail-closed unmeasured verdict. A fresh bar VWAP still fail-closes when
+    the last print is missing.
+    """
+    symbol = str(row.get("symbol") or "").upper()
+    sampled = resolved.get("vwap") if isinstance(resolved, dict) and resolved.get("measured") else None
+    view = _cached_completed_bar_vwap(symbol, now_et)
+    choice = data_quality.choose_vwap(
+        sampled_vwap=sampled,
+        gate_vwap=row.get("vwap"),
+        bar_vwap=view.get("vwap"),
+        bar_age_s=view.get("age_seconds"),
+        bar_count=int(view.get("bar_count") or 0),
+        source=data_quality.vwap_source_flag(),
+    )
+    choice["last"] = row.get("last")
+    choice["bar_age_s_raw"] = view.get("age_seconds_raw")
+    # Enforcement (VWAP_SOURCE=bars) fail-closes when the bar VWAP is stale
+    # or missing. The sampled value stays off the gate. Default sampled
+    # does not enter this branch.
+    if choice.get("fail_closed"):
+        row["vwap"] = None
+        row["vwap_source"] = None
+        row["gate_vwap_source"] = None
+        row["gate_vwap_verdict"] = "unmeasured"
+        row["gate_vwap_reason"] = choice.get("enforcement_reason")
+    elif choice.get("replace_gate") and data_quality.bars_allowed_for_gate(
+        symbol,
+        bar_vwap=choice.get("bar_vwap"),
+        bar_age_s=choice.get("bar_age_s"),
+        bar_count=int(choice.get("bar_count") or 0),
+    ):
+        side = _gate_side_verdict(row.get("last"), {"measured": True, "vwap": choice.get("bar_vwap")})
+        if side == "unmeasured":
+            row["vwap"] = None
+            row["vwap_source"] = None
+            row["gate_vwap_source"] = None
+            row["gate_vwap_verdict"] = "unmeasured"
+            row["gate_vwap_reason"] = "bar_vwap_unmeasured"
+            choice["applied_gate_vwap"] = None
+        else:
+            row["vwap"] = choice.get("bar_vwap")
+            row["vwap_source"] = "bars"
+            row["gate_vwap_source"] = "bars"
+            row["gate_vwap_reason"] = None
+            row["gate_vwap_verdict"] = side
+            row["gate_vwap_crosscheck_bps"] = choice.get("diff_bps")
+            choice["applied_gate_vwap"] = choice.get("bar_vwap")
+    data_quality.note_vwap(symbol, choice)
 
 
 # Massive RTH minute VWAP, cached by ET session date. The scanner loop
@@ -17235,7 +17494,6 @@ async def _index_vwap_quotes(
 # this cache. Massive day.vw and the snapshot minute `vw` stay telemetry.
 # They are not gate inputs. A restart begins with an empty cache and fails
 # closed until the first successful refresh.
-_MINUTE_VWAP_REFRESH_S = 90.0
 _MINUTE_VWAP_TIMEOUT_S = 3.0
 _minute_vwap_cache: Dict[str, Dict[str, Any]] = {}
 _minute_vwap_attempt_at: Dict[str, float] = {}
@@ -17552,7 +17810,7 @@ def _gate_fields_for_observe(
         reason = (quote or {}).get("gate_vwap_reason")
         cross = (quote or {}).get("gate_vwap_crosscheck_bps")
         return {
-            "gate_vwap_source": source if source == "session_sampled" and verdict != "unmeasured" else None,
+            "gate_vwap_source": source if source in {"session_sampled", "bars"} and verdict != "unmeasured" else None,
             "gate_vwap_verdict": verdict,
             "gate_vwap_reason": reason if isinstance(reason, str) and reason else None,
             "gate_vwap_crosscheck_bps": (
@@ -17586,9 +17844,11 @@ async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> No
     """Refresh cached regular-hours minute VWAPs. Never raises.
 
     The scanner loop calls this during the session. /status may call it too.
-    The CALL gate does not. At most once per 90s per symbol, with a 3s timeout
-    per request. Does not use MassiveClient._get, so a failure cannot change
-    auth_status or feed health. A timeout or a bad response leaves the previous
+    The CALL gate does not. The default is main's elapsed 90s throttle, one
+    full-day GET per symbol. ``BAR_PULL_ALIGNED_60S`` uses 60s, about 5s
+    after the minute closes. Timeout is 3s. This does not use MassiveClient._get, so a 401,
+    403, or 429 cannot change auth_status or feed health. A timeout or a bad
+    response leaves the previous
     slot in place and records ``error``. A response with no positive
     today-session VWAP does not replace the slot. A prior day's slot is never
     read back as today. The lock only records who is due; the HTTP call sits
@@ -17601,11 +17861,18 @@ async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> No
         now_et = _utcnow().astimezone(_ET_ZONE)
         day = now_et.date().isoformat()
         now = time.time()
+        interval_s = data_quality.aggs_pull_interval_s()
+        align = data_quality.aggs_alignment_active(interval_s)
+        # The throttle clock is wall time, matching the stored attempt stamp.
+        # The session date of the request stays on _utcnow so a frozen test
+        # clock still names the right day. Alignment uses the same instant
+        # as the attempt stamp.
+        align_clock = datetime.fromtimestamp(now, timezone.utc).astimezone(_ET_ZONE)
         lock = _minute_vwap_lock()
         async with lock:
             for sym in [str(s).upper() for s in (symbols or _index_observe_symbols()) if s]:
                 last = float(_minute_vwap_attempt_at.get(_minute_vwap_cache_key(sym, day)) or 0)
-                if now - last >= _MINUTE_VWAP_REFRESH_S:
+                if data_quality.agg_pull_due(now, last, interval_s, align, align_clock):
                     due.append(sym)
             if not due:
                 return
@@ -17616,29 +17883,93 @@ async def refresh_massive_minute_vwap(symbols: Optional[List[str]] = None) -> No
         async with httpx.AsyncClient(timeout=_MINUTE_VWAP_TIMEOUT_S) as client:
             for sym in due:
                 try:
+                    # One GET per symbol. The key is a header and is not logged.
+                    # Default: the session day, and the VWAP is recomputed from
+                    # that full response. AGGS_INCREMENTAL_MERGE=true merges
+                    # from the last bar and falls back to the recompute when
+                    # the running sum disagrees.
+                    cache_key = _minute_vwap_cache_key(sym, day)
+                    prior = _minute_vwap_cache.get(cache_key)
+                    prior_bars = prior.get("bars") if isinstance(prior, dict) else None
+                    incremental = data_quality.aggs_incremental_merge_enabled()
+                    frm, to = data_quality.agg_request_range(
+                        day,
+                        data_quality.last_bar_epoch(prior_bars if isinstance(prior_bars, list) else None),
+                        incremental=incremental,
+                    )
+                    data_quality.note_agg_request(sym, frm, to)
                     resp = await asyncio.wait_for(
                         client.get(
-                            f"{massive.BASE_URL}/v2/aggs/ticker/{sym}/range/1/minute/{day}/{day}",
+                            f"{massive.BASE_URL}/v2/aggs/ticker/{sym}/range/1/minute/{frm}/{to}",
                             params={"adjusted": "true", "sort": "asc", "limit": 50000},
                             headers=headers,
                         ),
                         timeout=_MINUTE_VWAP_TIMEOUT_S,
                     )
-                    if getattr(resp, "status_code", 0) != 200:
+                    status_code = int(getattr(resp, "status_code", 0) or 0)
+                    if status_code != 200:
+                        # 401/403 fail-closes the shadow research. The status
+                        # code is the only thing logged, not the URL or key.
+                        if status_code in (401, 403):
+                            data_quality.note_bars_feed(
+                                data_quality.classify_http_dependency(status_code, has_data=False),
+                            )
+                            logger.warning(
+                                "[DATA QUALITY] bars dependency status=no_data reason=%s symbol=%s",
+                                "unauthorized" if status_code == 401 else "forbidden",
+                                sym,
+                            )
                         _note_minute_vwap_refresh(sym, "error")
                         continue
-                    parsed = minute_aggs_rth_vwap(resp.json(), now_et)
+                    payload = resp.json()
+                    incoming = payload.get("results") if isinstance(payload, dict) else None
+                    raw_bars = [bar for bar in incoming if isinstance(bar, dict)] if isinstance(incoming, list) else []
+                    if incremental:
+                        adopted = data_quality.adopt_session_bars(
+                            prior_bars if isinstance(prior_bars, list) else None,
+                            raw_bars,
+                            incremental=True,
+                        )
+                        if adopted.get("mismatch"):
+                            logger.warning(
+                                "[DATA QUALITY] incremental VWAP mismatch symbol=%s — full recompute",
+                                sym,
+                            )
+                        merged = adopted["bars"]
+                    else:
+                        # Same list the cross-check used before this proposal.
+                        # No merge and no reorder.
+                        merged = raw_bars
+                    parsed = minute_aggs_rth_vwap({"results": merged}, now_et)
+                    bar_state = data_quality.classify_aggs_payload(
+                        {"results": merged}, now_et, status_code=200,
+                    )
+                    data_quality.note_symbol_bars(sym, bar_state)
+                    if bar_state.get("status") == data_quality.SHADOW_OK:
+                        data_quality.note_bars_feed(bar_state)
                     if _positive_vwap(parsed.get("vwap")) is None:
                         _note_minute_vwap_refresh(sym, "error")
                         continue
                     if _epoch_et_date(parsed.get("last_bar_epoch"), now_et) != now_et.date():
                         _note_minute_vwap_refresh(sym, "error")
                         continue
+                    try:
+                        extremes = data_quality.series_for_extremes(merged, sym)
+                        data_quality.note_bad_ticks(sym, extremes.get("flagged") or [])
+                        confirmed = data_quality.real_move_confirmed(merged, sym)
+                        data_quality.note_real_move_confirmed(sym, confirmed.get("real_moves") or [])
+                    except Exception:
+                        extremes = {"flagged_count": 0}
+                        logger.debug("bad tick shadow skipped for %s", sym)
                     stored = dict(parsed)
                     stored["session_date"] = day
                     stored["fetched_at"] = now_et.timestamp()
+                    # Raw bars. vw/v are what the VWAP uses. Clamped highs
+                    # stay on the shadow series and are not this cache.
+                    stored["bars"] = merged
+                    stored["bad_ticks_flagged"] = int(extremes.get("flagged_count") or 0)
                     async with lock:
-                        _minute_vwap_cache[_minute_vwap_cache_key(sym, day)] = stored
+                        _minute_vwap_cache[cache_key] = stored
                     _note_minute_vwap_refresh(sym, "ok")
                 except Exception:
                     _note_minute_vwap_refresh(sym, "error")
@@ -30658,6 +30989,19 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
     delta = _finite_or_none(option_delta)
     instrument_label = str(instrument or "").strip().lower() or None
     pt_fields = _pro_trader_position_fields(pro_trader_decision)
+    bar_vwap_verdict = None
+    try:
+        bar_vwap_verdict = data_quality.bar_vwap_verdict()
+        logger.info(
+            "[DATA QUALITY] bar vwap admitted ticker=%s verdict=%s",
+            ticker, bar_vwap_verdict,
+        )
+    except Exception as exc:
+        bar_vwap_verdict = None
+        logger.warning(
+            "[DATA QUALITY] bar vwap admitted snapshot skipped ticker=%s kind=%s",
+            ticker, type(exc).__name__,
+        )
     position = {
         "qty": int(qty),
         "action": str(action or "BUY").upper(),
@@ -30706,6 +31050,7 @@ async def _record_open(ticker: str, qty: int, entry: Optional[float], stop: Opti
         "signal_id": signal_label,
         "option_delta": delta,
         "instrument": instrument_label,
+        "bar_vwap_verdict": bar_vwap_verdict,
         **pt_fields,
     })
 
@@ -38576,6 +38921,10 @@ async def on_startup():
             "except /health and /healthz returns 401. Set the secret and redeploy."
         )
     await start_worker()
+    try:
+        await probe_data_quality_entitlement(force=True)
+    except Exception:
+        logger.warning("[DATA QUALITY] entitlement probe failed kind=startup")
     logger.info(f"✅ Bot ready (state backend: {state.backend_name})")
     # GO-LIVE PREFLIGHT — say out loud whether this process can actually trade.
     # A bot that boots clean, reports healthy and then refuses every entry for a
@@ -39980,6 +40329,10 @@ def _pro_trader_status_payload(trades_today: Any = None) -> Dict[str, Any]:
     rails["flatten_et"] = _flatten_et_label(close)
     body["hard_rails"] = rails
     body["session_phase"] = _pro_session_phase(minute, close)
+    try:
+        body["data_quality_shadow"] = data_quality.shadow_status()
+    except Exception:
+        body["data_quality_shadow"] = {"read_only": True, "available": False}
     return body
 
 
