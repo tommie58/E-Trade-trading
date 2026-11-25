@@ -2059,3 +2059,156 @@ def test_shadow_drain_log_uses_the_exception_type(monkeypatch, caplog):
     assert done is True
     assert "RuntimeError" in caplog.text
     assert "https://" not in caplog.text
+
+
+def test_boot_window_parks_rows_until_the_log_exists(tmp_path, monkeypatch):
+    """Rows enqueued while restore still owns the boot are appended after it, not dropped."""
+    main_bot.reset_setup_disable_state()
+    main_bot._shadow_log = None
+    main_bot._shadow_mirrored_hashes.clear()
+    monkeypatch.setattr(main_bot, "_shadow_restore_delays", (0.0, 0.0, 0.0))
+    path = tmp_path / "setup_disable_shadow.jsonl"
+    built = main_bot.SetupDisableShadowLog(path)
+    built.append({"signal_id": "restored-1"})
+    built.append({"signal_id": "restored-2"})
+    durable = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    path.unlink()
+    main_bot._shadow_log = None
+    hold = asyncio.Event()
+    started = asyncio.Event()
+
+    async def loader():
+        started.set()
+        await hold.wait()
+        return list(durable)
+
+    main_bot._shadow_line_loader = loader
+    payload = {"ticker": "FAKE", "setup": "breakdown", "action": "BUY", "signal_id": "boot"}
+
+    async def scenario():
+        boot = asyncio.create_task(main_bot.prepare_setup_disable_shadow(path))
+        await started.wait()
+        assert main_bot._shadow_log is None
+        assert main_bot._shadow_restore_pending() is True
+        pending = [
+            asyncio.create_task(main_bot.persist_setup_disable_decision(
+                {**payload, "signal_id": f"boot-{n}"},
+                quantity=1, enforced=False, quantity_basis="after_sizing",
+                path="entry", fresh_order=True,
+                outcome={"order_id": str(n), "placement_status": "placed"},
+            ))
+            for n in (1, 2)
+        ]
+        for _ in range(50):
+            if len(main_bot._shadow_parked) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        assert main_bot.setup_disable_status()["ledger"]["dropped"] == 0
+        assert main_bot._shadow_log is None
+        hold.set()
+        await asyncio.gather(boot, *pending)
+        rows = await main_bot.read_setup_disable_shadow_async(10)
+        ok = main_bot._shadow_log.verify()
+        dropped = main_bot.setup_disable_status()["ledger"]["dropped"]
+        await _cancel_shadow_tasks()
+        return rows, ok, dropped
+
+    try:
+        rows, ok, dropped = asyncio.run(scenario())
+    finally:
+        main_bot._shadow_line_loader = None
+        main_bot._shadow_log = None
+        main_bot.reset_setup_disable_state()
+    assert dropped == 0
+    assert [row["seq"] for row in rows] == [1, 2, 3, 4]
+    assert sum(1 for row in rows if row.get("restart") is True) == 1
+    assert [row["data"].get("signal_id") for row in rows[:2]] == ["restored-1", "restored-2"]
+    assert rows[2]["prev_hash"] == rows[1]["hash"]
+    assert rows[3]["prev_hash"] == rows[2]["hash"]
+    assert ok[0] is True, ok
+
+
+def test_parked_shadow_queue_counts_overflow():
+    async def run():
+        main_bot.reset_setup_disable_state()
+        main_bot._shadow_restore_begin()
+        try:
+            for n in range(main_bot._SHADOW_LEDGER_QUEUE_MAX):
+                assert main_bot._park_shadow_row({"n": n}, None) is True
+            before = main_bot.setup_disable_status()["ledger"]["dropped"]
+            assert main_bot._park_shadow_row({"n": "overflow"}, None) is False
+            after = main_bot.setup_disable_status()["ledger"]["dropped"]
+            return before, after, len(main_bot._shadow_parked)
+        finally:
+            main_bot._shadow_accepting = False
+            task = main_bot._shadow_relink_task
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            main_bot._shadow_parked.clear()
+            main_bot._shadow_restore_end()
+            main_bot.reset_setup_disable_state()
+
+    before, after, parked = asyncio.run(run())
+    assert parked == main_bot._SHADOW_LEDGER_QUEUE_MAX
+    assert after == before + 1
+
+
+def test_restore_waits_for_the_shadow_schema(tmp_path, monkeypatch):
+    main_bot.reset_setup_disable_state()
+    monkeypatch.setattr(main_bot, "_shadow_restore_delays", (0.0, 0.0, 0.0))
+    path = tmp_path / "setup_disable_shadow.jsonl"
+    order = []
+    ready = {"ok": False}
+
+    async def schema():
+        order.append("schema")
+        await asyncio.sleep(0.05)
+        ready["ok"] = True
+
+    async def loader():
+        order.append("restore")
+        if not ready["ok"]:
+            raise RuntimeError("missing table")
+        return []
+
+    monkeypatch.setattr(main_bot, "_ensure_shadow_schema", schema)
+    main_bot._shadow_line_loader = loader
+    main_bot._shadow_table_task = None
+
+    async def run():
+        main_bot._schedule_shadow_schema()
+        await main_bot.prepare_setup_disable_shadow(path)
+        failed = main_bot.setup_disable_status()["ledger"]["restore_failed"]
+        attempts = main_bot.setup_disable_status()["ledger"]["restore_attempts"]
+        await _cancel_shadow_tasks()
+        return list(order), failed, attempts
+
+    try:
+        seen, failed, attempts = asyncio.run(run())
+    finally:
+        main_bot._shadow_line_loader = None
+        main_bot._shadow_table_task = None
+        main_bot.reset_setup_disable_state()
+    assert seen[0] == "schema"
+    assert "restore" in seen
+    assert seen.index("schema") < seen.index("restore")
+    assert failed is False
+    assert attempts == 1
+
+
+def test_shutdown_cancels_the_shadow_writer():
+    async def run():
+        async def hang():
+            await asyncio.Event().wait()
+
+        main_bot._shadow_writer = asyncio.create_task(hang())
+        await main_bot._cancel_shadow_maintenance()
+        return main_bot._shadow_writer.done()
+
+    try:
+        done = asyncio.run(run())
+    finally:
+        main_bot._shadow_writer = None
+        main_bot.reset_setup_disable_state()
+    assert done is True

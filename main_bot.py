@@ -18072,9 +18072,23 @@ def _start_shadow_restore_retry(path: Path) -> None:
     _shadow_restore_task = loop.create_task(_shadow_restore_retry(path), name="setup-disable-shadow-restore")
 
 
+async def _await_shadow_schema() -> None:
+    """Let CREATE finish before the first restore, so a missing table is not a failed boot."""
+    task = _shadow_table_task
+    if task is None:
+        return
+    if task.done():
+        return
+    try:
+        await task
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+
+
 async def _prepare_shadow_body(path: Path) -> None:
     """Restore and seed. The caller holds the restore gate."""
     global _shadow_restore_failed, _shadow_restore_attempts, _shadow_nonce_for_boot
+    await _await_shadow_schema()
     ok = False
     for delay in _shadow_restore_delays:
         if delay:
@@ -18203,10 +18217,16 @@ def _ensure_shadow_writer() -> asyncio.Queue:
     return _shadow_queue
 
 
-def _park_shadow_row(body: Dict[str, Any], fut: Optional[asyncio.Future]) -> None:
-    """Hold a row that must not become a second genesis while restore is in flight."""
+def _park_shadow_row(body: Dict[str, Any], fut: Optional[asyncio.Future]) -> bool:
+    """Hold a row until restore has opened the log. Overflow is counted and dropped."""
+    if len(_shadow_parked) >= max(1, int(_SHADOW_LEDGER_QUEUE_MAX)):
+        _shadow_ledger_counts["dropped"] += 1
+        if fut is not None and not fut.done():
+            fut.set_result(None)
+        return False
     _shadow_parked.append((body, fut))
     _ensure_shadow_relink()
+    return True
 
 
 def _ensure_shadow_relink() -> None:
@@ -18281,19 +18301,20 @@ async def _shadow_ledger_writer() -> None:
         _shadow_inflight += 1
         try:
             log = _shadow_log
-            if log is None:
+            if _shadow_restore_pending():
+                # The log is still None during the boot window. Park, do not drop.
+                parked = _park_shadow_row(body, fut)
+            elif log is None:
                 _shadow_ledger_counts["dropped"] += 1
             else:
                 ready = await _wait_shadow_restore()
                 log = _shadow_log
                 if not ready or log is None:
-                    _park_shadow_row(body, fut)
-                    parked = True
+                    parked = _park_shadow_row(body, fut)
                 else:
                     rec = await _shadow_io(_append_shadow_after_restore, log, body)
                     if rec is None:
-                        _park_shadow_row(body, fut)
-                        parked = True
+                        parked = _park_shadow_row(body, fut)
                     else:
                         _shadow_ledger_counts["written"] += 1
                         seq = rec.get("seq")
@@ -18396,9 +18417,10 @@ def setup_disable_status() -> Dict[str, Any]:
 
     Counts live in memory. Startup seeds them once from the ledger tail.
     A status poll does not re-read the ledger. Each setup in the list is
-    reported on its own, including a zero. ``chain_anchors`` is the per-chain
-    row count and tail hash from the last open or append, so a truncated tail
-    is visible without scanning the file again.
+    reported on its own, including a zero. ``chain_anchors`` is a point-in-time
+    snapshot of each chain's row count and tail hash from the last open or
+    append. A status poll does not rescan the file. Those numbers show a
+    truncated tail only when they are compared with an external copy of the chain.
     """
     parsed = resolved_setup_disable_list()
     by_setup = _setup_disable_counts.get("by_setup") or {}
@@ -40876,6 +40898,7 @@ async def _cancel_shadow_maintenance() -> None:
     """Stop restore, backfill, schema, and count tasks. The flush has already run."""
     pending = []
     for task in (
+        _shadow_writer,
         _shadow_backfill_task,
         _shadow_restore_task,
         _shadow_relink_task,
