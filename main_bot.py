@@ -12038,10 +12038,14 @@ class Scanner:
                         cand["dispatch"] = "shadow-tracked (retired setup)"
                     except Exception as e:
                         logger.warning(f"shadow record failed for {cand['ticker']}: {e}")
+                    await _note_entry_signal_snapshot(build_signal(quote, cand, "paper"))
             if not cand["qualifies"]:
                 continue
             if cfg["mode"] != "live":
                 cand["dispatch"] = "shadow (not sent)"
+                shadow_quote = next((q for q in quotes if q["symbol"] == cand["ticker"]), None)
+                if shadow_quote is not None:
+                    await _note_entry_signal_snapshot(build_signal(shadow_quote, cand, "paper"))
                 continue
             quote = next((q for q in quotes if q["symbol"] == cand["ticker"]), None)
             if quote is None:
@@ -12058,6 +12062,9 @@ class Scanner:
                     f"🔭 Scanner refused to dispatch {cand['ticker']} — E*TRADE quote status "
                     f"'{status}' is not real-time (accept the market data agreement to enable live scanning)"
                 )
+                await _note_entry_signal_snapshot(build_signal(
+                    quote, {**cand, "expiry": next_friday_expiry(self.now_et())}, "live",
+                ))
                 continue
             payload = build_signal(
                 quote,
@@ -15097,7 +15104,9 @@ import asyncio
 import hashlib
 import hmac
 import contextvars
+import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime, date, time as dtime, timedelta, timezone
@@ -15445,7 +15454,10 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # /status positions_open is the open book with status, side, and qty.
 # Logs, alerts, and HTTP responses mask accountIdKey (**** + last 4).
 # Order routing still uses the real key.
-BOT_VERSION = "5.99.11-pro-day-trader"
+# 5.99.16 records each E*TRADE quote fetch (the app route and the decision
+# reads) as a scrubbed log line. Quote values, decisions, orders, and
+# routing are unchanged. Renumbered at merge.
+BOT_VERSION = "5.99.16-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -22461,7 +22473,10 @@ async def get_quotes(symbols: str = Query(...)):
     try:
         # Exponential backoff covers throttles, 5xx AND the post-renewal 401s
         # the old hand-rolled fixed-sleep loop existed for.
-        raw = await _etrade_call(market.get_quote, symbol_list, resp_format="json", source="quote")
+        raw = await _etrade_call(
+            market.get_quote, symbol_list, resp_format="json",
+            source="quote", quote_log_as="/etrade/quote",
+        )
         normalized = normalize_quote_response(raw)
         judged = _record_quote_entitlement(normalized["quotes"])
         delayed = (judged or {}).get("delayed_symbols") or []
@@ -22475,6 +22490,46 @@ async def get_quotes(symbols: str = Query(...)):
         return {**normalized, "raw": raw} if DEBUG_QUOTES else normalized
     except Exception as e:
         raise HTTPException(500, detail=scrub_etrade_text(str(e)))
+
+
+@app.get("/etrade/quotes/log")
+async def etrade_quotes_log(
+    symbol: Optional[str] = Query(None),
+    since: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
+):
+    """Scrubbed E*TRADE quote ground truth, newest first.
+
+    Auth is fail-closed: a missing secret, a wrong secret, and an unset
+    WEBHOOK_SECRET are all 401. The read is rate-limited and `limit` cannot
+    exceed 1000. This route only reads the log.
+    """
+    if not _secrets_match(x_rork_secret, WEBHOOK_SECRET):
+        raise HTTPException(401, "invalid secret")
+    try:
+        allowed = _quote_log_allow_read()
+    except Exception:
+        raise HTTPException(429, "rate limit unavailable")
+    if not allowed:
+        raise HTTPException(429, "rate limit exceeded")
+    try:
+        limit_n = int(limit)
+    except (TypeError, ValueError):
+        raise HTTPException(422, "limit must be an integer")
+    if limit_n < 1 or limit_n > 1000:
+        raise HTTPException(422, "limit must be between 1 and 1000")
+    cutoff = None
+    if since is not None and str(since).strip():
+        try:
+            cutoff = _parse_quote_log_since(str(since))
+        except ValueError:
+            raise HTTPException(400, "since must be an ISO-8601 timestamp")
+    try:
+        records = await _read_etrade_quote_log(symbol, cutoff, limit_n)
+    except Exception:
+        raise HTTPException(500, "quote log unreadable")
+    return {"quotes": records, "count": len(records), "limit": limit_n}
 
 
 @app.get("/etrade/option-quote")
@@ -26433,12 +26488,956 @@ def _is_retryable_error(e: Exception) -> bool:
     return any(marker in text for marker in _RETRYABLE_ERROR_MARKERS)
 
 
-def _sync_etrade_call(fn, *args, source: str = "etrade", **kwargs):
+# ==================== E*TRADE QUOTE GROUND TRUTH ====================
+# Read-only record of each market quote the bot actually fetched. The quote
+# dict that decisions and /etrade/quote return is not modified. Failures here
+# are swallowed. ETRADE_QUOTE_LOG_ENABLED defaults on because this is logging
+# only: set it to false/0/no/off to record nothing.
+ETRADE_QUOTE_LOG_PREFIX = "etrade_quote "
+ETRADE_QUOTE_LOG_KEY = "etrade:quote_log"
+ETRADE_QUOTE_LOG_CAP = 20000
+ETRADE_QUOTE_LOG_FIELDS = (
+    "source",
+    "symbol",
+    "option_symbol",
+    "bid",
+    "ask",
+    "last",
+    "open",
+    "previousClose",
+    "quoteStatus",
+    "realtime",
+    "dateTime",
+    "fetched_at",
+    "latency_ms",
+)
+# source= values already passed to the retry wrappers, used when a caller
+# does not pass quote_log_as. Order placement and token fetches are absent.
+_QUOTE_LOG_SOURCE_LABELS = {
+    "quote": "/etrade/quote",
+    "stop_reprice_quote": "_etrade_bid_ask",
+    "scanner_quote": "_scanner_fetch_etrade_quotes",
+    "option_chain": "option_chain",
+}
+_OPTION_QUOTE_RE = re.compile(
+    r"^(?P<root>[A-Za-z][A-Za-z0-9.]{0,10}):(?P<y>\d{4}):(?P<m>\d{1,2}):"
+    r"(?P<d>\d{1,2}):(?P<right>CALL|PUT):(?P<strike>\d+(?:\.\d+)?)$"
+)
+_QUOTE_LOG_MEMORY: deque = deque(maxlen=ETRADE_QUOTE_LOG_CAP)
+_QUOTE_LOG_SEEN: Dict[str, float] = {}
+_QUOTE_LOG_READS: deque = deque()
+_QUOTE_LOG_LOCK = threading.Lock()
+_QUOTE_LOG_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _etrade_quote_log_enabled() -> bool:
+    """Default true. Unset or blank stays on. false/0/no/off disable the log."""
+    raw = os.getenv("ETRADE_QUOTE_LOG_ENABLED")
+    if raw is None or not str(raw).strip():
+        return True
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _etrade_quote_log_interval_s() -> float:
+    """Minimum seconds between stored records for one symbol. Default 5."""
+    raw = os.getenv("ETRADE_QUOTE_LOG_MIN_INTERVAL_S", "5")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 5.0
+    if not math.isfinite(value) or value < 0:
+        return 5.0
+    return value
+
+
+def _etrade_quote_log_cap() -> int:
+    return ETRADE_QUOTE_LOG_CAP
+
+
+def _quote_log_read_per_min() -> int:
+    raw = os.getenv("ETRADE_QUOTE_LOG_READ_PER_MIN", "60")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 60
+    return max(1, min(value, 600))
+
+
+def _quote_log_secrets() -> List[str]:
+    """Live credentials to strip if a quote string ever contains one."""
+    found: List[str] = []
+    try:
+        candidates = [
+            _resolved_account_id_key,
+            _resolved_crypto_account_id_key,
+            os.getenv("ETRADE_ACCOUNT_ID"),
+            os.getenv("ETRADE_CONSUMER_KEY"),
+            os.getenv("ETRADE_CONSUMER_SECRET"),
+            CONSUMER_KEY,
+            CONSUMER_SECRET,
+            WEBHOOK_SECRET,
+        ]
+        tokens = _current_tokens if isinstance(_current_tokens, dict) else {}
+        candidates.extend(tokens.get(name) for name in ("oauth_token", "oauth_token_secret"))
+        for value in candidates:
+            if isinstance(value, str) and len(value) >= 4 and value not in found:
+                found.append(value)
+    except Exception:
+        return found
+    return found
+
+
+def _format_broker_time(value: Any) -> Optional[str]:
+    """Broker dateTime or epoch, as text that survives digit scrubbing."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return _epoch_to_iso(float(value))
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit() and len(text) in (10, 13):
+        converted = _epoch_to_iso(float(text))
+        return converted or text
+    return text
+
+
+def _epoch_to_iso(value: float) -> Optional[str]:
+    if not math.isfinite(value):
+        return None
+    n = float(value)
+    if n > 10_000_000_000:
+        n = n / 1000.0
+    if n < 1_000_000_000 or n > 10_000_000_000:
+        return None
+    try:
+        return datetime.fromtimestamp(n, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _broker_stamp(*values: Any) -> Optional[str]:
+    for value in values:
+        text = _format_broker_time(value)
+        if text:
+            return text
+    return None
+
+
+def _quote_log_finite(raw: Any) -> Optional[float]:
+    """A finite float, or None. Booleans and NaN/inf are not prices."""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def _quote_field_number(node: Any, *keys: str) -> Optional[float]:
+    if not isinstance(node, dict):
+        return None
+    for key in keys:
+        if key not in node:
+            continue
+        return _quote_log_finite(node.get(key))
+    return None
+
+
+def _split_option_symbol(raw: str) -> Optional[Tuple[str, str]]:
+    match = _OPTION_QUOTE_RE.match(str(raw).strip())
+    if not match:
+        return None
+    root = match.group("root").upper()
+    normalized = (
+        f"{root}:{int(match.group('y'))}:{int(match.group('m'))}:{int(match.group('d'))}:"
+        f"{match.group('right').upper()}:{float(match.group('strike')):g}"
+    )
+    return root, normalized
+
+
+def _built_option_symbol(root: Any, expiry: Any, right: Any, strike: Any) -> Optional[str]:
+    if not root:
+        return None
+    if hasattr(expiry, "strftime"):
+        exp = expiry.strftime("%Y-%m-%d")
+    else:
+        exp = str(expiry or "")[:10]
+    if len(exp) < 10:
+        return None
+    side = "PUT" if str(right or "").upper().startswith("P") else "CALL"
+    number = _quote_log_finite(strike)
+    if number is None:
+        return None
+    return f"{str(root).upper()}:{exp}:{side}:{number:g}"
+
+
+def _assemble_quote_record(
+    source: str,
+    symbol: str,
+    option_symbol: Optional[str],
+    bid: Optional[float],
+    ask: Optional[float],
+    last: Optional[float],
+    open_px: Optional[float],
+    previous: Optional[float],
+    quote_status: Optional[str],
+    broker_time: Optional[str],
+    latency_ms: int,
+    fetched_at: str,
+) -> Dict[str, Any]:
+    return {
+        "source": source,
+        "symbol": symbol,
+        "option_symbol": option_symbol,
+        "bid": bid,
+        "ask": ask,
+        "last": last,
+        "open": open_px,
+        "previousClose": previous,
+        "quoteStatus": quote_status,
+        "realtime": isinstance(quote_status, str) and quote_status in _REALTIME_QUOTE_STATUSES,
+        "dateTime": broker_time,
+        "fetched_at": fetched_at,
+        "latency_ms": latency_ms,
+    }
+
+
+def _requested_quote_symbols(args: tuple) -> List[str]:
+    if not args:
+        return []
+    first = args[0]
+    if isinstance(first, str):
+        return [first]
+    if isinstance(first, (list, tuple)):
+        return [str(item) for item in first if isinstance(item, str)]
+    return []
+
+
+def _records_from_equity_quotes(
+    source: str, payload: Dict[str, Any], args: tuple, latency_ms: int, fetched_at: str,
+) -> List[Dict[str, Any]]:
+    data = (payload.get("QuoteResponse") or {}).get("QuoteData")
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    option_by_root: Dict[str, str] = {}
+    for raw in _requested_quote_symbols(args):
+        split = _split_option_symbol(raw)
+        if split:
+            option_by_root.setdefault(split[0], split[1])
+    out: List[Dict[str, Any]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        all_q = entry.get("All") if isinstance(entry.get("All"), dict) else {}
+        product = entry.get("Product") if isinstance(entry.get("Product"), dict) else {}
+        raw_symbol = str(product.get("symbol") or entry.get("symbol") or "").strip()
+        if not raw_symbol:
+            continue
+        split = _split_option_symbol(raw_symbol)
+        if split:
+            symbol, option_symbol = split
+        else:
+            symbol = raw_symbol.upper()
+            option_symbol = option_by_root.get(symbol)
+        status = entry.get("quoteStatus")
+        status_text = None if status is None else str(status).upper().strip()
+        out.append(_assemble_quote_record(
+            source=source,
+            symbol=symbol,
+            option_symbol=option_symbol,
+            bid=_quote_field_number(all_q, "bid"),
+            ask=_quote_field_number(all_q, "ask"),
+            last=_quote_field_number(all_q, "lastTrade", "lastPrice", "last"),
+            open_px=_quote_field_number(all_q, "open"),
+            previous=_quote_field_number(all_q, "previousClose"),
+            quote_status=status_text,
+            broker_time=_broker_stamp(
+                entry.get("dateTime"), entry.get("dateTimeUTC"),
+                all_q.get("dateTime"), all_q.get("timeStamp"),
+            ),
+            latency_ms=latency_ms,
+            fetched_at=fetched_at,
+        ))
+    return out
+
+
+def _records_from_option_chain(
+    source: str, payload: Dict[str, Any], args: tuple, kwargs: Dict[str, Any],
+    latency_ms: int, fetched_at: str,
+) -> List[Dict[str, Any]]:
+    root = payload.get("OptionChainResponse")
+    if not isinstance(root, dict):
+        return []
+    underlying = args[0].strip().upper() if args and isinstance(args[0], str) else ""
+    expiry = kwargs.get("expiry_date") if isinstance(kwargs, dict) else None
+    chain_right = kwargs.get("chain_type") if isinstance(kwargs, dict) else None
+    chain_status = root.get("quoteType")
+    chain_status_text = None if chain_status is None else str(chain_status).upper().strip()
+    chain_time = _broker_stamp(root.get("dateTime"), root.get("timeStamp"), root.get("dateTimeUTC"))
+    pairs = root.get("OptionPair") or []
+    if isinstance(pairs, dict):
+        pairs = [pairs]
+    if not isinstance(pairs, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        for side in ("Call", "Put"):
+            leg = pair.get(side)
+            if not isinstance(leg, dict):
+                continue
+            leg_symbol = str(leg.get("symbol") or underlying or "").strip().upper()
+            if not leg_symbol:
+                continue
+            # Colon form, not the OSI key: the OSI strike is an 8-digit run and
+            # scrub_etrade_text would erase it. This is the same symbol the
+            # bot sends to get_quote.
+            option_symbol = _built_option_symbol(
+                leg_symbol,
+                leg.get("expirationDate") or expiry,
+                leg.get("optionType") or side or chain_right,
+                leg.get("strikePrice"),
+            )
+            leg_status = leg.get("quoteStatus")
+            use_status = None if leg_status is None else str(leg_status).upper().strip()
+            if use_status is None:
+                use_status = chain_status_text
+            leg_time = _broker_stamp(leg.get("dateTime"), leg.get("timeStamp"), leg.get("dateTimeUTC"))
+            out.append(_assemble_quote_record(
+                source=source,
+                symbol=leg_symbol,
+                option_symbol=option_symbol,
+                bid=_quote_field_number(leg, "bid"),
+                ask=_quote_field_number(leg, "ask"),
+                last=_quote_field_number(leg, "lastPrice", "lastTrade", "last"),
+                open_px=_quote_field_number(leg, "open"),
+                previous=_quote_field_number(leg, "previousClose"),
+                quote_status=use_status,
+                broker_time=leg_time or chain_time,
+                latency_ms=latency_ms,
+                fetched_at=fetched_at,
+            ))
+    return out
+
+
+def _extract_etrade_quote_records(
+    source: str, payload: Any, args: tuple, kwargs: Dict[str, Any],
+    latency_ms: int, fetched_at: str,
+) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    if "QuoteResponse" in payload:
+        return _records_from_equity_quotes(source, payload, args, latency_ms, fetched_at)
+    if "OptionChainResponse" in payload:
+        return _records_from_option_chain(source, payload, args, kwargs, latency_ms, fetched_at)
+    return []
+
+
+def _format_etrade_quote_line(record: Dict[str, Any]) -> str:
+    """One scrubbed logger line. Raises if the line cannot stay valid JSON."""
+    secrets = _quote_log_secrets()
+    body: Dict[str, Any] = {}
+    for key in ETRADE_QUOTE_LOG_FIELDS:
+        value = record.get(key)
+        if isinstance(value, str):
+            value = scrub_etrade_text(value, secrets=secrets)
+        elif isinstance(value, float) and not math.isfinite(value):
+            value = None
+        body[key] = value
+    body["realtime"] = bool(body.get("realtime"))
+    payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    line = ETRADE_QUOTE_LOG_PREFIX + payload
+    scrubbed = scrub_etrade_text(line, secrets=secrets)
+    if not scrubbed.startswith(ETRADE_QUOTE_LOG_PREFIX):
+        raise ValueError("quote log prefix missing")
+    parsed = json.loads(scrubbed[len(ETRADE_QUOTE_LOG_PREFIX):])
+    if not isinstance(parsed, dict):
+        raise ValueError("quote log is not an object")
+    for key in ETRADE_QUOTE_LOG_FIELDS:
+        parsed.setdefault(key, body.get(key))
+    final_body = {key: parsed.get(key) for key in ETRADE_QUOTE_LOG_FIELDS}
+    final = ETRADE_QUOTE_LOG_PREFIX + json.dumps(
+        final_body, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    )
+    again = scrub_etrade_text(final, secrets=secrets)
+    try:
+        json.loads(again[len(ETRADE_QUOTE_LOG_PREFIX):])
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return final
+    if not again.startswith(ETRADE_QUOTE_LOG_PREFIX):
+        return final
+    return again
+
+
+def _note_quote_log_loop() -> None:
+    global _QUOTE_LOG_LOOP
+    try:
+        _QUOTE_LOG_LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+
+def _observe_etrade_quote_fetch(
+    source: str,
+    quote_log_as: Optional[str],
+    args: tuple,
+    kwargs: Dict[str, Any],
+    payload: Any,
+    started: float,
+) -> None:
+    """Best-effort. Never raises. Does not mutate `payload`."""
+    try:
+        _observe_etrade_quote_fetch_inner(source, quote_log_as, args, kwargs, payload, started)
+    except Exception:
+        return
+
+
+def _observe_etrade_quote_fetch_inner(
+    source: str,
+    quote_log_as: Optional[str],
+    args: tuple,
+    kwargs: Dict[str, Any],
+    payload: Any,
+    started: float,
+) -> None:
+    if not _etrade_quote_log_enabled():
+        return
+    label = quote_log_as or _QUOTE_LOG_SOURCE_LABELS.get(str(source or ""))
+    if not label:
+        return
+    _note_quote_log_loop()
+    elapsed = time.perf_counter() - started
+    latency_ms = 0 if not math.isfinite(elapsed) or elapsed < 0 else int(round(elapsed * 1000.0))
+    fetched_at = _utcnow().isoformat()
+    records = _extract_etrade_quote_records(
+        str(label), payload, args, kwargs or {}, latency_ms, fetched_at,
+    )
+    interval = _etrade_quote_log_interval_s()
+    now = time.monotonic()
+    prepared: List[Tuple[str, str]] = []
+    for rec in records:
+        try:
+            line = _format_etrade_quote_line(rec)
+            parsed = json.loads(line[len(ETRADE_QUOTE_LOG_PREFIX):])
+        except Exception:
+            continue
+        sample = parsed.get("option_symbol") or parsed.get("symbol")
+        if not sample:
+            continue
+        prepared.append((str(sample).upper(), line))
+    if not prepared:
+        return
+    kept: List[str] = []
+    with _QUOTE_LOG_LOCK:
+        for key, line in prepared:
+            last = _QUOTE_LOG_SEEN.get(key)
+            if last is not None and (now - last) < interval:
+                continue
+            _QUOTE_LOG_SEEN[key] = now
+            _QUOTE_LOG_MEMORY.appendleft(line)
+            kept.append(line)
+        if len(_QUOTE_LOG_SEEN) > 4000:
+            cutoff = now - max(interval, 60.0)
+            for key, seen_at in list(_QUOTE_LOG_SEEN.items()):
+                if seen_at < cutoff:
+                    _QUOTE_LOG_SEEN.pop(key, None)
+    for line in kept:
+        try:
+            logger.info(line)
+        except Exception:
+            pass
+    _schedule_quote_log_redis(kept)
+
+
+def _schedule_quote_log_redis(lines: List[str]) -> None:
+    if not lines:
+        return
+    try:
+        if getattr(state, "redis", None) is None:
+            return
+        payload = list(lines)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = _QUOTE_LOG_LOOP
+            if loop is None or not loop.is_running():
+                return
+
+            def _kick(bound_loop=loop, bound_payload=payload):
+                try:
+                    bound_loop.create_task(_push_quote_log_redis(bound_payload))
+                except Exception:
+                    return
+
+            loop.call_soon_threadsafe(_kick)
+            return
+        loop.create_task(_push_quote_log_redis(payload))
+    except Exception:
+        return
+
+
+async def _push_quote_log_redis(lines: List[str]) -> None:
+    """Capped Redis list, same LPUSH+LTRIM shape as alerts:recent.
+
+    Used only when Redis is connected. The SQL mirror is not a telemetry
+    store, so a missing Redis client keeps the process deque and the logger
+    line and does not write this list through list_push_capped.
+    """
+    try:
+        if getattr(state, "redis", None) is None:
+            return
+        cap = _etrade_quote_log_cap()
+        for line in lines:
+            await state.list_push_capped(ETRADE_QUOTE_LOG_KEY, line, max_len=cap)
+    except Exception:
+        return
+
+
+def _quote_log_line_text(line: Any) -> Optional[str]:
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", "replace")
+    if not isinstance(line, str):
+        return None
+    return line
+
+
+def _parse_quote_log_line(line: Any) -> Optional[Dict[str, Any]]:
+    text = _quote_log_line_text(line)
+    if not text or not text.startswith(ETRADE_QUOTE_LOG_PREFIX):
+        return None
+    try:
+        parsed = json.loads(text[len(ETRADE_QUOTE_LOG_PREFIX):])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    try:
+        cleaned = _format_etrade_quote_line(parsed)
+        rec = json.loads(cleaned[len(ETRADE_QUOTE_LOG_PREFIX):])
+    except Exception:
+        return None
+    if not isinstance(rec, dict):
+        return None
+    return {key: rec.get(key) for key in ETRADE_QUOTE_LOG_FIELDS}
+
+
+def _parse_quote_log_since(value: str) -> datetime:
+    text = str(value).strip()
+    if not text:
+        raise ValueError("empty")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _record_fetched_at(rec: Dict[str, Any]) -> Optional[datetime]:
+    try:
+        return _parse_quote_log_since(str(rec.get("fetched_at") or ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _quote_log_symbol_match(rec: Dict[str, Any], symbol: Optional[str]) -> bool:
+    if symbol is None or not str(symbol).strip():
+        return True
+    want = str(symbol).strip().upper()
+    for key in ("symbol", "option_symbol"):
+        val = rec.get(key)
+        if isinstance(val, str) and val.strip().upper() == want:
+            return True
+    return False
+
+
+def _quote_log_allow_read() -> bool:
+    limit = _quote_log_read_per_min()
+    now = time.monotonic()
+    with _QUOTE_LOG_LOCK:
+        while _QUOTE_LOG_READS and now - _QUOTE_LOG_READS[0] >= 60.0:
+            _QUOTE_LOG_READS.popleft()
+        if len(_QUOTE_LOG_READS) >= limit:
+            return False
+        _QUOTE_LOG_READS.append(now)
+        return True
+
+
+async def _read_etrade_quote_log(
+    symbol: Optional[str], cutoff: Optional[datetime], limit_n: int,
+) -> List[Dict[str, Any]]:
+    with _QUOTE_LOG_LOCK:
+        local = list(_QUOTE_LOG_MEMORY)
+    remote: List[Any] = []
+    redis = getattr(state, "redis", None)
+    if redis is not None:
+        try:
+            remote = await redis.lrange(ETRADE_QUOTE_LOG_KEY, 0, _etrade_quote_log_cap() - 1)
+        except Exception:
+            remote = []
+    seen = set()
+    records: List[Dict[str, Any]] = []
+    for raw in list(local) + list(remote or []):
+        text = _quote_log_line_text(raw)
+        if text is None or text in seen:
+            continue
+        seen.add(text)
+        rec = _parse_quote_log_line(text)
+        if rec is None:
+            continue
+        if not _quote_log_symbol_match(rec, symbol):
+            continue
+        if cutoff is not None:
+            stamped = _record_fetched_at(rec)
+            if stamped is None or stamped < cutoff:
+                continue
+        records.append(rec)
+    records.sort(key=lambda rec: str(rec.get("fetched_at") or ""), reverse=True)
+    return records[:limit_n]
+
+
+# ==================== OPTION QUOTE SNAPSHOTS ====================
+# Ground truth around an entry signal. Offset 0 is the decision. Later
+# offsets are modeled exits (+15, +30, +60 min), replaced by today's flatten
+# (3:40 PM ET, 12:40 PM ET on a half day) when that clock comes first.
+# Read-only: enqueue and a quote fetch. No orders, positions, or stops.
+# OPTION_QUOTE_SNAPSHOT_MAX_PENDING caps queued fetches (default 200).
+OPTION_SNAPSHOT_OFFSETS_MIN = (15, 30, 60)
+_OPTION_SNAPSHOT_PENDING: Dict[Tuple[str, int], Dict[str, Any]] = {}
+_OPTION_SNAPSHOT_SEEN: Dict[Tuple[str, int], float] = {}
+_OPTION_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _option_snapshot_max_pending() -> int:
+    raw = os.getenv("OPTION_QUOTE_SNAPSHOT_MAX_PENDING", "200")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 200
+    if value < 1:
+        return 1
+    return min(value, 10000)
+
+
+def _flatten_deadline_et(signal_at: datetime) -> datetime:
+    """Today's hard flatten in ET: 15:40, or 12:40 on a half day."""
+    et = signal_at.astimezone(_ET_ZONE)
+    minute = _session_close_minute(et) - _flatten_lead_minutes()
+    if minute < 0 or minute >= 24 * 60:
+        minute = 15 * 60 + 40
+    hour, mins = divmod(int(minute), 60)
+    return et.replace(hour=hour, minute=mins, second=0, microsecond=0)
+
+
+def plan_option_snapshot_schedule(signal_at: datetime) -> List[Tuple[int, datetime]]:
+    """Modeled exits after `signal_at`. Offset 0 is not included.
+
+    Each of +15, +30, +60 is kept when it falls at or before the flatten.
+    The first offset that would land after the flatten is replaced by one
+    snapshot at the flatten, and later offsets are not queued.
+    """
+    if signal_at.tzinfo is None:
+        signal_at = signal_at.replace(tzinfo=timezone.utc)
+    signal_et = signal_at.astimezone(_ET_ZONE)
+    flatten = _flatten_deadline_et(signal_et)
+    planned: List[Tuple[int, datetime]] = []
+    seen_offsets = set()
+    for minutes in OPTION_SNAPSHOT_OFFSETS_MIN:
+        due = signal_et + timedelta(minutes=int(minutes))
+        if signal_et < flatten < due:
+            delta = int(round((flatten - signal_et).total_seconds() / 60.0))
+            delta = max(1, delta)
+            if delta not in seen_offsets:
+                planned.append((delta, flatten))
+                seen_offsets.add(delta)
+            break
+        if due > flatten:
+            break
+        if minutes not in seen_offsets:
+            planned.append((int(minutes), due))
+            seen_offsets.add(int(minutes))
+    return planned
+
+
+def _option_snapshot_spec(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Contract hint copied off the signal. Missing fields stay missing."""
+    ticker = str(payload.get("ticker") or "").upper().strip()
+    contract = payload.get("contract") if isinstance(payload.get("contract"), dict) else {}
+    expiry = contract.get("expiration") or payload.get("expiration_hint") or payload.get("expiry") or payload.get("expiration")
+    strike = contract.get("strike") if contract.get("strike") is not None else (
+        payload.get("strike_hint") if payload.get("strike_hint") is not None else payload.get("strike")
+    )
+    right = contract.get("right") or payload.get("option_right") or payload.get("call_put") or ""
+    option_symbol = None
+    if ticker and expiry and strike is not None and str(right).strip():
+        try:
+            option_symbol = _quote_symbol(ticker, {
+                "expiration": str(expiry)[:10],
+                "strike": float(strike),
+                "right": right,
+            })
+        except (TypeError, ValueError):
+            option_symbol = None
+        if option_symbol == ticker:
+            option_symbol = None
+    return {
+        "ticker": ticker or None,
+        "option_symbol": option_symbol,
+    }
+
+
+def _missing_option_quote(spec: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    symbol = None
+    if isinstance(spec, dict):
+        raw = spec.get("option_symbol")
+        symbol = str(raw) if raw else None
+    return {
+        "status": "missing",
+        "bid": None,
+        "ask": None,
+        "last": None,
+        "dateTime": None,
+        "option_symbol": symbol,
+    }
+
+
+def _scrub_snapshot_value(value: Any) -> Any:
+    secrets = _quote_log_secrets()
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False, default=str)
+        cleaned = scrub_etrade_text(encoded, secrets=secrets)
+        parsed = json.loads(cleaned)
+    except (TypeError, ValueError):
+        if isinstance(value, str):
+            return scrub_etrade_text(value, secrets=secrets)
+        return value
+    again = scrub_etrade_text(
+        json.dumps(parsed, ensure_ascii=False, separators=(",", ":"), allow_nan=False, default=str),
+        secrets=secrets,
+    )
+    try:
+        return json.loads(again)
+    except (TypeError, ValueError):
+        return parsed
+
+
+def _trim_option_snapshot_seen() -> None:
+    cap = max(800, _option_snapshot_max_pending() * 4)
+    while len(_OPTION_SNAPSHOT_SEEN) > cap:
+        _OPTION_SNAPSHOT_SEEN.pop(next(iter(_OPTION_SNAPSHOT_SEEN)), None)
+
+
+def _enqueue_option_snapshot(
+    signal_key: str, offset_min: int, due: datetime, spec: Dict[str, Any],
+) -> str:
+    """'queued', 'duplicate', or 'capped'. Does not fetch."""
+    key = (str(signal_key), int(offset_min))
+    due_epoch = due.astimezone(timezone.utc).timestamp()
+    with _OPTION_SNAPSHOT_LOCK:
+        if key in _OPTION_SNAPSHOT_SEEN or key in _OPTION_SNAPSHOT_PENDING:
+            return "duplicate"
+        cap = _option_snapshot_max_pending()
+        if len(_OPTION_SNAPSHOT_PENDING) >= cap:
+            return "capped"
+        _OPTION_SNAPSHOT_PENDING[key] = {
+            "signal_key": str(signal_key),
+            "offset_min": int(offset_min),
+            "due_epoch": due_epoch,
+            "spec": spec,
+        }
+        return "queued"
+
+
+async def _read_option_snapshot_quote(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """One read of the hinted contract. Any failure is a missing quote."""
+    missing = _missing_option_quote(spec)
+    symbol = spec.get("option_symbol") if isinstance(spec, dict) else None
+    if not symbol:
+        return missing
+    tokens = None
+    try:
+        tokens = load_tokens()
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot token read failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+        return missing
+    if not tokens:
+        return missing
+    try:
+        market = pyetrade.ETradeMarket(
+            CONSUMER_KEY, CONSUMER_SECRET,
+            tokens.get("oauth_token"), tokens.get("oauth_token_secret"),
+            dev=is_sandbox,
+        )
+        raw = await _etrade_call(
+            market.get_quote, [symbol], resp_format="json",
+            source="option_snapshot", quote_log_as="_option_quote_snapshot",
+        )
+        fetched_at = _utcnow().isoformat()
+        records = _records_from_equity_quotes(
+            "_option_quote_snapshot", raw if isinstance(raw, dict) else {},
+            ([symbol],), 0, fetched_at,
+        )
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot fetch failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+        return missing
+    if not records:
+        return missing
+    rec = records[0]
+    if rec.get("bid") is None and rec.get("ask") is None and rec.get("last") is None:
+        missing["option_symbol"] = rec.get("option_symbol") or symbol
+        missing["dateTime"] = rec.get("dateTime")
+        return missing
+    return {
+        "status": "ok",
+        "bid": rec.get("bid"),
+        "ask": rec.get("ask"),
+        "last": rec.get("last"),
+        "dateTime": rec.get("dateTime"),
+        "option_symbol": rec.get("option_symbol") or symbol,
+    }
+
+
+async def _write_option_snapshot_row(
+    signal_key: str, offset_min: int, spec: Dict[str, Any],
+) -> None:
+    try:
+        quote = await _read_option_snapshot_quote(spec)
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot read failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+        quote = _missing_option_quote(spec)
+    body = _scrub_snapshot_value({
+        "event_type": "option_quote_snapshot",
+        "signal_key": str(signal_key),
+        "offset_min": int(offset_min),
+        "status": quote.get("status") or "missing",
+        "quote": quote,
+    })
+    try:
+        await trade_ledger.record("option_quote_snapshot", body)
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot ledger write failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+
+
+async def note_option_quote_snapshots(payload: Dict[str, Any], now: Optional[datetime] = None) -> None:
+    """Queue offset 0 and the modeled exits for one entry signal.
+
+    Returns without raising. The caller is not an order path; this function
+    does not place, cancel, or resize anything.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return
+        signal_key = _signal_key(payload)
+        spec = _scrub_snapshot_value(_option_snapshot_spec(payload))
+        if not isinstance(spec, dict):
+            spec = _option_snapshot_spec(payload)
+        signal_at = now or _utcnow()
+        outcome = _enqueue_option_snapshot(signal_key, 0, signal_at, spec)
+        if outcome == "capped":
+            logger.warning(
+                "option quote snapshot pending cap reached (%s) — not scheduling %s offset 0",
+                _option_snapshot_max_pending(), signal_key,
+            )
+        for offset_min, due in plan_option_snapshot_schedule(signal_at):
+            queued = _enqueue_option_snapshot(signal_key, offset_min, due, spec)
+            if queued == "capped":
+                logger.warning(
+                    "option quote snapshot pending cap reached (%s) — not scheduling %s offset %s",
+                    _option_snapshot_max_pending(), signal_key, offset_min,
+                )
+                break
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot schedule failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+
+
+async def _option_snapshot_tick(now: Optional[datetime] = None) -> int:
+    """Write snapshots whose due time has arrived. Returns how many ran."""
+    clock = now or _utcnow()
+    if clock.tzinfo is None:
+        clock = clock.replace(tzinfo=timezone.utc)
+    epoch = clock.timestamp()
+    jobs: List[Dict[str, Any]] = []
+    with _OPTION_SNAPSHOT_LOCK:
+        for key, job in list(_OPTION_SNAPSHOT_PENDING.items()):
+            try:
+                due_epoch = float(job.get("due_epoch"))
+            except (TypeError, ValueError):
+                due_epoch = epoch
+            if due_epoch <= epoch:
+                _OPTION_SNAPSHOT_PENDING.pop(key, None)
+                _OPTION_SNAPSHOT_SEEN[key] = time.monotonic()
+                jobs.append(job)
+        _trim_option_snapshot_seen()
+    wrote = 0
+    for job in jobs:
+        try:
+            await _write_option_snapshot_row(
+                str(job.get("signal_key") or ""),
+                int(job.get("offset_min") or 0),
+                job.get("spec") if isinstance(job.get("spec"), dict) else {},
+            )
+            wrote += 1
+        except Exception as e:
+            logger.warning(
+                "option quote snapshot scheduler failed: %s",
+                scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+            )
+    return wrote
+
+
+async def _note_entry_signal_snapshot(payload: Dict[str, Any]) -> None:
+    """Entry-signal hook. Swallows every error."""
+    try:
+        await note_option_quote_snapshots(payload)
+    except Exception as e:
+        logger.warning(
+            "option quote snapshot schedule failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
+
+
+async def option_snapshot_worker() -> None:
+    """Fire due snapshots. A tick that raises is logged and the loop continues."""
+    while not _worker_stop:
+        try:
+            await _option_snapshot_tick(_utcnow())
+        except Exception as e:
+            logger.warning(
+                "option quote snapshot scheduler failed: %s",
+                scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+            )
+        await asyncio.sleep(1.0)
+
+
+def _sync_etrade_call(fn, *args, source: str = "etrade", quote_log_as: Optional[str] = None, **kwargs):
     """Exponential-backoff wrapper for SYNC pyetrade calls running inside a
     worker thread (e.g. contract snapping) — blocking sleeps are fine there."""
+    started = time.perf_counter()
     for attempt in range(ETRADE_RETRY_ATTEMPTS):
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
         except Exception as e:
             if attempt >= ETRADE_RETRY_ATTEMPTS - 1 or not _is_retryable_error(e):
                 raise
@@ -26448,16 +27447,27 @@ def _sync_etrade_call(fn, *args, source: str = "etrade", **kwargs):
                 f"{scrub_etrade_text(str(e))} — retrying in {delay:.1f}s"
             )
             time.sleep(delay)
+        else:
+            try:
+                _observe_etrade_quote_fetch(source, quote_log_as, args, kwargs, result, started)
+            except Exception:
+                pass
+            return result
 
 
-async def _etrade_call(fn, *args, source: str = "etrade", idempotent: bool = True, **kwargs):
+async def _etrade_call(
+    fn, *args, source: str = "etrade", idempotent: bool = True,
+    quote_log_as: Optional[str] = None, **kwargs,
+):
     """Run a sync pyetrade call in a thread with exponential backoff + jitter.
     idempotent=False (order placement) executes EXACTLY once — a failed place
     may still have reached the broker, so a blind retry risks a double order
     (the reconciliation engine heals whatever state results)."""
+    started = time.perf_counter()
+    _note_quote_log_loop()
     for attempt in range(ETRADE_RETRY_ATTEMPTS):
         try:
-            return await asyncio.to_thread(fn, *args, **kwargs)
+            result = await asyncio.to_thread(fn, *args, **kwargs)
         except Exception as e:
             # A 429 was never processed by the broker — safe to retry even for
             # non-idempotent calls (order placement). Anything else follows the
@@ -26471,6 +27481,12 @@ async def _etrade_call(fn, *args, source: str = "etrade", idempotent: bool = Tru
                 f"{scrub_etrade_text(str(e))} — retrying in {delay:.1f}s"
             )
             await asyncio.sleep(delay)
+        else:
+            try:
+                _observe_etrade_quote_fetch(source, quote_log_as, args, kwargs, result, started)
+            except Exception:
+                pass
+            return result
 
 
 # ==================== STOP GUARD ====================
@@ -27813,7 +28829,10 @@ async def _etrade_bid_ask(ticker: str, contract: Optional[dict] = None) -> Tuple
         sym = _quote_symbol(ticker, contract)
         # A failed fetch must not leave an older verdict describing no quote.
         _LAST_MARK_QUALITY.pop(sym, None)
-        resp = await _etrade_call(market.get_quote, [sym], resp_format="json", source="stop_reprice_quote")
+        resp = await _etrade_call(
+            market.get_quote, [sym], resp_format="json",
+            source="stop_reprice_quote", quote_log_as="_etrade_bid_ask",
+        )
         data = (((resp or {}).get("QuoteResponse") or {}).get("QuoteData")) or []
         if isinstance(data, dict):
             data = [data]
@@ -32743,6 +33762,7 @@ def _best_expression_contract(market, symbol: str, spot: Any, vol_annual: Any,
                 market.get_option_chains, symbol, expiry_date=exp, chain_type=right,
                 strike_price_near=int(round(k)), no_of_strikes=10,
                 resp_format="json", source="option_chain",
+                quote_log_as="_best_expression_contract",
             )
         except Exception as e:
             logger.warning(f"best-expiry: {symbol} {exp} chain unreadable ({e}) — candidate dropped")
@@ -34135,6 +35155,7 @@ def _snap_option_contract(market, symbol: str, expiry: str, strike: float, call_
             no_of_strikes=10,
             resp_format="json",
             source="option_chain",
+            quote_log_as="_snap_option_contract",
         )
         pairs = (((chains or {}).get("OptionChainResponse") or {}).get("OptionPair")) or []
         if liquidity_out is not None:
@@ -38630,7 +39651,10 @@ async def _scanner_fetch_etrade_quotes(symbols: List[str]) -> Dict[str, Any]:
         CONSUMER_KEY, CONSUMER_SECRET,
         tokens["oauth_token"], tokens["oauth_token_secret"], dev=is_sandbox,
     )
-    return await _etrade_call(market.get_quote, list(symbols), resp_format="json", source="scanner_quote")
+    return await _etrade_call(
+        market.get_quote, list(symbols), resp_format="json",
+        source="scanner_quote", quote_log_as="_scanner_fetch_etrade_quotes",
+    )
 
 
 async def _scanner_dispatch(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -38772,13 +39796,18 @@ async def start_worker():
     asyncio.create_task(entry_paths_worker())
     asyncio.create_task(exit_followup_worker())
     asyncio.create_task(chain_shadow_worker())
+    asyncio.create_task(option_snapshot_worker())
     await _start_scanner()
 
 
 # ==================== STARTUP ====================
 @app.on_event("startup")
 async def on_startup():
-    global state
+    global state, _QUOTE_LOG_LOOP
+    try:
+        _QUOTE_LOG_LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
     logger.info(f"Starting → {'SANDBOX' if is_sandbox else 'PRODUCTION'} | LIVE={LIVE_TRADING} | VERSION={BOT_VERSION}")
     # Database FIRST — it now backs durable state and the ledger mirror, so it
     # must exist before the StateStore hydrates and before the ledger restores.
@@ -39611,6 +40640,8 @@ async def process_signal(pd: dict, replay: bool = False) -> dict:
     take a shortcut around a risk gate. `replay=True` is only the parked-401
     path reclaiming a signal it already owns."""
     is_close = _is_close_payload(pd)
+    if not is_close:
+        await _note_entry_signal_snapshot(pd)
     mode = str(pd.get("mode") or "paper").lower()
     live_intent = _live_intent(mode)
 
