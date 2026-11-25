@@ -7708,12 +7708,13 @@ RISK_CONTEXT_KEYS = (
     "vix", "spy_range_pct", "spy_gap_pct", "gap_pct", "earnings_nearby",
     "bid_size", "ask_size", "volume", "open_interest",
     "spy_gap_verified", "spy_structure_valid", "spy_feed_healthy", "spy_spread_healthy",
-    "spy_gap_reference_rejected",
+    "spy_gap_reference_rejected", "spy_gap_reject_kind",
 )
 _RISK_CONTEXT_FLAGS = (
     "spy_gap_verified", "spy_structure_valid", "spy_feed_healthy", "spy_spread_healthy",
     "spy_gap_reference_rejected",
 )
+_GAP_REJECT_KINDS = frozenset({"session_bar", "vendor_change", "vendor_percent", "trust_cap"})
 
 
 def sanitize_risk_context(raw: Any) -> Dict[str, Any]:
@@ -7731,6 +7732,8 @@ def sanitize_risk_context(raw: Any) -> Dict[str, Any]:
     for key in _RISK_CONTEXT_FLAGS:
         flag = raw.get(key)
         out[key] = flag if isinstance(flag, bool) else None
+    kind = raw.get("spy_gap_reject_kind")
+    out["spy_gap_reject_kind"] = kind if kind in _GAP_REJECT_KINDS else None
     if out["vix"] is not None and not 5.0 <= out["vix"] <= 150.0:
         out["vix"] = None
     e = raw.get("earnings_nearby")
@@ -7738,14 +7741,27 @@ def sanitize_risk_context(raw: Any) -> Dict[str, Any]:
     return out
 
 
-def opening_gap_reference_rejected(reason: Any) -> bool:
-    """True when verify_opening_gap rejected the prior-close reference.
+def opening_gap_reject_kind(reason: Any) -> Optional[str]:
+    """Which sanity check rejected the opening gap, or None when it did not.
 
-    The unmeasured case ('open or previous close unmeasured') is not a
-    rejection. Rejection text is the bar check, the vendor-change checks,
-    and the trust cap — each ends with 'reference rejected'.
+    The unmeasured case ('open or previous close unmeasured') is not one of
+    these. Every kind blocks new entries until a verified gap arrives.
     """
-    return "reference rejected" in str(reason or "")
+    text = str(reason or "")
+    if "session bar does not contain" in text:
+        return "session_bar"
+    if "vendor percent" in text:
+        return "vendor_percent"
+    if "vendor change" in text:
+        return "vendor_change"
+    if "trust cap" in text:
+        return "trust_cap"
+    return None
+
+
+def opening_gap_reference_rejected(reason: Any) -> bool:
+    """True when verify_opening_gap rejected the reference."""
+    return opening_gap_reject_kind(reason) is not None
 
 
 def gap_pct(open_px: Any, prev_close: Any) -> Optional[float]:
@@ -7790,8 +7806,8 @@ def verify_opening_gap(
     (2026-11-23 SPY: 724.33 vs 689.81 = +5.004%, which prints as +5.00%).
     It is wrong when the day bar is a prior session, the open never printed,
     or the previous close disagrees with the vendor's own change. Those
-    return gap_pct None and verified False — a bad reference must not pause
-    the book, and it must not be stored as a gap.
+    return gap_pct None and verified False. The entry gate blocks until a
+    verified gap arrives, and the number is not stored as a gap.
 
     A check that cannot be run (no high/low, no vendor change) does not fail
     a otherwise finite open/close pair. A check that runs and disagrees does.
@@ -7880,6 +7896,7 @@ def index_gap_context(
         "spy_gap_pct": None,
         "spy_gap_verified": False,
         "spy_gap_reference_rejected": False,
+        "spy_gap_reject_kind": None,
         "spy_structure_valid": False,
         "spy_feed_healthy": False,
         "spy_spread_healthy": False,
@@ -7899,6 +7916,7 @@ def index_gap_context(
         "spy_gap_pct": verdict["gap_pct"] if verdict["verified"] else None,
         "spy_gap_verified": bool(verdict["verified"]),
         "spy_gap_reference_rejected": opening_gap_reference_rejected(verdict.get("reason")),
+        "spy_gap_reject_kind": opening_gap_reject_kind(verdict.get("reason")),
         "spy_structure_valid": index_session_ready(quote, min_range_pct),
         "spy_feed_healthy": quote.get("realtime") is True and verdict["bar_consistent"] is not False,
         "spy_spread_healthy": spread is not None and spread <= float(max_spread_pct),
@@ -7953,6 +7971,8 @@ def _gap_memory_blank(day: Optional[str] = None) -> None:
         "unmeasured_alerted": False,
         "rejected_alerted": False,
         "pending_alert": None,
+        "pending_alert_text": None,
+        "block_code": None,
     })
 
 
@@ -7977,20 +7997,24 @@ def note_spy_gap_session(
     day: str,
     *,
     reference_rejected: bool = False,
+    reject_kind: Any = None,
 ) -> Dict[str, Any]:
     """Apply one gap reading to today's in-memory session.
 
-    A verified gap at or above 2% sits the day out. A verified gap under 2%
-    marks the day measured and allows entries. A rejected prior-close
-    reference does not pause. No value yet blocks until a measurement.
+    A gap counts as measured only when `verified is True`. A verified gap at
+    or above 2% sits the day out. A verified gap under 2% allows entries.
+    Anything else — no value, a missing verified flag, or a rejected
+    reference — blocks until a verified gap arrives.
     """
     day_s = str(day or "")
     if _SPY_GAP_SIT_OUT.get("day") != day_s:
         _gap_memory_blank(day_s)
     gap = _finite(spy_gap)
-    verified_gap = gap is not None and verified is not False
+    verified_gap = gap is not None and verified is True
     if _SPY_GAP_SIT_OUT.get("active"):
         _SPY_GAP_SIT_OUT["pending_alert"] = "sit_out"
+        _SPY_GAP_SIT_OUT["pending_alert_text"] = None
+        _SPY_GAP_SIT_OUT["block_code"] = "gap_sit_out"
         return {
             "block": _SPY_GAP_SIT_OUT.get("reason"),
             "code": "gap_sit_out",
@@ -8008,6 +8032,8 @@ def note_spy_gap_session(
             "logged": True,
             "persisted": False,
             "pending_alert": "sit_out",
+            "pending_alert_text": None,
+            "block_code": "gap_sit_out",
         })
         logging.getLogger("etrade-bot").warning(f"SPY GAP SIT-OUT — {reason}")
         return {"block": reason, "code": "gap_sit_out", "alert": "sit_out", "persist": True}
@@ -8019,19 +8045,34 @@ def note_spy_gap_session(
             "gap_pct": round(float(gap), 3),
             "reason": None,
             "pending_alert": None,
+            "pending_alert_text": None,
+            "block_code": None,
         })
         return {"block": None, "code": None, "alert": None, "persist": False}
-    rejected = bool(reference_rejected) or (verified is False and gap is not None)
-    if rejected:
-        _SPY_GAP_SIT_OUT["pending_alert"] = "reference_rejected"
-        return {"block": None, "code": None, "alert": "reference_rejected", "persist": False}
     if _SPY_GAP_SIT_OUT.get("measured"):
         _SPY_GAP_SIT_OUT["pending_alert"] = None
+        _SPY_GAP_SIT_OUT["block_code"] = None
         return {"block": None, "code": None, "alert": None, "persist": False}
-    reason = (
-        "SPY opening gap unmeasured — no new entries until the open gap is verified"
-    )
+    kind = reject_kind if reject_kind in _GAP_REJECT_KINDS else None
+    label = {
+        "session_bar": "session bar",
+        "vendor_change": "vendor mismatch",
+        "vendor_percent": "vendor percent",
+        "trust_cap": "trust cap",
+    }.get(kind)
+    if label:
+        reason = (
+            f"SPY gap reference rejected ({label}) — entries blocked until verified"
+        )
+    elif reference_rejected:
+        reason = "SPY gap reference rejected — entries blocked until verified"
+    else:
+        reason = (
+            "SPY opening gap unmeasured — no new entries until the open gap is verified"
+        )
     _SPY_GAP_SIT_OUT["pending_alert"] = "unmeasured"
+    _SPY_GAP_SIT_OUT["pending_alert_text"] = reason
+    _SPY_GAP_SIT_OUT["block_code"] = "gap_unmeasured"
     if not _SPY_GAP_SIT_OUT.get("logged"):
         _SPY_GAP_SIT_OUT["logged"] = True
         logging.getLogger("etrade-bot").warning(f"SPY GAP UNMEASURED — {reason}")
@@ -8081,6 +8122,16 @@ def spy_gap_sit_out_view(day: str) -> Dict[str, Any]:
 def take_spy_gap_pending_alert() -> Optional[str]:
     kind = _SPY_GAP_SIT_OUT.get("pending_alert")
     return str(kind) if kind else None
+
+
+def spy_gap_pending_alert_text() -> Optional[str]:
+    text = _SPY_GAP_SIT_OUT.get("pending_alert_text")
+    return str(text) if text else None
+
+
+def gap_block_code() -> Optional[str]:
+    code = _SPY_GAP_SIT_OUT.get("block_code")
+    return str(code) if code else None
 
 
 def spy_gap_alert_sent(kind: str) -> bool:
@@ -11648,9 +11699,9 @@ def build_risk_context(quote: Dict[str, Any], quotes_by_symbol: Dict[str, Any]) 
     volume. No VIX here — the scanner reads quotes, not the index.
 
     Gaps go through verify_opening_gap. A stale day bar or a previous close
-    that disagrees with the vendor change is stored as unmeasured, not as a
-    pause. SPY's range is dropped with the same bar — a prior session's
-    high/low is not today's crisis range."""
+    that disagrees with the vendor change is stored as unverified, and the
+    entry gate blocks until a verified gap arrives. SPY's range is dropped
+    with the same bar — a prior session's high/low is not today's crisis range."""
     spy = (quotes_by_symbol or {}).get(edge_mod.BENCHMARK) or {}
     index = risk_mod.index_gap_context(spy if spy else None)
     bar_ok = index.pop("bar_consistent", None)
@@ -11666,6 +11717,7 @@ def build_risk_context(quote: Dict[str, Any], quotes_by_symbol: Dict[str, Any]) 
         risk_mod.note_spy_gap_session(
             index.get("spy_gap_pct"), index.get("spy_gap_verified"), sit_day,
             reference_rejected=bool(index.get("spy_gap_reference_rejected")),
+            reject_kind=index.get("spy_gap_reject_kind"),
         )
     except Exception as exc:
         logger.warning(f"SPY gap sit-out note failed: {exc}")
@@ -12290,9 +12342,9 @@ class Scanner:
                 except Exception:
                     logger.debug("scanner alert failed", exc_info=True)
 
+        sit_day = now_et.date().isoformat()
+        sit = risk_mod.spy_gap_sit_out_view(sit_day)
         try:
-            sit_day = now_et.date().isoformat()
-            sit = risk_mod.spy_gap_sit_out_view(sit_day)
             if sit.get("active") and not sit.get("persisted"):
                 await self.state.set(
                     f"spy_gap_sit_out:{sit_day}",
@@ -12304,22 +12356,18 @@ class Scanner:
                     ex=36 * 3600,
                 )
                 risk_mod.mark_spy_gap_persisted()
+        except Exception as exc:
+            logger.warning(f"SPY gap sit-out persist failed: {exc}")
+        try:
             kind = risk_mod.take_spy_gap_pending_alert()
+            minute = now_et.hour * 60 + now_et.minute
+            if kind == "unmeasured" and minute < 9 * 60 + 30:
+                kind = None
             if kind and not risk_mod.spy_gap_alert_sent(kind) and self.alert is not None:
-                text = {
-                    "sit_out": str(sit.get("reason") or "SPY gap sit-out"),
-                    "unmeasured": (
-                        "SPY opening gap unmeasured — no new entries until the open gap is verified"
-                    ),
-                    "reference_rejected": (
-                        "SPY prior-close reference rejected — entries are not paused"
-                    ),
-                }.get(kind, kind)
-                event = {
-                    "sit_out": "spy_gap_sit_out",
-                    "unmeasured": "spy_gap_unmeasured",
-                    "reference_rejected": "spy_gap_reference_rejected",
-                }.get(kind, "spy_gap_sit_out")
+                text = risk_mod.spy_gap_pending_alert_text() or str(
+                    sit.get("reason") or "SPY opening gap unmeasured — no new entries until the open gap is verified"
+                )
+                event = "spy_gap_sit_out" if kind == "sit_out" else "spy_gap_unmeasured"
                 await self.alert(
                     "warning", event, text, dedupe_key=f"{event}:{sit_day}",
                 )
@@ -20985,10 +21033,11 @@ async def _persist_spy_gap_sit_out(day: str) -> None:
 async def entry_gap_sit_out_reason(payload: Any, *, is_close: bool = False) -> Optional[str]:
     """Why this entry is blocked, or None.
 
-    Closes, stops, and crypto are not entries. A verified gap of 2% or more
-    is stored for the ET date. An unmeasured open blocks until a verified
-    gap arrives. A rejected prior-close reference does not block. A gap
-    recorded earlier today still blocks after the in-memory copy is gone.
+    Closes, stops, and crypto are not entries. A gap counts only when
+    `spy_gap_verified is True`. A verified gap of 2% or more is stored for
+    the ET date. No verified value, a missing verified flag, or any rejected
+    reference blocks until a verified gap arrives. A sit-out recorded earlier
+    today still blocks after the in-memory copy is gone.
     """
     if is_close or not isinstance(payload, dict):
         return None
@@ -21004,6 +21053,7 @@ async def entry_gap_sit_out_reason(payload: Any, *, is_close: bool = False) -> O
         ctx.get("spy_gap_verified"),
         day,
         reference_rejected=ctx.get("spy_gap_reference_rejected") is True,
+        reject_kind=ctx.get("spy_gap_reject_kind"),
     )
     if noted.get("persist"):
         await _persist_spy_gap_sit_out(day)
@@ -21011,28 +21061,26 @@ async def entry_gap_sit_out_reason(payload: Any, *, is_close: bool = False) -> O
     return str(block) if block else None
 
 
-_SPY_GAP_ALERT_TEXT = {
-    "sit_out": None,
-    "unmeasured": "SPY opening gap unmeasured — no new entries until the open gap is verified",
-    "reference_rejected": "SPY prior-close reference rejected — entries are not paused",
-}
-_SPY_GAP_ALERT_EVENT = {
-    "sit_out": "spy_gap_sit_out",
-    "unmeasured": "spy_gap_unmeasured",
-    "reference_rejected": "spy_gap_reference_rejected",
-}
+def _spy_gap_alert_counts_now(kind: str) -> bool:
+    """The day's one unmeasured alert starts at 9:30 ET. Earlier calls do not use it up."""
+    if kind != "unmeasured":
+        return True
+    now = _utcnow().astimezone(_ET_ZONE)
+    return now.hour * 60 + now.minute >= 9 * 60 + 30
 
 
 async def _alert_spy_gap_sit_out_once(reason: str, *, dry_run: bool = False) -> None:
     """One warning for the pending gap condition. A dry run does not send."""
     if dry_run:
         return
-    kind = portfolio_risk.take_spy_gap_pending_alert() or "sit_out"
-    if portfolio_risk.spy_gap_alert_sent(kind):
+    kind = portfolio_risk.take_spy_gap_pending_alert()
+    if not kind or portfolio_risk.spy_gap_alert_sent(kind):
+        return
+    if not _spy_gap_alert_counts_now(kind):
         return
     day = _session_day_et()
-    event = _SPY_GAP_ALERT_EVENT.get(kind, "spy_gap_sit_out")
-    text = reason if kind == "sit_out" else _SPY_GAP_ALERT_TEXT.get(kind, reason)
+    event = "spy_gap_sit_out" if kind == "sit_out" else "spy_gap_unmeasured"
+    text = portfolio_risk.spy_gap_pending_alert_text() or reason
     try:
         await alerts.send(
             "warning", event, text or reason,
@@ -21097,8 +21145,12 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
     if sit:
         blocked.append(sit)
         if not dry_run:
-            code = "gap_unmeasured" if "unmeasured" in sit else "gap_sit_out"
+            code = portfolio_risk.gap_block_code() or (
+                "gap_unmeasured" if "unmeasured" in sit or "reference rejected" in sit
+                else "gap_sit_out"
+            )
             await _record_entry_skipped(p, code, sit)
+        return False, blocked
 
     # CALL INDEX VWAP — bullish premium only when SPY or QQQ holds above the
     # session VWAP. Applies to app-decided and bot-decided entries alike: a
@@ -34620,7 +34672,10 @@ async def execute_live_order(payload: dict):
         sit = await entry_gap_sit_out_reason(payload)
         await _alert_spy_gap_sit_out_once(sit or "")
         if sit:
-            code = "gap_unmeasured" if "unmeasured" in sit else "gap_sit_out"
+            code = portfolio_risk.gap_block_code() or (
+                "gap_unmeasured" if "unmeasured" in sit or "reference rejected" in sit
+                else "gap_sit_out"
+            )
             await _record_entry_skipped(payload, code, sit)
             raise LocalRefusal(sit)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -350,50 +351,193 @@ def test_unmeasured_gap_blocks_until_a_small_gap_is_measured(quiet_gap, monkeypa
     assert later is None
 
 
-def test_rejected_reference_alerts_and_does_not_block(quiet_gap, monkeypatch):
+def _gap_ctx_from_quote(quote):
+    index = main_bot.portfolio_risk.index_gap_context(quote)
+    index.pop("bar_consistent", None)
+    return main_bot.portfolio_risk.sanitize_risk_context(index)
+
+
+def _entry_with(origin, ctx):
+    payload = _bare(origin)
+    payload["risk_context"] = ctx
+    return payload
+
+
+def test_each_rejected_reference_blocks_entries(quiet_gap, monkeypatch):
+    """Bar, both vendor mismatches, and the trust cap each block as gap_unmeasured."""
     monkeypatch.setattr(main_bot, "_session_day_et", lambda: "2026-11-25")
+    good = {
+        "open": 660.35, "previous_close": 675.0, "last": 662.0, "high": 664.0, "low": 658.0,
+        "change_close": -13.0, "change_close_pct": -1.926, "realtime": True,
+    }
+    vendor_change = dict(good, change_close=-2.0)
+    vendor_percent = dict(good)
+    vendor_percent.pop("change_close")
+    vendor_percent["change_close_pct"] = -0.3
+    trust = {
+        "open": 66.035, "previous_close": 675.0, "last": 66.2, "high": 66.4, "low": 65.8,
+        "realtime": True,
+    }
+    session_bar = {
+        "open": 724.33, "previous_close": 689.81, "last": 723.76,
+        "high": 718.29, "low": 686.75, "realtime": True,
+    }
+    cases = (
+        (session_bar, "session_bar", "session bar"),
+        (vendor_change, "vendor_change", "vendor mismatch"),
+        (vendor_percent, "vendor_percent", "vendor percent"),
+        (trust, "trust_cap", "trust cap"),
+    )
+    saved = main_bot.state
+    main_bot.state = main_bot.StateStore(None)
+    try:
+        for quote, kind, label in cases:
+            main_bot.portfolio_risk.clear_spy_gap_sit_out()
+            ctx = _gap_ctx_from_quote(quote)
+            assert ctx["spy_gap_verified"] is False
+            assert ctx["spy_gap_reference_rejected"] is True
+            assert ctx["spy_gap_reject_kind"] == kind
+            reason = _run(main_bot.entry_gap_sit_out_reason(
+                _entry_with(main_bot.DISPATCH_ORIGIN_SCANNER, ctx),
+            ))
+            assert reason and "entries blocked until verified" in reason
+            assert label in reason
+            assert main_bot.portfolio_risk.gap_block_code() == "gap_unmeasured"
+            app = _run(main_bot.entry_gap_sit_out_reason(
+                _entry_with(main_bot.DISPATCH_ORIGIN_APP, ctx),
+            ))
+            assert app == reason
+    finally:
+        main_bot.state = saved
+
+
+def test_nov23_stale_bar_blocks_the_five_percent_open(quiet_gap, monkeypatch):
+    """724.33 vs 689.81 with the prior session high still on the bar does not trade."""
+    monkeypatch.setattr(main_bot, "_session_day_et", lambda: "2026-11-23")
+    quote = {
+        "open": 724.33, "previous_close": 689.81, "last": 723.76,
+        "high": 718.29, "low": 686.75, "realtime": True,
+    }
+    ctx = _gap_ctx_from_quote(quote)
+    assert ctx["spy_gap_pct"] is None
+    assert ctx["spy_gap_reject_kind"] == "session_bar"
     saved = main_bot.state
     main_bot.state = main_bot.StateStore(None)
     sent = []
 
-    async def send(*_args, **kwargs):
+    async def send(*args, **kwargs):
+        sent.append((args[2] if len(args) > 2 else "", kwargs.get("dedupe_key")))
+
+    monkeypatch.setattr(main_bot.alerts, "send", send)
+
+    async def scenario():
+        reason = await main_bot.entry_gap_sit_out_reason(
+            _entry_with(main_bot.DISPATCH_ORIGIN_SCANNER, ctx),
+        )
+        await main_bot._alert_spy_gap_sit_out_once(reason or "")
+        return reason
+
+    try:
+        reason = _run(scenario())
+    finally:
+        main_bot.state = saved
+    assert reason and "session bar" in reason
+    assert "entries blocked until verified" in reason
+    assert sent == [(
+        "SPY gap reference rejected (session bar) — entries blocked until verified",
+        "spy_gap_unmeasured:2026-11-23",
+    )]
+
+
+def test_unverified_value_without_a_flag_blocks_and_does_not_measure(quiet_gap, monkeypatch):
+    monkeypatch.setattr(main_bot, "_session_day_et", lambda: "2026-11-25")
+    saved = main_bot.state
+    main_bot.state = main_bot.StateStore(None)
+
+    async def scenario():
+        flagged = await main_bot.entry_gap_sit_out_reason(
+            _entry_with("app", {"spy_gap_pct": -2.6, "spy_gap_verified": False}),
+        )
+        still = await main_bot.entry_gap_sit_out_reason(_bare("app"))
+        unflagged = await main_bot.entry_gap_sit_out_reason(
+            _entry_with("app", {"spy_gap_pct": 0.2}),
+        )
+        after = await main_bot.entry_gap_sit_out_reason(_bare("scanner"))
+        return flagged, still, unflagged, after
+
+    try:
+        flagged, still, unflagged, after = _run(scenario())
+    finally:
+        main_bot.state = saved
+    assert flagged and "unmeasured" in flagged
+    assert still and "unmeasured" in still
+    assert unflagged and "unmeasured" in unflagged
+    assert after and "unmeasured" in after
+    assert main_bot.portfolio_risk.spy_gap_sit_out_view("2026-11-25")["measured"] is False
+
+
+def test_preopen_request_does_not_consume_the_unmeasured_alert(quiet_gap, monkeypatch):
+    monkeypatch.setattr(main_bot, "_session_day_et", lambda: "2026-11-25")
+    saved = main_bot.state
+    main_bot.state = main_bot.StateStore(None)
+    sent = []
+    clock = {"at": datetime(2026, 11, 25, 14, 0, tzinfo=timezone.utc)}
+
+    async def send(*args, **kwargs):
         sent.append(kwargs.get("dedupe_key"))
 
     monkeypatch.setattr(main_bot.alerts, "send", send)
-    stale = {
-        "symbol": "SPY", "last": 723.76, "open": 713.56, "high": 718.29, "low": 686.75,
-        "previous_close": 680.0, "bid": 723.7, "ask": 723.8, "realtime": True,
-        "change_close": 5.0,
-    }
-    quote = main_bot.portfolio_risk.index_gap_context(stale)
-    assert quote["spy_gap_verified"] is False
-    assert quote["spy_gap_reference_rejected"] is True
-    missing = main_bot.portfolio_risk.index_gap_context({"symbol": "SPY", "last": 100.0})
-    assert missing["spy_gap_reference_rejected"] is False
-    assert missing["spy_gap_pct"] is None
-
-    payload = _bare(main_bot.DISPATCH_ORIGIN_APP)
-    payload["risk_context"] = {
-        "spy_gap_reference_rejected": True,
-        "spy_gap_verified": False,
-    }
+    monkeypatch.setattr(main_bot, "_utcnow", lambda: clock["at"])
 
     async def scenario():
-        first = await main_bot.entry_gap_sit_out_reason(payload)
-        await main_bot._alert_spy_gap_sit_out_once(first or "")
-        scanner = dict(payload)
-        scanner[main_bot.DISPATCH_ORIGIN_FIELD] = main_bot.DISPATCH_ORIGIN_SCANNER
-        second = await main_bot.entry_gap_sit_out_reason(scanner)
-        await main_bot._alert_spy_gap_sit_out_once(second or "")
-        return first, second
+        early = await main_bot.entry_gap_sit_out_reason(_bare("app"))
+        await main_bot._alert_spy_gap_sit_out_once(early or "")
+        clock["at"] = datetime(2026, 11, 25, 14, 31, tzinfo=timezone.utc)
+        later = await main_bot.entry_gap_sit_out_reason(_bare("scanner"))
+        await main_bot._alert_spy_gap_sit_out_once(later or "")
+        await main_bot._alert_spy_gap_sit_out_once(later or "")
+        return early, later
 
     try:
-        first, second = _run(scenario())
+        early, later = _run(scenario())
     finally:
         main_bot.state = saved
-    assert first is None
-    assert second is None
-    assert sent == ["spy_gap_reference_rejected:2026-11-25"]
+    assert early and "unmeasured" in early
+    assert later and "unmeasured" in later
+    assert sent == ["spy_gap_unmeasured:2026-11-25"]
+
+
+def test_gap_refusal_writes_one_entry_skipped_and_stops(quiet_gap, monkeypatch):
+    monkeypatch.setattr(main_bot, "_session_day_et", lambda: "2026-11-25")
+    saved = main_bot.state
+    main_bot.state = main_bot.StateStore(None)
+    rows = []
+
+    async def record(event, data):
+        rows.append((event, data))
+
+    async def not_killed():
+        return False
+
+    async def send(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(main_bot.trade_ledger, "record", record)
+    monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.state, "is_killed", not_killed)
+
+    async def scenario():
+        return await main_bot._passes_entry_filters(_bare("app"))
+
+    try:
+        ok, reasons = _run(scenario())
+    finally:
+        main_bot.state = saved
+    skipped = [data for event, data in rows if event == "entry_skipped"]
+    assert ok is False
+    assert len(reasons) == 1 and "unmeasured" in reasons[0]
+    assert len(skipped) == 1
+    assert skipped[0]["reason"] == "gap_unmeasured"
 
 
 def test_explain_dry_run_does_not_alert_the_sit_out(quiet_gap, monkeypatch):

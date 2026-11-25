@@ -473,6 +473,8 @@ def test_filter_blocked_by_is_unchanged_when_observe_raises(monkeypatch):
 
     async def scenario():
         main_bot.state = main_bot.StateStore(None)
+        main_bot.portfolio_risk.clear_spy_gap_sit_out()
+        main_bot.portfolio_risk.note_spy_gap_session(0.4, True, main_bot._session_day_et())
         first = dict(payload)
         ok1, blocked1 = await main_bot._passes_entry_filters(first, dry_run=True)
         real = main_bot.build_call_index_vwap_observe
@@ -488,6 +490,7 @@ def test_filter_blocked_by_is_unchanged_when_observe_raises(monkeypatch):
     try:
         ok1, blocked1, ok2, blocked2, first = _run(scenario())
     finally:
+        main_bot.portfolio_risk.clear_spy_gap_sit_out()
         _restore(saved)
     assert blocked1 == blocked2
     assert ok1 is ok2
@@ -579,6 +582,8 @@ def test_rejected_entry_ledger_carries_unmeasured_day_vwap(monkeypatch):
     async def scenario():
         store = main_bot.StateStore(None)
         main_bot.state = store
+        main_bot.portfolio_risk.clear_spy_gap_sit_out()
+        main_bot.portfolio_risk.note_spy_gap_session(0.4, True, main_bot._session_day_et())
         await store.set_killed(True)
         return await main_bot.process_signal({
             "ticker": "NVDA",
@@ -595,6 +600,7 @@ def test_rejected_entry_ledger_carries_unmeasured_day_vwap(monkeypatch):
     try:
         result = _run(scenario())
     finally:
+        main_bot.portfolio_risk.clear_spy_gap_sit_out()
         _restore(saved)
 
     assert result["status"] == "rejected"
