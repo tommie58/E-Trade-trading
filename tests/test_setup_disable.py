@@ -237,11 +237,18 @@ def test_replay_script_matches_exact_setup_ids():
     disabled = replay.disabled_ids()
     assert "momentum" in disabled
     assert "momentum fade" not in disabled
-    named = replay.replay_trades(replay.load_csv(replay.TRADES), disabled)
-    skipped_setups = {row["setup_id"] for row in named["skipped"]}
-    assert skipped_setups <= {"breakdown", "vwap rejection", "momentum"}
-    assert "momentum fade" not in skipped_setups
-    book = replay.replay_setup_table(replay.load_csv(replay.SETUPS), disabled)
-    assert book["trades"] == 57
-    assert book["skipped_n"] == 27
-    assert book["book_net"] == replay._money("-1063.28")
+    closes = replay.load_closes(replay.TRADES)
+    assert len(closes) == 57
+    without = replay.summarize(closes, disabled, apply_flag=False)
+    flagged = replay.summarize(closes, disabled, apply_flag=True)
+    assert without["skipped_n"] == 0
+    assert without["net"] == replay._money("-1063.28")
+    assert flagged["skipped_n"] == 27
+    assert {row["setup"] for row in flagged["skipped"]} <= disabled
+    assert any(row["setup"] == "momentum fade" for row in closes)
+    assert not any(row["setup"] == "momentum fade" for row in flagged["skipped"])
+    ex = [row for row in closes if not replay.is_amzn_nov5_winner(row)]
+    assert len(ex) == 56
+    ex_flagged = replay.summarize(ex, disabled, apply_flag=True)
+    assert ex_flagged["net"] == flagged["net"]
+    assert ex_flagged["max_dd"] == flagged["max_dd"]

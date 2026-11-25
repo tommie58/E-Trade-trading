@@ -1,9 +1,0 @@
-setup,trades,gross_pnl
-breakdown,16,-545
-breakout,20,-458
-momentum,3,-428
-vwap reclaim,1,-105
-mean reversion,2,-18
-vwap rejection,8,7
-momentum fade,5,221
-orb,2,322
