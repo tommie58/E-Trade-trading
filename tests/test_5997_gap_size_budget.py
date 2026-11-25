@@ -120,7 +120,7 @@ def test_risk_weight_under_one_skips_on_scanner_and_app_paths():
         assert decision["skipped"] is True
         assert decision["qty"] == 0
         assert "not rounded up" in decision["reason"]
-        ctx = {"weight": 0.25, "notes": [f"{origin} unproven"]}
+        ctx = {"weight": 0.25, "notes": [f"{origin} regime cut"]}
         assert main_bot._apply_risk_weight("TSLA", 1, ctx) == 0
         assert "not rounded up" in ctx["skip_reason"]
         assert main_bot._risk_weight_skip(ctx) == ctx["skip_reason"]
@@ -136,6 +136,116 @@ def test_risk_weight_under_one_skips_on_scanner_and_app_paths():
     assert four["skipped"] is False
     full = main_bot.contract_qty_for_risk_weight(1, 1.0)
     assert full["qty"] == 1 and full["skipped"] is False
+
+
+def _calm_tape():
+    return {
+        "minutes_since_open": 90,
+        "structure_valid": True,
+        "feeds_healthy": True,
+        "spreads_healthy": True,
+        "setup": "vwap rejection",
+    }
+
+
+def test_one_lot_unproven_weight_stays_one_contract():
+    decision = main_bot.contract_qty_for_risk_weight(
+        1, 0.5, market_weight=1.0, ev_weight=0.5,
+    )
+    assert decision["skipped"] is False
+    assert decision["qty"] == 1
+    ctx = {
+        "weight": 0.5,
+        "ev_weight": 0.5,
+        "regime": {"weight": 1.0, "notes": []},
+        "notes": ["permitted, not proven → ×0.5 (unproven)"],
+    }
+    assert main_bot._apply_risk_weight("TSLA", 1, ctx) == 1
+    assert "skip_reason" not in ctx
+
+
+def test_one_lot_regime_cut_skips():
+    sizing = main_bot.portfolio_risk.assess_regime_sizing(
+        {"spy_gap_pct": 0.4, "spy_gap_verified": True},
+        "stressed",
+        _calm_tape(),
+    )
+    assert sizing["pause"] is False
+    assert sizing["weight"] == 0.5
+    ctx = {
+        "weight": round(sizing["weight"] * 0.5, 3),
+        "ev_weight": 0.5,
+        "regime": sizing,
+        "notes": sizing["notes"],
+    }
+    assert main_bot._apply_risk_weight("TSLA", 1, ctx) == 0
+    assert ctx["skip_reason"].startswith("regime cut ")
+    assert "not rounded up" in ctx["skip_reason"]
+    assert main_bot._risk_weight_skip(ctx) == ctx["skip_reason"]
+
+
+def test_one_lot_gap_cut_skips():
+    sizing = main_bot.portfolio_risk.assess_regime_sizing(
+        {"gap_pct": 4.0, "spy_gap_pct": 0.2, "spy_gap_verified": True},
+        "calm",
+        _calm_tape(),
+    )
+    assert sizing["pause"] is False
+    assert sizing["weight"] == 0.5
+    assert any("opening gap" in note for note in sizing["notes"])
+    ctx = {
+        "weight": sizing["weight"],
+        "ev_weight": 1.0,
+        "regime": sizing,
+        "notes": sizing["notes"],
+    }
+    assert main_bot._apply_risk_weight("NVDA", 1, ctx) == 0
+    assert ctx["skip_reason"].startswith("gap cut ")
+    assert "not rounded up" in ctx["skip_reason"]
+
+
+def test_one_lot_kept_for_unproven_still_refuses_a_cap_breach():
+    kept = main_bot.contract_qty_for_risk_weight(1, 0.5, market_weight=1.0, ev_weight=0.5)
+    assert kept["qty"] == 1 and kept["skipped"] is False
+    over_budget = main_bot.assess_remaining_daily_budget(
+        {"remaining_usd": 20, "used_usd": 480, "budget_usd": 500},
+        100,
+    )
+    assert over_budget and "20" in over_budget
+    # 0.5 of a $500 day budget is the $250 per-trade ceiling. One contract at
+    # $400 of risk does not fit, and neither does $400 against $50 left.
+    priced = main_bot.plan_priced_option_risk(
+        5.0, kept["qty"], 1.0, remaining_budget_usd=500, base_budget_usd=500,
+    )
+    assert priced["action"] == "reject"
+    left = main_bot.plan_priced_option_risk(
+        5.0, kept["qty"], 1.0, remaining_budget_usd=50, base_budget_usd=1000,
+    )
+    assert left["action"] == "reject"
+    assert left["ceiling_source"] == "remaining"
+    hard = main_bot.assess_open_risk_ceiling(0, 700, 10_000, main_bot.HARD_RISK_CAP_PCT)
+    assert hard and "6%" in hard
+    unread = main_bot.plan_risk_budget(10_000, "nope", 0, loss_limit_pct=10)
+    assert unread["unreadable"] is True
+    assert main_bot.contract_qty_for_risk_weight(
+        1, 0.5, market_weight="nope", ev_weight=0.5,
+    )["skipped"] is True
+
+
+def test_three_lot_unproven_weight_is_unchanged():
+    decision = main_bot.contract_qty_for_risk_weight(
+        3, 0.5, market_weight=1.0, ev_weight=0.5,
+    )
+    assert decision["skipped"] is False
+    assert decision["qty"] == 1
+    ctx = {
+        "weight": 0.5,
+        "ev_weight": 0.5,
+        "regime": {"weight": 1.0},
+        "notes": ["permitted, not proven → ×0.5 (unproven)"],
+    }
+    assert main_bot._apply_risk_weight("TSLA", 3, ctx) == 1
+    assert "skip_reason" not in ctx
 
 
 def test_app_budget_and_priced_risk_refuse_and_fail_closed(monkeypatch):

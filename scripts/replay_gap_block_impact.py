@@ -5,10 +5,11 @@ Reads the Yahoo Finance chart API (daily bars and the 9:30 ET minute) or the
 committed snapshot in scripts/data/. It does not call a broker, an order
 route, or POST /policy.
 
-Vendor change and vendor percent need Massive changeClose and
-changeClosePercentage on the quote the bot saw. Those fields are not in a
-public daily or minute bar, so those two checks are reported as not replayed.
-They are not filled in with a guess.
+Vendor change and vendor percent need the quote vendor's change from the
+prior close: Massive changeClose and changeClosePercentage, or the same
+fields from E*TRADE when that feed is the fallback. Those fields are not in
+a public daily or minute bar, so those two checks are reported as not
+replayed. They are not filled in with a guess.
 
     python3 scripts/replay_gap_block_impact.py           # snapshot, markdown table
     python3 scripts/replay_gap_block_impact.py --fetch   # refresh the snapshot from Yahoo
@@ -298,8 +299,9 @@ def main() -> None:
     print()
     print(
         "Vendor change and vendor percent were not replayed. "
-        "The public bars have no Massive changeClose or changeClosePercentage, "
-        "and those fields were not estimated."
+        "The public bars do not include the quote vendor's prior-close change "
+        "(Massive changeClose / changeClosePercentage, or E*TRADE when it is "
+        "the fallback), and those fields were not estimated."
     )
 
 

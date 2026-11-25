@@ -20394,12 +20394,21 @@ async def _assess_portfolio_risk(
     return out
 
 
-def contract_qty_for_risk_weight(qty: Any, weight: Any) -> Dict[str, Any]:
+def contract_qty_for_risk_weight(
+    qty: Any,
+    weight: Any,
+    *,
+    market_weight: Any = None,
+    ev_weight: Any = None,
+    cut: Any = None,
+) -> Dict[str, Any]:
     """Size by risk weight. A product under 1 contract is a skip, not a round-up.
 
-    Weight >= 1 leaves the quantity. Otherwise floor(qty × weight). A floor
-    of at least 1 is that integer. Under 1 skips. Scanner and app both use
-    this. Pure.
+    A plan of 1 contract ignores the unproven-EV weight (`ev_weight`). A
+    regime or gap cut (`market_weight`) can still take it under 1, and that
+    skips with no round-up. A larger plan keeps the combined `weight`,
+    including the unproven weight. A non-numeric quantity skips. A
+    non-numeric market weight, when one is supplied, skips. Pure.
     """
     try:
         base = int(qty)
@@ -20415,6 +20424,35 @@ def contract_qty_for_risk_weight(qty: Any, weight: Any) -> Dict[str, Any]:
         return {
             "qty": 0, "skipped": True, "weight": w, "product": 0.0,
             "reason": "quantity under 1 contract — skipped",
+        }
+    if base == 1 and market_weight is not None:
+        try:
+            market = float(market_weight)
+        except (TypeError, ValueError):
+            market = float("nan")
+        if not math.isfinite(market):
+            return {
+                "qty": 0, "skipped": True, "weight": w, "product": 0.0,
+                "reason": "regime/gap weight unreadable — skipped",
+            }
+        market = max(0.0, market)
+        product = base * market
+        if math.floor(product + 1e-12) < 1:
+            label = str(cut or "regime/gap cut")
+            return {
+                "qty": 0,
+                "skipped": True,
+                "weight": w,
+                "product": product,
+                "ev_weight": ev_weight,
+                "reason": (
+                    f"{label} {market:g} × {base} = {product:g} < 1 contract — "
+                    "skipped, not rounded up to 1"
+                ),
+            }
+        return {
+            "qty": base, "skipped": False, "weight": w, "product": float(base),
+            "ev_weight": ev_weight, "reason": "",
         }
     if w >= 1.0:
         return {"qty": base, "skipped": False, "weight": w, "product": float(base), "reason": ""}
@@ -20435,12 +20473,35 @@ def contract_qty_for_risk_weight(qty: Any, weight: Any) -> Dict[str, Any]:
     return {"qty": want, "skipped": False, "weight": w, "product": product, "reason": ""}
 
 
+def _risk_cut_label(ctx: Dict[str, Any]) -> str:
+    """Name the market cut on a skip. The unproven-EV weight is not one."""
+    notes = " ".join(str(note) for note in (ctx.get("notes") or []))
+    gap = "opening gap" in notes
+    regime = "regime" in notes or "volatility" in notes
+    if gap and regime:
+        return "regime/gap cut"
+    if gap:
+        return "gap cut"
+    if regime:
+        return "regime cut"
+    return "regime/gap cut"
+
+
 def _apply_risk_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]]) -> int:
     """Shrink an ENTRY by the regime × evidence weight (after the learning
-    weight). Under 1 contract sets `skip_reason` and returns 0."""
+    weight). A 1-contract plan does not skip on the unproven-EV weight alone.
+    Under 1 contract sets `skip_reason` and returns 0."""
     if not ctx or not PORTFOLIO_RISK_ENABLED:
         return qty
-    decision = contract_qty_for_risk_weight(qty, ctx.get("weight") if ctx.get("weight") is not None else 1.0)
+    regime = ctx.get("regime") if isinstance(ctx.get("regime"), dict) else None
+    market_weight = None if regime is None else regime.get("weight")
+    decision = contract_qty_for_risk_weight(
+        qty,
+        ctx.get("weight") if ctx.get("weight") is not None else 1.0,
+        market_weight=market_weight,
+        ev_weight=ctx.get("ev_weight"),
+        cut=_risk_cut_label(ctx) if market_weight is not None else None,
+    )
     ctx.update({
         "requested_qty": int(qty) if isinstance(qty, int) else qty,
         "sized_qty": int(decision["qty"]),
