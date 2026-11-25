@@ -2375,8 +2375,10 @@ every path here swallows and logs its own errors.
 Order, stop, flatten, and kill paths call `send_nowait`. That still logs and
 pushes `alerts:recent` before any POST. The POST itself is a background task
 with a strong reference and a done-callback. More than 50 deliveries in flight
-drops the new POST; the in-app record is kept. `send` still awaits the POST
-for callers that need the result, including the delivery test.
+drops a non-critical POST (counted). A critical delivery waits in a small
+overflow queue and starts when a slot frees. Shutdown gives in-flight posts
+at most 3 seconds to finish. `send` still awaits the POST for callers that
+need the result, including the delivery test.
 """
 from __future__ import annotations
 
@@ -2384,8 +2386,9 @@ import asyncio
 import json
 import logging
 import re
+from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("etrade-bot.alerts")
 
@@ -2397,11 +2400,30 @@ _VALID_SEVERITIES = {"info", "warning", "error", "critical"}
 _SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2, "critical": 3}
 DEFAULT_MIN_SEVERITY = "warning"
 _MAX_INFLIGHT_DELIVERIES = 50
+# Critical POSTs wait here instead of being dropped. Above this we still
+# keep them — a critical delivery is never discarded — and log a warning.
+_CRITICAL_QUEUE_BOUND = 20
+_DRAIN_TIMEOUT_S = 3.0
 _URL_IN_TEXT = re.compile(r"https?://\S+")
+_CRITICAL_EVENTS = {
+    "position_unprotected",
+    "stop_placement_failed",
+    "partial_fill_unprotected",
+    "native_trail_unprotected",
+    "eod_flatten_blocked",
+    "flatten_close_unsaved",
+    "kill_switch_engaged",
+    "circuit_breaker_tripped",
+}
 # Webhook POSTs. Capped so a hung receiver cannot pile tasks up.
 _delivery_tasks: set = set()
 # Tasks created by synchronous callers (they await send_nowait themselves).
 _background_tasks: set = set()
+# (coroutine, label) waiting for an in-flight slot. Critical only.
+_critical_queue: Deque[Tuple[Any, str]] = deque()
+_dropped = 0
+# Cleared during shutdown drain so a finishing task does not start another.
+_deliveries_open = True
 
 
 def _utcnow_iso() -> str:
@@ -2417,39 +2439,150 @@ def _redact_exc(exc: BaseException) -> str:
     return _redact_text(f"{type(exc).__name__}: {exc}")[:200]
 
 
+def _delivery_is_critical(severity: str, event: str) -> bool:
+    """True when this POST must not be dropped at the in-flight cap.
+
+    Severity `critical` qualifies, and so do the unprotected / flatten / kill
+    events even when one of them is labelled warning or error.
+    """
+    if str(severity or "").lower() == "critical":
+        return True
+    name = str(event or "")
+    if name in _CRITICAL_EVENTS:
+        return True
+    if name.endswith("_unprotected"):
+        return True
+    if name.startswith("stop_timeout_"):
+        return True
+    return False
+
+
+def delivery_status() -> Dict[str, int]:
+    """In-flight posts, non-critical drops, and critical deliveries waiting."""
+    return {
+        "in_flight": len(_delivery_tasks),
+        "dropped": int(_dropped),
+        "queued": len(_critical_queue),
+    }
+
+
 def _on_alert_task_done(task: "asyncio.Task") -> None:
     _delivery_tasks.discard(task)
     _background_tasks.discard(task)
-    if task.cancelled():
-        return
-    try:
-        exc = task.exception()
-    except asyncio.CancelledError:
-        return
-    if exc is not None:
-        logger.warning(f"alert delivery task failed: {_redact_exc(exc)}")
+    if not task.cancelled():
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            exc = None
+        if exc is not None:
+            logger.warning(f"alert delivery task failed: {_redact_exc(exc)}")
+    if _deliveries_open:
+        try:
+            _drain_critical_queue()
+        except Exception as e:
+            logger.warning(f"alert queue drain failed: {_redact_exc(e)}")
 
 
-def schedule_alert(coro, *, label: str = "") -> bool:
-    """Run a delivery coroutine in the background.
-
-    Holds a strong reference until the task finishes. The done-callback logs
-    a failure at warning and does not re-raise. Returns False when 50
-    deliveries are already in flight — the coroutine is closed, not started.
-    """
-    if len(_delivery_tasks) >= _MAX_INFLIGHT_DELIVERIES:
-        where = f" ({label})" if label else ""
-        logger.warning(
-            f"alert delivery dropped — {len(_delivery_tasks)} already in flight{where}"
-        )
-        close = getattr(coro, "close", None)
-        if close is not None:
-            close()
+def _start_delivery(coro, label: str) -> bool:
+    """Start one POST if a slot is free. The caller still owns `coro` on False."""
+    if not _deliveries_open or len(_delivery_tasks) >= _MAX_INFLIGHT_DELIVERIES:
         return False
     task = asyncio.create_task(coro)
     _delivery_tasks.add(task)
     task.add_done_callback(_on_alert_task_done)
     return True
+
+
+def _drain_critical_queue() -> None:
+    """Start queued critical POSTs until the in-flight cap is full again."""
+    while _critical_queue and len(_delivery_tasks) < _MAX_INFLIGHT_DELIVERIES:
+        if not _deliveries_open:
+            return
+        coro, label = _critical_queue.popleft()
+        if not _start_delivery(coro, label):
+            _critical_queue.appendleft((coro, label))
+            return
+
+
+def _close_coro(coro) -> None:
+    close = getattr(coro, "close", None)
+    if close is not None:
+        close()
+
+
+def schedule_alert(coro, *, label: str = "", critical: bool = False) -> bool:
+    """Run a delivery coroutine in the background.
+
+    Holds a strong reference until the task finishes. The done-callback logs
+    a failure at warning and does not re-raise. A critical delivery that
+    finds 50 posts already in flight is queued, not dropped, and starts when
+    a slot frees. A non-critical one is dropped and counted. Returns False
+    only when the POST was dropped.
+    """
+    global _dropped
+    keep = bool(critical) or _delivery_is_critical("", label)
+    if keep:
+        if not _critical_queue and _start_delivery(coro, label):
+            return True
+        _critical_queue.append((coro, label))
+        if len(_critical_queue) > _CRITICAL_QUEUE_BOUND:
+            logger.warning(
+                f"critical alert queue above bound ({_CRITICAL_QUEUE_BOUND}) "
+                f"— {label or 'alert'} still queued, not dropped"
+            )
+        _drain_critical_queue()
+        return True
+    _drain_critical_queue()
+    if _start_delivery(coro, label):
+        return True
+    _dropped += 1
+    where = f" ({label})" if label else ""
+    logger.warning(
+        f"alert delivery dropped — {len(_delivery_tasks)} already in flight{where}"
+    )
+    _close_coro(coro)
+    return False
+
+
+async def drain(timeout: float = _DRAIN_TIMEOUT_S) -> Dict[str, int]:
+    """Finish in-flight deliveries, waiting at most `timeout` seconds.
+
+    Called on shutdown / lifespan exit. Queued critical POSTs start as slots
+    free. Whatever is still running at the deadline is cancelled so a redeploy
+    cannot hang, and anything still queued is closed and logged by event name.
+    """
+    global _deliveries_open
+    try:
+        timeout_s = max(0.0, float(timeout))
+    except (TypeError, ValueError):
+        timeout_s = _DRAIN_TIMEOUT_S
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while True:
+        _drain_critical_queue()
+        pending = [task for task in list(_delivery_tasks) if not task.done()]
+        if not pending and not _critical_queue:
+            break
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        if not pending:
+            break
+        await asyncio.wait(pending, timeout=remaining)
+    _deliveries_open = False
+    leftover = [task for task in list(_delivery_tasks) if not task.done()]
+    for task in leftover:
+        task.cancel()
+    if leftover:
+        await asyncio.sleep(0)
+        logger.warning(
+            f"alert drain stopped with {len(leftover)} delivery(s) still in flight"
+        )
+    while _critical_queue:
+        coro, label = _critical_queue.popleft()
+        _close_coro(coro)
+        logger.warning(f"alert drain closed queued delivery ({label or 'alert'})")
+    return delivery_status()
 
 
 def retain(task: "asyncio.Task") -> "asyncio.Task":
@@ -2766,7 +2899,8 @@ async def send_nowait(severity: str, event: str, message: str,
     The log line and `alerts:recent` push finish before this returns and
     before the POST starts. The POST is an `asyncio` task held in a set; its
     done-callback logs failures at warning. When 50 deliveries are already in
-    flight the POST is dropped with a warning and the in-app record stays.
+    flight a non-critical POST is dropped and counted. A critical one is
+    queued until a slot frees. The in-app record stays either way.
     Never raises.
     """
     try:
@@ -2782,7 +2916,8 @@ async def send_nowait(severity: str, event: str, message: str,
         record, text = staged
         schedule_alert(
             _manager._post_webhook(record, text_override=text),
-            label=str(event),
+            label=str(record.get("event") or event),
+            critical=_delivery_is_critical(record.get("severity"), record.get("event")),
         )
     except Exception as e:
         logger.warning(f"alert send_nowait failed ({event}): {_redact_exc(e)}")
@@ -38771,8 +38906,13 @@ async def _announce_preflight() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    """Lifespan exit. In-flight alert posts get at most 3s, then state closes."""
     global _worker_stop
     _worker_stop = True
+    try:
+        await alerts.drain(alerts._DRAIN_TIMEOUT_S)
+    except Exception as e:
+        logger.warning(f"alert drain failed: {type(e).__name__}")
     await _close_study_page_engine()
     await state.close()
 
@@ -39796,6 +39936,7 @@ async def status():
         },
         "pro_trader": _pro_trader_status_payload(daily.get("trades_today")),
         "alert_webhook_configured": alerts.webhook_configured(),
+        "alert_delivery": alerts.delivery_status(),
         "account_binding": _account_binding,
         "crypto_account_binding": _crypto_account_binding,
         "crypto_enabled": CRYPTO_ENABLED,

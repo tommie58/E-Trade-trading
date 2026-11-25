@@ -78,10 +78,18 @@ async def _quiet_ledger(*_args, **_kwargs):
 
 
 def _restore_alerts(saved):
+    main_bot.alerts._deliveries_open = False
+    while main_bot.alerts._critical_queue:
+        coro, _label = main_bot.alerts._critical_queue.popleft()
+        close = getattr(coro, "close", None)
+        if close is not None:
+            close()
+    main_bot.alerts._dropped = 0
     for task in list(main_bot.alerts._delivery_tasks) + list(main_bot.alerts._background_tasks):
         task.cancel()
     main_bot.alerts._delivery_tasks.clear()
     main_bot.alerts._background_tasks.clear()
+    main_bot.alerts._deliveries_open = True
     main_bot.alerts._manager = saved
 
 
@@ -298,39 +306,179 @@ def test_alert_task_exception_is_swallowed_and_logged(monkeypatch, caplog):
     assert "https://" not in joined
 
 
-def test_delivery_cap_drops_the_post_and_keeps_the_record(monkeypatch, caplog):
+def _fill_inflight(release: asyncio.Event) -> None:
+    async def hold():
+        await release.wait()
+
+    for _ in range(main_bot.alerts._MAX_INFLIGHT_DELIVERIES):
+        assert main_bot.alerts.schedule_alert(hold(), label="hold") is True
+
+
+def test_cap_drops_non_critical_and_queues_critical(monkeypatch, caplog):
+    """Critical POSTs wait. Only non-critical ones are dropped, and counted."""
     saved_alerts = main_bot.alerts._manager
     _install_client(monkeypatch, hang=False)
     caplog.set_level(logging.WARNING, logger="etrade-bot.alerts")
     release = asyncio.Event()
 
-    async def hold():
-        await release.wait()
+    async def scenario():
+        store = main_bot.StateStore(None)
+        main_bot.alerts.init(store, _WEBHOOK)
+        _fill_inflight(release)
+        await main_bot.alerts.send_nowait(
+            "warning", "routine_note", "can wait",
+        )
+        await main_bot.alerts.send_nowait(
+            "critical", "position_unprotected", "still queued",
+        )
+        await main_bot.alerts.send_nowait(
+            "error", "flatten_close_unsaved", "error severity, still queued",
+        )
+        await main_bot.alerts.send_nowait(
+            "warning", "stop_timeout_entry_cancelled", "warning, still queued",
+        )
+        status = main_bot.alerts.delivery_status()
+        recent = await main_bot.alerts.recent(10)
+        # Captured before the loop cancels the holders. That cancel frees
+        # slots and is what later starts the queue.
+        posted_while_full = list(_Client.events)
+        main_bot.alerts._deliveries_open = False
+        return status, recent, posted_while_full
+
+    try:
+        status, recent, posted_while_full = asyncio.run(scenario())
+    finally:
+        _restore_alerts(saved_alerts)
+
+    assert status == {"in_flight": 50, "dropped": 1, "queued": 3}
+    events = {item.get("event") for item in recent}
+    assert {"routine_note", "position_unprotected", "flatten_close_unsaved",
+            "stop_timeout_entry_cancelled"} <= events
+    assert posted_while_full == []
+    assert any("alert delivery dropped" in rec.getMessage() for rec in caplog.records)
+    assert "hook-secret-do-not-log" not in caplog.text
+
+
+def test_queued_critical_starts_when_a_slot_frees(monkeypatch):
+    saved_alerts = main_bot.alerts._manager
+    _install_client(monkeypatch, hang=False)
+    release = asyncio.Event()
 
     async def scenario():
         store = main_bot.StateStore(None)
         main_bot.alerts.init(store, _WEBHOOK)
-        for _ in range(main_bot.alerts._MAX_INFLIGHT_DELIVERIES):
-            assert main_bot.alerts.schedule_alert(hold(), label="hold") is True
-        await main_bot.alerts.send_nowait(
-            "critical", "cap_drop", "still recorded", force_deliver=True,
-        )
-        recent = await main_bot.alerts.recent(10)
-        inflight = len(main_bot.alerts._delivery_tasks)
-        release.set()
-        await asyncio.gather(*list(main_bot.alerts._delivery_tasks), return_exceptions=True)
-        return recent, inflight
+        _fill_inflight(release)
+        await main_bot.alerts.send_nowait("critical", "kill_switch_engaged", "queued")
+        await main_bot.alerts.send_nowait("critical", "circuit_breaker_tripped", "second")
+        assert main_bot.alerts.delivery_status()["queued"] == 2
+
+        async def release_soon():
+            await asyncio.sleep(0.05)
+            release.set()
+
+        asyncio.create_task(release_soon())
+        await main_bot.alerts.drain(1.0)
+        return list(_Client.events), main_bot.alerts.delivery_status()
 
     try:
-        recent, inflight = asyncio.run(scenario())
+        posted, status = asyncio.run(scenario())
     finally:
         _restore_alerts(saved_alerts)
 
-    assert inflight == main_bot.alerts._MAX_INFLIGHT_DELIVERIES
-    assert any(item.get("event") == "cap_drop" for item in recent)
-    assert any("alert delivery dropped" in rec.getMessage() for rec in caplog.records)
-    assert "cap_drop" not in _Client.events
+    assert posted[:2] == ["kill_switch_engaged", "circuit_breaker_tripped"]
+    assert status["queued"] == 0
+    assert status["dropped"] == 0
+
+
+def test_critical_queue_above_bound_is_kept(monkeypatch, caplog):
+    saved_alerts = main_bot.alerts._manager
+    _install_client(monkeypatch, hang=False)
+    caplog.set_level(logging.WARNING, logger="etrade-bot.alerts")
+    release = asyncio.Event()
+    extra = main_bot.alerts._CRITICAL_QUEUE_BOUND + 1
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        main_bot.alerts.init(store, _WEBHOOK)
+        _fill_inflight(release)
+        for i in range(extra):
+            await main_bot.alerts.send_nowait(
+                "critical", "native_trail_unprotected", f"queued {i}",
+                dedupe_key=f"overflow:{i}",
+            )
+        return main_bot.alerts.delivery_status()
+
+    try:
+        status = asyncio.run(scenario())
+    finally:
+        _restore_alerts(saved_alerts)
+
+    assert status["queued"] == extra
+    assert status["dropped"] == 0
+    assert status["in_flight"] == 50
+    assert any("above bound" in rec.getMessage() for rec in caplog.records)
     assert "hook-secret-do-not-log" not in caplog.text
+
+
+def test_drain_finishes_a_fast_post_and_bounds_a_hung_one(monkeypatch):
+    saved_alerts = main_bot.alerts._manager
+    assert main_bot.alerts._DRAIN_TIMEOUT_S == 3.0
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        main_bot.alerts.init(store, _WEBHOOK)
+        _install_client(monkeypatch, hang=False)
+        await main_bot.alerts.send_nowait("critical", "eod_flatten_blocked", "fast")
+        await main_bot.alerts.drain(1.0)
+        fast = list(_Client.events)
+        main_bot.alerts._deliveries_open = True
+        _install_client(monkeypatch, hang=True)
+        await main_bot.alerts.send_nowait("critical", "stop_placement_failed", "slow")
+        started = time.perf_counter()
+        await main_bot.alerts.drain(0.25)
+        elapsed = time.perf_counter() - started
+        return fast, elapsed
+
+    try:
+        fast, elapsed = asyncio.run(scenario())
+    finally:
+        _restore_alerts(saved_alerts)
+
+    assert fast == ["eod_flatten_blocked"]
+    assert elapsed < 0.6
+
+
+def test_shutdown_drains_alerts_before_closing_state(monkeypatch):
+    saved_stop = main_bot._worker_stop
+    order = []
+
+    async def fake_drain(timeout=None):
+        order.append(("drain", timeout))
+
+    async def fake_study():
+        order.append("study")
+
+    async def fake_close():
+        order.append("state")
+
+    monkeypatch.setattr(main_bot.alerts, "drain", fake_drain)
+    monkeypatch.setattr(main_bot, "_close_study_page_engine", fake_study)
+    monkeypatch.setattr(main_bot.state, "close", fake_close)
+    try:
+        asyncio.run(main_bot.on_shutdown())
+    finally:
+        main_bot._worker_stop = saved_stop
+
+    assert order == [("drain", 3.0), "study", "state"]
+
+
+def test_status_field_reports_delivery_counts():
+    import inspect
+    assert main_bot.alerts.delivery_status() == {
+        "in_flight": 0, "dropped": 0, "queued": 0,
+    }
+    source = inspect.getsource(main_bot.status)
+    assert '"alert_delivery": alerts.delivery_status()' in source
 
 
 def test_severity_floor_and_force_deliver_are_unchanged(monkeypatch):
