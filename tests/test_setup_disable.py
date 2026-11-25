@@ -1,6 +1,7 @@
 """SETUP_DISABLE_ENABLED. Flag off does not change an admit or a size."""
 import asyncio
 import importlib.util
+import inspect
 import logging
 from pathlib import Path
 
@@ -252,3 +253,191 @@ def test_replay_script_matches_exact_setup_ids():
     ex_flagged = replay.summarize(ex, disabled, apply_flag=True)
     assert ex_flagged["net"] == flagged["net"]
     assert ex_flagged["max_dd"] == flagged["max_dd"]
+
+
+def test_kept_setup_cap_is_the_last_step_before_placement():
+    src = inspect.getsource(main_bot.execute_live_order)
+    cap_at = src.index("commit_final_kept_setup_qty(")
+    assert src.index("_apply_learning_weight") < cap_at
+    assert src.index("_apply_risk_weight") < cap_at
+    assert src.index("_apply_pro_trader_size") < cap_at
+    assert src.index("assess_hard_size_cap(") < cap_at
+    assert cap_at < src.index("_place_entry_with_funds_clamp")
+
+
+def test_final_placement_qty_caps_three_and_can_skip(monkeypatch):
+    """Upstream sizing of 3 is sent as 1. Upstream 0 is a skip, not a round-up."""
+    _reset(monkeypatch, enabled="true", shadow="false")
+    order = {"quantity": 3}
+    sent = main_bot.commit_final_kept_setup_qty("orb", 3, order, ticker="CRM", cycle="cap-3")
+    assert sent == 1
+    assert order["quantity"] == 1
+    order = {"quantity": 3}
+    sent = main_bot.commit_final_kept_setup_qty(
+        "momentum_fade", 3, order, ticker="UBER", cycle="cap-fade",
+    )
+    assert sent == 1
+    assert order["quantity"] == 1
+    order = {"quantity": 0}
+    sent = main_bot.commit_final_kept_setup_qty("orb", 0, order, ticker="CRM", cycle="cap-0")
+    assert sent is None
+    assert order["quantity"] == 0
+    _reset(monkeypatch, enabled="false", shadow="false")
+    order = {"quantity": 3}
+    assert main_bot.commit_final_kept_setup_qty("orb", 3, order, ticker="CRM", cycle="off") == 3
+    assert order["quantity"] == 3
+
+
+def test_order_placement_receives_the_capped_quantity(monkeypatch):
+    _reset(monkeypatch, enabled="true", shadow="false")
+    monkeypatch.setattr(main_bot, "LIVE_TRADING", True)
+    monkeypatch.setattr(main_bot, "is_sandbox", False)
+    monkeypatch.setattr(main_bot, "WEBHOOK_SECRET", "unit-secret")
+    monkeypatch.setattr(main_bot, "_is_market_open", lambda: True)
+    monkeypatch.setattr(main_bot, "_flatten_window_blocks_entry", lambda *a, **k: False)
+    monkeypatch.setattr(main_bot, "load_tokens", lambda: {
+        "oauth_token": "unit-token", "oauth_token_secret": "unit-secret",
+    })
+
+    async def account_key(tokens):
+        return "acct"
+
+    async def equity(*args, **kwargs):
+        return 100000.0
+
+    async def quiet(*args, **kwargs):
+        return None
+
+    class _Market:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    def snap(market, symbol, expiry, strike, call_put, liquidity_out=None):
+        if liquidity_out is not None:
+            liquidity_out["quote_type"] = "REALTIME"
+        return ("2026-12-18", 150.0, 4.90, 5.00)
+
+    async def fetch_quote(self, *args, **kwargs):
+        return {
+            "live": True, "bid": 4.90, "ask": 5.00, "age_s": 1.0,
+            "timeframe": "REAL-TIME", "reason": "payoff",
+        }
+
+    sent = []
+
+    async def place(kind, common, tokens, unit_cost=None):
+        sent.append(int(common["quantity"]))
+        return {"Order": [{"orderId": "1"}]}, int(common["quantity"]), str(common["clientOrderId"])
+
+    upstream = {"qty": 3}
+
+    def sized(symbol, qty, payload):
+        return upstream["qty"], None
+
+    def allow_hard_cap(premium, stop_premium, qty, equity):
+        return {
+            "allowed": True, "reason": "ok", "risk_usd": 1.0, "risk_cap_usd": 1000.0,
+            "notional_usd": 1.0, "notional_cap_usd": 1000.0, "qty": qty,
+        }
+
+    monkeypatch.setattr(main_bot, "_resolve_account_id_key", account_key)
+    monkeypatch.setattr(main_bot, "_live_equity", equity)
+    monkeypatch.setattr(main_bot, "_hard_cap_equity", equity)
+    monkeypatch.setattr(main_bot, "_risk_account_reference", equity)
+    monkeypatch.setattr(main_bot, "_index_vwap_quotes", quiet)
+    monkeypatch.setattr(main_bot, "_apply_pro_trader_size", sized)
+    monkeypatch.setattr(main_bot, "assess_hard_size_cap", allow_hard_cap)
+    monkeypatch.setattr(main_bot, "_place_entry_with_funds_clamp", place)
+    monkeypatch.setattr(main_bot, "_record_open", quiet)
+    monkeypatch.setattr(main_bot, "_arm_stop_guard", quiet)
+    monkeypatch.setattr(main_bot, "_stamp_entry_market_context", quiet)
+    monkeypatch.setattr(main_bot.alerts, "send", quiet)
+    monkeypatch.setattr(main_bot.pyetrade, "ETradeMarket", _Market)
+    monkeypatch.setattr(main_bot, "_snap_option_contract", snap)
+    monkeypatch.setattr(main_bot.massive.MassiveClient, "fetch_option_quote", fetch_quote)
+    saved_state = main_bot.state
+    main_bot.state = main_bot.StateStore(None)
+
+    payload = {
+        "mode": "live",
+        "instrument": "option",
+        "ticker": "CRM",
+        "action": "BUY",
+        "signal_id": "cap-three",
+        "_origin": "app",
+        "strike": 150,
+        "expiration_hint": "2026-12-18",
+        "option_right": "CALL",
+        "option_contracts": 1,
+        "option_limit_price": 5.0,
+        "option_stop_price": 3.9,
+        "entry": 148.0,
+        "stop": 140.0,
+        "target": 170.0,
+        "option_delta": 0.60,
+        "setup": "orb",
+        "timestamp": "2026-11-25T15:00:00+00:00",
+    }
+
+    async def run():
+        three = await main_bot.execute_live_order(dict(payload))
+        upstream["qty"] = 0
+        payload["signal_id"] = "cap-zero"
+        zero = await main_bot.execute_live_order(dict(payload, signal_id="cap-zero"))
+        return three, zero
+
+    try:
+        three, zero = asyncio.run(run())
+    finally:
+        main_bot.state = saved_state
+
+    assert three["status"] == "success", three
+    assert sent == [1]
+    assert zero["status"] == "refused"
+    assert zero["code"] == "setup_size_cap"
+    assert sent == [1]
+
+
+def test_shadow_observer_error_does_not_change_the_entry(monkeypatch, caplog):
+    _reset(monkeypatch, enabled="false", shadow="true")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("leak acct 999000111 token SUPERSECRET")
+
+    monkeypatch.setattr(main_bot, "_bump_setup_count", boom)
+    monkeypatch.setattr(main_bot.state, "is_killed", _kill_switch_raises)
+    with caplog.at_level(logging.WARNING, logger="etrade-bot"):
+        with pytest.raises(_ReachedUnchangedPath):
+            asyncio.run(main_bot._passes_entry_filters(_entry(setup="breakdown")))
+        with pytest.raises(_ReachedUnchangedPath):
+            asyncio.run(main_bot._passes_entry_filters(_entry(setup="breakdown", ticker="SHOP")))
+    text = " ".join(rec.message for rec in caplog.records)
+    assert "setup_disable observer failed (RuntimeError)" in text
+    assert "999000111" not in text
+    assert "SUPERSECRET" not in text
+    assert text.count("setup_disable observer failed") == 1
+
+
+def test_flag_on_still_skips_when_the_counter_raises(monkeypatch, caplog):
+    _reset(monkeypatch, enabled="true", shadow="false")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("leak acct 999000111")
+
+    monkeypatch.setattr(main_bot, "_bump_setup_count", boom)
+
+    async def _process(pd, replay=False):
+        raise AssertionError("enforcement must not enter process_signal")
+
+    monkeypatch.setattr(main_bot, "process_signal", _process)
+    with caplog.at_level(logging.WARNING, logger="etrade-bot"):
+        ok, reasons = asyncio.run(main_bot._passes_entry_filters(_entry(setup="momentum")))
+        result = asyncio.run(main_bot._scanner_dispatch(
+            _entry(setup="breakdown", ticker="SHOP", timestamp="2026-11-25T15:05:00+00:00"),
+        ))
+    assert ok is False
+    assert reasons == ["setup_disabled"]
+    assert result["status"] == "rejected"
+    assert result["reason"] == "setup_disabled"
+    text = " ".join(rec.message for rec in caplog.records)
+    assert "999000111" not in text

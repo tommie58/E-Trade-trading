@@ -16679,38 +16679,64 @@ def _bump_setup_count(canon: str, field: str) -> None:
     row[field] = int(row.get(field) or 0) + 1
 
 
+def _log_setup_disable_observer_error(exc: BaseException) -> None:
+    """One scrubbed line per exception type per minute. Never raises.
+
+    The message is the type name only. Exception text is not logged: a
+    counter failure must not print a payload, a token, or an account id.
+    """
+    try:
+        name = type(exc).__name__
+        minute = _utcnow().strftime("%Y-%m-%dT%H:%M")
+        if not _setup_disable_remember(f"observer-error|{name}|{minute}"):
+            return
+        logger.warning("setup_disable observer failed (%s); entry unchanged", name)
+    except Exception:
+        return
+
+
 def observe_setup_disable(payload: Any, *, path: str, dry_run: bool = False) -> Optional[str]:
     """Return setup_disabled when this entry must be skipped. Otherwise None.
 
-    Shadow logs and counts once per candidate per cycle and does not block.
+    Counting and logging are the shadow observer. Any exception there is
+    logged once, scrubbed, and swallowed. It cannot block, delay, or change
+    the admit. A skip verdict is returned even when the counter raises.
     A dry run reports a skip and does not touch the counters, so /explain
     does not look like a live candidate.
     """
-    if not isinstance(payload, dict) or _is_close_payload(payload):
+    try:
+        if not isinstance(payload, dict) or _is_close_payload(payload):
+            return None
+        verdict = judge_setup_disable(payload.get("setup"))
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
         return None
-    verdict = judge_setup_disable(payload.get("setup"))
     if verdict == "allow":
         return None
     if dry_run:
         return SETUP_DISABLE_REASON if verdict == "skip" else None
-    canon = canonical_setup_id(payload.get("setup"))
-    ticker = str(payload.get("ticker") or "").upper()
-    cycle = _setup_disable_cycle(payload)
-    key = f"{ticker}|{canon}|{cycle}|{verdict}"
-    if not _setup_disable_remember(key):
-        return SETUP_DISABLE_REASON if verdict == "skip" else None
+    try:
+        canon = canonical_setup_id(payload.get("setup"))
+        ticker = str(payload.get("ticker") or "").upper()
+        cycle = _setup_disable_cycle(payload)
+        key = f"{ticker}|{canon}|{cycle}|{verdict}"
+        if _setup_disable_remember(key):
+            if verdict == "skip":
+                _bump_setup_count(canon, "skipped")
+                logger.warning(
+                    "setup_disabled path=%s ticker=%s setup=%s cycle=%s",
+                    path, ticker, canon, cycle,
+                )
+            else:
+                _bump_setup_count(canon, "would_skip")
+                logger.info(
+                    "setup_disabled shadow path=%s ticker=%s setup=%s cycle=%s",
+                    path, ticker, canon, cycle,
+                )
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
     if verdict == "skip":
-        _bump_setup_count(canon, "skipped")
-        logger.warning(
-            "setup_disabled path=%s ticker=%s setup=%s cycle=%s",
-            path, ticker, canon, cycle,
-        )
         return SETUP_DISABLE_REASON
-    _bump_setup_count(canon, "would_skip")
-    logger.info(
-        "setup_disabled shadow path=%s ticker=%s setup=%s cycle=%s",
-        path, ticker, canon, cycle,
-    )
     return None
 
 
@@ -16744,16 +16770,47 @@ def apply_kept_setup_cap(setup: Any, quantity: Any, *, ticker: str = "", cycle: 
     capped = cap_kept_setup_quantity(setup, quantity)
     if capped == quantity or not setup_disable_enabled():
         return quantity
-    canon = canonical_setup_id(setup)
-    name = str(ticker or "").upper()
-    key = f"cap|{name}|{canon}|{cycle}"
-    if _setup_disable_remember(key):
-        _setup_disable_counts["capped"] = int(_setup_disable_counts.get("capped") or 0) + 1
-        logger.warning(
-            "setup_disabled cap path=entry ticker=%s setup=%s qty=%s -> %s",
-            name, canon, quantity, capped,
-        )
+    try:
+        canon = canonical_setup_id(setup)
+        name = str(ticker or "").upper()
+        key = f"cap|{name}|{canon}|{cycle}"
+        if _setup_disable_remember(key):
+            _setup_disable_counts["capped"] = int(_setup_disable_counts.get("capped") or 0) + 1
+            logger.warning(
+                "setup_disabled cap path=entry ticker=%s setup=%s qty=%s -> %s",
+                name, canon, quantity, capped,
+            )
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
     return capped
+
+
+def commit_final_kept_setup_qty(
+    setup: Any,
+    upstream_qty: Any,
+    order: Optional[Dict[str, Any]] = None,
+    *,
+    ticker: str = "",
+    cycle: str = "",
+) -> Any:
+    """Last sizing step, after learning, regime, gap, risk, and budget checks.
+
+    Writes the quantity the option order will send. Flag off returns
+    `upstream_qty` and does not rewrite the order. Flag on, for momentum
+    fade and orb only: never increases the size, floors anything above 1
+    to 1, and returns None when the size is below 1 so the caller skips
+    placement instead of rounding up to a contract.
+    """
+    final = apply_kept_setup_cap(setup, upstream_qty, ticker=ticker, cycle=cycle)
+    if not setup_disable_enabled() or canonical_setup_id(setup) not in _KEPT_SETUP_CAP:
+        return upstream_qty
+    if isinstance(final, bool) or not isinstance(final, int) or final < 1:
+        if isinstance(order, dict):
+            order["quantity"] = 0
+        return None
+    if isinstance(order, dict):
+        order["quantity"] = final
+    return final
 
 
 def setup_disable_status() -> Dict[str, Any]:
@@ -34452,10 +34509,6 @@ async def execute_live_order(payload: dict):
             # before an order could ever be placed.
             sym_u = str(symbol).upper()
             if not is_exit:
-                quantity = apply_kept_setup_cap(
-                    payload.get("setup"), quantity, ticker=sym_u,
-                    cycle=str(payload.get("timestamp") or payload.get("ts") or ""),
-                )
                 quantity = _apply_learning_weight(sym_u, quantity, learning_ctx)
                 quantity = _apply_risk_weight(sym_u, quantity, risk_ctx)
                 quantity, pt_block = _apply_pro_trader_size(sym_u, quantity, payload)
@@ -35247,6 +35300,25 @@ async def execute_live_order(payload: dict):
                             logger.error(f"[CLOSE] {sym_u} close failed AND stop re-arm failed: {re_err}")
                     raise
             else:
+                # Kept setups (momentum fade, orb) cap at 1 contract only after
+                # every earlier sizer and budget check. Later steps, including
+                # the funds clamp, can still shrink this. They cannot raise it.
+                committed = commit_final_kept_setup_qty(
+                    payload.get("setup"), quantity, common, ticker=sym_u,
+                    cycle=str(payload.get("timestamp") or payload.get("ts") or ""),
+                )
+                if committed is None:
+                    logger.info(
+                        "setup_disabled cap skip ticker=%s setup=%s",
+                        sym_u, canonical_setup_id(payload.get("setup")),
+                    )
+                    return {
+                        "status": "refused",
+                        "reason": "kept setup quantity below 1 contract",
+                        "code": "setup_size_cap",
+                        "paper": True,
+                    }
+                quantity = committed
                 # Per-contract cost = premium × 100 shares. Prefer the sanitized
                 # limit price (set from the real ask above); fall back to the
                 # raw ask for MARKET orders.
