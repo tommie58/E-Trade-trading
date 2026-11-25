@@ -174,8 +174,9 @@ def test_legacy_tail_matches_trade_ledger_tail_without_paging_keys(tmp_path, htt
     assert counted_body["chain_ok"] is ok
     assert counted_body["chain_records_checked"] == checked
     assert counted_body["chain_error"] == err
+    assert counted_body["bad_lines"] == 0
     assert set(counted_body) == {
-        "records", "chain_ok", "chain_records_checked", "chain_error",
+        "records", "chain_ok", "chain_records_checked", "chain_error", "bad_lines",
     }
 
     memory = {"status": "healthy", "records": 120, "message": "ledger memory intact"}
@@ -365,6 +366,9 @@ def test_rate_limit_returns_429_after_thirty(tmp_path, http, monkeypatch):
     assert blocked.status_code == 429
     assert blocked.json()["detail"] == "ledger rate limit exceeded"
     assert FAKE_KEY not in blocked.text
+    # The legacy tail is not in the paging bucket.
+    assert _get(http).status_code == 200
+    assert _get(http, "?count=1").status_code == 200
 
     # Unauthenticated calls never reach the limiter, so they do not consume it.
     main_bot._reset_ledger_rate_limit()
@@ -379,16 +383,152 @@ def test_rate_limit_returns_429_after_thirty(tmp_path, http, monkeypatch):
 
     monkeypatch.setattr(main_bot.time, "monotonic", clock)
     main_bot._reset_ledger_rate_limit()
-    assert _get(http).status_code == 200
+    assert _get(http, "?limit=1").status_code == 200
     for _ in range(LEDGER_BUDGET - 1):
-        assert _get(http).status_code == 200
-    assert _get(http).status_code == 429
+        assert _get(http, "?limit=1").status_code == 200
+    assert _get(http, "?limit=1").status_code == 429
     now["t"] += main_bot.LEDGER_RATE_WINDOW_SECONDS + 1
-    assert _get(http).status_code == 200
+    assert _get(http, "?limit=1").status_code == 200
 
 
 # The name is bound after import of main_bot so the test above can read it.
 LEDGER_BUDGET = main_bot.LEDGER_RATE_LIMIT
+
+
+def _drop_account_fields(value):
+    if isinstance(value, dict):
+        return {
+            key: _drop_account_fields(item)
+            for key, item in value.items()
+            if key not in ("accountId", "accountIdKey")
+        }
+    if isinstance(value, list):
+        return [_drop_account_fields(item) for item in value]
+    return value
+
+
+OCC_SYMBOL = "INTC  261127P00056000"
+# 64 hex characters, with an 8-digit run the generic scrub would eat.
+LEDGER_HASH = "1234567890abcdef" * 4
+
+
+def test_hash_and_occ_symbol_survive_and_tail_only_drops_account_fields(tmp_path, http):
+    assert len(LEDGER_HASH) == 64
+    assert "1234567890" in LEDGER_HASH
+    assert "00056000" in OCC_SYMBOL
+    records = []
+    for seq in range(1, 4):
+        records.append(_record(
+            seq,
+            "position_opened",
+            _day(seq),
+            hash=LEDGER_HASH,
+            prev_hash=LEDGER_HASH,
+            accountId="00056000",
+            accountIdKey=FAKE_KEY,
+            data={
+                "symbol": OCC_SYMBOL,
+                "option_symbol": OCC_SYMBOL,
+                "nested": {"accountId": "00056000", "accountIdKey": FAKE_KEY, "qty": 1},
+            },
+        ))
+    _write(tmp_path / "ledger.jsonl", records)
+
+    response = _get(http)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["records"] == [_drop_account_fields(rec) for rec in trade_ledger.tail(100)]
+    top = body["records"][0]
+    assert top["hash"] == LEDGER_HASH
+    assert top["prev_hash"] == LEDGER_HASH
+    assert top["data"]["symbol"] == OCC_SYMBOL
+    assert top["data"]["option_symbol"] == OCC_SYMBOL
+    assert "accountId" not in top
+    assert "accountIdKey" not in top
+    assert "accountId" not in top["data"]["nested"]
+    assert "accountIdKey" not in top["data"]["nested"]
+    assert FAKE_KEY not in response.text
+    assert "00056000" in top["data"]["symbol"]
+
+    paged = _get(http, "?limit=10")
+    assert paged.status_code == 200
+    assert paged.json()["records"][0]["hash"] == LEDGER_HASH
+    assert paged.json()["records"][0]["data"]["symbol"] == OCC_SYMBOL
+    assert "{redacted}" not in paged.text
+
+
+def test_dates_do_not_assume_timestamp_order(tmp_path, http, monkeypatch):
+    # seq 2 is AFTER the window, but seq 3 (later in the file) is inside it.
+    # A timestamp seek that stops at seq 2 would miss seq 3 and report has_more false.
+    records = [
+        _record(1, "position_opened", "2026-11-15T18:00:00+00:00"),
+        _record(2, "position_opened", "2026-11-20T18:00:00+00:00"),
+        _record(3, "position_opened", "2026-11-12T18:00:00+00:00"),
+    ]
+    _write(tmp_path / "ledger.jsonl", records)
+    response = _get(
+        http,
+        "?event_type=position_opened&start=2026-11-11&end=2026-11-18",
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [rec["seq"] for rec in body["records"]] == [3, 1]
+    assert body["has_more"] is False
+
+    monkeypatch.setattr(main_bot, "LEDGER_PAGE_SCAN_CAP", 1)
+    seen, last = _walk(
+        http,
+        {"event_type": "position_opened", "start": "2026-11-11", "end": "2026-11-18"},
+        "before_seq",
+        "next_before_seq",
+    )
+    assert seen == [3, 1]
+    assert last["has_more"] is False
+
+
+def _chained(seq: int, prev: str) -> dict:
+    rec = {
+        "seq": seq,
+        "ts": _day(seq),
+        "event": "heartbeat",
+        "data": {},
+        "prev_hash": prev,
+    }
+    rec["hash"] = trade_ledger._chain_hash(prev, trade_ledger._canonical(rec))
+    return rec
+
+
+def test_verify_skips_a_non_utf8_line(tmp_path, http):
+    prev = trade_ledger.GENESIS_HASH
+    first = _chained(1, prev)
+    second = _chained(2, first["hash"])
+    path = tmp_path / "ledger.jsonl"
+    path.write_bytes(b"")
+    trade_ledger.init(path)
+    path.write_bytes(
+        json.dumps(first).encode("utf-8") + b"\n"
+        + b"\xff\xfe\n"
+        + json.dumps(second).encode("utf-8") + b"\n"
+    )
+    response = _get(http, "?verify=true")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["bad_lines"] == 1
+    assert body["chain_ok"] is True
+    assert body["chain_records_checked"] == 2
+    assert body["chain_error"] is None
+
+
+def test_rate_limit_evicts_stale_keys_and_caps_the_table():
+    now = 10_000.0
+    main_bot._ledger_rate_hits["stale"] = [now - main_bot.LEDGER_RATE_WINDOW_SECONDS - 5]
+    for index in range(main_bot.LEDGER_RATE_MAX_KEYS + 10):
+        main_bot._ledger_rate_hits[f"k{index}"] = [now - (index * 0.001)]
+    main_bot._prune_ledger_rate_keys(now)
+    assert "stale" not in main_bot._ledger_rate_hits
+    assert len(main_bot._ledger_rate_hits) == main_bot.LEDGER_RATE_MAX_KEYS
+    assert "k0" in main_bot._ledger_rate_hits
+    assert f"k{main_bot.LEDGER_RATE_MAX_KEYS + 9}" not in main_bot._ledger_rate_hits
 
 
 def test_responses_and_logs_strip_the_account_key(tmp_path, http, monkeypatch, caplog):

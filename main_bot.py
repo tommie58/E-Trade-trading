@@ -40518,6 +40518,7 @@ LEDGER_PAGE_SCAN_CAP = 8000
 LEDGER_PAGE_MAX_LINE = 1024 * 1024
 LEDGER_RATE_LIMIT = 30
 LEDGER_RATE_WINDOW_SECONDS = 60.0
+LEDGER_RATE_MAX_KEYS = 1024
 _LEDGER_CT = ZoneInfo("America/Chicago")
 _LEDGER_STRIP_FIELDS = frozenset({"accountId", "accountIdKey"})
 _LEDGER_EVENT_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
@@ -40555,6 +40556,27 @@ def _collect_ledger_secrets(value: Any, found: List[str]) -> None:
             _collect_ledger_secrets(item, found)
 
 
+def _scrub_ledger_string(text: str, secrets: Sequence[str]) -> str:
+    """Same string scrub as the response middleware, plus known account keys.
+
+    URLs, `accountIdKey=` query values, and OAuth material go through
+    `_scrub_etrade_urls`. An opaque account key is removed wherever it
+    appears. An all-digit account number is removed only when it is the
+    entire value. The 8-digit pass in `scrub_etrade_text` is not applied,
+    so a hash or an OCC symbol keeps its digits.
+    """
+    cleaned = text
+    for secret in secrets:
+        if not secret or len(secret) < 4:
+            continue
+        if secret.isdigit():
+            if cleaned == secret:
+                cleaned = "{acct}"
+        else:
+            cleaned = cleaned.replace(secret, "{acct}")
+    return _scrub_etrade_urls(cleaned)
+
+
 def _redact_ledger_value(value: Any, secrets: Sequence[str]) -> Any:
     if isinstance(value, dict):
         out: Dict[str, Any] = {}
@@ -40566,7 +40588,7 @@ def _redact_ledger_value(value: Any, secrets: Sequence[str]) -> Any:
     if isinstance(value, list):
         return [_redact_ledger_value(item, secrets) for item in value]
     if isinstance(value, str):
-        return scrub_etrade_text(value, secrets=secrets)
+        return _scrub_ledger_string(value, secrets)
     return value
 
 
@@ -40576,13 +40598,34 @@ def _redact_ledger_payload(value: Any) -> Any:
     return _redact_ledger_value(value, secrets)
 
 
+def _prune_ledger_rate_keys(now: float) -> None:
+    """Drop expired clients, then the least recently used, down to 1024 keys."""
+    window = LEDGER_RATE_WINDOW_SECONDS
+    for key in list(_ledger_rate_hits):
+        fresh = [stamp for stamp in _ledger_rate_hits[key] if now - stamp < window]
+        if fresh:
+            _ledger_rate_hits[key] = fresh
+        else:
+            del _ledger_rate_hits[key]
+    overflow = len(_ledger_rate_hits) - LEDGER_RATE_MAX_KEYS
+    if overflow <= 0:
+        return
+    oldest = sorted(_ledger_rate_hits, key=lambda item: _ledger_rate_hits[item][-1])
+    for key in oldest[:overflow]:
+        del _ledger_rate_hits[key]
+
+
 def _enforce_ledger_rate_limit(request: Request) -> None:
-    """30 reads a minute per client host. Auth has already fail-closed."""
+    """30 paging reads a minute per client host. The legacy tail is exempt.
+
+    Auth has already fail-closed. Expired keys are removed, and the table
+    never keeps more than LEDGER_RATE_MAX_KEYS clients.
+    """
     now = time.monotonic()
+    _prune_ledger_rate_keys(now)
     client = request.client
     key = client.host if client is not None and client.host else "unknown"
-    window = LEDGER_RATE_WINDOW_SECONDS
-    hits = [stamp for stamp in _ledger_rate_hits.get(key, ()) if now - stamp < window]
+    hits = list(_ledger_rate_hits.get(key, ()))
     if len(hits) >= LEDGER_RATE_LIMIT:
         _ledger_rate_hits[key] = hits
         raise HTTPException(status_code=429, detail="ledger rate limit exceeded")
@@ -40680,26 +40723,35 @@ class _LedgerQuery:
         self.end = end
         self.ascending = since_seq is not None
 
-    def upper_ok(self, rec: Dict[str, Any]) -> bool:
-        if self.before_seq is not None:
-            seq = _ledger_seq(rec)
-            if seq is None or seq >= self.before_seq:
-                return False
-        if self.end is not None:
-            ts = _ledger_ts(rec)
-            if ts is None or ts >= self.end:
-                return False
-        return True
+    def seq_before_ok(self, rec: Dict[str, Any]) -> bool:
+        """True when `seq` is strictly below `before_seq`. Seq follows append order."""
+        if self.before_seq is None:
+            return True
+        seq = _ledger_seq(rec)
+        return seq is not None and seq < self.before_seq
 
-    def lower_in(self, rec: Dict[str, Any]) -> bool:
-        if self.since_seq is not None:
-            seq = _ledger_seq(rec)
-            if seq is None or seq <= self.since_seq:
-                return False
-        if self.start is not None:
-            ts = _ledger_ts(rec)
-            if ts is None or ts < self.start:
-                return False
+    def seq_since_ok(self, rec: Dict[str, Any]) -> bool:
+        """True when `seq` is strictly above `since_seq`. Seq follows append order."""
+        if self.since_seq is None:
+            return True
+        seq = _ledger_seq(rec)
+        return seq is not None and seq > self.since_seq
+
+    def date_ok(self, rec: Dict[str, Any]) -> bool:
+        """True when `ts` is inside the Central Time window.
+
+        A timestamp that is out of order does not end the scan. The caller
+        skips the row and keeps reading.
+        """
+        if self.start is None and self.end is None:
+            return True
+        ts = _ledger_ts(rec)
+        if ts is None:
+            return False
+        if self.start is not None and ts < self.start:
+            return False
+        if self.end is not None and ts >= self.end:
+            return False
         return True
 
     def event_ok(self, rec: Dict[str, Any]) -> bool:
@@ -40952,10 +41004,12 @@ def _seek_leftmost(path: Path, pred) -> Optional[int]:
 
 
 def _page_descending(path: Path, query: _LedgerQuery) -> Dict[str, Any]:
-    if query.before_seq is None and query.end is None:
+    # Dates are not a seek key. A later line can carry an earlier timestamp,
+    # so the walk starts at the seq bound (or EOF) and filters `ts` as it goes.
+    if query.before_seq is None:
         start = _newest_line_start(path)
     else:
-        start = _seek_rightmost(path, query.upper_ok)
+        start = _seek_rightmost(path, query.seq_before_ok)
     if start is None:
         return _empty_ledger_page()
     included: List[Dict[str, Any]] = []
@@ -40987,9 +41041,9 @@ def _page_descending(path: Path, query: _LedgerQuery) -> Dict[str, Any]:
             if seq is not None:
                 oldest_scanned = seq
             if rec is not None and seq is not None:
-                if not query.lower_in(rec):
+                if not query.seq_since_ok(rec):
                     break
-                if query.upper_ok(rec) and query.event_ok(rec):
+                if query.seq_before_ok(rec) and query.date_ok(rec) and query.event_ok(rec):
                     if len(included) < query.limit:
                         included.append(rec)
                         newest_included = seq if newest_included is None else max(newest_included, seq)
@@ -41011,7 +41065,7 @@ def _page_descending(path: Path, query: _LedgerQuery) -> Dict[str, Any]:
 
 
 def _page_ascending(path: Path, query: _LedgerQuery) -> Dict[str, Any]:
-    start = _seek_leftmost(path, query.lower_in)
+    start = _seek_leftmost(path, query.seq_since_ok)
     if start is None:
         return _empty_ledger_page()
     included: List[Dict[str, Any]] = []
@@ -41036,9 +41090,9 @@ def _page_ascending(path: Path, query: _LedgerQuery) -> Dict[str, Any]:
             if seq is not None:
                 newest_scanned = seq
             if rec is not None and seq is not None:
-                if not query.upper_ok(rec):
+                if not query.seq_before_ok(rec):
                     break
-                if query.lower_in(rec) and query.event_ok(rec):
+                if query.seq_since_ok(rec) and query.date_ok(rec) and query.event_ok(rec):
                     if len(included) < query.limit:
                         included.append(rec)
                         if oldest_included is None:
@@ -41114,6 +41168,50 @@ def _legacy_tail_records(count: int) -> List[Any]:
     return out
 
 
+def _ledger_verify_readable() -> Tuple[bool, int, Optional[str], int]:
+    """Hash-chain check that skips a non-UTF-8 line instead of failing the read.
+
+    Same verdict as `trade_ledger.verify` on a file that decodes. A line that
+    is not UTF-8 increments `bad_lines` and is not a 500. The boot-time
+    `trade_ledger.verify` call is unchanged.
+    """
+    path = _active_ledger_path()
+    if path is None or not path.is_file():
+        return True, 0, None, 0
+    checked = 0
+    bad_lines = 0
+    prev = trade_ledger.GENESIS_HASH
+    try:
+        if path.stat().st_size <= 0:
+            return True, 0, None, 0
+        with open(path, "rb") as handle:
+            for line_no, raw in enumerate(handle, start=1):
+                if not raw.strip():
+                    continue
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    bad_lines += 1
+                    continue
+                try:
+                    rec = json.loads(text)
+                except json.JSONDecodeError:
+                    return False, checked, f"line {line_no}: unparseable", bad_lines
+                claimed = str(rec.pop("hash", ""))
+                if str(rec.get("prev_hash")) != prev:
+                    if str(rec.get("prev_hash")) != trade_ledger.GENESIS_HASH:
+                        return False, checked, f"line {line_no}: prev_hash broken", bad_lines
+                if trade_ledger._chain_hash(str(rec.get("prev_hash")), trade_ledger._canonical(rec)) != claimed:
+                    return False, checked, f"line {line_no}: hash mismatch (record altered)", bad_lines
+                prev = claimed
+                checked += 1
+    except OSError as exc:
+        _ledger_log_failure("verify", exc)
+        detail = scrub_etrade_text(str(exc), secrets=_ledger_scrub_secrets())
+        return False, checked, detail, bad_lines
+    return True, checked, None, bad_lines
+
+
 def _ledger_http_body(
     records: List[Any],
     verify: bool,
@@ -41127,12 +41225,13 @@ def _ledger_http_body(
     if _ledger_memory is not None:
         body["memory"] = _ledger_memory
     if verify:
-        ok, checked, err = trade_ledger.verify()
+        ok, checked, err, bad_lines = _ledger_verify_readable()
         body["chain_ok"] = ok
         body["chain_records_checked"] = checked
         body["chain_error"] = (
             None if err is None else scrub_etrade_text(str(err), secrets=_ledger_scrub_secrets())
         )
+        body["bad_lines"] = bad_lines
     return body
 
 
@@ -41173,22 +41272,28 @@ async def ledger_tail(
     The page carries `next_before_seq`, `next_since_seq`, and `has_more`.
     Cursors are exclusive. Follow `next_before_seq` as `before_seq` to walk
     older, or `next_since_seq` as `since_seq` to walk newer. A request scans
-    at most LEDGER_PAGE_SCAN_CAP lines; `has_more` stays true when that cap
-    stops the scan before the window ends, and the cursor advances past the
-    lines already examined.
+    at most LEDGER_PAGE_SCAN_CAP lines. `has_more` stays true when that cap
+    stops the scan before the seq window or the file boundary, so a date
+    filter does not assume timestamps increase with the file. The cursor
+    advances past the lines already examined.
 
-    `verify=true` still walks the whole hash chain. That check is separate
-    from the page scan.
+    `verify=true` walks the hash chain. A non-UTF-8 line is skipped and
+    counted in `bad_lines` instead of failing the request. That check is
+    separate from the page scan.
 
     Auth is the X-Rork-Secret middleware (401 when the secret is unset or
-    wrong). After that, this route allows 30 requests a minute per client
-    (429). `accountId` and `accountIdKey` are removed from every record.
-    String fields and error text go through `scrub_etrade_text`.
+    wrong). Paging requests allow 30 a minute per client (429). The legacy
+    tail (no paging params) is not rate limited. `accountId` and
+    `accountIdKey` are removed. Other record strings are scrubbed the way
+    the response middleware scrubs them (account URLs, `accountIdKey=`
+    values, OAuth) plus a known account key. Digit runs in a hash or an
+    OCC symbol are left as written. Error text still goes through
+    `scrub_etrade_text`.
     """
-    _enforce_ledger_rate_limit(request)
     try:
         if not _paging_requested(since_seq, before_seq, limit, event_type, start, end):
             return await asyncio.to_thread(_ledger_http_body_legacy, count, verify)
+        _enforce_ledger_rate_limit(request)
         query = _parse_ledger_query(since_seq, before_seq, limit, event_type, start, end)
         page = await asyncio.to_thread(_read_ledger_page, query)
         return _ledger_http_body(page["records"], verify, page)
