@@ -14,6 +14,10 @@ class _ReachedUnchangedPath(Exception):
     pass
 
 
+def _open_shadow(tmp_path):
+    main_bot.init_setup_disable_shadow_log(tmp_path / "setup_disable_shadow.jsonl")
+
+
 def _reset(monkeypatch, *, enabled=None, shadow=None, items=None):
     if enabled is None:
         monkeypatch.delenv("SETUP_DISABLE_ENABLED", raising=False)
@@ -477,6 +481,7 @@ def test_shadow_ledger_records_one_row_per_signal(tmp_path):
     saved = main_bot.trade_ledger._ledger
     main_bot.reset_setup_disable_state()
     main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    _open_shadow(tmp_path)
     payload = {
         "ticker": "FAKE",
         "setup": "vwap rejection",
@@ -514,15 +519,14 @@ def test_shadow_ledger_records_one_row_per_signal(tmp_path):
 
     try:
         asyncio.run(run())
-        rows = [
-            rec for rec in main_bot.trade_ledger.recent(20)
-            if rec.get("event") == "setup_disable_shadow"
-        ]
+        rows = main_bot.read_setup_disable_shadow(20)
+        core = main_bot.trade_ledger.recent(20)
     finally:
         main_bot.trade_ledger._ledger = saved
         main_bot.reset_setup_disable_state()
 
     assert len(rows) == 1
+    assert all(rec.get("event") != "setup_disable_shadow" for rec in core)
     data = rows[0]["data"]
     assert data["setup"] == "vwap rejection"
     assert data["symbol"] == "FAKE"
@@ -552,6 +556,7 @@ def test_occ_order_id_and_signal_id_survive_byte_identical(tmp_path, monkeypatch
     saved = main_bot.trade_ledger._ledger
     main_bot.reset_setup_disable_state()
     main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    _open_shadow(tmp_path)
     monkeypatch.setenv("ETRADE_ACCOUNT_ID", "00100000")
     monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "8844221100987766")
     occ = "FAKE  261218C00100000"
@@ -592,10 +597,7 @@ def test_occ_order_id_and_signal_id_survive_byte_identical(tmp_path, monkeypatch
 
     try:
         asyncio.run(run())
-        rows = [
-            rec["data"] for rec in main_bot.trade_ledger.recent(10)
-            if rec.get("event") == "setup_disable_shadow"
-        ]
+        rows = [rec["data"] for rec in main_bot.read_setup_disable_shadow(10)]
     finally:
         main_bot.trade_ledger._ledger = saved
         main_bot.reset_setup_disable_state()
@@ -647,13 +649,14 @@ def test_position_opened_stamps_signal_key(tmp_path, monkeypatch):
     assert rows[0]["data"]["contract"]["occ_symbol"] == occ
 
 
-def test_shadow_ledger_failure_does_not_raise(monkeypatch):
+def test_shadow_ledger_failure_does_not_raise(tmp_path, monkeypatch):
     _reset(monkeypatch, enabled="false", shadow="true")
+    _open_shadow(tmp_path)
 
-    async def boom(event, data=None):
+    def boom(data):
         raise RuntimeError("ledger down")
 
-    monkeypatch.setattr(main_bot.trade_ledger, "record", boom)
+    monkeypatch.setattr(main_bot._shadow_log, "append", boom)
 
     async def run():
         await main_bot.persist_setup_disable_decision(
@@ -668,6 +671,7 @@ def test_second_same_day_entry_gets_its_own_shadow_row(tmp_path):
     saved = main_bot.trade_ledger._ledger
     main_bot.reset_setup_disable_state()
     main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    _open_shadow(tmp_path)
     payload = {
         "ticker": "FAKE", "setup": "breakout", "action": "BUY",
         "option_right": "PUT", "signal_id": "same-day", "strike": 50,
@@ -688,10 +692,7 @@ def test_second_same_day_entry_gets_its_own_shadow_row(tmp_path):
 
     try:
         asyncio.run(run())
-        rows = [
-            rec["data"] for rec in main_bot.trade_ledger.recent(20)
-            if rec.get("event") == "setup_disable_shadow"
-        ]
+        rows = [rec["data"] for rec in main_bot.read_setup_disable_shadow(20)]
     finally:
         main_bot.trade_ledger._ledger = saved
         main_bot.reset_setup_disable_state()
@@ -705,6 +706,7 @@ def test_startup_seed_keeps_the_next_same_day_attempt(tmp_path):
     saved = main_bot.trade_ledger._ledger
     main_bot.reset_setup_disable_state()
     main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    _open_shadow(tmp_path)
     payload = {
         "ticker": "FAKE", "setup": "momentum", "action": "BUY",
         "option_right": "CALL", "signal_id": "same-day",
@@ -726,10 +728,7 @@ def test_startup_seed_keeps_the_next_same_day_attempt(tmp_path):
 
     try:
         asyncio.run(run())
-        rows = [
-            rec["data"] for rec in main_bot.trade_ledger.recent(20)
-            if rec.get("event") == "setup_disable_shadow"
-        ]
+        rows = [rec["data"] for rec in main_bot.read_setup_disable_shadow(20)]
     finally:
         main_bot.trade_ledger._ledger = saved
         main_bot.reset_setup_disable_state()
@@ -782,26 +781,20 @@ def test_slow_shadow_write_does_not_delay_the_handoff(monkeypatch):
     assert elapsed < 0.5
 
 
-def test_shadow_append_timeout_keeps_the_hash_chain(tmp_path):
-    """A 0.3s file write must not leave the next record unchained.
-
-    Four records are already chained. The old caller timeout cancelled the
-    append after the line landed, and verify() returned
-    (False, 5, 'line 6: prev_hash broken').
-    """
+def test_shadow_side_log_keeps_its_own_hash_chain(tmp_path):
+    """A slow shadow append stays on the side log. The core chain is untouched."""
     import time
     saved = main_bot.trade_ledger._ledger
     main_bot.reset_setup_disable_state()
     main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
-    ledger = main_bot.trade_ledger._ledger
-    original = ledger._append_line
+    _open_shadow(tmp_path)
+    original = main_bot._shadow_log.append
 
-    def slow(line):
-        if "setup_disable_shadow" in line:
-            time.sleep(0.3)
-        return original(line)
+    def slow(data):
+        time.sleep(0.3)
+        return original(data)
 
-    ledger._append_line = slow
+    main_bot._shadow_log.append = slow
     payload = {
         "ticker": "FAKE", "setup": "breakdown", "action": "BUY",
         "option_right": "CALL", "signal_id": "chain-1",
@@ -818,40 +811,92 @@ def test_shadow_append_timeout_keeps_the_hash_chain(tmp_path):
         await main_bot.trade_ledger.record("heartbeat", {"n": 1})
         if main_bot._shadow_queue is not None:
             await asyncio.wait_for(main_bot._shadow_queue.join(), timeout=2)
-        return main_bot.trade_ledger.verify()
+        return main_bot.trade_ledger.verify(), main_bot._shadow_log.verify()
 
     try:
-        ok, checked, err = asyncio.run(run())
-        rows = main_bot.trade_ledger.recent(20)
+        core, side = asyncio.run(run())
+        core_rows = main_bot.trade_ledger.recent(20)
+        side_rows = main_bot.read_setup_disable_shadow(20)
         written = main_bot.setup_disable_status()["ledger"]["written"]
     finally:
         main_bot.trade_ledger._ledger = saved
         main_bot.reset_setup_disable_state()
-    assert ok is True, (checked, err)
-    assert err is None
-    assert checked == 6
+    assert core[0] is True and core[2] is None
+    assert core[1] == 5
+    assert side[0] is True and side[2] is None
+    assert side[1] == 1
     assert written == 1
-    assert [row["event"] for row in rows].count("setup_disable_shadow") == 1
-    assert rows[-1]["event"] == "heartbeat"
+    assert all(row["event"] != "setup_disable_shadow" for row in core_rows)
+    assert len(side_rows) == 1
 
 
-def test_shadow_queue_counts_written_dropped_and_queued(monkeypatch):
+def test_core_open_does_not_wait_on_a_slow_shadow_write(tmp_path):
+    import time
+    saved = main_bot.trade_ledger._ledger
+    saved_state = main_bot.state
+    main_bot.reset_setup_disable_state()
+    main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    main_bot.state = main_bot.StateStore(None)
+    _open_shadow(tmp_path)
+    original = main_bot._shadow_log.append
+
+    def slow(data):
+        time.sleep(0.3)
+        return original(data)
+
+    main_bot._shadow_log.append = slow
+
+    async def run():
+        main_bot.note_setup_disable_decision(
+            {"ticker": "FAKE", "setup": "breakdown", "action": "BUY", "signal_id": "slow-open"},
+            quantity=1, enforced=False, quantity_basis="after_sizing", path="entry",
+            fresh_order=True,
+        )
+        started = time.perf_counter()
+        seq = await main_bot._record_open(
+            "FAKE", 1, 10.0, 9.0, 12.0, None, "BUY", "breakdown",
+            signal_id="slow-open", instrument="equity",
+            signal_key="FAKE|breakdown|slow-open|1",
+        )
+        elapsed = time.perf_counter() - started
+        if main_bot._shadow_queue is not None:
+            await asyncio.wait_for(main_bot._shadow_queue.join(), timeout=2)
+        return elapsed, seq
+
+    try:
+        elapsed, seq = asyncio.run(run())
+        core = main_bot.trade_ledger.recent(10)
+        side = main_bot.read_setup_disable_shadow(10)
+    finally:
+        main_bot.trade_ledger._ledger = saved
+        main_bot.state = saved_state
+        main_bot.reset_setup_disable_state()
+    assert elapsed < 0.15
+    assert seq is not None
+    assert any(row["event"] == "position_opened" for row in core)
+    assert all(row["event"] != "setup_disable_shadow" for row in core)
+    assert len(side) == 1
+
+
+def test_shadow_queue_counts_written_dropped_and_queued(tmp_path, monkeypatch):
+    import threading
     _reset(monkeypatch, enabled="false", shadow="true")
     monkeypatch.setattr(main_bot, "_SHADOW_LEDGER_QUEUE_MAX", 2)
-    started = asyncio.Event()
-    release = asyncio.Event()
+    _open_shadow(tmp_path)
+    main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    started = threading.Event()
+    release = threading.Event()
     seen = []
+    original = main_bot._shadow_log.append
 
-    async def blocked(event, data=None):
-        if event == main_bot.SETUP_DISABLE_EVENT:
-            seen.append((data or {}).get("signal_id"))
-            if not started.is_set():
-                started.set()
-                await release.wait()
-            return 1
-        return 99
+    def blocked(data):
+        seen.append((data or {}).get("signal_id"))
+        if not started.is_set():
+            started.set()
+            release.wait(timeout=3)
+        return original(data)
 
-    monkeypatch.setattr(main_bot.trade_ledger, "record", blocked)
+    monkeypatch.setattr(main_bot._shadow_log, "append", blocked)
 
     async def run():
         main_bot.note_setup_disable_decision(
@@ -859,7 +904,7 @@ def test_shadow_queue_counts_written_dropped_and_queued(monkeypatch):
             quantity=1, enforced=False, quantity_basis="requested", path="entry",
             fresh_order=True,
         )
-        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.to_thread(started.wait, 1)
         for i in range(1, 4):
             main_bot.note_setup_disable_decision(
                 {"ticker": "FAKE", "setup": "breakdown", "action": "BUY", "signal_id": f"q-{i}"},
@@ -867,19 +912,23 @@ def test_shadow_queue_counts_written_dropped_and_queued(monkeypatch):
                 fresh_order=True,
             )
         mid = main_bot.setup_disable_status()["ledger"]
+        started_core = time.perf_counter()
         core = await main_bot.trade_ledger.record("heartbeat", {"ok": True})
+        core_elapsed = time.perf_counter() - started_core
         release.set()
         await asyncio.wait_for(main_bot._shadow_queue.join(), timeout=2)
-        return mid, core, main_bot.setup_disable_status()["ledger"], list(seen)
+        return mid, core, core_elapsed, main_bot.setup_disable_status()["ledger"], list(seen)
 
-    mid, core, done, wrote = asyncio.run(run())
+    import time
+    mid, core, core_elapsed, done, wrote = asyncio.run(run())
     assert mid["queued"] == 2
     assert mid["dropped"] == 1
     assert mid["written"] == 0
-    assert core == 99
+    assert core is not None
+    assert core_elapsed < 0.15
     assert done["written"] == 3
     assert done["dropped"] == 1
-    assert "q-1" not in wrote
+    assert "q-3" not in wrote
     assert wrote[0] == "q-0"
 
 
@@ -888,6 +937,7 @@ def test_account_id_substring_survives_the_written_rows(tmp_path, monkeypatch):
     saved = main_bot.trade_ledger._ledger
     main_bot.reset_setup_disable_state()
     main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    _open_shadow(tmp_path)
     occ = "FAKE  261218C00056000"
     order_id = "OID-00056000"
     signal_id = "sig-00056000"
@@ -919,11 +969,12 @@ def test_account_id_substring_survives_the_written_rows(tmp_path, monkeypatch):
     try:
         seq = asyncio.run(run())
         rows = main_bot.trade_ledger.recent(10)
+        side = main_bot.read_setup_disable_shadow(10)
     finally:
         main_bot.trade_ledger._ledger = saved
         main_bot.reset_setup_disable_state()
     opened = next(row["data"] for row in rows if row["event"] == "position_opened")
-    shadow = next(row["data"] for row in rows if row["event"] == "setup_disable_shadow")
+    shadow = side[0]["data"]
     assert opened["signal_key"] == signal_key
     assert opened["contract"]["occ_symbol"] == occ
     assert shadow["would_be_contract"]["option_symbol"] == occ
@@ -1108,20 +1159,21 @@ def test_open_ledger_write_does_not_clobber_a_concurrent_stop(tmp_path):
     assert "opened_seq" not in left
 
 
-def test_shutdown_drain_counts_leftover_shadow_rows_as_dropped(monkeypatch):
+def test_shutdown_drain_counts_leftover_shadow_rows_as_dropped(tmp_path, monkeypatch):
+    import threading
     _reset(monkeypatch, enabled="false", shadow="true")
-    started = asyncio.Event()
-    release = asyncio.Event()
+    _open_shadow(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    original = main_bot._shadow_log.append
 
-    async def blocked(event, data=None):
-        if event == main_bot.SETUP_DISABLE_EVENT:
-            if not started.is_set():
-                started.set()
-                await release.wait()
-            return 1
-        return 1
+    def blocked(data):
+        if not started.is_set():
+            started.set()
+            release.wait(timeout=3)
+        return original(data)
 
-    monkeypatch.setattr(main_bot.trade_ledger, "record", blocked)
+    monkeypatch.setattr(main_bot._shadow_log, "append", blocked)
 
     async def run():
         main_bot.note_setup_disable_decision(
@@ -1129,14 +1181,14 @@ def test_shutdown_drain_counts_leftover_shadow_rows_as_dropped(monkeypatch):
             quantity=1, enforced=False, quantity_basis="requested", path="entry",
             fresh_order=True,
         )
-        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.to_thread(started.wait, 1)
         for i in range(1, 3):
             main_bot.note_setup_disable_decision(
                 {"ticker": "FAKE", "setup": "breakdown", "action": "BUY", "signal_id": f"d-{i}"},
                 quantity=1, enforced=False, quantity_basis="requested", path="entry",
                 fresh_order=True,
             )
-        dropped = await main_bot.drain_shadow_queue()
+        dropped = await main_bot.drain_shadow_queue(timeout=0.1)
         status = main_bot.setup_disable_status()["ledger"]
         release.set()
         if main_bot._shadow_queue is not None:
@@ -1150,3 +1202,28 @@ def test_shutdown_drain_counts_leftover_shadow_rows_as_dropped(monkeypatch):
     assert dropped == 2
     assert status["dropped"] == 2
     assert status["queued"] == 0
+
+
+def test_shutdown_drain_writes_rows_that_finish_within_two_seconds(tmp_path):
+    main_bot.reset_setup_disable_state()
+    _open_shadow(tmp_path)
+
+    async def run():
+        for i in range(2):
+            main_bot.note_setup_disable_decision(
+                {"ticker": "FAKE", "setup": "breakdown", "action": "BUY", "signal_id": f"w-{i}"},
+                quantity=1, enforced=False, quantity_basis="requested", path="entry",
+                fresh_order=True,
+            )
+        dropped = await main_bot.drain_shadow_queue()
+        return dropped, main_bot.read_setup_disable_shadow(10), main_bot.setup_disable_status()["ledger"]
+
+    try:
+        dropped, rows, status = asyncio.run(run())
+    finally:
+        main_bot.reset_setup_disable_state()
+    assert dropped == 0
+    assert status["written"] == 2
+    assert status["dropped"] == 0
+    assert [row["data"]["signal_id"] for row in rows] == ["w-0", "w-1"]
+    assert main_bot._shadow_log.verify()[0] is True

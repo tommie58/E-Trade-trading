@@ -16853,11 +16853,12 @@ _SHADOW_SECRET_ENV = (
 _SHADOW_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _SHADOW_QUOTE_KEYS = ("bid", "ask", "mid", "spread_pct", "source", "quote_time")
 _SHADOW_LEDGER_QUEUE_MAX = 256
-# Same 100ms the order path used to wait. Shutdown may spend it draining
-# shadow rows. It is not a wait on order placement.
-_SHADOW_SHUTDOWN_DRAIN_S = 0.1
+# Shutdown may spend this long waiting for the side log. Not an order-path wait.
+_SHADOW_SHUTDOWN_DRAIN_S = 2.0
+_shadow_log: Optional["SetupDisableShadowLog"] = None
 _shadow_queue: Optional[asyncio.Queue] = None
 _shadow_writer: Optional[asyncio.Task] = None
+_shadow_loop: Optional[asyncio.AbstractEventLoop] = None
 _shadow_accepting = True
 _shadow_ledger_counts: Dict[str, int] = {"written": 0, "dropped": 0}
 _OPENED_SEQ_MAX = 512
@@ -17068,7 +17069,7 @@ def seed_setup_disable_from_ledger() -> None:
         return
     _setup_disable_seeded = True
     try:
-        rows = trade_ledger.recent(_SETUP_DISABLE_LEDGER_LOOKBACK)
+        rows = read_setup_disable_shadow(_SETUP_DISABLE_LEDGER_LOOKBACK)
     except Exception as exc:
         _log_setup_disable_observer_error(exc)
         return
@@ -17375,7 +17376,7 @@ async def persist_setup_disable_decision(
         )
         if body is None:
             return
-        await trade_ledger.record(SETUP_DISABLE_EVENT, body)
+        await _await_shadow_write(body)
     except Exception as exc:
         _log_setup_disable_observer_error(exc)
 
@@ -17409,78 +17410,215 @@ def note_setup_disable_decision(
         _log_setup_disable_observer_error(exc)
 
 
-def _ensure_shadow_writer() -> asyncio.Queue:
-    """One consumer for shadow rows. Core ledger writes never enter this queue."""
-    global _shadow_queue, _shadow_writer
+class SetupDisableShadowLog:
+    """Append-only hash chain for setup-disable shadow rows. Not the trade ledger.
+
+    Read it with read_setup_disable_shadow(n), or open the JSONL file named in
+    setup_disable_status()["ledger"]["file"]. Each line is one record:
+    seq, ts, event, data, prev_hash, hash.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._seq, self._prev_hash = self._load_tail()
+
+    def _load_tail(self) -> Tuple[int, str]:
+        try:
+            if not self.path.exists():
+                return 0, "0" * 64
+            last = ""
+            with open(self.path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.strip():
+                        last = line
+            if not last:
+                return 0, "0" * 64
+            rec = json.loads(last)
+            return int(rec.get("seq") or 0), str(rec.get("hash") or ("0" * 64))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return 0, "0" * 64
+
+    def append(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Hash, write, then advance the head. Only the side-log consumer calls this."""
+        self._seq += 1
+        rec: Dict[str, Any] = {
+            "seq": self._seq,
+            "ts": _utcnow().isoformat(),
+            "event": SETUP_DISABLE_EVENT,
+            "data": data or {},
+            "prev_hash": self._prev_hash,
+        }
+        body = json.dumps(rec, sort_keys=True, default=str)
+        rec["hash"] = hashlib.sha256((self._prev_hash + body).encode("utf-8")).hexdigest()
+        line = json.dumps(rec, sort_keys=True, default=str)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        self._prev_hash = rec["hash"]
+        return rec
+
+    def verify(self) -> Tuple[bool, int, Optional[str]]:
+        prev = "0" * 64
+        checked = 0
+        try:
+            if not self.path.exists():
+                return True, 0, None
+            with open(self.path, "r", encoding="utf-8") as handle:
+                for line_no, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    claimed = str(rec.pop("hash", ""))
+                    if str(rec.get("prev_hash")) != prev:
+                        return False, checked, f"line {line_no}: prev_hash broken"
+                    body = json.dumps(rec, sort_keys=True, default=str)
+                    if hashlib.sha256((str(rec.get("prev_hash")) + body).encode("utf-8")).hexdigest() != claimed:
+                        return False, checked, f"line {line_no}: hash mismatch"
+                    prev = claimed
+                    checked += 1
+            return True, checked, None
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            return False, checked, type(exc).__name__
+
+    def recent(self, count: int = 100) -> List[Dict[str, Any]]:
+        if count < 1 or not self.path.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                lines = [ln for ln in handle if ln.strip()]
+            for line in lines[-count:]:
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except OSError:
+            return []
+        return out
+
+
+def init_setup_disable_shadow_log(path: Path) -> None:
+    """Point the side log at `path`. Does not touch the trade ledger."""
+    global _shadow_log
+    _shadow_log = SetupDisableShadowLog(Path(path))
+
+
+def read_setup_disable_shadow(count: int = 100) -> List[Dict[str, Any]]:
+    """Newest-last shadow rows from the side log. Empty when the log is not open."""
+    log = _shadow_log
+    if log is None:
+        return []
+    try:
+        return log.recent(count)
+    except Exception as exc:
+        _log_setup_disable_observer_error(exc)
+        return []
+
+
+def _start_shadow_writer() -> None:
+    global _shadow_writer
+    if _shadow_writer is not None and not _shadow_writer.done():
+        return
     loop = asyncio.get_running_loop()
-    stale = (
-        _shadow_queue is None
-        or _shadow_writer is None
-        or _shadow_writer.done()
-        or _shadow_writer.get_loop() is not loop
-    )
-    if stale:
-        _shadow_queue = asyncio.Queue()
-        _shadow_writer = loop.create_task(_shadow_ledger_writer(_shadow_queue))
+    _shadow_writer = loop.create_task(_shadow_ledger_writer(), name="setup-disable-shadow-writer")
+    _shadow_writer.add_done_callback(_on_shadow_writer_done)
+
+
+def _on_shadow_writer_done(task: asyncio.Task) -> None:
+    """Restart a writer that died. A shutdown or a clean cancel stays down."""
+    if not _shadow_accepting:
+        return
+    if task.cancelled():
+        return
+    try:
+        exc = task.exception()
+    except Exception:
+        return
+    if exc is None:
+        return
+    logger.error("setup disable shadow writer died (%s)", type(exc).__name__)
+    try:
+        task.get_loop().call_soon(_start_shadow_writer)
+    except Exception as restart_exc:
+        _log_setup_disable_observer_error(restart_exc)
+
+
+def _ensure_shadow_writer() -> asyncio.Queue:
+    """One consumer. A dead writer is replaced. The queue itself stays put."""
+    global _shadow_queue, _shadow_writer, _shadow_loop
+    loop = asyncio.get_running_loop()
+    if _shadow_loop is not loop or _shadow_queue is None:
+        _shadow_queue = asyncio.Queue(maxsize=max(1, int(_SHADOW_LEDGER_QUEUE_MAX)))
+        _shadow_loop = loop
+        _shadow_writer = None
+    if _shadow_writer is None or _shadow_writer.done():
+        _start_shadow_writer()
     return _shadow_queue
 
 
-def _count_shadow_write(seq: Any) -> None:
-    if seq is None:
-        _shadow_ledger_counts["dropped"] += 1
-    else:
-        _shadow_ledger_counts["written"] += 1
-
-
-async def _shadow_ledger_writer(queue: asyncio.Queue) -> None:
-    """Append shadow rows one at a time.
-
-    The caller's wait is not this task. record() runs under a shield, so a
-    timeout on the order path cannot cancel the append or break the hash chain.
-    """
-    while True:
-        body = await queue.get()
+async def _shadow_ledger_writer() -> None:
+    """The only task that appends shadow rows. The append runs off the event loop."""
+    queue = _shadow_queue
+    while queue is not None:
+        body, fut = await queue.get()
+        seq = None
         try:
-            write = asyncio.create_task(trade_ledger.record(SETUP_DISABLE_EVENT, body))
-            try:
-                seq = await asyncio.shield(write)
-            except asyncio.CancelledError:
-                seq = await write
-                _count_shadow_write(seq)
-                raise
-            _count_shadow_write(seq)
+            log = _shadow_log
+            if log is None:
+                _shadow_ledger_counts["dropped"] += 1
+            else:
+                rec = await asyncio.to_thread(log.append, body)
+                _shadow_ledger_counts["written"] += 1
+                seq = rec.get("seq")
+            if fut is not None and not fut.done():
+                fut.set_result(seq)
         except asyncio.CancelledError:
+            queue.task_done()
             raise
         except Exception as exc:
             _shadow_ledger_counts["dropped"] += 1
             _log_setup_disable_observer_error(exc)
-        finally:
+            if fut is not None and not fut.done():
+                fut.set_result(None)
+            queue.task_done()
+        else:
             queue.task_done()
 
 
-def _enqueue_shadow_row(body: Dict[str, Any]) -> None:
-    """Hand a shadow row to the writer. A full queue drops the oldest shadow row."""
+def _enqueue_shadow_row(body: Dict[str, Any], fut: Optional[asyncio.Future] = None) -> str:
+    """Queue one shadow row. A full queue drops this row and counts it."""
     if not _shadow_accepting:
         _shadow_ledger_counts["dropped"] += 1
-        return
-    queue = _ensure_shadow_writer()
-    limit = max(1, int(_SHADOW_LEDGER_QUEUE_MAX))
-    while queue.qsize() >= limit:
-        try:
-            queue.get_nowait()
-        except asyncio.QueueEmpty:
-            break
-        queue.task_done()
+        if fut is not None and not fut.done():
+            fut.set_result(None)
+        return "dropped"
+    try:
+        queue = _ensure_shadow_writer()
+        queue.put_nowait((body, fut))
+        return "queued"
+    except asyncio.QueueFull:
         _shadow_ledger_counts["dropped"] += 1
-    queue.put_nowait(body)
+        if fut is not None and not fut.done():
+            fut.set_result(None)
+        return "dropped"
 
 
-async def drain_shadow_queue() -> int:
-    """Drop shadow rows still queued after the 100ms shutdown budget.
+async def _await_shadow_write(body: Dict[str, Any]) -> None:
+    """Tests wait for the side-log row. The order path must not call this."""
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    if _enqueue_shadow_row(body, fut) == "dropped":
+        return
+    await fut
 
-    An append already inside trade_ledger.record is left alone. Rows that
-    will not be written are counted as dropped so a restart does not orphan
-    them silently.
+
+async def drain_shadow_queue(timeout: float = _SHADOW_SHUTDOWN_DRAIN_S) -> int:
+    """Wait for the shadow queue, then count anything still waiting as dropped.
+
+    Shutdown uses 2 seconds. An append already inside the side-log file is
+    left to finish. Rows still queued after the wait are not written.
     """
     global _shadow_accepting
     _shadow_accepting = False
@@ -17488,8 +17626,8 @@ async def drain_shadow_queue() -> int:
     if queue is None:
         return 0
     try:
-        await asyncio.wait_for(queue.join(), timeout=_SHADOW_SHUTDOWN_DRAIN_S)
-    except (asyncio.TimeoutError, Exception):
+        await asyncio.wait_for(queue.join(), timeout=max(0.0, float(timeout)))
+    except asyncio.TimeoutError:
         pass
     dropped = 0
     while True:
@@ -17543,6 +17681,8 @@ def setup_disable_status() -> Dict[str, Any]:
             "written": int(_shadow_ledger_counts.get("written") or 0),
             "dropped": int(_shadow_ledger_counts.get("dropped") or 0),
             "queued": _shadow_queue_depth(),
+            "file": str(_shadow_log.path) if _shadow_log is not None else None,
+            "read": "read_setup_disable_shadow",
         },
         "read_only": True,
         "env_read": "each_entry",
@@ -39766,6 +39906,10 @@ async def on_startup():
     trade_ledger.init(TRADE_LEDGER_FILE)
     if persistence is not None:
         trade_ledger.set_mirror(_ledger_mirror)
+    init_setup_disable_shadow_log(Path(os.getenv(
+        "SETUP_DISABLE_SHADOW_FILE",
+        str(TRADE_LEDGER_FILE.with_name("setup_disable_shadow.jsonl")),
+    )))
     seed_setup_disable_from_ledger()
     # Say out loud whether this process actually remembers anything. A ledger
     # that comes up empty is indistinguishable from a healthy one in the logs,
