@@ -182,7 +182,7 @@ def test_unparseable_env_falls_back_to_the_default_list(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="etrade-bot"):
         parsed = main_bot.resolved_setup_disable_list()
     assert parsed["unparseable"] is True
-    assert parsed["source"] == "default_fallback"
+    assert parsed["source"] == "fallback"
     assert parsed["ids"] == frozenset({"breakdown", "breakout", "vwap rejection", "momentum"})
     assert any("unparseable" in rec.message for rec in caplog.records)
     assert "breakdown;momentum" not in " ".join(rec.message for rec in caplog.records)
@@ -277,6 +277,7 @@ def test_kept_setup_cap_is_the_last_step_before_placement():
     assert src.index("_apply_pro_trader_size") < cap_at
     assert src.index("assess_hard_size_cap(") < cap_at
     assert cap_at < src.index("_place_entry_with_funds_clamp")
+    assert src.rindex("note_setup_disable_decision") > src.index("_place_entry_with_funds_clamp")
 
 
 def test_final_placement_qty_caps_three_and_can_skip(monkeypatch):
@@ -495,6 +496,16 @@ def test_shadow_ledger_records_one_row_per_signal(tmp_path):
         await main_bot.persist_setup_disable_decision(
             payload, quantity=3, enforced=False,
             quantity_basis="after_sizing", path="entry",
+            option_quote={
+                "bid": 1.1, "ask": 1.3, "mid": 1.2, "spread_pct": 16.67,
+                "source": "Massive", "quote_time": "2026-11-30T10:00:00-05:00",
+                "quote_age_s": 1.0,
+            },
+            sizing={
+                "qty_before_learning": 4, "qty_after_learning": 3,
+                "qty_after_risk": 3, "limit_price": 1.25,
+                "initial_stop_premium": 0.9, "planned_risk_usd": 105.0,
+            },
         )
         await main_bot.persist_setup_disable_decision(
             dict(payload, timestamp="2026-11-30T15:01:00+00:00"),
@@ -515,16 +526,24 @@ def test_shadow_ledger_records_one_row_per_signal(tmp_path):
     data = rows[0]["data"]
     assert data["setup"] == "vwap rejection"
     assert data["symbol"] == "FAKE"
-    assert data["side"] == "long"
+    assert data["direction"] == "bullish"
+    assert data["option_type"] == "CALL"
+    assert data["signal_id"] == "fake-signal-1"
+    assert data["attempt"] == 1
     assert data["enforced"] is False
     assert data["would_be_quantity"] == 3
+    assert data["list_source"] in {"default", "env", "fallback"}
+    assert data["config"]["bot_version"] == main_bot.BOT_VERSION
+    assert "et_timestamp" in data
     assert data["quantity_basis"] == "after_sizing"
     assert data["would_be_contract"]["strike"] == 100
     assert data["would_be_contract"]["expiry"] == "2026-12-18"
     assert data["would_be_contract"]["option_symbol"].startswith("FAKE")
     assert data["entry_price"] == 10.5
-    assert data["quote"]["bid"] == 1.2
-    assert data["quote"]["ask"] == 1.3
+    assert data["option_quote"]["bid"] == 1.1
+    assert data["option_quote"]["source"] == "Massive"
+    assert data["sizing"]["qty_before_learning"] == 4
+    assert data["sizing"]["qty_final"] == 3
     assert "account" not in str(data).lower()
 
 
@@ -543,3 +562,121 @@ def test_shadow_ledger_failure_does_not_raise(monkeypatch):
         )
 
     asyncio.run(run())
+
+
+def test_second_same_day_entry_gets_its_own_shadow_row(tmp_path):
+    saved = main_bot.trade_ledger._ledger
+    main_bot.reset_setup_disable_state()
+    main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    payload = {
+        "ticker": "FAKE", "setup": "breakout", "action": "BUY",
+        "option_right": "PUT", "signal_id": "same-day", "strike": 50,
+        "expiration_hint": "2026-12-18",
+    }
+
+    async def run():
+        await main_bot.persist_setup_disable_decision(
+            payload, quantity=1, enforced=False, quantity_basis="after_sizing",
+            path="entry", fresh_order=True,
+            outcome={"order_id": "1", "placement_status": "placed"},
+        )
+        await main_bot.persist_setup_disable_decision(
+            payload, quantity=2, enforced=False, quantity_basis="after_sizing",
+            path="entry", fresh_order=True,
+            outcome={"order_id": "2", "placement_status": "placed"},
+        )
+
+    try:
+        asyncio.run(run())
+        rows = [
+            rec["data"] for rec in main_bot.trade_ledger.recent(20)
+            if rec.get("event") == "setup_disable_shadow"
+        ]
+    finally:
+        main_bot.trade_ledger._ledger = saved
+        main_bot.reset_setup_disable_state()
+    assert [row["attempt"] for row in rows] == [1, 2]
+    assert rows[0]["option_type"] == "PUT"
+    assert rows[0]["direction"] == "bearish"
+    assert rows[1]["outcome"]["order_id"] == "2"
+
+
+def test_startup_seed_keeps_the_next_same_day_attempt(tmp_path):
+    saved = main_bot.trade_ledger._ledger
+    main_bot.reset_setup_disable_state()
+    main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    payload = {
+        "ticker": "FAKE", "setup": "momentum", "action": "BUY",
+        "option_right": "CALL", "signal_id": "same-day",
+    }
+
+    async def run():
+        await main_bot.persist_setup_disable_decision(
+            payload, quantity=1, enforced=False, quantity_basis="after_sizing",
+            path="entry", fresh_order=True,
+            outcome={"order_id": "1", "placement_status": "placed", "position_opened_seq": 7},
+        )
+        main_bot.reset_setup_disable_state()
+        main_bot.seed_setup_disable_from_ledger()
+        await main_bot.persist_setup_disable_decision(
+            payload, quantity=1, enforced=False, quantity_basis="after_sizing",
+            path="entry", fresh_order=True,
+            outcome={"order_id": "2", "placement_status": "placed"},
+        )
+
+    try:
+        asyncio.run(run())
+        rows = [
+            rec["data"] for rec in main_bot.trade_ledger.recent(20)
+            if rec.get("event") == "setup_disable_shadow"
+        ]
+    finally:
+        main_bot.trade_ledger._ledger = saved
+        main_bot.reset_setup_disable_state()
+    assert [row["attempt"] for row in rows] == [1, 2]
+    assert rows[1]["signal_key"].endswith("|2")
+
+
+def test_empty_or_unknown_list_falls_back(monkeypatch, caplog):
+    _reset(monkeypatch, items="   ")
+    with caplog.at_level(logging.WARNING, logger="etrade-bot"):
+        blank = main_bot.resolved_setup_disable_list()
+    assert blank["source"] == "fallback"
+    assert blank["ids"] == frozenset({"breakdown", "breakout", "vwap rejection", "momentum"})
+    _reset(monkeypatch, items="not_a_setup,also_unknown")
+    with caplog.at_level(logging.WARNING, logger="etrade-bot"):
+        unknown = main_bot.resolved_setup_disable_list()
+    assert unknown["source"] == "fallback"
+    assert unknown["ids"] == blank["ids"]
+    text = " ".join(rec.message for rec in caplog.records)
+    assert "not_a_setup" in text and "also_unknown" in text
+
+
+def test_slow_shadow_write_does_not_delay_the_handoff(monkeypatch):
+    import time
+    _reset(monkeypatch, enabled="false", shadow="true")
+
+    async def slow(event, data=None):
+        if event == main_bot.SETUP_DISABLE_EVENT:
+            await asyncio.sleep(2)
+        return 1
+
+    monkeypatch.setattr(main_bot.trade_ledger, "record", slow)
+    payload = {
+        "ticker": "FAKE", "setup": "breakout", "action": "BUY",
+        "option_right": "CALL", "signal_id": "slow-1",
+    }
+
+    async def run():
+        started = time.perf_counter()
+        main_bot.note_setup_disable_decision(
+            payload, quantity=3, enforced=False, quantity_basis="after_sizing",
+            path="entry", fresh_order=True,
+            option_quote={"bid": 1.1, "ask": 1.2, "mid": 1.15, "spread_pct": 8.7,
+                          "source": "Massive", "quote_time": None, "quote_age_s": 0.4},
+            outcome={"placement_status": "placed", "order_id": "99"},
+        )
+        return time.perf_counter() - started
+
+    elapsed = asyncio.run(run())
+    assert elapsed < 0.5
