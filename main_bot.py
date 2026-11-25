@@ -2464,7 +2464,9 @@ class AlertManager:
                 f"min_severity={self._min_severity}"
             )
         except Exception as e:
-            logger.warning(f"alert config load failed (using env default): {e}")
+            logger.warning(
+                f"alert config load failed (using env default): {_scrub_alert_text(str(e))}"
+            )
 
     async def set_config(self, webhook_url: Optional[str],
                          min_severity: Optional[str]) -> Dict[str, Any]:
@@ -2483,7 +2485,9 @@ class AlertManager:
         try:
             await self._state.set(ALERTS_CONFIG_KEY, json.dumps(payload))
         except Exception as e:
-            logger.warning(f"alert config persist failed (applied in-memory only): {e}")
+            logger.warning(
+                f"alert config persist failed (applied in-memory only): {_scrub_alert_text(str(e))}"
+            )
         return await self.get_config()
 
     async def get_config(self) -> Dict[str, Any]:
@@ -2518,7 +2522,7 @@ class AlertManager:
                 ALERTS_RECENT_KEY, json.dumps(record, default=str), ALERTS_RECENT_MAX,
             )
         except Exception as e:
-            logger.warning(f"test alert store failed: {e}")
+            logger.warning(f"test alert store failed: {_scrub_alert_text(str(e))}")
         if not self._webhook_url:
             return {"delivered": False, "detail": "No webhook URL configured"}
         ok, detail = await self._post_webhook(record)
@@ -2555,7 +2559,9 @@ class AlertManager:
                     logger.debug(f"[ALERT][dup suppressed] {event}")
                     return
             except Exception as e:
-                logger.warning(f"alert dedupe check failed (sending anyway): {e}")
+                logger.warning(
+                    f"alert dedupe check failed (sending anyway): {_scrub_alert_text(str(e))}"
+                )
 
         # 1) Always log.
         log_fn = logger.info if severity == "info" else (
@@ -2569,7 +2575,7 @@ class AlertManager:
                 ALERTS_RECENT_KEY, json.dumps(record, default=str), ALERTS_RECENT_MAX,
             )
         except Exception as e:
-            logger.warning(f"alert store failed: {e}")
+            logger.warning(f"alert store failed: {_scrub_alert_text(str(e))}")
 
         # 3) Webhook — severity-filtered, deduped, best-effort.
         if not self._webhook_url:
@@ -2604,8 +2610,13 @@ class AlertManager:
                 if not ok:
                     logger.warning(f"alert webhook returned {resp.status_code}")
         except Exception as e:
-            detail = str(e)[:200]
-            logger.warning(f"alert webhook delivery failed: {e}")
+            # httpx puts the request URL in str(e). Scrub before the log line
+            # and before the delivery record GET /alerts/config returns.
+            detail = _scrub_alert_text(str(e))[:200]
+            secret = self._webhook_url or ""
+            if secret and secret in detail:
+                detail = "webhook delivery failed"
+            logger.warning(f"alert webhook delivery failed: {detail}")
         try:
             await self._state.set(ALERTS_LAST_DELIVERY_KEY, json.dumps({
                 "ts": _utcnow_iso(),
@@ -2622,7 +2633,7 @@ class AlertManager:
         try:
             raw = await self._state.list_range(ALERTS_RECENT_KEY, count)
         except Exception as e:
-            logger.warning(f"alert list read failed: {e}")
+            logger.warning(f"alert list read failed: {_scrub_alert_text(str(e))}")
             return []
         out: List[Dict[str, Any]] = []
         for item in raw:
@@ -2689,12 +2700,19 @@ async def send(severity: str, event: str, message: str,
     """
     try:
         if _manager is None:
-            logger.warning(f"[ALERT][{severity.upper()}] {event} — {message} (alerting not initialised)")
+            logger.warning(
+                f"[ALERT][{severity.upper()}] {event} — {_scrub_alert_text(str(message))} "
+                f"(alerting not initialised)"
+            )
             return
         await _manager.send(severity, event, message, dedupe_key=dedupe_key, data=data,
                             force_deliver=force_deliver, webhook_text=webhook_text)
     except Exception as e:
-        logger.error(f"alert send failed ({event}): {e}")
+        text = _scrub_alert_text(str(e))
+        secret = (_manager._webhook_url or "") if _manager is not None else ""
+        if secret and secret in text:
+            text = "webhook delivery failed"
+        logger.error(f"alert send failed ({event}): {text}")
 
 
 async def recent(count: int = 50) -> List[Dict[str, Any]]:
@@ -15078,6 +15096,7 @@ Run:
     uvicorn main_bot:app --host 0.0.0.0 --port 8000
 """
 from fastapi import FastAPI, HTTPException, Body, Query, Header, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, validator, ValidationError
@@ -15445,7 +15464,9 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # /status positions_open is the open book with status, side, and qty.
 # Logs, alerts, and HTTP responses mask accountIdKey (**** + last 4).
 # Order routing still uses the real key.
-BOT_VERSION = "5.99.11-pro-day-trader"
+# Webhook URLs and credential query values are redacted on logs, alert
+# delivery errors, and HTTP error bodies. Order routing is unchanged.
+BOT_VERSION = "5.99.15-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -26107,7 +26128,8 @@ async def check_risk_limits(is_close: bool = False) -> None:
 # Same name and signature as etrade_async.scrub_etrade_text on
 # cursor/reconcile-etrade-404-3b51 (#36). This copy lives on the main module,
 # not inside that bundle, so the two definitions do not share lines. The body
-# is #36's, plus accountIdKey query redaction (_ACCT_KEY_QUERY).
+# is #36's, plus accountIdKey query redaction (_ACCT_KEY_QUERY) and webhook
+# URL redaction (_scrub_webhook_hosts / _scrub_query_secrets).
 _ACCT_IN_PATH = re.compile(r"(/accounts/)([^/?#]+)")
 _LONG_DIGITS = re.compile(r"\d{8,}")
 _AUTH_HEADER = re.compile(r"(?i)authorization\s*[:=]\s*\S+")
@@ -26116,6 +26138,38 @@ _OAUTH_PARAM = re.compile(
 )
 _ACCT_KEY_QUERY = re.compile(
     r"(?i)(accountIdKey\s*=\s*)(?!\{acct\}|\{redacted\})([^&\s\"',}{]+)"
+)
+# Discord/Slack webhook secrets live in the path. Keep the host and the
+# fixed prefix; the id and token are the tail. Optional userinfo is left
+# for _URL_USERINFO so it does not survive inside the prefix.
+_WEBHOOK_TAIL = r"[^\s\"'<>),;`]+"
+_DISCORD_WEBHOOK_URL = re.compile(
+    r"(?i)"
+    r"(https?://(?:[^\s/?#@]+(?::[^\s/?#@]+)?@)?"
+    r"(?:[a-z0-9-]+\.)*"
+    r"(?:discord\.com|discordapp\.com)"
+    r"(?::\d+)?"
+    r"/api/webhooks/)"
+    + _WEBHOOK_TAIL
+)
+_SLACK_WEBHOOK_URL = re.compile(
+    r"(?i)"
+    r"(https?://(?:[^\s/?#@]+(?::[^\s/?#@]+)?@)?"
+    r"hooks\.slack\.com"
+    r"(?::\d+)?"
+    r"/services/)"
+    + _WEBHOOK_TAIL
+)
+_URL_USERINFO = re.compile(
+    r"(?i)(https?://)[^\s/?#@:]+:[^\s/?#@]+@"
+)
+# Credential query values only. `token` and `key` are included, so this must
+# not run on a successful authorize URL (`?key=&token=`), which the app needs.
+_SENSITIVE_QUERY = re.compile(
+    r"(?i)"
+    r"([?&](?:access_token|oauth_signature|oauth_token|api_key|apikey|"
+    r"signature|secret|token|key|sig)=)"
+    r"[^&#\s\"'<>)]*"
 )
 _RESPONSE_KEY_FIELDS = {
     "accountIdKey", "account_id_key", "crypto_account_id_key", "resolved_account_id_key",
@@ -26134,11 +26188,35 @@ _ACCOUNT_PICKER_PATHS = {
 }
 
 
+def _scrub_webhook_hosts(text: str) -> str:
+    """Redact Discord and Slack webhook URLs, and user:pass@ userinfo.
+
+    Host and non-secret path stay readable. discord.com and discordapp.com
+    /api/webhooks/<id>/<token> become /api/webhooks/[redacted]. Slack
+    hooks.slack.com/services/* becomes /services/[redacted].
+    """
+    cleaned = _DISCORD_WEBHOOK_URL.sub(r"\1[redacted]", text)
+    cleaned = _SLACK_WEBHOOK_URL.sub(r"\1[redacted]", cleaned)
+    cleaned = _URL_USERINFO.sub(r"\1[redacted]@", cleaned)
+    return cleaned
+
+
+def _scrub_query_secrets(text: str) -> str:
+    """Replace credential query-parameter values with [redacted]."""
+    return _SENSITIVE_QUERY.sub(r"\1[redacted]", text)
+
+
 def _scrub_etrade_urls(text: str) -> str:
-    """Redact account path segments, accountIdKey query values, and OAuth material."""
+    """Redact webhook hosts, account paths, accountIdKey, and OAuth material.
+
+    Generic ?token= / ?key= values are left alone: the E*TRADE authorize URL
+    returned to the app is ?key=&token=. Logs and error bodies add that pass
+    via _scrub_log_text.
+    """
+    cleaned = _scrub_webhook_hosts(text)
     cleaned = _ACCT_IN_PATH.sub(
         lambda m: m.group(0) if m.group(2) == "{acct}" else m.group(1) + "{acct}",
-        text,
+        cleaned,
     )
     cleaned = _ACCT_KEY_QUERY.sub(r"\1{acct}", cleaned)
     cleaned = _AUTH_HEADER.sub("Authorization: [redacted]", cleaned)
@@ -26146,13 +26224,18 @@ def _scrub_etrade_urls(text: str) -> str:
     return cleaned
 
 
+def _scrub_log_text(text: str) -> str:
+    """Scrub a log line or alert string. Order ids and timestamps stay."""
+    return _scrub_query_secrets(_scrub_etrade_urls(text))
+
+
 def scrub_etrade_text(text: str, secrets: Optional[Sequence[str]] = None) -> str:
-    """Strip account ids, long digit runs, and OAuth material from a log line."""
+    """Strip account ids, long digit runs, OAuth material, and webhook URLs."""
     cleaned = str(text or "")
     for secret in secrets or ():
         if secret and len(secret) >= 4:
             cleaned = cleaned.replace(secret, "{acct}")
-    cleaned = _scrub_etrade_urls(cleaned)
+    cleaned = _scrub_log_text(cleaned)
     cleaned = _LONG_DIGITS.sub("{redacted}", cleaned)
     return cleaned
 
@@ -26169,17 +26252,31 @@ def mask_account_key(value: Optional[str]) -> Optional[str]:
     return "****" + text[-4:]
 
 
-def redact_http_payload(path: str, payload: Any) -> Any:
+def redact_http_payload(path: str, payload: Any, *, scrub_query_secrets: bool = False) -> Any:
     """Mask account keys (and, off the account picker, account numbers) in a JSON body.
 
-    Strings are also scrubbed for /v1/accounts/<key>/, accountIdKey=, and OAuth
-    header values. The in-memory key is not touched; this runs on the response.
+    Strings are also scrubbed for webhook URLs, /v1/accounts/<key>/,
+    accountIdKey=, and OAuth header values. scrub_query_secrets also redacts
+    credential query values; error responses pass True. Success responses
+    leave ?key= and ?token= so the authorize URL still links. The in-memory
+    key is not touched; this runs on the response.
     """
     mask_numbers = (path or "").rstrip("/") not in _ACCOUNT_PICKER_PATHS
-    return _redact_json_value(payload, mask_numbers=mask_numbers)
+    return _redact_json_value(
+        payload,
+        mask_numbers=mask_numbers,
+        scrub_query_secrets=scrub_query_secrets,
+    )
 
 
-def _redact_json_value(value: Any, *, mask_numbers: bool) -> Any:
+def _scrub_response_string(text: str, *, scrub_query_secrets: bool) -> str:
+    cleaned = _scrub_etrade_urls(text)
+    if scrub_query_secrets:
+        cleaned = _scrub_query_secrets(cleaned)
+    return cleaned
+
+
+def _redact_json_value(value: Any, *, mask_numbers: bool, scrub_query_secrets: bool = False) -> Any:
     if isinstance(value, dict):
         is_binding = "resolved_account_id_key" in value or "resolved_last4" in value
         out: Dict[str, Any] = {}
@@ -26191,19 +26288,30 @@ def _redact_json_value(value: Any, *, mask_numbers: bool) -> Any:
             elif is_binding and key in {"configured", "pinned"} and isinstance(item, str):
                 out[key] = mask_account_key(item)
             elif isinstance(item, str):
-                out[key] = _scrub_etrade_urls(item)
+                out[key] = _scrub_response_string(item, scrub_query_secrets=scrub_query_secrets)
             else:
-                out[key] = _redact_json_value(item, mask_numbers=mask_numbers)
+                out[key] = _redact_json_value(
+                    item,
+                    mask_numbers=mask_numbers,
+                    scrub_query_secrets=scrub_query_secrets,
+                )
         return out
     if isinstance(value, list):
-        return [_redact_json_value(item, mask_numbers=mask_numbers) for item in value]
+        return [
+            _redact_json_value(
+                item,
+                mask_numbers=mask_numbers,
+                scrub_query_secrets=scrub_query_secrets,
+            )
+            for item in value
+        ]
     if isinstance(value, str):
-        return _scrub_etrade_urls(value)
+        return _scrub_response_string(value, scrub_query_secrets=scrub_query_secrets)
     return value
 
 
 class _EtradeLogRedactor(logging.Filter):
-    """Scrub account URLs and OAuth material on every log record.
+    """Scrub account URLs, webhook URLs, and OAuth material on every log record.
 
     The message keeps long digit runs (order ids, timestamps). Tracebacks do
     not: logger.exception, exc_info, and stack_info are formatted and passed
@@ -26214,7 +26322,7 @@ class _EtradeLogRedactor(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             rendered = record.getMessage()
-            cleaned = _scrub_etrade_urls(rendered)
+            cleaned = _scrub_log_text(rendered)
             if cleaned != rendered:
                 record.msg = cleaned
                 record.args = None
@@ -26269,7 +26377,7 @@ def _install_etrade_log_redactor() -> None:
     # Created here if uvicorn has not configured logging yet. dictConfig may
     # later replace logger filters; handlers added after this patch still
     # receive the redactor.
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "httpx", "httpcore"):
         _arm_logger(logging.getLogger(name))
 
     manager = logging.Logger.manager
@@ -26298,7 +26406,7 @@ def _install_etrade_log_redactor() -> None:
 
 
 _install_etrade_log_redactor()
-alerts._ALERT_SCRUB = _scrub_etrade_urls
+alerts._ALERT_SCRUB = _scrub_log_text
 
 
 async def _read_response_body(response) -> bytes:
@@ -26327,9 +26435,31 @@ def _replace_response_body(response, raw: bytes) -> None:
     response.headers["content-length"] = str(len(raw))
 
 
+@app.exception_handler(HTTPException)
+async def _redact_http_exception(request: Request, exc: HTTPException):
+    """Scrub webhook URLs and credential query values in HTTP error bodies."""
+    try:
+        path = request.url.path.rstrip("/") or "/"
+        scrubbed = redact_http_payload(path, exc.detail, scrub_query_secrets=True)
+    except Exception:
+        return await http_exception_handler(request, exc)
+    if scrubbed != exc.detail:
+        exc = HTTPException(
+            status_code=exc.status_code,
+            detail=scrubbed,
+            headers=getattr(exc, "headers", None),
+        )
+    return await http_exception_handler(request, exc)
+
+
 @app.middleware("http")
 async def _redact_account_response(request: Request, call_next):
-    """Mask account keys on the way out. Internal routing state is unchanged."""
+    """Mask account keys and credential URLs on the way out.
+
+    Internal routing state is unchanged. Error JSON (HTTPException included)
+    also drops credential query values. A successful authorize URL keeps
+    ?key= and ?token=.
+    """
     response = await call_next(request)
     media = str(response.headers.get("content-type") or "")
     if "application/json" not in media:
@@ -26344,7 +26474,9 @@ async def _redact_account_response(request: Request, call_next):
         _replace_response_body(response, raw)
         return response
     path = request.url.path.rstrip("/") or "/"
-    redacted = redact_http_payload(path, payload)
+    redacted = redact_http_payload(
+        path, payload, scrub_query_secrets=response.status_code >= 400,
+    )
     encoded = raw if redacted == payload else json.dumps(
         redacted, ensure_ascii=False, allow_nan=False, separators=(",", ":"), default=str,
     ).encode("utf-8")
@@ -40061,7 +40193,7 @@ async def alerts_config_set(
     try:
         cfg = await alerts.set_config(url, sev)
     except ValueError as e:
-        raise HTTPException(422, str(e))
+        raise HTTPException(422, scrub_etrade_text(str(e)))
     logger.info(
         f"Alert delivery config updated — webhook={'configured' if cfg['webhook_configured'] else 'CLEARED'}, "
         f"min_severity={cfg['min_severity']}"
