@@ -1977,8 +1977,54 @@ def portfolio_no_data(family: str, status: int, code: str, body_empty: bool) -> 
     return str(code or "").strip() in _PORTFOLIO_EMPTY_CODES
 
 
+def orders_no_data(family: str, status: int, code: str) -> bool:
+    """Empty order book: HTTP 204 with code 53 or 1007 only.
+
+    The Order API's shared error table documents 204 / 53 ("Data not found").
+    Code 1007 is the same no-data code the portfolio uses. A bare 204, a 404,
+    and every other code stay failures.
+    """
+    if family != "orders" or int(status) != 204:
+        return False
+    return str(code or "").strip() in _PORTFOLIO_EMPTY_CODES
+
+
 def empty_portfolio_response() -> Dict[str, Any]:
     return {"PortfolioResponse": {"AccountPortfolio": []}}
+
+
+def empty_orders_response() -> Dict[str, Any]:
+    return {"OrdersResponse": {"Order": []}}
+
+
+def _read_endpoint_alerts(method: str, path: str) -> bool:
+    """Webhook alerts are for the reconcile reads only, never order routes."""
+    if str(method or "").upper() != "GET":
+        return False
+    redacted = redact_etrade_path(path)
+    return redacted.endswith(("/portfolio.json", "/orders.json", "/balance.json"))
+
+
+_PENDING_ALERTS: set = set()
+
+
+def schedule_etrade_alert(coro: Awaitable[None]) -> None:
+    """Run an alert off the caller's stack. Never awaited by _request."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        coro.close()
+        return
+    task = loop.create_task(coro)
+    _PENDING_ALERTS.add(task)
+    task.add_done_callback(_PENDING_ALERTS.discard)
+
+
+async def drain_etrade_alerts() -> None:
+    """Test hook: wait for alerts scheduled during the current loop."""
+    pending = [task for task in list(_PENDING_ALERTS) if not task.done()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def claim_etrade_alert(key: str, now: Optional[float] = None) -> bool:
@@ -2053,6 +2099,11 @@ async def emit_etrade_error(
     if code_s or msg_s:
         line += f" [{code_s}] {msg_s}".rstrip()
     logger.error(line)
+    # Preview, place, and cancel stay log-only. A webhook wait here used to
+    # sit in front of the pyetrade fallback, the OTOCO fallback, and the
+    # insufficient-funds retry.
+    if not _read_endpoint_alerts(method_u, red_path):
+        return line
     key = f"{method_u} {red_path}"
     if not claim_etrade_alert(key):
         return line
@@ -2067,18 +2118,19 @@ async def emit_etrade_error(
         )
 
     sender = alert or _default_alert
-    try:
+
+    async def _deliver() -> None:
         try:
             await sender(
                 "error", "etrade_http_error", line,
                 dedupe_key=f"etrade:{key}",
                 dedupe_seconds=ETRADE_ERROR_ALERT_SECONDS,
             )
-        except TypeError:
-            await sender("error", "etrade_http_error", line, dedupe_key=f"etrade:{key}")
-    except Exception:
-        _ETRADE_ALERT_AT.pop(key, None)
-        logger.debug("etrade error alert failed", exc_info=True)
+        except Exception:
+            _ETRADE_ALERT_AT.pop(key, None)
+            logger.debug("etrade error alert failed", exc_info=True)
+
+    schedule_etrade_alert(_deliver())
     return line
 
 # ---- Broker-native trailing stops ----
@@ -2114,8 +2166,10 @@ class ETradeAPIError(Exception):
         self.method = str(method or "").upper()
         self.path = redact_etrade_path(path) if path else ""
         self.code = scrub_etrade_text(str(code or ""), secrets)[:32]
-        self.message = scrub_etrade_text(str(message or ""), secrets)[:300]
-        self.body = scrub_etrade_text(str(body or ""), secrets)[:500]
+        # Full scrubbed text. Callers parse hints such as 8400's max quantity
+        # from str(e); logs and alerts truncate on their own.
+        self.message = scrub_etrade_text(str(message or ""), secrets)
+        self.body = scrub_etrade_text(str(body or ""), secrets)
         self.status_code = int(status_code)
         self.reported = False
         where = f"{self.method} {self.path} ".strip()
@@ -2216,14 +2270,18 @@ class ETradeAsyncClient:
             secrets = _account_ids_in_path(path)
             safe_msg = scrub_etrade_text(msg, secrets)
             safe_body = scrub_etrade_text(resp.text or "", secrets)
-            if portfolio_no_data(family, resp.status_code, code, body_empty):
-                # Documented empty portfolio (HTTP 204). Not an error, and
-                # not a 404: a 404 never reaches this branch.
+            if portfolio_no_data(family, resp.status_code, code, body_empty) or orders_no_data(
+                family, resp.status_code, code,
+            ):
+                # Documented empty book (HTTP 204 + 1007/53, or an empty
+                # portfolio body). A 404 never reaches this branch.
                 logger.info(
                     "E*TRADE %s %s -> %s [%s] %s — documented no-data, empty list",
                     method.upper(), redact_etrade_path(path), resp.status_code,
                     scrub_etrade_text(code, secrets), safe_msg[:180],
                 )
+                if family == "orders":
+                    return empty_orders_response()
                 return empty_portfolio_response()
             if family == "portfolio" and resp.status_code == 204:
                 await emit_etrade_error(
@@ -2235,8 +2293,7 @@ class ETradeAsyncClient:
                 )
                 err.reported = True
                 raise err
-            # List Orders has no documented 204 no-orders signature. A 204
-            # that still carries a body is a failure, not an empty book.
+            # Any other orders 204 that still carries a body is a failure.
             # An empty 204 body keeps the historical `{}` return below.
             if family == "orders" and resp.status_code == 204 and not body_empty:
                 await emit_etrade_error(
@@ -3247,6 +3304,8 @@ logger = logging.getLogger("etrade-bot.reconcile")
 
 RECONCILE_LOCK = "reconcile"
 RECONCILE_REPORT_KEY = "reconcile:last"
+# Consecutive passes whose fill booking was deferred. Reset on a good pair.
+RECONCILE_FETCH_FAIL_STREAK = "reconcile:fetch_fail_streak"
 # The account as the BROKER sees it, refreshed every reconcile pass. Read by
 # /status and /etrade/positions so the app never has to trust bot memory.
 ACCOUNT_SNAPSHOT_KEY = "account:snapshot"
@@ -4241,11 +4300,7 @@ async def reconcile_once(
                 kwargs["dedupe_key"] = dedupe_key
             if dedupe_seconds is not None:
                 kwargs["dedupe_seconds"] = dedupe_seconds
-            try:
-                await alert(severity, event, message, **kwargs)
-            except TypeError:
-                kwargs.pop("dedupe_seconds", None)
-                await alert(severity, event, message, **kwargs)
+            await alert(severity, event, message, **kwargs)
         except Exception:
             logger.debug("reconcile alert delivery failed", exc_info=True)
 
@@ -4266,14 +4321,15 @@ async def reconcile_once(
             code = str(getattr(err, "code", "") or "")
             message = str(err)
             already = False
+        log_message = (message or "")[:180]
         if already:
             # The shared request helper already logged and alerted this
             # response. Reconcile records the same scrubbed line under its
             # own logger and does not send a second alert.
             status_s = str(status) if status else "network"
             line = f"E*TRADE {method} {path} -> {status_s}"
-            if code or message:
-                line += f" [{code}] {message}".rstrip()
+            if code or log_message:
+                line += f" [{code}] {log_message}".rstrip()
         else:
             line = await etrade_async.emit_etrade_error(
                 method, path, status, code, message, alert=_alert,
@@ -4358,8 +4414,48 @@ async def reconcile_once(
     # gone, and the orders list has the fill. Either failure defers it.
     report["fill_booking"] = "ran" if (portfolio_ok and orders_ok) else "deferred"
 
+    async def _alert_reconcile_fetch_failed() -> None:
+        """Monitors still key on reconcile_fetch_failed. One send, not awaited
+        by the broker call. Critical after 3 deferred passes in a row."""
+        deferred = report.get("fill_booking") == "deferred"
+        try:
+            if not deferred:
+                await state.set(RECONCILE_FETCH_FAIL_STREAK, "0")
+                return
+            raw = await state.get(RECONCILE_FETCH_FAIL_STREAK)
+            try:
+                streak = int(raw or 0) + 1
+            except (TypeError, ValueError):
+                streak = 1
+            await state.set(RECONCILE_FETCH_FAIL_STREAK, str(streak))
+        except Exception:
+            logger.debug("reconcile fail-streak update failed", exc_info=True)
+            return
+        if not tracked:
+            return
+        failed_reads = []
+        if not portfolio_ok:
+            failed_reads.append("portfolio.json")
+        if not orders_ok:
+            failed_reads.append("orders.json")
+        which = " and ".join(failed_reads) or "a broker read"
+        tickers = ", ".join(sorted(str(ticker) for ticker in tracked))
+        severity = "critical" if streak >= 3 else "error"
+        message = etrade_async.scrub_etrade_text(
+            f"Stop-fill booking deferred — {which} failed. Open: {tickers}."
+        )
+
+        async def _fire() -> None:
+            await _alert(
+                severity, "reconcile_fetch_failed", message,
+                dedupe_key=f"reconcile_fetch_failed:{severity}",
+            )
+
+        etrade_async.schedule_etrade_alert(_fire())
+
     if not portfolio_ok and not orders_ok:
         report["ok"] = False
+        await _alert_reconcile_fetch_failed()
         await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
         return report
 
@@ -4762,6 +4858,7 @@ async def reconcile_once(
         )
 
     report["ok"] = bool(portfolio_ok and orders_ok)
+    await _alert_reconcile_fetch_failed()
     await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
     if report["healed"] or report["warnings"]:
         logger.info(f"[RECONCILE] pass done — healed={len(report['healed'])} warnings={len(report['warnings'])}")

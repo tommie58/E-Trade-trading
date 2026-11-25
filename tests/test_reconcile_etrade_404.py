@@ -262,6 +262,7 @@ def test_portfolio_204_code_53_is_empty_and_153_is_not(monkeypatch, caplog):
         parsed = await client.get_portfolio(ACCT)
         with pytest.raises(etrade_async.ETradeAPIError) as exc:
             await client.get_portfolio(ACCT)
+        await etrade_async.drain_etrade_alerts()
         return parsed, exc.value, sent
 
     parsed, err, sent = _run(scenario())
@@ -309,6 +310,7 @@ def test_generic_404_is_a_failure_logged_with_method_and_path(monkeypatch, caplo
             await client.get_portfolio(ACCT)
         with pytest.raises(etrade_async.ETradeAPIError) as third:
             await client.list_orders(ACCT)
+        await etrade_async.drain_etrade_alerts()
         return first.value, second.value, third.value, sent
 
     portfolio_404, resource_404, orders_err, sent = _run(scenario())
@@ -391,6 +393,7 @@ def test_orders_failure_defers_stop_fill_and_still_uses_portfolio(monkeypatch, c
             })
 
         report = await _reconcile(store, fetch_portfolio, fetch_orders, sinks, alert)
+        await etrade_async.drain_etrade_alerts()
         positions = await store.all_positions()
         snapshot = await store.get(main_bot.reconciliation.ACCOUNT_SNAPSHOT_KEY)
         return report, positions, sinks, alerts, snapshot
@@ -547,6 +550,7 @@ def test_etrade_error_alert_is_one_per_endpoint_per_15_min(monkeypatch, caplog):
         clock["now"] = 5_000.0 + (15 * 60)
         with pytest.raises(etrade_async.ETradeAPIError):
             await client.get_portfolio(ACCT)
+        await etrade_async.drain_etrade_alerts()
         return sent
 
     sent = _run(scenario())
@@ -579,6 +583,7 @@ def test_no_account_number_in_any_log_output(monkeypatch, caplog):
         client = _client()
         with pytest.raises(etrade_async.ETradeAPIError):
             await client.get_portfolio(ACCT)
+        await etrade_async.drain_etrade_alerts()
         return sent
 
     sent = _run(scenario())
@@ -591,3 +596,235 @@ def test_no_account_number_in_any_log_output(monkeypatch, caplog):
     assert f"E*TRADE GET {PORTFOLIO} -> 404" in text
     _assert_no_secrets(sent[0]["message"])
     _assert_no_secrets(sent[0]["dedupe_key"])
+
+
+def test_order_path_error_does_not_call_or_wait_on_the_webhook(monkeypatch):
+    """preview, place, and cancel log the failure and return without a webhook."""
+    _reset_alert_clock(monkeypatch)
+    body = json.dumps({"Error": {"code": 400, "message": f"rejected {ACCT}"}})
+    _install_http(monkeypatch, [(400, body), (400, body), (400, body)])
+    calls = {"n": 0}
+
+    async def slow_send(*args, **kwargs):
+        calls["n"] += 1
+        await asyncio.sleep(1.0)
+
+    async def scenario():
+        monkeypatch.setattr("alerts.send", slow_send)
+        client = _client()
+        started = time.monotonic()
+        for method, path in (
+            ("POST", f"/v1/accounts/{ACCT}/orders/preview.json"),
+            ("POST", f"/v1/accounts/{ACCT}/orders/place.json"),
+            ("PUT", f"/v1/accounts/{ACCT}/orders/cancel.json"),
+        ):
+            with pytest.raises(etrade_async.ETradeAPIError):
+                await client._request(method, path, json_body={"PreviewOrderRequest": {}}, idempotent=False)
+        elapsed = time.monotonic() - started
+        await asyncio.sleep(0)
+        return elapsed
+
+    elapsed = _run(scenario())
+    assert calls["n"] == 0
+    assert elapsed < 0.25
+    assert not etrade_async._PENDING_ALERTS
+
+
+def test_read_alert_is_scheduled_once_even_if_send_raises_typeerror(monkeypatch):
+    """A TypeError inside the sender is not retried."""
+    _reset_alert_clock(monkeypatch)
+    calls = {"n": 0}
+
+    async def send(*args, **kwargs):
+        calls["n"] += 1
+        raise TypeError("sender failed internally")
+
+    async def scenario():
+        await etrade_async.emit_etrade_error(
+            "GET", f"/v1/accounts/{ACCT}/portfolio.json", 404, "404", f"missing {ACCT}",
+            alert=send,
+        )
+        await etrade_async.drain_etrade_alerts()
+
+    _run(scenario())
+    assert calls["n"] == 1
+
+
+def test_orders_204_code_53_or_1007_is_an_empty_book(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    _reset_alert_clock(monkeypatch)
+    code_53 = json.dumps({"Error": {"code": 53, "message": f"Data not found {ACCT}"}})
+    code_1007 = json.dumps({"Error": {"code": 1007, "message": f"no orders {ACCT}"}})
+    http_404 = json.dumps({"Error": {"code": 53, "message": f"no orders {ACCT}"}})
+    other = json.dumps({"Error": {"code": 404, "message": f"Resource not found {ACCT}"}})
+    _install_http(monkeypatch, [
+        (204, code_53),
+        (204, code_1007),
+        (404, http_404),
+        (204, other),
+    ])
+
+    async def scenario():
+        client = _client()
+        first = await client.list_orders(ACCT)
+        second = await client.list_orders(ACCT)
+        with pytest.raises(etrade_async.ETradeAPIError) as missing:
+            await client.list_orders(ACCT)
+        with pytest.raises(etrade_async.ETradeAPIError) as resource:
+            await client.list_orders(ACCT)
+        await etrade_async.drain_etrade_alerts()
+        return first, second, missing.value, resource.value
+
+    first, second, missing, resource = _run(scenario())
+    assert main_bot.reconciliation.parse_open_orders(first) == []
+    assert main_bot.reconciliation.parse_open_orders(second) == []
+    assert first == etrade_async.empty_orders_response()
+    assert missing.status_code == 404
+    assert resource.status_code == 204
+    assert resource.code == "404"
+    text = _logs(caplog)
+    _assert_no_secrets(text)
+    _assert_no_secrets(str(missing) + str(resource))
+
+
+def test_long_8400_message_keeps_the_quantity_hint(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    _reset_alert_clock(monkeypatch)
+    hint = "the maximum allowable quantity was estimated to be 57."
+    long_msg = "insufficient funds. " + ("detail " * 80) + hint + " Code 8400."
+    assert len(long_msg) > 300
+    body = json.dumps({"Error": {"code": 8400, "message": f"{long_msg} account {ACCT}"}})
+    _install_http(monkeypatch, [(400, body)])
+
+    async def scenario():
+        client = _client()
+        with pytest.raises(etrade_async.ETradeAPIError) as exc:
+            await client._request(
+                "POST", f"/v1/accounts/{ACCT}/orders/place.json",
+                json_body={"PlaceOrderRequest": {}}, idempotent=False,
+            )
+        return exc.value
+
+    err = _run(scenario())
+    assert len(err.message) > 300
+    assert hint in err.message
+    assert main_bot._max_qty_from_insufficient_funds(str(err)) == 57
+    text = _logs(caplog)
+    assert hint not in text
+    assert f"E*TRADE POST /v1/accounts/{{acct}}/orders/place.json -> 400" in text
+    _assert_no_secrets(text)
+    _assert_no_secrets(str(err))
+
+
+def test_reconcile_fetch_failed_names_tickers_escalates_and_resets():
+    """Deferred booking with open positions alerts as reconcile_fetch_failed."""
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        await store.set_position("SPY", _aged_option(qty=1, stop_id="STOP-1", strike=500))
+        await store.set_position("QQQ", _aged_option(qty=1, stop_id="STOP-2", strike=400))
+        alerts = []
+        sinks = {"closes": [], "rearms": [], "cancels": []}
+
+        async def fetch_portfolio():
+            return {
+                "PortfolioResponse": {
+                    "AccountPortfolio": {
+                        "Position": _portfolio_position("QQQ", 1, 400),
+                    }
+                }
+            }
+
+        async def fetch_orders_fail():
+            raise etrade_async.ETradeAPIError(
+                404, f"Account {ACCT} missing", method="GET",
+                path=f"/v1/accounts/{ACCT}/orders.json", code="404",
+            )
+
+        async def fetch_portfolio_held():
+            return {
+                "PortfolioResponse": {
+                    "AccountPortfolio": {
+                        "Position": [
+                            _portfolio_position("QQQ", 1, 400),
+                            _portfolio_position("SPY", 1, 500),
+                        ],
+                    }
+                }
+            }
+
+        async def fetch_orders_ok():
+            return {"OrdersResponse": {"Order": [
+                _open_stop("STOP-2", "QQQ"),
+                _open_stop("STOP-1", "SPY"),
+            ]}}
+
+        async def alert(severity, event, message, dedupe_key=None, dedupe_seconds=None):
+            alerts.append({
+                "severity": severity,
+                "event": event,
+                "message": message,
+                "dedupe_key": dedupe_key,
+            })
+
+        async def fail_once():
+            return await _reconcile(store, fetch_portfolio, fetch_orders_fail, sinks, alert)
+
+        reports = []
+        for _ in range(3):
+            reports.append(await fail_once())
+            await etrade_async.drain_etrade_alerts()
+        good = await _reconcile(store, fetch_portfolio_held, fetch_orders_ok, sinks, alert)
+        await etrade_async.drain_etrade_alerts()
+        reports.append(await fail_once())
+        await etrade_async.drain_etrade_alerts()
+        return alerts, reports, good
+
+    alerts, reports, good = _run(scenario())
+    fetch = [item for item in alerts if item["event"] == "reconcile_fetch_failed"]
+    assert [item["severity"] for item in fetch] == ["error", "error", "critical", "error"]
+    first = fetch[0]
+    assert "orders.json" in first["message"]
+    assert "portfolio.json" not in first["message"]
+    assert "SPY" in first["message"] and "QQQ" in first["message"]
+    assert ACCT not in first["message"]
+    assert first["dedupe_key"] == "reconcile_fetch_failed:error"
+    assert fetch[2]["severity"] == "critical"
+    assert fetch[2]["dedupe_key"] == "reconcile_fetch_failed:critical"
+    assert good["ok"] is True
+    assert good["fill_booking"] == "ran"
+    assert all(report["fill_booking"] == "deferred" for report in reports)
+    for item in fetch:
+        _assert_no_secrets(item["message"])
+
+    async def both():
+        store = main_bot.StateStore(None)
+        await store.set_position("SPY", _aged_option())
+        seen = []
+
+        async def fetch_portfolio():
+            raise etrade_async.ETradeAPIError(
+                404, "down", method="GET", path=PORTFOLIO, code="404",
+            )
+
+        async def fetch_orders():
+            raise etrade_async.ETradeAPIError(
+                404, "down", method="GET", path=ORDERS, code="404",
+            )
+
+        async def alert(severity, event, message, dedupe_key=None, dedupe_seconds=None):
+            seen.append({"event": event, "message": message, "severity": severity})
+
+        await _reconcile(
+            store, fetch_portfolio, fetch_orders,
+            {"closes": [], "rearms": [], "cancels": []}, alert,
+        )
+        await etrade_async.drain_etrade_alerts()
+        return seen
+
+    both_alerts = [item for item in _run(both()) if item["event"] == "reconcile_fetch_failed"]
+    assert len(both_alerts) == 1
+    assert "portfolio.json" in both_alerts[0]["message"]
+    assert "orders.json" in both_alerts[0]["message"]
+    assert "SPY" in both_alerts[0]["message"]
+    assert both_alerts[0]["severity"] == "error"
