@@ -16829,44 +16829,72 @@ def commit_final_kept_setup_qty(
     return final
 
 
-_SECRET_FIELD_NAMES = {
+_SHADOW_SECRET_KEYS = {
     "accountid", "accountidkey", "account_id", "account_id_key",
-    "oauth_token", "oauth_token_secret", "secret",
+    "oauth_token", "oauth_token_secret", "secret", "token",
+    "access_token", "refresh_token", "api_key", "apikey",
+    "password", "authorization", "consumer_key", "consumer_secret",
 }
+_SHADOW_SECRET_ENV = (
+    "ETRADE_ACCOUNT_ID", "ETRADE_CRYPTO_ACCOUNT_ID", "ETRADE_ACCOUNT_ID_KEY",
+    "ETRADE_CONSUMER_KEY", "ETRADE_CONSUMER_SECRET",
+    "ETRADE_OAUTH_TOKEN", "ETRADE_OAUTH_TOKEN_SECRET",
+)
+_SHADOW_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_SHADOW_QUOTE_KEYS = ("bid", "ask", "mid", "spread_pct", "source", "quote_time", "quote_age_s")
 _setup_disable_seeded = False
 _setup_disable_inflight: Dict[tuple, str] = {}
 _setup_disable_attempt_n: Dict[tuple, int] = {}
 _setup_disable_closed_attempt: set = set()
 
 
-def scrub_etrade_text(value: Any) -> Any:
-    """Drop account-id fields and strip a configured account id from strings.
+def _shadow_secret_values() -> set:
+    """Exact configured secrets. A substring of an OCC symbol is not a secret."""
+    found = set()
+    for name in _SHADOW_SECRET_ENV:
+        token = str(os.getenv(name) or "").strip()
+        if len(token) >= 4:
+            found.add(token)
+    return found
 
-    Numbers, strikes, and option symbols stay. A ledger row must not carry
-    an account id or an account key.
+
+def _shadow_key_is_secret(key: Any) -> bool:
+    name = str(key).lower().replace("-", "").replace("_", "").replace(" ", "")
+    if name in {item.replace("_", "") for item in _SHADOW_SECRET_KEYS}:
+        return True
+    return "account" in name and "id" in name
+
+
+def _redact_shadow_text(text: str, secrets: set) -> str:
+    """Redact a URL or a value that is itself a known secret.
+
+    Digit runs stay. An OCC symbol, an order id, and a signal id are not
+    rewritten because they contain eight digits.
     """
+    if text in secrets:
+        return "[redacted]"
+    return _SHADOW_URL_RE.sub("[redacted]", text)
+
+
+def _shadow_ledger_value(value: Any, secrets: set) -> Any:
+    """Keep known fields. Drop secret keys. Do not scrub digit runs."""
     if isinstance(value, dict):
         out: Dict[str, Any] = {}
         for key, item in value.items():
-            name = str(key).lower().replace("-", "").replace(" ", "")
-            if name in _SECRET_FIELD_NAMES or ("account" in name and "id" in name):
+            if _shadow_key_is_secret(key):
                 continue
-            out[str(key)] = scrub_etrade_text(item)
+            out[str(key)] = _shadow_ledger_value(item, secrets)
         return out
     if isinstance(value, list):
-        return [scrub_etrade_text(item) for item in value]
+        return [_shadow_ledger_value(item, secrets) for item in value]
     if isinstance(value, str):
-        text = value
-        for raw in (
-            os.getenv("ETRADE_ACCOUNT_ID"),
-            os.getenv("ETRADE_CRYPTO_ACCOUNT_ID"),
-            os.getenv("ETRADE_ACCOUNT_ID_KEY"),
-        ):
-            token = str(raw or "").strip()
-            if len(token) >= 4 and token in text:
-                text = text.replace(token, "[redacted]")
-        return text
+        return _redact_shadow_text(value, secrets)
     return value
+
+
+def _shadow_option_quote(option_quote: Any) -> Dict[str, Any]:
+    raw = option_quote if isinstance(option_quote, dict) else {}
+    return {key: raw.get(key) for key in _SHADOW_QUOTE_KEYS}
 
 
 def setup_disable_signal_parts(payload: Any) -> Tuple[str, str, str]:
@@ -17199,10 +17227,7 @@ def compose_setup_disable_row(
         sized = sizing or {}
         if enabled and canonical_setup_id(setup) in _KEPT_SETUP_CAP and sized.get("capped"):
             verdict = "cap"
-        quote = option_quote if isinstance(option_quote, dict) else {
-            "bid": None, "ask": None, "mid": None, "spread_pct": None,
-            "source": None, "quote_time": None, "quote_age_s": None,
-        }
+        quote = _shadow_option_quote(option_quote)
         underlying = payload.get("underlying_price")
         if underlying is None:
             underlying = payload.get("entry")
@@ -17264,7 +17289,7 @@ def compose_setup_disable_row(
         optional = _shadow_optional_features(payload)
         if optional:
             body["scanner_features"] = optional
-        return scrub_etrade_text(body)
+        return _shadow_ledger_value(body, _shadow_secret_values())
     except Exception as exc:
         _log_setup_disable_observer_error(exc)
         return None

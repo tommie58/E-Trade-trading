@@ -547,6 +547,106 @@ def test_shadow_ledger_records_one_row_per_signal(tmp_path):
     assert "account" not in str(data).lower()
 
 
+def test_occ_order_id_and_signal_id_survive_byte_identical(tmp_path, monkeypatch):
+    """A digit-run scrubber would turn the OCC strike and a long id into a redaction."""
+    saved = main_bot.trade_ledger._ledger
+    main_bot.reset_setup_disable_state()
+    main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    monkeypatch.setenv("ETRADE_ACCOUNT_ID", "00100000")
+    monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "8844221100987766")
+    occ = "FAKE  261218C00100000"
+    order_id = "8844221100987766-ORDER"
+    signal_id = "sig-7f3a9c1e4b8d6a00100000ff"
+    payload = {
+        "ticker": "FAKE",
+        "setup": "vwap rejection",
+        "action": "BUY",
+        "option_right": "CALL",
+        "strike": 100,
+        "expiration_hint": "2026-12-18",
+        "signal_id": signal_id,
+        "accountId": "00100000",
+        "accountIdKey": "8844221100987766",
+        "underlying_source": "https://quotes.example/FAKE?accountId=00100000",
+    }
+
+    async def run():
+        await main_bot.persist_setup_disable_decision(
+            payload, quantity=1, enforced=False, quantity_basis="after_sizing",
+            path="scanner", fresh_order=True,
+            option_quote={
+                "bid": 1.2, "ask": 1.3, "mid": 1.25, "spread_pct": 8.0,
+                "source": "Massive", "quote_time": "2026-11-30T11:00:00-05:00",
+                "quote_age_s": 0.4,
+                "accountId": "00100000",
+                "preview_url": "https://broker.example/orders/8844221100987766",
+            },
+            sizing={"limit_price": "00100000"},
+            outcome={
+                "order_id": order_id,
+                "placement_status": "placed",
+                "reason": "placed via https://broker.example/orders/8844221100987766",
+                "accountId": "00100000",
+            },
+        )
+
+    try:
+        asyncio.run(run())
+        rows = [
+            rec["data"] for rec in main_bot.trade_ledger.recent(10)
+            if rec.get("event") == "setup_disable_shadow"
+        ]
+    finally:
+        main_bot.trade_ledger._ledger = saved
+        main_bot.reset_setup_disable_state()
+    assert len(rows) == 1
+    data = rows[0]
+    assert data["would_be_contract"]["option_symbol"] == occ
+    assert data["outcome"]["order_id"] == order_id
+    assert data["signal_id"] == signal_id
+    assert data["signal_key"] == f"FAKE|vwap rejection|{signal_id}|1"
+    assert data["sizing"]["limit_price"] == "[redacted]"
+    assert data["underlying_source"] == "[redacted]"
+    assert "https://" not in str(data)
+    assert "accountId" not in str(data)
+    assert "preview_url" not in data["option_quote"]
+
+
+def test_position_opened_stamps_signal_key(tmp_path, monkeypatch):
+    saved = main_bot.trade_ledger._ledger
+    main_bot.trade_ledger.init(tmp_path / "ledger.jsonl")
+    signal_key = "FAKE|breakout|sig-7f3a9c1e4b8d6a00100000ff|1"
+    occ = "FAKE  261218C00100000"
+
+    async def quiet(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main_bot.state, "set_position", quiet)
+    monkeypatch.setattr(main_bot.state, "incr_trades_today", quiet)
+
+    async def run():
+        await main_bot._record_open(
+            "FAKE", 1, 10.5, 9.0, 12.0,
+            {"occ_symbol": occ, "right": "CALL", "strike": 100.0, "expiration": "2026-12-18"},
+            "BUY", "breakout",
+            signal_id="sig-7f3a9c1e4b8d6a00100000ff",
+            instrument="option",
+            signal_key=signal_key,
+        )
+
+    try:
+        asyncio.run(run())
+        rows = [
+            rec for rec in main_bot.trade_ledger.recent(10)
+            if rec.get("event") == "position_opened"
+        ]
+    finally:
+        main_bot.trade_ledger._ledger = saved
+    assert len(rows) == 1
+    assert rows[0]["data"]["signal_key"] == signal_key
+    assert rows[0]["data"]["contract"]["occ_symbol"] == occ
+
+
 def test_shadow_ledger_failure_does_not_raise(monkeypatch):
     _reset(monkeypatch, enabled="false", shadow="true")
 
