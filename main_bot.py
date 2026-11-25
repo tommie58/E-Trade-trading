@@ -12075,9 +12075,12 @@ class Scanner:
                     f"🔭 Scanner refused to dispatch {cand['ticker']} — E*TRADE quote status "
                     f"'{status}' is not real-time (accept the market data agreement to enable live scanning)"
                 )
-                await _note_entry_signal_snapshot(build_signal(
-                    quote, {**cand, "expiry": next_friday_expiry(self.now_et())}, "live",
-                ))
+                try:
+                    await _note_entry_signal_snapshot(build_signal(
+                        quote, {**cand, "expiry": next_friday_expiry(self.now_et())}, "live",
+                    ))
+                except Exception as e:
+                    logger.warning(f"scanner snapshot failed for {cand['ticker']}: {e}")
                 continue
             payload = build_signal(
                 quote,
@@ -15101,7 +15104,7 @@ from fastapi import FastAPI, HTTPException, Body, Query, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, validator, ValidationError
-from typing import Optional, Dict, Any, List, Sequence, Tuple
+from typing import Optional, Dict, Any, List, Sequence, Tuple, Callable, Awaitable
 import httpx
 import pyetrade
 import os
@@ -23222,6 +23225,16 @@ def _ledger_table_sql() -> str:
     )
 
 
+def _quote_snapshot_table_sql() -> str:
+    """Side-log mirror. Not bot_ledger, so core ledger reads never see these rows."""
+    return (
+        f"CREATE TABLE IF NOT EXISTS {_bt('bot_quote_snapshots')} ("
+        "hash TEXT PRIMARY KEY, "
+        "seq BIGINT NOT NULL, "
+        "line TEXT NOT NULL)"
+    )
+
+
 class PgStatePersistence:
     """Duck-typed persistence adapter for StateStore's durable memory mode.
     All methods are best-effort from the caller's perspective — StateStore
@@ -23270,11 +23283,58 @@ async def _init_durable_state() -> Optional[PgStatePersistence]:
         async with engine.begin() as conn:
             await conn.execute(sql_text(_state_table_sql()))
             await conn.execute(sql_text(_ledger_table_sql()))
+            await conn.execute(sql_text(_quote_snapshot_table_sql()))
         _state_persistence = PgStatePersistence(engine)
         return _state_persistence
     except Exception as e:
         logger.error(f"durable state init failed — falling back to plain memory: {e}")
         return None
+
+
+async def _quote_snapshot_mirror(seq: int, rec_hash: str, line: str) -> None:
+    """Mirror one side-log row into its own table."""
+    if engine is None:
+        return
+    async with engine.begin() as conn:
+        await conn.execute(
+            sql_text(
+                f"INSERT INTO {_bt('bot_quote_snapshots')} (hash, seq, line) "
+                "VALUES (:hash, :seq, :line) ON CONFLICT (hash) DO NOTHING"
+            ),
+            {"hash": rec_hash, "seq": int(seq), "line": line},
+        )
+
+
+async def _quote_snapshot_durable_count() -> Optional[int]:
+    if engine is None:
+        return None
+    try:
+        async with engine.connect() as conn:
+            counted = (await conn.execute(
+                sql_text(f"SELECT COUNT(*) FROM {_bt('bot_quote_snapshots')}")
+            )).scalar()
+        return int(counted or 0)
+    except Exception as exc:
+        logger.warning("quote snapshot mirror count failed (%s)", type(exc).__name__)
+        return None
+
+
+async def _restore_quote_snapshots_from_db() -> None:
+    """Rebuild the side log when a redeploy wiped the local file. Never raises."""
+    global _snap_mirror_failures
+    if engine is None:
+        return
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                sql_text(f"SELECT line FROM {_bt('bot_quote_snapshots')} ORDER BY seq")
+            )
+            lines = [row[0] for row in result.fetchall()]
+        if lines:
+            restore_quote_snapshot_lines(QUOTE_SNAPSHOT_FILE, lines)
+    except Exception as exc:
+        _snap_mirror_failures += 1
+        logger.warning("quote snapshot restore failed (%s)", type(exc).__name__)
 
 
 async def _ledger_mirror(seq: int, rec_hash: str, line: str) -> None:
@@ -27184,37 +27244,52 @@ async def _read_etrade_quote_log(
     return records[:limit_n]
 
 
+def _snapshot_row_matches(rec: Dict[str, Any], symbol: Optional[str], cutoff: Optional[datetime]) -> Optional[Dict[str, Any]]:
+    data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+    body = _scrub_snapshot_value(data)
+    if not isinstance(body, dict):
+        return None
+    quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
+    if symbol is not None and str(symbol).strip():
+        want = str(symbol).strip().upper()
+        fields = [
+            quote.get("option_symbol"), quote.get("symbol"), body.get("option_symbol"),
+        ]
+        if not any(isinstance(val, str) and val.strip().upper() == want for val in fields):
+            return None
+    if cutoff is not None:
+        stamped = _record_fetched_at({"fetched_at": rec.get("ts")})
+        if stamped is None or stamped < cutoff:
+            return None
+    return {
+        "seq": rec.get("seq"),
+        "ts": rec.get("ts"),
+        "event": rec.get("event"),
+        "data": body,
+    }
+
+
 def _read_quote_snapshot_rows(
     symbol: Optional[str], cutoff: Optional[datetime], limit_n: int,
 ) -> List[Dict[str, Any]]:
-    """Newest snapshot rows from the side log, scrubbed the same way they were stored."""
+    """Newest snapshot rows from the side-log file, scrubbed the same way they were stored."""
     log = _snap_log
-    if log is None:
+    if log is None or limit_n < 1 or not log.path.exists():
         return []
-    rows = []
-    for rec in reversed(log.recent(max(limit_n * 5, limit_n))):
-        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
-        body = _scrub_snapshot_value(data)
-        if not isinstance(body, dict):
+    rows: List[Dict[str, Any]] = []
+    with open(log.path, "r", encoding="utf-8") as handle:
+        lines = [line for line in handle if line.strip()]
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
             continue
-        quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
-        if symbol is not None and str(symbol).strip():
-            want = str(symbol).strip().upper()
-            fields = [
-                quote.get("option_symbol"), quote.get("symbol"), body.get("option_symbol"),
-            ]
-            if not any(isinstance(val, str) and val.strip().upper() == want for val in fields):
-                continue
-        if cutoff is not None:
-            stamped = _record_fetched_at({"fetched_at": rec.get("ts")})
-            if stamped is None or stamped < cutoff:
-                continue
-        rows.append({
-            "seq": rec.get("seq"),
-            "ts": rec.get("ts"),
-            "event": rec.get("event"),
-            "data": body,
-        })
+        if not isinstance(rec, dict):
+            continue
+        row = _snapshot_row_matches(rec, symbol, cutoff)
+        if row is None:
+            continue
+        rows.append(row)
         if len(rows) >= limit_n:
             break
     return rows
@@ -27229,7 +27304,7 @@ def _read_quote_snapshot_rows(
 OPTION_SNAPSHOT_OFFSETS_MIN = (15, 30, 60)
 _OPTION_SNAPSHOT_PENDING: Dict[Tuple[str, Any], Dict[str, Any]] = {}
 _OPTION_SNAPSHOT_SEEN: Dict[Tuple[str, Any], float] = {}
-_OPTION_SNAPSHOT_STOP_TOUCHED: set = set()
+_OPTION_SNAPSHOT_STOP_TOUCHED: Dict[str, None] = {}
 _LAST_QUOTE_STAMP: Dict[str, Dict[str, Any]] = {}
 _OPTION_SNAPSHOT_LOCK = threading.Lock()
 
@@ -27468,6 +27543,10 @@ async def _read_option_snapshot_quote(spec: Dict[str, Any]) -> Dict[str, Any]:
         return missing
     if not tokens:
         return missing
+    if _order_path_in_flight():
+        missing["status"] = "deferred"
+        missing["_deferred"] = "order_in_flight"
+        return missing
     try:
         market = pyetrade.ETradeMarket(
             CONSUMER_KEY, CONSUMER_SECRET,
@@ -27524,6 +27603,7 @@ def _public_snapshot_quote(quote: Dict[str, Any]) -> Tuple[Dict[str, Any], Optio
     source = raw.pop("_quote_time_source", None)
     fetched_at = raw.pop("_fetched_at", None)
     broker_epoch = raw.pop("_broker_epoch", None)
+    raw.pop("_deferred", None)
     if source not in {"broker_quote", "broker_unverified"}:
         source = "broker_quote" if raw.get("dateTime") else "broker_unverified"
     age = _quote_age_ms(raw.get("dateTime"), fetched_at, broker_epoch)
@@ -27533,25 +27613,40 @@ def _public_snapshot_quote(quote: Dict[str, Any]) -> Tuple[Dict[str, Any], Optio
     return raw, age, source
 
 
+def _defer_snapshot_job(job: Dict[str, Any], reason: str) -> None:
+    """Put a fetch back on the pending list. No E*TRADE call."""
+    later = (_utcnow() + timedelta(seconds=_snapshot_min_delay_s())).timestamp()
+    key = _snapshot_dedupe_key(
+        str(job.get("signal_key") or ""),
+        job.get("offset_min"),
+        str(job.get("offset_kind") or ("entry" if job.get("offset_min") == 0 else "modeled")),
+        job.get("order_id"),
+    )
+    with _OPTION_SNAPSHOT_LOCK:
+        _OPTION_SNAPSHOT_SEEN.pop(key, None)
+        deferred = dict(job)
+        deferred["due_epoch"] = later
+        deferred["deferred"] = reason
+        if key not in _OPTION_SNAPSHOT_PENDING and len(_OPTION_SNAPSHOT_PENDING) < _option_snapshot_max_pending():
+            _OPTION_SNAPSHOT_PENDING[key] = deferred
+
+
 async def _write_option_snapshot_row(job: Dict[str, Any]) -> None:
     spec = job.get("spec") if isinstance(job.get("spec"), dict) else {}
     preset = job.get("preset_quote") if isinstance(job.get("preset_quote"), dict) else None
+    if preset is None and _order_path_in_flight():
+        try:
+            _defer_snapshot_job(job, "order_in_flight")
+        except Exception as e:
+            logger.warning(
+                "option quote snapshot defer failed: %s",
+                scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+            )
+        return
     if preset is None and not _snapshot_fetch_allowed():
         # Own budget. Put the job back later instead of calling E*TRADE.
         try:
-            later = (_utcnow() + timedelta(seconds=_snapshot_min_delay_s())).timestamp()
-            key = _snapshot_dedupe_key(
-                str(job.get("signal_key") or ""),
-                job.get("offset_min"),
-                str(job.get("offset_kind") or ("entry" if job.get("offset_min") == 0 else "modeled")),
-                job.get("order_id"),
-            )
-            with _OPTION_SNAPSHOT_LOCK:
-                _OPTION_SNAPSHOT_SEEN.pop(key, None)
-                deferred = dict(job)
-                deferred["due_epoch"] = later
-                if key not in _OPTION_SNAPSHOT_PENDING and len(_OPTION_SNAPSHOT_PENDING) < _option_snapshot_max_pending():
-                    _OPTION_SNAPSHOT_PENDING[key] = deferred
+            _defer_snapshot_job(job, "budget")
         except Exception as e:
             logger.warning(
                 "option quote snapshot defer failed: %s",
@@ -27675,6 +27770,9 @@ async def _note_entry_signal_snapshot(payload: Dict[str, Any]) -> None:
         )
 
 
+scanner_mod._note_entry_signal_snapshot = _note_entry_signal_snapshot
+
+
 def _position_signal_key(ticker: str, pos: Optional[dict], payload: Optional[dict]) -> str:
     sig = (pos or {}).get("entry_signal") if isinstance((pos or {}).get("entry_signal"), dict) else {}
     if not sig and isinstance(payload, dict) and payload.get("signal_id"):
@@ -27780,12 +27878,35 @@ def _exit_fill_clock(order_id: Optional[str], payload: Optional[dict]) -> Tuple[
     return None, "local_record"
 
 
+def _stop_touch_cap() -> int:
+    return max(200, _option_snapshot_max_pending() * 2)
+
+
+def _trim_stop_touched() -> None:
+    cap = _stop_touch_cap()
+    while len(_OPTION_SNAPSHOT_STOP_TOUCHED) > cap:
+        _OPTION_SNAPSHOT_STOP_TOUCHED.pop(next(iter(_OPTION_SNAPSHOT_STOP_TOUCHED)))
+
+
+def _clear_stop_touch(ticker: str, pos: Optional[dict]) -> None:
+    """Drop the once-key for a position that has closed."""
+    opened = ""
+    if isinstance(pos, dict):
+        opened = str(pos.get("ts") or "")
+    prefix = f"{str(ticker).upper()}|{opened}|"
+    with _OPTION_SNAPSHOT_LOCK:
+        doomed = [key for key in _OPTION_SNAPSHOT_STOP_TOUCHED if str(key).startswith(prefix)]
+        for key in doomed:
+            _OPTION_SNAPSHOT_STOP_TOUCHED.pop(key, None)
+
+
 def enqueue_exit_option_snapshot(
     ticker: str, pos: Optional[dict], payload: Optional[dict],
     close_reason: Optional[str], expired: bool = False,
 ) -> None:
     """Queue an exit_fill or stop_trigger snapshot. Sync: no quote fetch, no await."""
     try:
+        _clear_stop_touch(ticker, pos)
         if expired:
             return
         kind = "stop_trigger" if _is_stop_close_reason(close_reason) else "exit_fill"
@@ -27850,7 +27971,8 @@ def note_polled_stop_touch(ticker: str, pos: dict, bid: Any, ask: Any, mark: Any
         with _OPTION_SNAPSHOT_LOCK:
             if once in _OPTION_SNAPSHOT_STOP_TOUCHED:
                 return
-            _OPTION_SNAPSHOT_STOP_TOUCHED.add(once)
+            _OPTION_SNAPSHOT_STOP_TOUCHED[once] = None
+            _trim_stop_touched()
         spec = _spec_from_position(ticker, pos, {})
         sym = _quote_symbol(ticker, contract) if contract.get("right") else str(ticker).upper()
         stamp = _LAST_QUOTE_STAMP.get(sym) if isinstance(_LAST_QUOTE_STAMP.get(sym), dict) else {}
@@ -27921,44 +28043,136 @@ class QuoteSnapshotLog:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
+        self.corrupt_counts: Dict[str, int] = {}
+        self._write_lock = threading.Lock()
         self._seq, self._prev_hash = self._load_tail()
 
-    def _load_tail(self) -> Tuple[int, str]:
+    def _note_corrupt(self, exc: BaseException) -> None:
+        kind = type(exc).__name__
+        self.corrupt_counts[kind] = self.corrupt_counts.get(kind, 0) + 1
+        logger.warning("quote snapshot log skipped a corrupt line (%s)", kind)
+
+    def _valid_record(self, line: bytes) -> Optional[Dict[str, Any]]:
+        try:
+            rec = json.loads(line.decode("utf-8"))
+            if not isinstance(rec, dict):
+                raise TypeError("not an object")
+            digest = rec.get("hash")
+            if not isinstance(digest, str) or not digest:
+                raise ValueError("missing hash")
+            int(rec.get("seq"))
+            return rec
+        except (json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
+            return None
+
+    def _repair_partial_tail(self) -> None:
+        """Drop a torn or invalid trailing line so the next append has a real predecessor."""
         try:
             if not self.path.exists():
+                return
+            data = self.path.read_bytes()
+        except OSError as exc:
+            self._note_corrupt(exc)
+            return
+        if not data:
+            return
+        end = len(data)
+        changed = False
+        if not data.endswith(b"\n"):
+            cut = data.rfind(b"\n")
+            end = 0 if cut < 0 else cut + 1
+            changed = True
+            self._note_corrupt(json.JSONDecodeError("partial line", "", 0))
+        while end > 0:
+            prev_nl = data.rfind(b"\n", 0, end - 1)
+            start = 0 if prev_nl < 0 else prev_nl + 1
+            piece = data[start:end].strip()
+            if not piece:
+                end = start
+                continue
+            rec = self._valid_record(piece)
+            if rec is not None:
+                break
+            self._note_corrupt(json.JSONDecodeError("invalid tail", "", 0))
+            end = start
+            changed = True
+        if not changed or end == len(data):
+            return
+        try:
+            with open(self.path, "r+b") as handle:
+                handle.truncate(end)
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except OSError as exc:
+                    self._note_corrupt(exc)
+        except OSError as exc:
+            self._note_corrupt(exc)
+
+    def _load_tail(self) -> Tuple[int, str]:
+        """Last valid record. A corrupt or partial tail does not rewind the chain to genesis."""
+        try:
+            self._repair_partial_tail()
+            if not self.path.exists():
                 return 0, "0" * 64
-            last = ""
+            seq = 0
+            prev = "0" * 64
+            found = False
             with open(self.path, "r", encoding="utf-8") as handle:
                 for line in handle:
-                    if line.strip():
-                        last = line
-            if not last:
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if not isinstance(rec, dict):
+                            raise TypeError("not an object")
+                        digest = rec.get("hash")
+                        if not isinstance(digest, str) or not digest:
+                            raise ValueError("missing hash")
+                        seq = int(rec.get("seq"))
+                        prev = digest
+                        found = True
+                    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                        self._note_corrupt(exc)
+            if not found:
                 return 0, "0" * 64
-            rec = json.loads(last)
-            return int(rec.get("seq") or 0), str(rec.get("hash") or ("0" * 64))
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return seq, prev
+        except OSError as exc:
+            self._note_corrupt(exc)
             return 0, "0" * 64
 
     def append(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Hash then write then advance the head. Only the side-log consumer calls this."""
-        self._seq += 1
-        rec: Dict[str, Any] = {
-            "seq": self._seq,
-            "ts": _utcnow().isoformat(),
-            "event": "option_quote_snapshot",
-            "data": data or {},
-            "prev_hash": self._prev_hash,
-        }
-        body = json.dumps(rec, sort_keys=True, default=str)
-        rec["hash"] = hashlib.sha256((self._prev_hash + body).encode("utf-8")).hexdigest()
-        line = json.dumps(rec, sort_keys=True, default=str)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        self._prev_hash = rec["hash"]
-        return rec
+        """Hash then write then advance the head. One append at a time, including across threads."""
+        with self._write_lock:
+            seq = self._seq + 1
+            prev = self._prev_hash
+            rec: Dict[str, Any] = {
+                "seq": seq,
+                "ts": _utcnow().isoformat(),
+                "event": "option_quote_snapshot",
+                "data": data or {},
+                "prev_hash": prev,
+            }
+            body = json.dumps(rec, sort_keys=True, default=str)
+            rec["hash"] = hashlib.sha256((prev + body).encode("utf-8")).hexdigest()
+            line = json.dumps(rec, sort_keys=True, default=str)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(self.path, "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except Exception:
+                # The line may already be on disk. Reload that tail instead of
+                # keeping a head the file has moved past, or rewinding past it.
+                self._repair_partial_tail()
+                self._seq, self._prev_hash = self._load_tail()
+                if self._seq == seq and self._prev_hash == rec["hash"]:
+                    return rec
+                raise
+            self._seq = seq
+            self._prev_hash = rec["hash"]
+            return rec
 
     def verify(self) -> Tuple[bool, int, Optional[str]]:
         prev = "0" * 64
@@ -27970,7 +28184,13 @@ class QuoteSnapshotLog:
                 for line_no, line in enumerate(handle, start=1):
                     if not line.strip():
                         continue
-                    rec = json.loads(line)
+                    try:
+                        rec = json.loads(line)
+                        if not isinstance(rec, dict):
+                            raise TypeError("not an object")
+                    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                        self._note_corrupt(exc)
+                        continue
                     claimed = str(rec.pop("hash", ""))
                     if str(rec.get("prev_hash")) != prev:
                         return False, checked, f"line {line_no}: prev_hash broken"
@@ -27980,8 +28200,9 @@ class QuoteSnapshotLog:
                     prev = claimed
                     checked += 1
             return True, checked, None
-        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
-            return False, checked, str(e)
+        except OSError as exc:
+            self._note_corrupt(exc)
+            return False, checked, type(exc).__name__
 
     def recent(self, count: int = 100) -> List[Dict[str, Any]]:
         if count < 1 or not self.path.exists():
@@ -28016,6 +28237,72 @@ def snapshot_writer_counts() -> Dict[str, int]:
     return {"written": _snap_written, "dropped": _snap_dropped}
 
 
+_snap_mirror: Optional[Callable[[int, str, str], Awaitable[None]]] = None
+_snap_durable = 0
+_snap_mirror_failures = 0
+
+
+def set_quote_snapshot_mirror(fn: Optional[Callable[[int, str, str], Awaitable[None]]]) -> None:
+    """Install the durable mirror. Same shape as the trade ledger: (seq, hash, line)."""
+    global _snap_mirror
+    _snap_mirror = fn
+
+
+def quote_snapshot_log_status() -> Dict[str, int]:
+    """On-disk chain length versus rows the durable mirror accepted."""
+    on_disk = 0
+    if _snap_log is not None:
+        try:
+            on_disk = max(0, int(_snap_log._seq))
+        except (TypeError, ValueError):
+            on_disk = 0
+    return {
+        "on_disk": on_disk,
+        "durable": int(_snap_durable),
+        "mirror_failures": int(_snap_mirror_failures),
+    }
+
+
+def restore_quote_snapshot_lines(path: Path, lines: List[str]) -> int:
+    """Rebuild the side-log file from mirrored rows when the local file is empty.
+
+    A non-empty file is left alone. Core ledger files are not touched.
+    """
+    try:
+        target = Path(path)
+        if target.exists() and target.stat().st_size > 0:
+            return 0
+        payload = [ln for ln in lines if ln and str(ln).strip()]
+        if not payload:
+            return 0
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(payload) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        logger.info("quote snapshot log restored from durable mirror — %s record(s)", len(payload))
+        return len(payload)
+    except OSError as exc:
+        logger.warning("quote snapshot restore failed (%s)", type(exc).__name__)
+        return 0
+
+
+async def _mirror_snapshot_record(rec: Dict[str, Any]) -> None:
+    """Best-effort copy of one side-log row. A failure is counted and does not raise."""
+    global _snap_durable, _snap_mirror_failures
+    fn = _snap_mirror
+    if fn is None or not isinstance(rec, dict):
+        return
+    try:
+        line = json.dumps(rec, sort_keys=True, default=str)
+        await fn(int(rec["seq"]), str(rec["hash"]), line)
+    except Exception as exc:
+        _snap_mirror_failures += 1
+        logger.warning("quote snapshot mirror failed (%s)", type(exc).__name__)
+        return
+    _snap_durable += 1
+
+
 def _snapshot_fetch_allowed() -> bool:
     limit = _snapshot_max_per_min()
     now = time.monotonic()
@@ -28027,15 +28314,28 @@ def _snapshot_fetch_allowed() -> bool:
     return True
 
 
+def _snapshot_writer_died_text(exc: BaseException) -> str:
+    """Free-text alert only. Structured snapshot rows are scrubbed separately."""
+    try:
+        detail = scrub_etrade_text(str(exc), secrets=_quote_log_secrets())
+        detail = re.sub(r"https?://\S+", "[redacted]", detail)
+    except Exception:
+        detail = ""
+    return f"quote snapshot writer died and was restarted: {type(exc).__name__}: {detail}"
+
+
 async def _alert_snapshot_writer_death(exc: BaseException) -> None:
     try:
         await alerts.send(
             "warning", "quote_snapshot_writer_died",
-            f"quote snapshot writer died and was restarted: {exc}",
+            _snapshot_writer_died_text(exc),
             dedupe_key="quote_snapshot_writer",
         )
     except Exception as e:
-        logger.warning("quote snapshot writer alert failed: %s", e)
+        logger.warning(
+            "quote snapshot writer alert failed: %s",
+            scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+        )
 
 
 def _on_snap_writer_done(task: asyncio.Task) -> None:
@@ -28046,7 +28346,7 @@ def _on_snap_writer_done(task: asyncio.Task) -> None:
     exc = task.exception()
     if exc is None:
         return
-    logger.error("quote snapshot writer died: %s", exc)
+    logger.error("%s", _snapshot_writer_died_text(exc))
     try:
         task.get_loop().create_task(_alert_snapshot_writer_death(exc))
     except Exception:
@@ -28068,10 +28368,35 @@ def _start_snapshot_consumer() -> None:
     _snap_task.add_done_callback(_on_snap_writer_done)
 
 
+def _abandon_snapshot_queue(queue: Optional[asyncio.Queue]) -> None:
+    """Complete leftovers from a queue this loop can no longer serve."""
+    global _snap_dropped
+    if queue is None:
+        return
+    while True:
+        try:
+            _body, fut = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        _snap_dropped += 1
+        if fut is not None and not fut.done():
+            try:
+                fut.set_result(None)
+            except Exception:
+                pass
+        try:
+            queue.task_done()
+        except ValueError:
+            pass
+
+
 def _ensure_snapshot_writer() -> asyncio.Queue:
     global _snap_q, _snap_task, _snap_loop
     loop = asyncio.get_running_loop()
-    if _snap_loop is not loop or _snap_q is None or (_snap_task is not None and _snap_task.done()):
+    if _snap_q is None or _snap_loop is not loop:
+        # A new loop cannot await the previous queue. Count those rows dropped.
+        if _snap_q is not None and _snap_loop is not loop:
+            _abandon_snapshot_queue(_snap_q)
         _snap_q = asyncio.Queue(maxsize=_snapshot_queue_max())
         _snap_loop = loop
         _snap_task = None
@@ -28095,6 +28420,7 @@ async def _snapshot_write_consumer() -> None:
             else:
                 rec = await asyncio.shield(asyncio.to_thread(_snap_log.append, body))
                 _snap_written += 1
+                await _mirror_snapshot_record(rec)
                 if fut is not None and not fut.done():
                     fut.set_result(rec.get("seq"))
         except asyncio.CancelledError:
@@ -28205,6 +28531,9 @@ def _sync_etrade_call(fn, *args, source: str = "etrade", quote_log_as: Optional[
             return result
 
 
+_ORDER_PATH_INFLIGHT = 0
+
+
 async def _etrade_call(
     fn, *args, source: str = "etrade", idempotent: bool = True,
     quote_log_as: Optional[str] = None, **kwargs,
@@ -28215,6 +28544,37 @@ async def _etrade_call(
     (the reconciliation engine heals whatever state results)."""
     started = time.perf_counter()
     _note_quote_log_loop()
+    order_path = _is_order_path_source(source)
+    if order_path:
+        _enter_order_path()
+    try:
+        return await _etrade_call_body(fn, args, kwargs, source, idempotent, quote_log_as, started)
+    finally:
+        if order_path:
+            _leave_order_path()
+
+
+def _is_order_path_source(source: str) -> bool:
+    text = str(source or "")
+    return text.startswith("place_") or text == "cancel_order"
+
+
+def _order_path_in_flight() -> bool:
+    return _ORDER_PATH_INFLIGHT > 0
+
+
+def _enter_order_path() -> None:
+    global _ORDER_PATH_INFLIGHT
+    _ORDER_PATH_INFLIGHT += 1
+
+
+def _leave_order_path() -> None:
+    global _ORDER_PATH_INFLIGHT
+    if _ORDER_PATH_INFLIGHT > 0:
+        _ORDER_PATH_INFLIGHT -= 1
+
+
+async def _etrade_call_body(fn, args, kwargs, source, idempotent, quote_log_as, started):
     for attempt in range(ETRADE_RETRY_ATTEMPTS):
         try:
             result = await asyncio.to_thread(fn, *args, **kwargs)
@@ -40607,9 +40967,15 @@ async def on_startup():
     # then resume the hash chain and mirror every new record.
     await _restore_ledger_from_db()
     trade_ledger.init(TRADE_LEDGER_FILE)
+    await _restore_quote_snapshots_from_db()
     init_quote_snapshot_log(QUOTE_SNAPSHOT_FILE)
     if persistence is not None:
         trade_ledger.set_mirror(_ledger_mirror)
+        set_quote_snapshot_mirror(_quote_snapshot_mirror)
+        counted = await _quote_snapshot_durable_count()
+        if counted is not None:
+            global _snap_durable
+            _snap_durable = counted
     # Say out loud whether this process actually remembers anything. A ledger
     # that comes up empty is indistinguishable from a healthy one in the logs,
     # and it silently disarms the only mechanism that learns from past trades.
@@ -41716,6 +42082,7 @@ async def status():
         "env": ENV,
         "live_trading": LIVE_TRADING,
         "version": BOT_VERSION,
+        "quote_snapshots": quote_snapshot_log_status(),
         "secret_configured": bool(WEBHOOK_SECRET),
         # Moved off public /healthz. The app reads the guardian here, with the secret.
         "guardian": await _guardian_snapshot(),

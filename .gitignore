@@ -9,6 +9,7 @@ __pycache__/
 .etrade_state.json
 etrade_cache.db
 trade_ledger.jsonl
+data/quote_snapshots.jsonl
 
 # IDE
 .vscode/

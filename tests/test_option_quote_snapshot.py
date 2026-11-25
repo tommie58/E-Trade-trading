@@ -26,6 +26,10 @@ def _isolate_snapshots():
     main_bot._OPTION_SNAPSHOT_STOP_TOUCHED.clear()
     main_bot._SNAP_FETCHES.clear()
     main_bot._snap_shutdown = False
+    main_bot._ORDER_PATH_INFLIGHT = 0
+    main_bot.set_quote_snapshot_mirror(None)
+    main_bot._snap_durable = 0
+    main_bot._snap_mirror_failures = 0
     yield
     main_bot._snap_shutdown = True
     main_bot._OPTION_SNAPSHOT_PENDING.clear()
@@ -793,8 +797,7 @@ def test_shutdown_flushes_the_snapshot_writer(tmp_path):
     try:
         async def scenario():
             for n in range(3):
-                seq = await main_bot.submit_quote_snapshot({"n": n})
-                assert seq == n + 1
+                main_bot._put_snapshot({"n": n}, None)
             await main_bot.flush_quote_snapshot_writer(2.0)
             assert main_bot._snap_task.done()
             return main_bot._snap_log.verify()
@@ -898,4 +901,385 @@ def test_full_snapshot_queue_drops_snapshots_only(tmp_path, monkeypatch):
     assert "option_quote_snapshot" not in text
     assert ok, err
     assert count == 2
+
+
+def test_writer_death_alert_scrubs_url_token_and_account_key(tmp_path, monkeypatch, caplog):
+    token = "sekret1234"
+    monkeypatch.setattr(main_bot, "_resolved_account_id_key", FAKE_KEY)
+    monkeypatch.setattr(main_bot, "_current_tokens", {"oauth_token": token, "oauth_token_secret": "x"})
+    sent = []
+
+    async def fake_send(*args, **kwargs):
+        sent.append(args[2] if len(args) > 2 else kwargs.get("message"))
+
+    monkeypatch.setattr(main_bot.alerts, "send", fake_send)
+    caplog.set_level(logging.ERROR, logger="etrade-bot")
+    saved = main_bot._snap_log
+    main_bot.init_quote_snapshot_log(Path(tmp_path) / "quote_snapshots.jsonl")
+
+    class Probe(RuntimeError):
+        def __str__(self):
+            return (
+                "https://api.etrade.com/v1/accounts/TESTACCTKEY123/orders.json"
+                "?accountIdKey=TESTACCTKEY123 "
+                'oauth_token="sekret1234"'
+            )
+
+    try:
+        async def scenario():
+            await main_bot.submit_quote_snapshot({"n": 0})
+            old = main_bot._snap_task
+            old.remove_done_callback(main_bot._on_snap_writer_done)
+            old.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await old
+
+            async def boom():
+                raise Probe()
+
+            dead = asyncio.create_task(boom())
+            main_bot._snap_task = dead
+            dead.add_done_callback(main_bot._on_snap_writer_done)
+            await asyncio.sleep(0.1)
+
+        _run(scenario())
+    finally:
+        main_bot._snap_log = saved
+    assert sent
+    blob = "\n".join(sent) + "\n" + caplog.text
+    assert "Probe" in blob
+    assert FAKE_KEY not in blob
+    assert token not in blob
+    assert "https://api.etrade.com" not in blob
+    assert "accountIdKey=TESTACCTKEY123" not in blob
+
+
+def test_restart_reuses_the_queue_and_orphans_are_dropped(tmp_path):
+    saved = main_bot._snap_log
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    main_bot.init_quote_snapshot_log(path)
+    try:
+        async def scenario():
+            await main_bot.submit_quote_snapshot({"n": 0})
+            queue = main_bot._snap_q
+            old = main_bot._snap_task
+            old.remove_done_callback(main_bot._on_snap_writer_done)
+            old.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await old
+            fut = asyncio.get_running_loop().create_future()
+            queue.put_nowait(({"n": 1}, fut))
+            assert main_bot._ensure_snapshot_writer() is queue
+            seq = await asyncio.wait_for(fut, 2)
+            assert seq is not None
+            orphan = asyncio.Queue()
+            orphan_fut = asyncio.get_running_loop().create_future()
+            orphan.put_nowait(({"n": "gone"}, orphan_fut))
+            before = main_bot.snapshot_writer_counts()["dropped"]
+            main_bot._abandon_snapshot_queue(orphan)
+            assert orphan_fut.result() is None
+            assert main_bot.snapshot_writer_counts()["dropped"] == before + 1
+            return main_bot._snap_log.verify()
+
+        ok, count, err = _run(scenario())
+    finally:
+        main_bot._snap_log = saved
+    assert ok, err
+    assert count == 2
+    rows = [json.loads(line)["data"]["n"] for line in path.read_text(encoding="utf-8").splitlines()]
+    assert rows == [0, 1]
+
+
+def test_corrupt_tail_keeps_the_last_valid_link(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="etrade-bot")
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    secret = "TAILTOKEN99"
+    log = main_bot.QuoteSnapshotLog(path)
+    log.append({"n": 1})
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "not-json "
+            + secret
+            + " https://api.etrade.com/v1/accounts/TESTACCTKEY123/x?accountIdKey=TESTACCTKEY123\n"
+        )
+    reloaded = main_bot.QuoteSnapshotLog(path)
+    assert reloaded._seq == 1
+    assert reloaded.corrupt_counts.get("JSONDecodeError") == 1
+    reloaded.append({"n": 2})
+    ok, count, err = reloaded.verify()
+    assert ok, err
+    assert count == 2
+    assert secret not in caplog.text
+    assert "TESTACCTKEY123" not in caplog.text
+    assert "JSONDecodeError" in caplog.text
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("{")]
+    assert rows[1]["seq"] == 2
+    assert rows[1]["prev_hash"] == rows[0]["hash"]
+
+
+def test_snapshot_fetch_defers_while_an_order_is_in_flight(monkeypatch):
+    release = threading.Event()
+    entered = threading.Event()
+    fetched = []
+
+    def place_fn(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(3)
+        return {"ok": True}
+
+    original = main_bot._etrade_call
+
+    async def wrapped(fn, *args, source="etrade", **kwargs):
+        if source == "option_snapshot":
+            fetched.append(source)
+        return await original(fn, *args, source=source, **kwargs)
+
+    monkeypatch.setattr(main_bot, "_etrade_call", wrapped)
+    when = _at(14, 0)
+
+    async def scenario():
+        place = asyncio.create_task(original(
+            place_fn, source="place_equity", idempotent=False,
+        ))
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert main_bot._order_path_in_flight()
+        main_bot._enqueue_option_snapshot(
+            "sig-defer", 0, when, {"option_symbol": "SPY:1"}, offset_kind="entry",
+        )
+        wrote = await main_bot._option_snapshot_tick(when)
+        release.set()
+        await place
+        return wrote
+
+    try:
+        wrote = _run(scenario())
+    finally:
+        release.set()
+    assert wrote == 1
+    assert fetched == []
+    job = next(iter(main_bot._OPTION_SNAPSHOT_PENDING.values()))
+    assert job["deferred"] == "order_in_flight"
+
+
+def test_stop_placement_does_not_wait_behind_a_snapshot_fetch():
+    release = threading.Event()
+    entered = threading.Event()
+
+    def snap_fn(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(3)
+        return {}
+
+    def place_fn(*_args, **_kwargs):
+        return {"ok": True}
+
+    async def scenario():
+        snap = asyncio.create_task(main_bot._etrade_call(snap_fn, source="option_snapshot"))
+        assert await asyncio.to_thread(entered.wait, 2)
+        started = time.monotonic()
+        await main_bot._etrade_call(place_fn, source="place_equity", idempotent=False)
+        elapsed = time.monotonic() - started
+        still_blocked = not release.is_set()
+        release.set()
+        await snap
+        return elapsed, still_blocked
+
+    try:
+        elapsed, still_blocked = _run(scenario())
+    finally:
+        release.set()
+    assert still_blocked
+    assert elapsed < 0.5
+
+
+def test_refused_realtime_build_signal_error_does_not_stop_the_scan(monkeypatch):
+    quotes = [
+        {"symbol": "AAA", "realtime": False, "quote_status": "DELAYED", "last": 10},
+        {"symbol": "BBB", "realtime": True, "quote_status": "REALTIME", "last": 20},
+    ]
+    dispatched = []
+
+    def evaluate(quote, _series, _cfg, _progress, _context):
+        return {
+            "ticker": quote["symbol"],
+            "qualifies": True,
+            "score": 1,
+            "shadow_eligible": False,
+            "book": {},
+            "setup": "orb",
+            "side": "long",
+            "rvol": 2.0,
+            "entry": 1.0,
+            "stop": 0.8,
+            "target": 1.4,
+            "ts": "2026-11-25T19:00:00+00:00",
+        }
+
+    def build(quote, cand, mode):
+        if quote["symbol"] == "AAA":
+            raise RuntimeError("build blew")
+        return {"ticker": cand["ticker"], "mode": mode}
+
+    async def dispatch(payload):
+        dispatched.append(payload["ticker"])
+        return {"status": "sent"}
+
+    async def fetch(_chunk):
+        return {}
+
+    monkeypatch.setattr(main_bot.scanner_mod, "parse_quotes", lambda _raw: quotes)
+    monkeypatch.setattr(main_bot.scanner_mod, "evaluate_quote", evaluate)
+    monkeypatch.setattr(main_bot.scanner_mod, "build_signal", build)
+    scan = main_bot.scanner_mod.Scanner(
+        main_bot.StateStore(None), fetch, dispatch, lambda: True, lambda: True,
+        lambda: _at(14, 0),
+    )
+    scan._config["mode"] = "live"
+    scan._config["universe"] = ["AAA", "BBB"]
+    _run(scan.scan_once())
+    assert dispatched == ["BBB"]
+
+
+def test_stop_touch_set_is_bounded_and_cleared_on_close(monkeypatch):
+    monkeypatch.setattr(main_bot, "_stop_touch_cap", lambda: 2)
+    first = _option_pos("ORD1")
+    second = _option_pos("ORD2")
+    second["ts"] = "2026-11-25T15:01:00+00:00"
+    third = _option_pos("ORD3")
+    third["ts"] = "2026-11-25T15:02:00+00:00"
+    main_bot.note_polled_stop_touch("SPY", first, 0.5, 0.6, 0.5)
+    main_bot.note_polled_stop_touch("SPY", second, 0.5, 0.6, 0.5)
+    main_bot.note_polled_stop_touch("SPY", third, 0.5, 0.6, 0.5)
+    assert len(main_bot._OPTION_SNAPSHOT_STOP_TOUCHED) == 2
+    assert all(not str(key).endswith("|ORD1") for key in main_bot._OPTION_SNAPSHOT_STOP_TOUCHED)
+    main_bot.enqueue_exit_option_snapshot(
+        "SPY", second, {"ticker": "SPY"}, "close_fill", False,
+    )
+    assert all(not str(key).endswith("|ORD2") for key in main_bot._OPTION_SNAPSHOT_STOP_TOUCHED)
+    assert any(str(key).endswith("|ORD3") for key in main_bot._OPTION_SNAPSHOT_STOP_TOUCHED)
+
+
+def test_fsync_failure_reloads_the_tail_and_appends_do_not_overlap(tmp_path, monkeypatch):
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    log = main_bot.QuoteSnapshotLog(path)
+    real_fsync = main_bot.os.fsync
+    calls = {"n": 0}
+
+    def flaky(fd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("fsync failed")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(main_bot.os, "fsync", flaky)
+    first = log.append({"n": 1})
+    second = log.append({"n": 2})
+    ok, count, err = log.verify()
+    assert ok, err
+    assert count == 2
+    assert second["prev_hash"] == first["hash"]
+    assert log._prev_hash == second["hash"]
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def blocking(fd):
+        holding.set()
+        assert release.wait(3)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(main_bot.os, "fsync", blocking)
+    overlapped = {"second_started_write": False}
+
+    def write_first():
+        log.append({"n": 3})
+
+    def write_second():
+        holding.wait(3)
+        overlapped["second_started_write"] = True
+        log.append({"n": 4})
+
+    left = threading.Thread(target=write_first)
+    right = threading.Thread(target=write_second)
+    left.start()
+    assert holding.wait(2)
+    right.start()
+    time.sleep(0.05)
+    assert right.is_alive()
+    release.set()
+    left.join(3)
+    right.join(3)
+    ok, count, err = log.verify()
+    assert ok, err
+    assert count == 4
+    assert overlapped["second_started_write"] is True
+
+
+def test_partial_tail_is_repaired_on_load(tmp_path):
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    log = main_bot.QuoteSnapshotLog(path)
+    first = log.append({"n": 1})
+    with path.open("ab") as handle:
+        handle.write(b'{"seq": 2, "partial"')
+    reloaded = main_bot.QuoteSnapshotLog(path)
+    assert reloaded._seq == 1
+    assert reloaded._prev_hash == first["hash"]
+    assert b"partial" not in path.read_bytes()
+    second = reloaded.append({"n": 2})
+    ok, count, err = reloaded.verify()
+    assert ok, err
+    assert count == 2
+    assert second["prev_hash"] == first["hash"]
+
+
+def test_side_log_mirrors_and_restores_after_a_wipe(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="etrade-bot")
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    saved = main_bot._snap_log
+    rows = []
+
+    async def remember(seq, digest, line):
+        rows.append((seq, digest, line))
+
+    async def broken(seq, digest, line):
+        raise RuntimeError("db down SECRETTOKEN99")
+
+    main_bot.init_quote_snapshot_log(path)
+    main_bot.set_quote_snapshot_mirror(remember)
+    try:
+        async def write_two():
+            await main_bot.submit_quote_snapshot({"n": 1})
+            await main_bot.submit_quote_snapshot({"n": 2})
+
+        _run(write_two())
+        assert [row[0] for row in rows] == [1, 2]
+        assert main_bot.quote_snapshot_log_status() == {
+            "on_disk": 2, "durable": 2, "mirror_failures": 0,
+        }
+        path.unlink()
+        restored = main_bot.restore_quote_snapshot_lines(path, [row[2] for row in rows])
+        assert restored == 2
+        assert main_bot.restore_quote_snapshot_lines(path, ["should-not-replace"]) == 0
+        main_bot.init_quote_snapshot_log(path)
+        ok, count, err = main_bot._snap_log.verify()
+        assert ok, err
+        assert count == 2
+        assert main_bot.quote_snapshot_log_status()["on_disk"] == 2
+        main_bot.set_quote_snapshot_mirror(broken)
+
+        async def write_third():
+            return await main_bot.submit_quote_snapshot({"n": 3})
+
+        seq = _run(write_third())
+        assert seq == 3
+        assert main_bot.quote_snapshot_log_status()["mirror_failures"] == 1
+        assert main_bot.quote_snapshot_log_status()["on_disk"] == 3
+    finally:
+        main_bot.set_quote_snapshot_mirror(None)
+        main_bot._snap_log = saved
+    assert "SECRETTOKEN99" not in caplog.text
+    assert "RuntimeError" in caplog.text
+    mirror_src = __import__("inspect").getsource(main_bot._quote_snapshot_mirror)
+    assert "bot_quote_snapshots" in mirror_src
+    assert "bot_ledger" not in mirror_src
 
