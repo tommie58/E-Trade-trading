@@ -12038,19 +12038,27 @@ class Scanner:
                 # Shadows are recorded on the same real-time tape a live entry
                 # would need — a delayed print would bias the paper record.
                 if quote is not None and quote.get("realtime"):
+                    shadow_signal = None
                     try:
-                        await self.shadow(build_signal(quote, cand, "paper"), cand.get("book") or {})
+                        shadow_signal = build_signal(quote, cand, "paper")
+                        await self.shadow(shadow_signal, cand.get("book") or {})
                         cand["dispatch"] = "shadow-tracked (retired setup)"
                     except Exception as e:
                         logger.warning(f"shadow record failed for {cand['ticker']}: {e}")
-                    await _note_entry_signal_snapshot(build_signal(quote, cand, "paper"))
+                    if shadow_signal is not None:
+                        await _note_entry_signal_snapshot(shadow_signal)
             if not cand["qualifies"]:
                 continue
             if cfg["mode"] != "live":
                 cand["dispatch"] = "shadow (not sent)"
                 shadow_quote = next((q for q in quotes if q["symbol"] == cand["ticker"]), None)
                 if shadow_quote is not None:
-                    await _note_entry_signal_snapshot(build_signal(shadow_quote, cand, "paper"))
+                    try:
+                        await _note_entry_signal_snapshot(
+                            build_signal(shadow_quote, cand, "paper")
+                        )
+                    except Exception as e:
+                        logger.warning(f"shadow snapshot failed for {cand['ticker']}: {e}")
                 continue
             quote = next((q for q in quotes if q["symbol"] == cand["ticker"]), None)
             if quote is None:
@@ -16283,6 +16291,7 @@ ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", "300"))
 # Immutable trade ledger — append-only, hash-chained JSONL (GET /ledger).
 TRADE_LEDGER_FILE = Path(os.getenv("TRADE_LEDGER_FILE", "trade_ledger.jsonl"))
+QUOTE_SNAPSHOT_FILE = Path(os.getenv("QUOTE_SNAPSHOT_FILE", "data/quote_snapshots.jsonl"))
 # Fast per-trade review list (Redis/memory) mirroring each position_closed
 # snapshot so GET /trades works even when Postgres study views are offline.
 TRADES_HISTORY_KEY = "trades:history"
@@ -22502,6 +22511,7 @@ async def etrade_quotes_log(
     symbol: Optional[str] = Query(None),
     since: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=1000),
+    kind: Optional[str] = Query(None),
     x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
 ):
     """Scrubbed E*TRADE quote ground truth, newest first.
@@ -22530,7 +22540,11 @@ async def etrade_quotes_log(
             cutoff = _parse_quote_log_since(str(since))
         except ValueError:
             raise HTTPException(400, "since must be an ISO-8601 timestamp")
+    kind_text = kind.strip().lower() if isinstance(kind, str) else ""
     try:
+        if kind_text == "snapshots":
+            records = _read_quote_snapshot_rows(symbol, cutoff, limit_n)
+            return {"snapshots": records, "count": len(records), "limit": limit_n}
         records = await _read_etrade_quote_log(symbol, cutoff, limit_n)
     except Exception:
         raise HTTPException(500, "quote log unreadable")
@@ -27170,6 +27184,42 @@ async def _read_etrade_quote_log(
     return records[:limit_n]
 
 
+def _read_quote_snapshot_rows(
+    symbol: Optional[str], cutoff: Optional[datetime], limit_n: int,
+) -> List[Dict[str, Any]]:
+    """Newest snapshot rows from the side log, scrubbed the same way they were stored."""
+    log = _snap_log
+    if log is None:
+        return []
+    rows = []
+    for rec in reversed(log.recent(max(limit_n * 5, limit_n))):
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        body = _scrub_snapshot_value(data)
+        if not isinstance(body, dict):
+            continue
+        quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
+        if symbol is not None and str(symbol).strip():
+            want = str(symbol).strip().upper()
+            fields = [
+                quote.get("option_symbol"), quote.get("symbol"), body.get("option_symbol"),
+            ]
+            if not any(isinstance(val, str) and val.strip().upper() == want for val in fields):
+                continue
+        if cutoff is not None:
+            stamped = _record_fetched_at({"fetched_at": rec.get("ts")})
+            if stamped is None or stamped < cutoff:
+                continue
+        rows.append({
+            "seq": rec.get("seq"),
+            "ts": rec.get("ts"),
+            "event": rec.get("event"),
+            "data": body,
+        })
+        if len(rows) >= limit_n:
+            break
+    return rows
+
+
 # ==================== OPTION QUOTE SNAPSHOTS ====================
 # Ground truth around an entry signal. Offset 0 is the decision. Later
 # offsets are modeled exits (+15, +30, +60 min), replaced by today's flatten
@@ -27486,6 +27536,28 @@ def _public_snapshot_quote(quote: Dict[str, Any]) -> Tuple[Dict[str, Any], Optio
 async def _write_option_snapshot_row(job: Dict[str, Any]) -> None:
     spec = job.get("spec") if isinstance(job.get("spec"), dict) else {}
     preset = job.get("preset_quote") if isinstance(job.get("preset_quote"), dict) else None
+    if preset is None and not _snapshot_fetch_allowed():
+        # Own budget. Put the job back later instead of calling E*TRADE.
+        try:
+            later = (_utcnow() + timedelta(seconds=_snapshot_min_delay_s())).timestamp()
+            key = _snapshot_dedupe_key(
+                str(job.get("signal_key") or ""),
+                job.get("offset_min"),
+                str(job.get("offset_kind") or ("entry" if job.get("offset_min") == 0 else "modeled")),
+                job.get("order_id"),
+            )
+            with _OPTION_SNAPSHOT_LOCK:
+                _OPTION_SNAPSHOT_SEEN.pop(key, None)
+                deferred = dict(job)
+                deferred["due_epoch"] = later
+                if key not in _OPTION_SNAPSHOT_PENDING and len(_OPTION_SNAPSHOT_PENDING) < _option_snapshot_max_pending():
+                    _OPTION_SNAPSHOT_PENDING[key] = deferred
+        except Exception as e:
+            logger.warning(
+                "option quote snapshot defer failed: %s",
+                scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+            )
+        return
     try:
         quote = dict(preset) if preset is not None else await _read_option_snapshot_quote(spec)
     except Exception as e:
@@ -27513,10 +27585,10 @@ async def _write_option_snapshot_row(job: Dict[str, Any]) -> None:
         body["fill_time"] = job.get("fill_time")
         body["fill_time_source"] = job.get("fill_time_source") or "local_record"
     try:
-        await trade_ledger.record("option_quote_snapshot", body)
+        await submit_quote_snapshot(body)
     except Exception as e:
         logger.warning(
-            "option quote snapshot ledger write failed: %s",
+            "option quote snapshot side-log write failed: %s",
             scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
         )
 
@@ -27536,7 +27608,8 @@ async def note_option_quote_snapshots(payload: Dict[str, Any], now: Optional[dat
             spec = _option_snapshot_spec(payload)
         signal_at = now or _utcnow()
         outcome = _enqueue_option_snapshot(
-            signal_key, 0, signal_at, spec, offset_kind="entry",
+            signal_key, 0, signal_at + timedelta(seconds=_snapshot_min_delay_s()),
+            spec, offset_kind="entry",
         )
         if outcome == "capped":
             logger.warning(
@@ -27813,88 +27886,286 @@ def note_polled_stop_touch(ticker: str, pos: dict, bid: Any, ask: Any, mark: Any
         )
 
 
-# One consumer owns every ledger append this process makes, including
-# option_quote_snapshot rows. A caller that times out is cancelled while
-# waiting, not while the hash is being written, so the next record chains
-# from the row that actually landed.
-_LEDGER_WRITE_Q: Optional[asyncio.Queue] = None
-_LEDGER_WRITER: Optional[asyncio.Task] = None
-_LEDGER_LOOP: Optional[asyncio.AbstractEventLoop] = None
-_LEDGER_WRITTEN = 0
-_LEDGER_DROPPED = 0
-_LEDGER_QUEUE_MAX = 10000
+def _snapshot_min_delay_s() -> float:
+    """Offset 0 waits at least 2s so it does not share the order-path quote call."""
+    raw = os.getenv("ETRADE_QUOTE_SNAPSHOT_MIN_DELAY_S", "2")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 2.0
+    if not math.isfinite(value) or value < 2.0:
+        return 2.0
+    return value
 
 
-def ledger_writer_counts() -> Dict[str, int]:
-    """Appends the sequential writer finished, and appends it did not keep."""
-    return {"written": _LEDGER_WRITTEN, "dropped": _LEDGER_DROPPED}
+def _snapshot_max_per_min() -> int:
+    raw = os.getenv("ETRADE_QUOTE_SNAPSHOT_MAX_PER_MIN", "30")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 30
+    return max(1, min(value, 600))
 
 
-def _ensure_ledger_writer() -> asyncio.Queue:
-    global _LEDGER_WRITE_Q, _LEDGER_WRITER, _LEDGER_LOOP
+def _snapshot_queue_max() -> int:
+    raw = os.getenv("QUOTE_SNAPSHOT_QUEUE_MAX", "500")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 500
+    return max(1, min(value, 100000))
+
+
+class QuoteSnapshotLog:
+    """Append-only hash chain for option quote snapshots. Not the trade ledger."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._seq, self._prev_hash = self._load_tail()
+
+    def _load_tail(self) -> Tuple[int, str]:
+        try:
+            if not self.path.exists():
+                return 0, "0" * 64
+            last = ""
+            with open(self.path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.strip():
+                        last = line
+            if not last:
+                return 0, "0" * 64
+            rec = json.loads(last)
+            return int(rec.get("seq") or 0), str(rec.get("hash") or ("0" * 64))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return 0, "0" * 64
+
+    def append(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Hash then write then advance the head. Only the side-log consumer calls this."""
+        self._seq += 1
+        rec: Dict[str, Any] = {
+            "seq": self._seq,
+            "ts": _utcnow().isoformat(),
+            "event": "option_quote_snapshot",
+            "data": data or {},
+            "prev_hash": self._prev_hash,
+        }
+        body = json.dumps(rec, sort_keys=True, default=str)
+        rec["hash"] = hashlib.sha256((self._prev_hash + body).encode("utf-8")).hexdigest()
+        line = json.dumps(rec, sort_keys=True, default=str)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        self._prev_hash = rec["hash"]
+        return rec
+
+    def verify(self) -> Tuple[bool, int, Optional[str]]:
+        prev = "0" * 64
+        checked = 0
+        try:
+            if not self.path.exists():
+                return True, 0, None
+            with open(self.path, "r", encoding="utf-8") as handle:
+                for line_no, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    claimed = str(rec.pop("hash", ""))
+                    if str(rec.get("prev_hash")) != prev:
+                        return False, checked, f"line {line_no}: prev_hash broken"
+                    body = json.dumps(rec, sort_keys=True, default=str)
+                    if hashlib.sha256((str(rec.get("prev_hash")) + body).encode("utf-8")).hexdigest() != claimed:
+                        return False, checked, f"line {line_no}: hash mismatch"
+                    prev = claimed
+                    checked += 1
+            return True, checked, None
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+            return False, checked, str(e)
+
+    def recent(self, count: int = 100) -> List[Dict[str, Any]]:
+        if count < 1 or not self.path.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        with open(self.path, "r", encoding="utf-8") as handle:
+            lines = [ln for ln in handle if ln.strip()]
+        for line in lines[-count:]:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return out
+
+
+_snap_log: Optional[QuoteSnapshotLog] = None
+_snap_q: Optional[asyncio.Queue] = None
+_snap_task: Optional[asyncio.Task] = None
+_snap_loop: Optional[asyncio.AbstractEventLoop] = None
+_snap_written = 0
+_snap_dropped = 0
+_snap_shutdown = False
+_SNAP_FETCHES: deque = deque()
+
+
+def init_quote_snapshot_log(path: Path) -> None:
+    global _snap_log
+    _snap_log = QuoteSnapshotLog(Path(path))
+
+
+def snapshot_writer_counts() -> Dict[str, int]:
+    return {"written": _snap_written, "dropped": _snap_dropped}
+
+
+def _snapshot_fetch_allowed() -> bool:
+    limit = _snapshot_max_per_min()
+    now = time.monotonic()
+    while _SNAP_FETCHES and now - _SNAP_FETCHES[0] >= 60.0:
+        _SNAP_FETCHES.popleft()
+    if len(_SNAP_FETCHES) >= limit:
+        return False
+    _SNAP_FETCHES.append(now)
+    return True
+
+
+async def _alert_snapshot_writer_death(exc: BaseException) -> None:
+    try:
+        await alerts.send(
+            "warning", "quote_snapshot_writer_died",
+            f"quote snapshot writer died and was restarted: {exc}",
+            dedupe_key="quote_snapshot_writer",
+        )
+    except Exception as e:
+        logger.warning("quote snapshot writer alert failed: %s", e)
+
+
+def _on_snap_writer_done(task: asyncio.Task) -> None:
+    if _snap_shutdown:
+        return
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        return
+    logger.error("quote snapshot writer died: %s", exc)
+    try:
+        task.get_loop().create_task(_alert_snapshot_writer_death(exc))
+    except Exception:
+        pass
+    if _snap_shutdown:
+        return
+    try:
+        task.get_loop().call_soon(_start_snapshot_consumer)
+    except Exception:
+        pass
+
+
+def _start_snapshot_consumer() -> None:
+    global _snap_task
     loop = asyncio.get_running_loop()
-    if _LEDGER_LOOP is not loop or _LEDGER_WRITE_Q is None or (
-        _LEDGER_WRITER is not None and _LEDGER_WRITER.done()
-    ):
-        _LEDGER_WRITE_Q = asyncio.Queue(maxsize=_LEDGER_QUEUE_MAX)
-        _LEDGER_LOOP = loop
-        _LEDGER_WRITER = None
-    if _LEDGER_WRITER is None or _LEDGER_WRITER.done():
-        _LEDGER_WRITER = loop.create_task(_ledger_write_consumer(), name="ledger-writer")
-    return _LEDGER_WRITE_Q
+    if _snap_task is not None and not _snap_task.done():
+        return
+    _snap_task = loop.create_task(_snapshot_write_consumer(), name="quote-snapshot-writer")
+    _snap_task.add_done_callback(_on_snap_writer_done)
 
 
-async def _ledger_write_consumer() -> None:
-    global _LEDGER_WRITTEN, _LEDGER_DROPPED
-    queue = _LEDGER_WRITE_Q
-    direct = trade_ledger._direct_record
+def _ensure_snapshot_writer() -> asyncio.Queue:
+    global _snap_q, _snap_task, _snap_loop
+    loop = asyncio.get_running_loop()
+    if _snap_loop is not loop or _snap_q is None or (_snap_task is not None and _snap_task.done()):
+        _snap_q = asyncio.Queue(maxsize=_snapshot_queue_max())
+        _snap_loop = loop
+        _snap_task = None
+    if _snap_task is None or _snap_task.done():
+        _start_snapshot_consumer()
+    return _snap_q
+
+
+async def _snapshot_write_consumer() -> None:
+    """The only task that appends snapshot rows. Hash chaining stays here."""
+    global _snap_written, _snap_dropped
+    queue = _snap_q
     while True:
         item = await queue.get()
-        if item is None:
-            queue.task_done()
-            return
-        event, data, fut = item
+        body, fut = item
         try:
-            seq = await asyncio.shield(direct(event, data))
-            if seq is None:
-                _LEDGER_DROPPED += 1
+            if _snap_log is None:
+                _snap_dropped += 1
+                if fut is not None and not fut.done():
+                    fut.set_result(None)
             else:
-                _LEDGER_WRITTEN += 1
-            if not fut.done():
-                fut.set_result(seq)
+                rec = await asyncio.shield(asyncio.to_thread(_snap_log.append, body))
+                _snap_written += 1
+                if fut is not None and not fut.done():
+                    fut.set_result(rec.get("seq"))
         except asyncio.CancelledError:
-            if not fut.done():
-                fut.cancel()
+            queue.task_done()
             raise
         except Exception as e:
-            _LEDGER_DROPPED += 1
-            if not fut.done():
-                fut.set_exception(e)
-        finally:
+            _snap_dropped += 1
+            logger.warning(
+                "quote snapshot append failed: %s",
+                scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
+            )
+            if fut is not None and not fut.done():
+                fut.set_result(None)
+            queue.task_done()
+        else:
             queue.task_done()
 
 
-async def _queued_ledger_record(event: str, data: Optional[Dict[str, Any]] = None) -> Optional[int]:
-    """Hand one append to the single writer. Cancellation waits, it does not cut the write."""
-    global _LEDGER_DROPPED
+def _put_snapshot(body: Dict[str, Any], fut: Optional[asyncio.Future]) -> str:
+    global _snap_dropped
     try:
-        queue = _ensure_ledger_writer()
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        queue.put_nowait((event, data, fut))
+        queue = _ensure_snapshot_writer()
+        queue.put_nowait((body, fut))
+        return "queued"
     except asyncio.QueueFull:
-        _LEDGER_DROPPED += 1
+        _snap_dropped += 1
+        if fut is not None and not fut.done():
+            fut.set_result(None)
+        return "dropped"
+
+
+async def submit_quote_snapshot(body: Dict[str, Any]) -> Optional[int]:
+    """Queue one snapshot row. Off-loop callers are scheduled or counted as dropped."""
+    global _snap_dropped
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = _QUOTE_LOG_LOOP
+        if loop is None or not loop.is_running():
+            _snap_dropped += 1
+            return None
+        def _schedule() -> None:
+            _put_snapshot(body, None)
+        try:
+            loop.call_soon_threadsafe(_schedule)
+        except Exception:
+            _snap_dropped += 1
         return None
-    except Exception as e:
-        _LEDGER_DROPPED += 1
-        logger.error(f"ledger append failed ({event}): {e}")
+    fut = loop.create_future()
+    if _put_snapshot(body, fut) == "dropped":
         return None
     return await fut
 
 
-if not getattr(trade_ledger, "_direct_record", None):
-    trade_ledger._direct_record = trade_ledger.record
-    trade_ledger.record = _queued_ledger_record
-    trade_ledger.writer_counts = ledger_writer_counts
+async def flush_quote_snapshot_writer(timeout: float = 2.0) -> None:
+    """Join the side-log queue for at most `timeout` seconds, then cancel the writer."""
+    global _snap_shutdown
+    _snap_shutdown = True
+    task = _snap_task
+    queue = _snap_q
+    if queue is not None and task is not None and not task.done():
+        try:
+            await asyncio.wait_for(queue.join(), timeout=max(0.0, float(timeout)))
+        except asyncio.TimeoutError:
+            pass
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _snap_shutdown = False
 
 
 async def option_snapshot_worker() -> None:
@@ -40336,6 +40607,7 @@ async def on_startup():
     # then resume the hash chain and mirror every new record.
     await _restore_ledger_from_db()
     trade_ledger.init(TRADE_LEDGER_FILE)
+    init_quote_snapshot_log(QUOTE_SNAPSHOT_FILE)
     if persistence is not None:
         trade_ledger.set_mirror(_ledger_mirror)
     # Say out loud whether this process actually remembers anything. A ledger
@@ -40457,6 +40729,7 @@ async def _announce_preflight() -> None:
 async def on_shutdown():
     global _worker_stop
     _worker_stop = True
+    await flush_quote_snapshot_writer(2.0)
     await _close_study_page_engine()
     await state.close()
 

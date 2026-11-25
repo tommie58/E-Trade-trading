@@ -447,6 +447,7 @@ def test_occ_symbol_and_order_id_survive_byte_identical(tmp_path, monkeypatch, c
     saved_state = main_bot.state
     saved_ledger = main_bot.trade_ledger._ledger
     saved_mirror = main_bot.trade_ledger._mirror
+    saved_snap = main_bot._snap_log
     main_bot.state = main_bot.StateStore(None)
     path = Path(tmp_path) / "ledger.jsonl"
     try:
@@ -480,8 +481,7 @@ def test_occ_symbol_and_order_id_survive_byte_identical(tmp_path, monkeypatch, c
 
         main_bot._OPTION_SNAPSHOT_PENDING.clear()
         main_bot._OPTION_SNAPSHOT_SEEN.clear()
-        main_bot.trade_ledger.set_mirror(None)
-        main_bot.trade_ledger.init(path)
+        main_bot.init_quote_snapshot_log(path)
         preset = {
             "status": "ok",
             "bid": 1.25,
@@ -508,6 +508,7 @@ def test_occ_symbol_and_order_id_survive_byte_identical(tmp_path, monkeypatch, c
         main_bot.state = saved_state
         main_bot.trade_ledger._ledger = saved_ledger
         main_bot.trade_ledger._mirror = saved_mirror
+        main_bot._snap_log = saved_snap
 
     data = ledger["data"]
     assert data["quote"]["option_symbol"] == OCC

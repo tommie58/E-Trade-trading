@@ -24,10 +24,14 @@ def _isolate_snapshots():
     main_bot._OPTION_SNAPSHOT_PENDING.clear()
     main_bot._OPTION_SNAPSHOT_SEEN.clear()
     main_bot._OPTION_SNAPSHOT_STOP_TOUCHED.clear()
+    main_bot._SNAP_FETCHES.clear()
+    main_bot._snap_shutdown = False
     yield
+    main_bot._snap_shutdown = True
     main_bot._OPTION_SNAPSHOT_PENDING.clear()
     main_bot._OPTION_SNAPSHOT_SEEN.clear()
     main_bot._OPTION_SNAPSHOT_STOP_TOUCHED.clear()
+    main_bot._SNAP_FETCHES.clear()
 
 
 def _run(coro):
@@ -109,14 +113,17 @@ def test_missing_quote_still_writes_a_ledger_row(tmp_path, monkeypatch):
     monkeypatch.setattr(main_bot, "_etrade_call", boom)
     saved = main_bot.trade_ledger._ledger
     saved_mirror = main_bot.trade_ledger._mirror
-    path = Path(tmp_path) / "ledger.jsonl"
+    saved_snap = main_bot._snap_log
+    ledger = Path(tmp_path) / "ledger.jsonl"
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
     main_bot.trade_ledger.set_mirror(None)
-    main_bot.trade_ledger.init(path)
+    main_bot.trade_ledger.init(ledger)
+    main_bot.init_quote_snapshot_log(path)
     when = _at(14, 0)
     try:
         async def scenario():
             await main_bot.note_option_quote_snapshots(_signal(), now=when)
-            wrote = await main_bot._option_snapshot_tick(when)
+            wrote = await main_bot._option_snapshot_tick(when + main_bot.timedelta(seconds=3))
             assert wrote == 1
 
         _run(scenario())
@@ -124,6 +131,7 @@ def test_missing_quote_still_writes_a_ledger_row(tmp_path, monkeypatch):
     finally:
         main_bot.trade_ledger._ledger = saved
         main_bot.trade_ledger._mirror = saved_mirror
+        main_bot._snap_log = saved_snap
 
     assert len(rows) == 1
     data = rows[0]["data"]
@@ -154,7 +162,7 @@ def test_scheduler_error_is_a_warning_and_does_not_raise(monkeypatch, caplog):
 
     async def scenario():
         await main_bot.note_option_quote_snapshots(_signal(), now=when)
-        wrote = await main_bot._option_snapshot_tick(when)
+        wrote = await main_bot._option_snapshot_tick(when + main_bot.timedelta(seconds=3))
         assert wrote == 0
         await main_bot.note_option_quote_snapshots(_signal("other"), now=when)
 
@@ -211,11 +219,14 @@ def test_snapshots_do_not_touch_orders_positions_or_stops(tmp_path, monkeypatch)
     monkeypatch.setattr(main_bot.pyetrade, "ETradeMarket", lambda *a, **k: _Market())
     saved_ledger = main_bot.trade_ledger._ledger
     saved_mirror = main_bot.trade_ledger._mirror
+    saved_snap = main_bot._snap_log
     saved_state = main_bot.state
     main_bot.state = main_bot.StateStore(None)
     main_bot.trade_ledger.set_mirror(None)
-    path = Path(tmp_path) / "ledger.jsonl"
-    main_bot.trade_ledger.init(path)
+    ledger = Path(tmp_path) / "ledger.jsonl"
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    main_bot.trade_ledger.init(ledger)
+    main_bot.init_quote_snapshot_log(path)
     marks = dict(main_bot._LAST_MARK_QUALITY)
     when = _at(14, 0)
     try:
@@ -234,9 +245,11 @@ def test_snapshots_do_not_touch_orders_positions_or_stops(tmp_path, monkeypatch)
     finally:
         main_bot.trade_ledger._ledger = saved_ledger
         main_bot.trade_ledger._mirror = saved_mirror
+        main_bot._snap_log = saved_snap
         main_bot.state = saved_state
 
     assert calls == []
+    assert not ledger.exists() or "option_quote_snapshot" not in ledger.read_text(encoding="utf-8")
     assert main_bot._LAST_MARK_QUALITY == marks
     assert [row["data"]["offset_min"] for row in rows] == [0, 15]
     quote = rows[0]["data"]["quote"]
@@ -380,15 +393,16 @@ def _queue_one_stop_touch(monkeypatch):
 
 def test_stop_touch_row_ages_the_broker_quote(tmp_path, monkeypatch):
     fetched, write, saved, saved_mirror = _queue_one_stop_touch(monkeypatch)
-    path = Path(tmp_path) / "ledger.jsonl"
-    main_bot.trade_ledger.set_mirror(None)
-    main_bot.trade_ledger.init(path)
+    saved_snap = main_bot._snap_log
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    main_bot.init_quote_snapshot_log(path)
     try:
         wrote = _run(write())
         rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     finally:
         main_bot.trade_ledger._ledger = saved
         main_bot.trade_ledger._mirror = saved_mirror
+        main_bot._snap_log = saved_snap
         main_bot._LAST_QUOTE_STAMP.clear()
     assert fetched["n"] == 0
     assert wrote == 1
@@ -518,9 +532,9 @@ def test_exit_fill_uses_the_polled_execution_clock(tmp_path, monkeypatch):
     pos = _option_pos()
     saved = main_bot.trade_ledger._ledger
     saved_mirror = main_bot.trade_ledger._mirror
-    path = Path(tmp_path) / "ledger.jsonl"
-    main_bot.trade_ledger.set_mirror(None)
-    main_bot.trade_ledger.init(path)
+    saved_snap = main_bot._snap_log
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    main_bot.init_quote_snapshot_log(path)
     try:
         main_bot.enqueue_exit_option_snapshot(
             "SPY", pos, {"ticker": "SPY", "executed_ts": when.timestamp()},
@@ -540,6 +554,7 @@ def test_exit_fill_uses_the_polled_execution_clock(tmp_path, monkeypatch):
     finally:
         main_bot.trade_ledger._ledger = saved
         main_bot.trade_ledger._mirror = saved_mirror
+        main_bot._snap_log = saved_snap
     assert calls["orders"] == 0
     by_order = {row["order_id"]: row for row in rows}
     assert by_order["ORD44"]["fill_time"] == when.isoformat()
@@ -550,47 +565,55 @@ def test_exit_fill_uses_the_polled_execution_clock(tmp_path, monkeypatch):
 
 
 def test_timed_out_snapshot_append_keeps_the_hash_chain(tmp_path, monkeypatch):
-    """A cancelled waiter does not cut the append. The next record chains after it."""
+    """A cancelled waiter does not cut the side-log append. The next snapshot chains after it."""
     saved = main_bot.trade_ledger._ledger
     saved_mirror = main_bot.trade_ledger._mirror
-    path = Path(tmp_path) / "ledger.jsonl"
+    saved_snap = main_bot._snap_log
+    side = Path(tmp_path) / "quote_snapshots.jsonl"
+    ledger = Path(tmp_path) / "ledger.jsonl"
     main_bot.trade_ledger.set_mirror(None)
-    main_bot.trade_ledger.init(path)
-    original = main_bot.trade_ledger.TradeLedger._append_line
+    main_bot.trade_ledger.init(ledger)
+    main_bot.init_quote_snapshot_log(side)
+    original = main_bot._snap_log.append
     started = threading.Event()
 
-    def slow(self, line):
+    def slow(data):
         started.set()
         time.sleep(0.3)
-        return original(self, line)
+        return original(data)
 
-    monkeypatch.setattr(main_bot.trade_ledger.TradeLedger, "_append_line", slow)
-    main_bot._LEDGER_WRITTEN = 0
-    main_bot._LEDGER_DROPPED = 0
+    monkeypatch.setattr(main_bot._snap_log, "append", slow)
+    main_bot._snap_written = 0
+    main_bot._snap_dropped = 0
 
     async def scenario():
-        snap = asyncio.create_task(main_bot.trade_ledger.record(
-            "option_quote_snapshot", {"option_symbol": OCC, "order_id": ORDER_ID},
+        snap = asyncio.create_task(main_bot.submit_quote_snapshot(
+            {"option_symbol": OCC, "order_id": ORDER_ID},
         ))
         await asyncio.to_thread(started.wait, 2)
         snap.cancel()
         with pytest.raises(asyncio.CancelledError):
             await snap
-        await main_bot.trade_ledger.record("position_opened", {"ticker": "INTC"})
-        ok, count, err = main_bot.trade_ledger.verify()
+        await main_bot.submit_quote_snapshot({"option_symbol": "QQQ:2099-01-15:CALL:500"})
+        ok, count, err = main_bot._snap_log.verify()
         assert ok, err
         assert count == 2
-        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        rows = [json.loads(line) for line in side.read_text(encoding="utf-8").splitlines()]
         assert rows[1]["prev_hash"] == rows[0]["hash"]
         assert rows[0]["event"] == "option_quote_snapshot"
-        counts = main_bot.ledger_writer_counts()
-        assert counts == {"written": 2, "dropped": 0}
+        assert main_bot.snapshot_writer_counts() == {"written": 2, "dropped": 0}
+        await main_bot.trade_ledger.record("position_opened", {"ticker": "INTC"})
+        trade_ok, trade_count, trade_err = main_bot.trade_ledger.verify()
+        assert trade_ok, trade_err
+        assert trade_count == 1
+        assert "option_quote_snapshot" not in ledger.read_text(encoding="utf-8")
 
     try:
         _run(scenario())
     finally:
         main_bot.trade_ledger._ledger = saved
         main_bot.trade_ledger._mirror = saved_mirror
+        main_bot._snap_log = saved_snap
 
 
 OCC = "INTC  261127C12345678"
@@ -630,9 +653,9 @@ def test_identity_fields_survive_an_account_id_substring(tmp_path, monkeypatch):
 
     saved = main_bot.trade_ledger._ledger
     saved_mirror = main_bot.trade_ledger._mirror
-    path = Path(tmp_path) / "ledger.jsonl"
-    main_bot.trade_ledger.set_mirror(None)
-    main_bot.trade_ledger.init(path)
+    saved_snap = main_bot._snap_log
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    main_bot.init_quote_snapshot_log(path)
     preset = {
         "status": "ok", "bid": 1.2, "ask": 1.3, "last": 1.25,
         "dateTime": "15:30:00 EST 11-25-2026",
@@ -655,11 +678,17 @@ def test_identity_fields_survive_an_account_id_substring(tmp_path, monkeypatch):
         assert _run(write()) == 1
         raw = path.read_text(encoding="utf-8")
         data = json.loads(raw)["data"]
+        main_bot._QUOTE_LOG_READS.clear()
+        listed = _run(main_bot.etrade_quotes_log(
+            symbol=OCC, since=None, limit=10, kind="snapshots", x_rork_secret="s3cret",
+        ))
     finally:
         main_bot.trade_ledger._ledger = saved
         main_bot.trade_ledger._mirror = saved_mirror
+        main_bot._snap_log = saved_snap
 
     assert data["quote"]["option_symbol"] == OCC
+    assert listed["snapshots"][0]["data"]["quote"]["option_symbol"] == OCC
     assert data["order_id"] == ORDER_ID
     assert data["signal_key"] == SIGNAL_KEY
     assert data["fill_time"] == "2026-11-25T15:30:00-05:00"
@@ -674,4 +703,178 @@ def test_quote_age_uses_the_documented_quote_time():
         "15:30:00 EST 11-25-2026", "2026-11-25T20:30:01+00:00",
     ) == 1000
     assert main_bot._quote_age_ms(None, "2026-11-25T20:30:00+00:00") is None
+
+
+def _module_record_source(text: str) -> str:
+    marker = "async def record(event: str, data: Optional[Dict[str, Any]] = None) -> Optional[int]:"
+    start = text.index(marker)
+    lines = text[start:].splitlines(keepends=True)
+    out = [lines[0]]
+    for line in lines[1:]:
+        if line.startswith(("async def ", "def ", "class ")):
+            break
+        out.append(line)
+    return "".join(out)
+
+
+def test_core_ledger_record_is_the_direct_path():
+    import subprocess
+    current = Path(main_bot.__file__).read_text(encoding="utf-8")
+    main_copy = subprocess.check_output(
+        ["git", "show", "origin/main:main_bot.py"], text=True,
+    )
+    here = _module_record_source(current)
+    there = _module_record_source(main_copy)
+    assert here == there
+    assert "await _ledger.record(event, data)" in here
+    assert not hasattr(main_bot.trade_ledger, "_direct_record")
+    assert not hasattr(main_bot.trade_ledger, "writer_counts")
+
+
+def test_snapshot_budget_defers_instead_of_fetching(tmp_path, monkeypatch):
+    monkeypatch.setenv("ETRADE_QUOTE_SNAPSHOT_MAX_PER_MIN", "1")
+    calls = {"n": 0}
+
+    async def quote(spec):
+        calls["n"] += 1
+        return {
+            "status": "missing", "bid": None, "ask": None, "last": None,
+            "dateTime": None, "option_symbol": (spec or {}).get("option_symbol"),
+        }
+
+    monkeypatch.setattr(main_bot, "_read_option_snapshot_quote", quote)
+    saved = main_bot._snap_log
+    main_bot.init_quote_snapshot_log(Path(tmp_path) / "quote_snapshots.jsonl")
+    when = _at(14, 0)
+    try:
+        async def scenario():
+            main_bot._SNAP_FETCHES.clear()
+            main_bot._enqueue_option_snapshot(
+                "sig-a", 0, when, {"option_symbol": "SPY:1"}, offset_kind="entry",
+            )
+            main_bot._enqueue_option_snapshot(
+                "sig-b", 0, when, {"option_symbol": "QQQ:1"}, offset_kind="entry",
+            )
+            return await main_bot._option_snapshot_tick(when)
+
+        wrote = _run(scenario())
+    finally:
+        main_bot._snap_log = saved
+    assert calls["n"] == 1
+    assert wrote == 2
+    assert len(main_bot._OPTION_SNAPSHOT_PENDING) == 1
+
+
+def test_shutdown_flushes_the_snapshot_writer(tmp_path):
+    saved = main_bot._snap_log
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    main_bot.init_quote_snapshot_log(path)
+    try:
+        async def scenario():
+            for n in range(3):
+                seq = await main_bot.submit_quote_snapshot({"n": n})
+                assert seq == n + 1
+            await main_bot.flush_quote_snapshot_writer(2.0)
+            assert main_bot._snap_task.done()
+            return main_bot._snap_log.verify()
+
+        ok, count, err = _run(scenario())
+    finally:
+        main_bot._snap_log = saved
+    assert ok, err
+    assert count == 3
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [row["data"]["n"] for row in rows] == [0, 1, 2]
+
+
+def test_snapshot_writer_restarts_after_it_dies(tmp_path, monkeypatch):
+    sent = []
+
+    async def fake_send(*args, **kwargs):
+        sent.append(args[1] if len(args) > 1 else kwargs.get("event"))
+
+    monkeypatch.setattr(main_bot.alerts, "send", fake_send)
+    saved = main_bot._snap_log
+    path = Path(tmp_path) / "quote_snapshots.jsonl"
+    main_bot.init_quote_snapshot_log(path)
+    try:
+        async def scenario():
+            await main_bot.submit_quote_snapshot({"n": 0})
+            old = main_bot._snap_task
+            old.remove_done_callback(main_bot._on_snap_writer_done)
+            old.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await old
+            async def boom():
+                raise RuntimeError("writer died")
+            dead = asyncio.create_task(boom())
+            main_bot._snap_task = dead
+            dead.add_done_callback(main_bot._on_snap_writer_done)
+            await asyncio.sleep(0.1)
+            assert main_bot._snap_task is not dead
+            assert not main_bot._snap_task.done()
+            await main_bot.submit_quote_snapshot({"n": 1})
+            return main_bot._snap_log.verify()
+
+        ok, count, err = _run(scenario())
+    finally:
+        main_bot._snap_log = saved
+    assert "quote_snapshot_writer_died" in sent
+    assert ok, err
+    assert count == 2
+
+
+def test_full_snapshot_queue_drops_snapshots_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("QUOTE_SNAPSHOT_QUEUE_MAX", "1")
+    saved_ledger = main_bot.trade_ledger._ledger
+    saved_mirror = main_bot.trade_ledger._mirror
+    saved_snap = main_bot._snap_log
+    side = Path(tmp_path) / "quote_snapshots.jsonl"
+    ledger = Path(tmp_path) / "ledger.jsonl"
+    main_bot.trade_ledger.set_mirror(None)
+    main_bot.trade_ledger.init(ledger)
+    main_bot.init_quote_snapshot_log(side)
+    original = main_bot._snap_log.append
+    entered = threading.Event()
+    gate = threading.Event()
+
+    def blocked(data):
+        entered.set()
+        assert gate.wait(5)
+        return original(data)
+
+    monkeypatch.setattr(main_bot._snap_log, "append", blocked)
+    main_bot._snap_dropped = 0
+    try:
+        async def scenario():
+            first = asyncio.create_task(main_bot.submit_quote_snapshot({"n": 1}))
+            assert await asyncio.to_thread(entered.wait, 2)
+            second = asyncio.create_task(main_bot.submit_quote_snapshot({"n": 2}))
+            await asyncio.sleep(0.05)
+            third = await main_bot.submit_quote_snapshot({"n": 3})
+            assert third is None
+            assert main_bot.snapshot_writer_counts()["dropped"] >= 1
+            seq = await main_bot.trade_ledger.record(
+                "position_closed", {"ticker": "INTC", "reason": "stop"},
+            )
+            assert seq == 1
+            trade_ok, trade_count, trade_err = main_bot.trade_ledger.verify()
+            assert trade_ok, trade_err
+            assert trade_count == 1
+            gate.set()
+            await first
+            await second
+            return main_bot._snap_log.verify()
+
+        ok, count, err = _run(scenario())
+    finally:
+        gate.set()
+        main_bot.trade_ledger._ledger = saved_ledger
+        main_bot.trade_ledger._mirror = saved_mirror
+        main_bot._snap_log = saved_snap
+    text = ledger.read_text(encoding="utf-8")
+    assert "position_closed" in text
+    assert "option_quote_snapshot" not in text
+    assert ok, err
+    assert count == 2
 
