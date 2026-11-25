@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -409,3 +410,110 @@ def test_redis_list_is_capped_and_scrubbed(monkeypatch):
         assert FAKE_KEY not in json.dumps(body)
 
     _run(scenario())
+
+
+OCC = "INTC  261127P00056000"
+ORDER_ID = "9988776655443"
+SIGNAL_KEY = "sig:12345678abcdef"
+
+
+def test_occ_symbol_and_order_id_survive_byte_identical(tmp_path, monkeypatch, caplog):
+    """Structured rows keep OCC symbols and order ids. The plain log line still uses the full scrub."""
+    monkeypatch.setattr(main_bot, "_resolved_account_id_key", FAKE_KEY)
+    monkeypatch.setattr(main_bot, "load_tokens", lambda: {
+        "oauth_token": "tok", "oauth_token_secret": "sec",
+    })
+    monkeypatch.setattr(main_bot, "WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setattr(main_bot, "DEBUG_QUOTES", False)
+    monkeypatch.setenv("ETRADE_QUOTE_LOG_ENABLED", "true")
+    monkeypatch.setenv("ETRADE_QUOTE_LOG_MIN_INTERVAL_S", "0")
+    main_bot._OPTION_SNAPSHOT_PENDING.clear()
+    main_bot._OPTION_SNAPSHOT_SEEN.clear()
+    main_bot._OPTION_SNAPSHOT_STOP_TOUCHED.clear()
+    caplog.set_level(logging.INFO, logger="etrade-bot")
+
+    payload = _equity_payload("INTC")
+    payload["QuoteResponse"]["QuoteData"][0]["dateTime"] = (
+        "15:30:00 EST 11-25-2026 https://api.etrade.com/v1/accounts/TESTACCTKEY123/orders.json"
+        "?accountIdKey=TESTACCTKEY123"
+    )
+
+    class _Market:
+        def get_quote(self, symbols, resp_format="json"):
+            assert symbols == [OCC]
+            return payload
+
+    monkeypatch.setattr(main_bot.pyetrade, "ETradeMarket", lambda *a, **k: _Market())
+    saved_state = main_bot.state
+    saved_ledger = main_bot.trade_ledger._ledger
+    saved_mirror = main_bot.trade_ledger._mirror
+    main_bot.state = main_bot.StateStore(None)
+    path = Path(tmp_path) / "ledger.jsonl"
+    try:
+        with TestClient(main_bot.app) as client:
+            main_bot._QUOTE_LOG_MEMORY.clear()
+            main_bot._QUOTE_LOG_SEEN.clear()
+            quoted = client.get(
+                "/etrade/quote",
+                params={"symbols": OCC},
+                headers={"X-Rork-Secret": "s3cret"},
+            )
+            logged = client.get(
+                "/etrade/quotes/log",
+                params={"symbol": OCC, "limit": 10},
+                headers={"X-Rork-Secret": "s3cret"},
+            )
+        assert quoted.status_code == 200, quoted.text
+        assert logged.status_code == 200, logged.text
+        rows = logged.json()["quotes"]
+        assert len(rows) == 1
+        assert rows[0]["option_symbol"] == OCC
+        assert rows[0]["symbol"] == "INTC"
+        assert OCC in logged.text
+        assert FAKE_KEY not in logged.text
+        assert "/v1/accounts/{acct}/" in logged.text
+
+        log_lines = [rec.getMessage() for rec in caplog.records if rec.getMessage().startswith("etrade_quote ")]
+        assert log_lines
+        assert OCC not in log_lines[-1]
+        assert "{redacted}" in log_lines[-1]
+
+        main_bot._OPTION_SNAPSHOT_PENDING.clear()
+        main_bot._OPTION_SNAPSHOT_SEEN.clear()
+        main_bot.trade_ledger.set_mirror(None)
+        main_bot.trade_ledger.init(path)
+        preset = {
+            "status": "ok",
+            "bid": 1.25,
+            "ask": 1.35,
+            "last": 1.28,
+            "dateTime": "15:30:00 EST 11-25-2026",
+            "option_symbol": OCC,
+            "_quote_time_source": "broker_quote",
+            "_fetched_at": "2026-11-25T20:30:00+00:00",
+        }
+        main_bot._enqueue_option_snapshot(
+            SIGNAL_KEY, None, datetime(2026, 11, 25, 20, 30, tzinfo=timezone.utc),
+            {"ticker": "INTC", "option_symbol": OCC},
+            offset_kind="exit_fill", order_id=ORDER_ID, preset_quote=preset,
+        )
+
+        async def write():
+            return await main_bot._option_snapshot_tick(datetime(2099, 1, 1, tzinfo=timezone.utc))
+
+        assert _run(write()) == 1
+        raw = path.read_text(encoding="utf-8")
+        ledger = json.loads(raw)
+    finally:
+        main_bot.state = saved_state
+        main_bot.trade_ledger._ledger = saved_ledger
+        main_bot.trade_ledger._mirror = saved_mirror
+
+    data = ledger["data"]
+    assert data["quote"]["option_symbol"] == OCC
+    assert data["order_id"] == ORDER_ID
+    assert data["signal_key"] == SIGNAL_KEY
+    assert OCC.encode() in raw.encode()
+    assert ORDER_ID.encode() in raw.encode()
+    assert SIGNAL_KEY.encode() in raw.encode()
+    assert FAKE_KEY not in raw

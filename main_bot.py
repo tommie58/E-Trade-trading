@@ -3442,7 +3442,11 @@ def parse_open_orders(orders_resp: Dict[str, Any], *, blank_as_open: bool = True
                 status = text or "UNKNOWN"
             try:
                 # E*TRADE stamps executedTime in epoch MILLISECONDS.
-                executed_ts = float(detail.get("executedTime") or 0) / 1000.0
+                # filledTime is the same clock when executedTime is absent.
+                raw_ts = detail.get("executedTime")
+                if raw_ts in (None, "", 0):
+                    raw_ts = detail.get("filledTime")
+                executed_ts = float(raw_ts or 0) / 1000.0
             except (TypeError, ValueError):
                 executed_ts = 0.0
             offset_value = trail_offset_from_order_detail(detail)
@@ -3909,6 +3913,7 @@ def plan_ghost_resolution(
             "kind": GHOST_CLOSED,
             "order_id": str(order.get("order_id") or ""),
             "exit_price": price,
+            "executed_ts": executed_ts if executed_ts > 0 else None,
             "basis": basis,
             # Only a STOP-type order has a trigger to slip from.
             # FIXED triggers only. A native trail's `stopPrice` is the trigger it
@@ -26727,6 +26732,10 @@ def _records_from_equity_quotes(
         return []
     option_by_root: Dict[str, str] = {}
     for raw in _requested_quote_symbols(args):
+        occ = _exact_occ_symbol(raw)
+        if occ:
+            option_by_root.setdefault(_occ_root(occ), occ)
+            continue
         split = _split_option_symbol(raw)
         if split:
             option_by_root.setdefault(split[0], split[1])
@@ -26739,8 +26748,12 @@ def _records_from_equity_quotes(
         raw_symbol = str(product.get("symbol") or entry.get("symbol") or "").strip()
         if not raw_symbol:
             continue
-        split = _split_option_symbol(raw_symbol)
-        if split:
+        occ = _exact_occ_symbol(raw_symbol)
+        split = None if occ else _split_option_symbol(raw_symbol)
+        if occ:
+            symbol = _occ_root(occ)
+            option_symbol = occ
+        elif split:
             symbol, option_symbol = split
         else:
             symbol = raw_symbol.upper()
@@ -26796,15 +26809,17 @@ def _records_from_option_chain(
             leg_symbol = str(leg.get("symbol") or underlying or "").strip().upper()
             if not leg_symbol:
                 continue
-            # Colon form, not the OSI key: the OSI strike is an 8-digit run and
-            # scrub_etrade_text would erase it. This is the same symbol the
-            # bot sends to get_quote.
-            option_symbol = _built_option_symbol(
-                leg_symbol,
-                leg.get("expirationDate") or expiry,
-                leg.get("optionType") or side or chain_right,
-                leg.get("strikePrice"),
-            )
+            # Keep a broker OCC symbol byte-for-byte. Otherwise build the
+            # colon symbol from the leg's own root, expiry, right, and strike.
+            osi = leg.get("osiKey")
+            option_symbol = _exact_occ_symbol(osi) if isinstance(osi, str) else None
+            if option_symbol is None:
+                option_symbol = _built_option_symbol(
+                    leg_symbol,
+                    leg.get("expirationDate") or expiry,
+                    leg.get("optionType") or side or chain_right,
+                    leg.get("strikePrice"),
+                )
             leg_status = leg.get("quoteStatus")
             use_status = None if leg_status is None else str(leg_status).upper().strip()
             if use_status is None:
@@ -26840,40 +26855,93 @@ def _extract_etrade_quote_records(
     return []
 
 
-def _format_etrade_quote_line(record: Dict[str, Any]) -> str:
-    """One scrubbed logger line. Raises if the line cannot stay valid JSON."""
-    secrets = _quote_log_secrets()
+# Identity fields are built from the symbol, the contract, the signal, or the
+# order id. They are not run through the 8-digit log scrub: that rule turns an
+# OCC strike and a numeric order id into "{redacted}".
+_QUOTE_IDENTITY_FIELDS = frozenset({"option_symbol", "order_id", "signal_key"})
+_OCC_SYMBOL_RE = re.compile(r"^[A-Z]{1,6} *\d{6}[CP]\d{8}$")
+
+
+def _exact_occ_symbol(raw: Any) -> Optional[str]:
+    """The OCC text as given, when it is an option symbol and not a URL."""
+    if not isinstance(raw, str) or not _OCC_SYMBOL_RE.match(raw):
+        return None
+    if "://" in raw or "/" in raw:
+        return None
+    return raw
+
+
+def _occ_root(occ: str) -> str:
+    match = re.match(r"^[A-Z]+", occ)
+    return match.group(0) if match else occ
+
+
+def _scrub_structured_text(text: str) -> str:
+    """URLs, OAuth, and known account-key values. Not the generic 8-digit rule."""
+    cleaned = str(text)
+    for secret in _quote_log_secrets():
+        if secret and len(secret) >= 4 and secret in cleaned:
+            cleaned = cleaned.replace(secret, "{acct}")
+    return _scrub_etrade_urls(cleaned)
+
+
+def _scrub_structured_value(value: Any) -> Any:
+    """Structured quote/snapshot JSON. Identity fields keep their digits."""
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _RESPONSE_KEY_FIELDS and isinstance(item, str):
+                out[key] = mask_account_key(item)
+            elif key in _RESPONSE_NUMBER_FIELDS and isinstance(item, str):
+                out[key] = mask_account_key(item)
+            elif key in _QUOTE_IDENTITY_FIELDS and isinstance(item, str):
+                # Built from the contract, the order, or the signal. A configured
+                # account id that happens to sit inside them is left as written.
+                out[key] = item
+            elif isinstance(item, str):
+                out[key] = _scrub_structured_text(item)
+            else:
+                out[key] = _scrub_structured_value(item)
+        return out
+    if isinstance(value, list):
+        return [_scrub_structured_value(item) for item in value]
+    if isinstance(value, str):
+        return _scrub_structured_text(value)
+    return value
+
+
+def _structured_quote_body(record: Dict[str, Any]) -> Dict[str, Any]:
     body: Dict[str, Any] = {}
     for key in ETRADE_QUOTE_LOG_FIELDS:
         value = record.get(key)
-        if isinstance(value, str):
-            value = scrub_etrade_text(value, secrets=secrets)
+        if key in _QUOTE_IDENTITY_FIELDS and isinstance(value, str):
+            pass
+        elif isinstance(value, str):
+            value = _scrub_structured_text(value)
         elif isinstance(value, float) and not math.isfinite(value):
             value = None
         body[key] = value
     body["realtime"] = bool(body.get("realtime"))
+    return body
+
+
+def _format_etrade_quote_line(record: Dict[str, Any]) -> str:
+    """Stored quote record. The plain logger line is scrubbed separately."""
+    body = _structured_quote_body(record)
     payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     line = ETRADE_QUOTE_LOG_PREFIX + payload
-    scrubbed = scrub_etrade_text(line, secrets=secrets)
-    if not scrubbed.startswith(ETRADE_QUOTE_LOG_PREFIX):
-        raise ValueError("quote log prefix missing")
-    parsed = json.loads(scrubbed[len(ETRADE_QUOTE_LOG_PREFIX):])
+    parsed = json.loads(payload)
     if not isinstance(parsed, dict):
         raise ValueError("quote log is not an object")
-    for key in ETRADE_QUOTE_LOG_FIELDS:
-        parsed.setdefault(key, body.get(key))
-    final_body = {key: parsed.get(key) for key in ETRADE_QUOTE_LOG_FIELDS}
-    final = ETRADE_QUOTE_LOG_PREFIX + json.dumps(
-        final_body, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
-    )
-    again = scrub_etrade_text(final, secrets=secrets)
+    return line
+
+
+def _etrade_quote_log_line(line: str) -> str:
+    """What the process logger writes. Full #38 scrub, including 8-digit runs."""
     try:
-        json.loads(again[len(ETRADE_QUOTE_LOG_PREFIX):])
-    except (json.JSONDecodeError, ValueError, TypeError):
-        return final
-    if not again.startswith(ETRADE_QUOTE_LOG_PREFIX):
-        return final
-    return again
+        return scrub_etrade_text(line, secrets=_quote_log_secrets())
+    except Exception:
+        return line
 
 
 def _note_quote_log_loop() -> None:
@@ -26950,7 +27018,7 @@ def _observe_etrade_quote_fetch_inner(
                     _QUOTE_LOG_SEEN.pop(key, None)
     for line in kept:
         try:
-            logger.info(line)
+            logger.info(_etrade_quote_log_line(line))
         except Exception:
             pass
     _schedule_quote_log_redis(kept)
@@ -27019,8 +27087,7 @@ def _parse_quote_log_line(line: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(parsed, dict):
         return None
     try:
-        cleaned = _format_etrade_quote_line(parsed)
-        rec = json.loads(cleaned[len(ETRADE_QUOTE_LOG_PREFIX):])
+        rec = _structured_quote_body(parsed)
     except Exception:
         return None
     if not isinstance(rec, dict):
@@ -27211,23 +27278,11 @@ def _missing_option_quote(spec: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _scrub_snapshot_value(value: Any) -> Any:
-    secrets = _quote_log_secrets()
+    """Ledger snapshot JSON. URLs and known keys only; OCC symbols stay intact."""
     try:
-        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False, default=str)
-        cleaned = scrub_etrade_text(encoded, secrets=secrets)
-        parsed = json.loads(cleaned)
-    except (TypeError, ValueError):
-        if isinstance(value, str):
-            return scrub_etrade_text(value, secrets=secrets)
+        return _scrub_structured_value(value)
+    except Exception:
         return value
-    again = scrub_etrade_text(
-        json.dumps(parsed, ensure_ascii=False, separators=(",", ":"), allow_nan=False, default=str),
-        secrets=secrets,
-    )
-    try:
-        return json.loads(again)
-    except (TypeError, ValueError):
-        return parsed
 
 
 def _trim_option_snapshot_seen() -> None:
@@ -27317,6 +27372,8 @@ def _enqueue_option_snapshot(
     offset_kind: Optional[str] = None,
     order_id: Optional[str] = None,
     preset_quote: Optional[Dict[str, Any]] = None,
+    fill_time: Optional[str] = None,
+    fill_time_source: Optional[str] = None,
 ) -> str:
     """'queued', 'duplicate', or 'capped'. Does not fetch and does not await."""
     kind = offset_kind or ("entry" if offset_min == 0 else "modeled")
@@ -27338,6 +27395,8 @@ def _enqueue_option_snapshot(
             "due_epoch": due_epoch,
             "spec": spec,
             "preset_quote": preset_quote,
+            "fill_time": fill_time,
+            "fill_time_source": fill_time_source,
         }
         return "queued"
 
@@ -27448,6 +27507,11 @@ async def _write_option_snapshot_row(job: Dict[str, Any]) -> None:
         "quote_time_source": time_source,
         "quote": public,
     })
+    if body.get("offset_kind") == "exit_fill":
+        # The ledger `ts` stays the booking time. fill_time is the broker
+        # execution clock when the order poll already carried one.
+        body["fill_time"] = job.get("fill_time")
+        body["fill_time_source"] = job.get("fill_time_source") or "local_record"
     try:
         await trade_ledger.record("option_quote_snapshot", body)
     except Exception as e:
@@ -27588,6 +27652,61 @@ def _spec_from_position(ticker: str, pos: Optional[dict], payload: Optional[dict
     return scrubbed if isinstance(scrubbed, dict) else spec
 
 
+_EXIT_FILL_TS: Dict[str, float] = {}
+
+
+def _remember_exit_fill_ts(order_id: Any, executed_ts: Any) -> None:
+    """Keep a fill clock the order-status poll already parsed. No new request."""
+    if order_id is None:
+        return
+    try:
+        ts = float(executed_ts)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(ts) or ts <= 0:
+        return
+    if ts > 10_000_000_000:
+        ts = ts / 1000.0
+    _EXIT_FILL_TS[str(order_id)] = ts
+
+
+def broker_fill_time_et(raw: Any) -> Optional[str]:
+    """E*TRADE executedTime / filledTime as an ET ISO timestamp. None if absent.
+
+    Values above 1e11 are epoch milliseconds, matching the order-list parser.
+    Smaller positive values are epoch seconds.
+    """
+    try:
+        ts = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ts) or ts <= 0:
+        return None
+    if ts > 10_000_000_000:
+        ts = ts / 1000.0
+    try:
+        stamped = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(_ET_ZONE)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return stamped.isoformat()
+
+
+def _exit_fill_clock(order_id: Optional[str], payload: Optional[dict]) -> Tuple[Optional[str], str]:
+    """(fill_time, fill_time_source) from clocks already on the poll or the payload."""
+    raw = None
+    if isinstance(payload, dict):
+        for key in ("executed_ts", "executedTime", "filledTime"):
+            if payload.get(key) not in (None, "", 0):
+                raw = payload.get(key)
+                break
+    if raw is None and order_id:
+        raw = _EXIT_FILL_TS.get(str(order_id))
+    et = broker_fill_time_et(raw)
+    if et:
+        return et, "broker_executed"
+    return None, "local_record"
+
+
 def enqueue_exit_option_snapshot(
     ticker: str, pos: Optional[dict], payload: Optional[dict],
     close_reason: Optional[str], expired: bool = False,
@@ -27600,9 +27719,14 @@ def enqueue_exit_option_snapshot(
         signal_key = _position_signal_key(ticker, pos, payload)
         spec = _spec_from_position(ticker, pos, payload)
         order_id = _snapshot_order_id(pos, payload)
+        fill_time = None
+        fill_source = None
+        if kind == "exit_fill":
+            fill_time, fill_source = _exit_fill_clock(order_id, payload)
         outcome = _enqueue_option_snapshot(
             signal_key, None, _utcnow(), spec,
             offset_kind=kind, order_id=order_id,
+            fill_time=fill_time, fill_time_source=fill_source,
         )
         if outcome == "capped":
             logger.warning(
@@ -27687,6 +27811,90 @@ def note_polled_stop_touch(ticker: str, pos: dict, bid: Any, ask: Any, mark: Any
             "option quote snapshot stop-touch enqueue failed: %s",
             scrub_etrade_text(str(e), secrets=_quote_log_secrets()),
         )
+
+
+# One consumer owns every ledger append this process makes, including
+# option_quote_snapshot rows. A caller that times out is cancelled while
+# waiting, not while the hash is being written, so the next record chains
+# from the row that actually landed.
+_LEDGER_WRITE_Q: Optional[asyncio.Queue] = None
+_LEDGER_WRITER: Optional[asyncio.Task] = None
+_LEDGER_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_LEDGER_WRITTEN = 0
+_LEDGER_DROPPED = 0
+_LEDGER_QUEUE_MAX = 10000
+
+
+def ledger_writer_counts() -> Dict[str, int]:
+    """Appends the sequential writer finished, and appends it did not keep."""
+    return {"written": _LEDGER_WRITTEN, "dropped": _LEDGER_DROPPED}
+
+
+def _ensure_ledger_writer() -> asyncio.Queue:
+    global _LEDGER_WRITE_Q, _LEDGER_WRITER, _LEDGER_LOOP
+    loop = asyncio.get_running_loop()
+    if _LEDGER_LOOP is not loop or _LEDGER_WRITE_Q is None or (
+        _LEDGER_WRITER is not None and _LEDGER_WRITER.done()
+    ):
+        _LEDGER_WRITE_Q = asyncio.Queue(maxsize=_LEDGER_QUEUE_MAX)
+        _LEDGER_LOOP = loop
+        _LEDGER_WRITER = None
+    if _LEDGER_WRITER is None or _LEDGER_WRITER.done():
+        _LEDGER_WRITER = loop.create_task(_ledger_write_consumer(), name="ledger-writer")
+    return _LEDGER_WRITE_Q
+
+
+async def _ledger_write_consumer() -> None:
+    global _LEDGER_WRITTEN, _LEDGER_DROPPED
+    queue = _LEDGER_WRITE_Q
+    direct = trade_ledger._direct_record
+    while True:
+        item = await queue.get()
+        if item is None:
+            queue.task_done()
+            return
+        event, data, fut = item
+        try:
+            seq = await asyncio.shield(direct(event, data))
+            if seq is None:
+                _LEDGER_DROPPED += 1
+            else:
+                _LEDGER_WRITTEN += 1
+            if not fut.done():
+                fut.set_result(seq)
+        except asyncio.CancelledError:
+            if not fut.done():
+                fut.cancel()
+            raise
+        except Exception as e:
+            _LEDGER_DROPPED += 1
+            if not fut.done():
+                fut.set_exception(e)
+        finally:
+            queue.task_done()
+
+
+async def _queued_ledger_record(event: str, data: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """Hand one append to the single writer. Cancellation waits, it does not cut the write."""
+    global _LEDGER_DROPPED
+    try:
+        queue = _ensure_ledger_writer()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        queue.put_nowait((event, data, fut))
+    except asyncio.QueueFull:
+        _LEDGER_DROPPED += 1
+        return None
+    except Exception as e:
+        _LEDGER_DROPPED += 1
+        logger.error(f"ledger append failed ({event}): {e}")
+        return None
+    return await fut
+
+
+if not getattr(trade_ledger, "_direct_record", None):
+    trade_ledger._direct_record = trade_ledger.record
+    trade_ledger.record = _queued_ledger_record
+    trade_ledger.writer_counts = ledger_writer_counts
 
 
 async def option_snapshot_worker() -> None:
@@ -28339,6 +28547,7 @@ async def _resolve_exit_fill(order_id, timeout_s: float = EXIT_FILL_TIMEOUT_SECO
                 if _filled_order_status(order.get("status")):
                     price = float(order.get("exec_price") or 0)
                     if price > 0:
+                        _remember_exit_fill_ts(order_id, order.get("executed_ts"))
                         return price
         except Exception as e:
             logger.warning(f"[CLOSE FILL] fill poll for order {order_id} failed: {e}")
@@ -37439,6 +37648,10 @@ async def _reconcile_record_close(ticker: str, pos: dict, resolution: dict) -> N
         return
     reason = f"fill_capture:{resolution.get('source') or 'unknown'}"
     broker_stop = resolution.get("stop_price")
+    if resolution.get("executed_ts"):
+        payload["executed_ts"] = resolution.get("executed_ts")
+    if resolution.get("order_id"):
+        payload["order_id"] = resolution.get("order_id")
     if str(resolution.get("basis") or "") == "premium":
         await _record_close(ticker, None, payload, exit_premium=exit_price, close_reason=reason,
                             stop_price=broker_stop)

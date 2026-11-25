@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime
+import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -491,6 +493,179 @@ def _async_none():
     async def _inner(*args, **kwargs):
         return None
     return _inner()
+
+
+def test_exit_fill_uses_the_polled_execution_clock(tmp_path, monkeypatch):
+    """fill_time comes from the order poll already in hand. No second order read."""
+    calls = {"orders": 0}
+
+    async def orders():
+        calls["orders"] += 1
+        raise AssertionError("exit snapshot must not poll orders again")
+
+    async def quote(spec):
+        return {
+            "status": "ok", "bid": 1.2, "ask": 1.3, "last": 1.25,
+            "dateTime": "15:30:00 EST 11-25-2026",
+            "option_symbol": (spec or {}).get("option_symbol"),
+            "_quote_time_source": "broker_quote",
+            "_fetched_at": "2026-11-25T20:30:00+00:00",
+        }
+
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", orders)
+    monkeypatch.setattr(main_bot, "_read_option_snapshot_quote", quote)
+    when = datetime(2026, 11, 25, 15, 30, tzinfo=ET)
+    pos = _option_pos()
+    saved = main_bot.trade_ledger._ledger
+    saved_mirror = main_bot.trade_ledger._mirror
+    path = Path(tmp_path) / "ledger.jsonl"
+    main_bot.trade_ledger.set_mirror(None)
+    main_bot.trade_ledger.init(path)
+    try:
+        main_bot.enqueue_exit_option_snapshot(
+            "SPY", pos, {"ticker": "SPY", "executed_ts": when.timestamp()},
+            "close_fill", False,
+        )
+        bare = _option_pos("ORD45")
+        main_bot.enqueue_exit_option_snapshot(
+            "SPY", bare, {"ticker": "SPY", "signal_id": "exit-2", "order_id": "ORD45"},
+            "close_fill", False,
+        )
+
+        async def write():
+            return await main_bot._option_snapshot_tick(datetime(2099, 1, 1, tzinfo=timezone.utc))
+
+        assert _run(write()) == 2
+        rows = [json.loads(line)["data"] for line in path.read_text(encoding="utf-8").splitlines()]
+    finally:
+        main_bot.trade_ledger._ledger = saved
+        main_bot.trade_ledger._mirror = saved_mirror
+    assert calls["orders"] == 0
+    by_order = {row["order_id"]: row for row in rows}
+    assert by_order["ORD44"]["fill_time"] == when.isoformat()
+    assert by_order["ORD44"]["fill_time_source"] == "broker_executed"
+    assert by_order["ORD45"]["fill_time"] is None
+    assert by_order["ORD45"]["fill_time_source"] == "local_record"
+    assert main_bot.broker_fill_time_et(when.timestamp() * 1000) == when.isoformat()
+
+
+def test_timed_out_snapshot_append_keeps_the_hash_chain(tmp_path, monkeypatch):
+    """A cancelled waiter does not cut the append. The next record chains after it."""
+    saved = main_bot.trade_ledger._ledger
+    saved_mirror = main_bot.trade_ledger._mirror
+    path = Path(tmp_path) / "ledger.jsonl"
+    main_bot.trade_ledger.set_mirror(None)
+    main_bot.trade_ledger.init(path)
+    original = main_bot.trade_ledger.TradeLedger._append_line
+    started = threading.Event()
+
+    def slow(self, line):
+        started.set()
+        time.sleep(0.3)
+        return original(self, line)
+
+    monkeypatch.setattr(main_bot.trade_ledger.TradeLedger, "_append_line", slow)
+    main_bot._LEDGER_WRITTEN = 0
+    main_bot._LEDGER_DROPPED = 0
+
+    async def scenario():
+        snap = asyncio.create_task(main_bot.trade_ledger.record(
+            "option_quote_snapshot", {"option_symbol": OCC, "order_id": ORDER_ID},
+        ))
+        await asyncio.to_thread(started.wait, 2)
+        snap.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await snap
+        await main_bot.trade_ledger.record("position_opened", {"ticker": "INTC"})
+        ok, count, err = main_bot.trade_ledger.verify()
+        assert ok, err
+        assert count == 2
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        assert rows[1]["prev_hash"] == rows[0]["hash"]
+        assert rows[0]["event"] == "option_quote_snapshot"
+        counts = main_bot.ledger_writer_counts()
+        assert counts == {"written": 2, "dropped": 0}
+
+    try:
+        _run(scenario())
+    finally:
+        main_bot.trade_ledger._ledger = saved
+        main_bot.trade_ledger._mirror = saved_mirror
+
+
+OCC = "INTC  261127C12345678"
+ORDER_ID = "991234567800"
+SIGNAL_KEY = "sig:abc12345678def"
+
+
+def test_identity_fields_survive_an_account_id_substring(tmp_path, monkeypatch):
+    monkeypatch.setattr(main_bot, "_resolved_account_id_key", "12345678")
+    monkeypatch.setenv("ETRADE_QUOTE_LOG_MIN_INTERVAL_S", "0")
+    monkeypatch.setenv("ETRADE_QUOTE_LOG_ENABLED", "true")
+    main_bot._QUOTE_LOG_MEMORY.clear()
+    main_bot._QUOTE_LOG_SEEN.clear()
+    main_bot._OPTION_SNAPSHOT_PENDING.clear()
+    payload = {
+        "QuoteResponse": {"QuoteData": [{
+            "dateTime": "15:30:00 EST 11-25-2026",
+            "quoteStatus": "REALTIME",
+            "Product": {"symbol": "INTC", "securityType": "OPTN"},
+            "All": {"bid": 1.2, "ask": 1.3, "lastTrade": 1.25, "open": 1.1, "previousClose": 1.0},
+        }]},
+    }
+
+    async def fetch_and_read():
+        await main_bot._etrade_call(
+            lambda symbols, resp_format="json": payload,
+            [OCC], resp_format="json", source="quote", quote_log_as="/etrade/quote",
+        )
+        return await main_bot.etrade_quotes_log(
+            symbol=OCC, since=None, limit=10, x_rork_secret="s3cret",
+        )
+
+    monkeypatch.setattr(main_bot, "WEBHOOK_SECRET", "s3cret")
+    main_bot._QUOTE_LOG_READS.clear()
+    listed = _run(fetch_and_read())
+    assert listed["quotes"][0]["option_symbol"] == OCC
+
+    saved = main_bot.trade_ledger._ledger
+    saved_mirror = main_bot.trade_ledger._mirror
+    path = Path(tmp_path) / "ledger.jsonl"
+    main_bot.trade_ledger.set_mirror(None)
+    main_bot.trade_ledger.init(path)
+    preset = {
+        "status": "ok", "bid": 1.2, "ask": 1.3, "last": 1.25,
+        "dateTime": "15:30:00 EST 11-25-2026",
+        "option_symbol": OCC,
+        "_quote_time_source": "broker_quote",
+        "_fetched_at": "2026-11-25T20:30:00+00:00",
+    }
+    try:
+        main_bot._OPTION_SNAPSHOT_PENDING.clear()
+        main_bot._enqueue_option_snapshot(
+            SIGNAL_KEY, None, datetime(2026, 11, 25, tzinfo=timezone.utc),
+            {"ticker": "INTC", "option_symbol": OCC},
+            offset_kind="exit_fill", order_id=ORDER_ID, preset_quote=preset,
+            fill_time="2026-11-25T15:30:00-05:00", fill_time_source="broker_executed",
+        )
+
+        async def write():
+            return await main_bot._option_snapshot_tick(datetime(2099, 1, 1, tzinfo=timezone.utc))
+
+        assert _run(write()) == 1
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)["data"]
+    finally:
+        main_bot.trade_ledger._ledger = saved
+        main_bot.trade_ledger._mirror = saved_mirror
+
+    assert data["quote"]["option_symbol"] == OCC
+    assert data["order_id"] == ORDER_ID
+    assert data["signal_key"] == SIGNAL_KEY
+    assert data["fill_time"] == "2026-11-25T15:30:00-05:00"
+    assert "12345678" in data["quote"]["option_symbol"]
+    assert "12345678" in data["order_id"]
+    assert "12345678" in data["signal_key"]
 
 
 def test_quote_age_uses_the_documented_quote_time():
