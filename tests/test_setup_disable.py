@@ -3,6 +3,7 @@ import asyncio
 import importlib.util
 import inspect
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -1227,3 +1228,171 @@ def test_shutdown_drain_writes_rows_that_finish_within_two_seconds(tmp_path):
     assert status["dropped"] == 0
     assert [row["data"]["signal_id"] for row in rows] == ["w-0", "w-1"]
     assert main_bot._shadow_log.verify()[0] is True
+
+
+def test_shadow_log_survives_a_file_wipe_via_the_mirror(tmp_path):
+    main_bot.reset_setup_disable_state()
+    path = tmp_path / "setup_disable_shadow.jsonl"
+    _open_shadow(tmp_path)
+    durable = []
+
+    async def mirror(seq, rec_hash, line):
+        durable.append(line)
+
+    main_bot.set_shadow_mirror(mirror)
+    payload = {
+        "ticker": "FAKE", "setup": "breakdown", "action": "BUY",
+        "option_right": "CALL", "signal_id": "restore-me",
+    }
+
+    async def write_two():
+        await main_bot.persist_setup_disable_decision(
+            payload, quantity=1, enforced=False, quantity_basis="after_sizing",
+            path="entry", fresh_order=True,
+            outcome={"order_id": "1", "placement_status": "placed"},
+        )
+        await main_bot.persist_setup_disable_decision(
+            payload, quantity=1, enforced=False, quantity_basis="after_sizing",
+            path="entry", fresh_order=True,
+            outcome={"order_id": "2", "placement_status": "placed"},
+        )
+
+    asyncio.run(write_two())
+    assert [row["data"]["attempt"] for row in main_bot.read_setup_disable_shadow(10)] == [1, 2]
+    path.unlink()
+    restored = main_bot.restore_shadow_lines(path, durable)
+    main_bot.init_setup_disable_shadow_log(path)
+    main_bot.reset_setup_disable_state()
+    main_bot._shadow_ledger_counts["durable"] = len(durable)
+    main_bot._shadow_ledger_counts["on_disk"] = restored
+    main_bot.seed_setup_disable_from_ledger()
+
+    async def write_third():
+        await main_bot.persist_setup_disable_decision(
+            payload, quantity=1, enforced=False, quantity_basis="after_sizing",
+            path="entry", fresh_order=True,
+            outcome={"order_id": "3", "placement_status": "placed"},
+        )
+
+    try:
+        asyncio.run(write_third())
+        rows = main_bot.read_setup_disable_shadow(10)
+        core = main_bot.trade_ledger.recent(20) if main_bot.trade_ledger._ledger else []
+        status = main_bot.setup_disable_status()["ledger"]
+    finally:
+        main_bot.set_shadow_mirror(None)
+        main_bot.reset_setup_disable_state()
+    assert restored == 2
+    assert [row["data"]["attempt"] for row in rows] == [1, 2, 3]
+    keys = [row["data"]["signal_key"] for row in rows]
+    assert len(keys) == len(set(keys))
+    assert all(row.get("event") != "setup_disable_shadow" for row in core)
+    assert status["on_disk"] == 3
+    assert status["durable"] == 3
+    assert "bot_shadow_ledger" in main_bot._shadow_ledger_table_sql()
+    assert "bot_ledger" not in main_bot._shadow_ledger_table_sql().split("bot_shadow_ledger")[0]
+
+
+def test_fsync_failure_does_not_break_the_next_shadow_hash(tmp_path, monkeypatch):
+    main_bot.reset_setup_disable_state()
+    _open_shadow(tmp_path)
+    log = main_bot._shadow_log
+    real = main_bot.os.fsync
+
+    def boom(fd):
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(main_bot.os, "fsync", boom)
+    try:
+        log.append({"setup": "breakdown", "signal_id": "a"})
+    except OSError:
+        pass
+    monkeypatch.setattr(main_bot.os, "fsync", real)
+    log.append({"setup": "breakdown", "signal_id": "b"})
+    ok, checked, err = log.verify()
+    assert ok is True, err
+    assert checked == 2
+
+
+def test_overlapping_appends_keep_one_shadow_chain(tmp_path, monkeypatch):
+    import threading
+    import time
+    main_bot.reset_setup_disable_state()
+    _open_shadow(tmp_path)
+    log = main_bot._shadow_log
+    real = os.fsync
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow(fd):
+        if not started.is_set():
+            started.set()
+            release.wait(timeout=2)
+        return real(fd)
+
+    monkeypatch.setattr(main_bot.os, "fsync", slow)
+    errors = []
+
+    def one(payload):
+        try:
+            log.append(payload)
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+
+    first = threading.Thread(target=one, args=({"signal_id": "1"},))
+    second = threading.Thread(target=one, args=({"signal_id": "2"},))
+    first.start()
+    assert started.wait(1)
+    second.start()
+    time.sleep(0.05)
+    release.set()
+    first.join(3)
+    second.join(3)
+    ok, checked, err = log.verify()
+    assert not errors
+    assert ok is True, err
+    assert checked == 2
+    assert [row["seq"] for row in log.recent(10)] == [1, 2]
+
+
+def test_partial_trailing_line_is_truncated_so_verify_passes(tmp_path):
+    main_bot.reset_setup_disable_state()
+    _open_shadow(tmp_path)
+    log = main_bot._shadow_log
+    log.append({"signal_id": "whole"})
+    with open(log.path, "a", encoding="utf-8") as handle:
+        handle.write('{"seq": 2, "partial"')
+    reopened = main_bot.SetupDisableShadowLog(log.path)
+    ok, checked, err = reopened.verify()
+    assert ok is True, err
+    assert checked == 1
+    assert reopened.partial_truncated == 1
+
+
+def test_dead_shadow_writer_does_not_make_shutdown_wait(tmp_path):
+    import time
+    main_bot.reset_setup_disable_state()
+    _open_shadow(tmp_path)
+
+    async def run():
+        async def dead():
+            raise RuntimeError("writer dead")
+
+        task = asyncio.create_task(dead())
+        with pytest.raises(RuntimeError):
+            await task
+        main_bot._shadow_writer = task
+        main_bot._shadow_queue = asyncio.Queue()
+        main_bot._shadow_queue.put_nowait(({"signal_id": "left"}, None))
+        main_bot._shadow_inflight = 1
+        started = time.perf_counter()
+        dropped = await main_bot.drain_shadow_queue()
+        return dropped, time.perf_counter() - started, main_bot.setup_disable_status()["ledger"]["dropped"]
+
+    try:
+        dropped, elapsed, counted = asyncio.run(run())
+    finally:
+        main_bot.reset_setup_disable_state()
+    assert dropped == 1
+    assert counted == 2
+    assert elapsed < 0.5
