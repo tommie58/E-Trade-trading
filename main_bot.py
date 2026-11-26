@@ -5422,6 +5422,7 @@ def plan_native_handoff(
     breakeven_locked: bool = False,
     mark: Any = None,
     option: bool = False,
+    entry: Any = None,
 ) -> Dict[str, Any]:
     """Whether to replace a fixed stop with an E*TRADE trailing stop.
 
@@ -5436,7 +5437,11 @@ def plan_native_handoff(
     first bounce is how winners were stopped out as noise. The trigger
     compared here is the bid minus that distance, floored to the cent. The
     placer rounds the order toward the market (tighter) and refuses, before
-    cancelling anything, if the order it would send sits below ``resting_stop``.
+    cancelling anything, if the order it would send sits below ``resting_stop``
+    or below ``entry``. ``entry`` is optional so older callers keep the
+    stop-only check. The floor is the fill itself: the engine ratchet may
+    rest one spread above entry, and that cushion stays the ratchet's job
+    when this handoff declines and falls through.
     """
     def decline(reason: str, why: str) -> Dict[str, Any]:
         return {"arm": False, "offset": None, "trigger": None, "reason": reason, "detail": why}
@@ -5480,6 +5485,19 @@ def plan_native_handoff(
             "would_loosen",
             f"native trigger {trigger:.2f} would sit below the resting stop "
             f"{stop_f:.2f} — keeping the tighter fixed stop",
+        )
+    # A breakeven lock can be true while the fixed stop is still the original
+    # ~20% level: this plan runs before the ratchet lifts it. A trigger that
+    # clears that stop can still sit under the fill (entry 3.00, stop 2.40,
+    # bid 3.24 → 2.79). Decline and leave the fixed stop for the ratchet.
+    entry_f = _finite(entry)
+    if entry_f is not None and entry_f > 0 and trigger + 1e-9 < entry_f:
+        return decline(
+            "below_entry",
+            (
+                f"native handoff declined: below_entry — trigger {trigger:.2f} "
+                f"sits under entry {entry_f:.2f}; the fixed stop stays resting"
+            ),
         )
     return {
         "arm": True,
@@ -16253,7 +16271,11 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # /status positions_open is the open book with status, side, and qty.
 # Logs, alerts, and HTTP responses mask accountIdKey (**** + last 4).
 # Order routing still uses the real key.
-BOT_VERSION = "5.99.11-pro-day-trader"
+# 5.99.12: a native trail handoff whose trigger would rest under the
+# entry price is declined (below_entry). The fixed stop stays and the
+# next pass retries. POST /trail/native uses the same floor unless the
+# body sets allow_below_entry true.
+BOT_VERSION = "5.99.12-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -29308,14 +29330,19 @@ async def _arm_native_trail(
     offset: Optional[float] = None,
     min_trigger: Optional[float] = None,
     source: str = "operator",
+    allow_below_entry: bool = False,
 ) -> dict:
     """Replace this position's resting stop with a BROKER-NATIVE trailing stop,
     sized from the live spread.
 
     The trail worker calls this with source="auto" when `plan_native_handoff`
-    says the trail is at least as tight as the fixed stop. The /trail/native
-    endpoint still calls it for an operator. Either way, once the order rests,
-    the reconciler adopts it and the engine trail stands down.
+    says the trail is at least as tight as the fixed stop and the fill. The
+    /trail/native endpoint still calls it for an operator. Either way, once
+    the order rests, the reconciler adopts it and the engine trail stands down.
+
+    The trigger must clear ``max(min_trigger, entry)`` before any cancel.
+    ``allow_below_entry`` skips only the entry half of that floor, and only
+    when the operator set it on purpose. Auto and repair never set it.
 
     WHY CANCEL BEFORE PLACE, despite the naked window. The obvious safer order
     is place-then-cancel, and it does not work here: the resting stop already
@@ -29325,9 +29352,9 @@ async def _arm_native_trail(
     original stop rather than returning with the position naked.
 
     Refuses rather than guesses on: an unmeasured spread, a chain too wide to
-    trail, a trigger that would loosen the resting stop, an unverifiable
-    cancel, and a stop that filled while we were working. Refusals that happen
-    before the cancel raise NativeTrailRefused.
+    trail, a trigger under the entry price, a trigger that would loosen the
+    resting stop, an unverifiable cancel, and a stop that filled while we
+    were working. Refusals that happen before the cancel raise NativeTrailRefused.
     """
     def refuse(why: str) -> None:
         raise NativeTrailRefused(f"{ticker}: {why}")
@@ -29386,9 +29413,39 @@ async def _arm_native_trail(
                if is_option else round(bid - offset_value, 2))
     if trigger <= 0:
         refuse(f"trail offset {offset_value:.2f} exceeds the {bid:.2f} bid")
-    if min_trigger is not None and trigger + 1e-9 < float(min_trigger):
+    # BEFORE any cancel. A refusal here leaves the fixed stop resting.
+    # Auto and repair pass min_trigger at max(stop, entry); the position's
+    # own entry is enforced even when a caller forgets that floor.
+    stop_floor = None
+    if min_trigger is not None:
+        try:
+            stop_floor = float(min_trigger)
+        except (TypeError, ValueError):
+            stop_floor = None
+    if stop_floor is not None and not (stop_floor > 0):
+        stop_floor = None
+    entry_floor = entry if (entry > 0 and not allow_below_entry) else None
+    if stop_floor is not None and entry_floor is not None:
+        bound = max(stop_floor, entry_floor)
+    elif stop_floor is not None:
+        bound = stop_floor
+    else:
+        bound = entry_floor
+    if bound is not None and trigger + 1e-9 < bound:
+        entry_binds = (
+            entry_floor is not None
+            and trigger + 1e-9 < entry_floor
+            and (stop_floor is None or entry_floor + 1e-9 >= stop_floor)
+        )
+        if entry_binds:
+            why = (
+                f"native handoff declined: below_entry — trigger {trigger:.2f} "
+                f"sits under entry {entry_floor:.2f}"
+            )
+            logger.info(f"[NATIVE TRAIL] {ticker} {why} — fixed stop left resting")
+            refuse(why)
         refuse(
-            f"native trigger {trigger:.2f} would loosen the resting stop {float(min_trigger):.2f}"
+            f"native trigger {trigger:.2f} would loosen the resting stop {stop_floor:.2f}"
         )
 
     # Resolve the account BEFORE the cancel. A missing token or an account
@@ -37568,10 +37625,10 @@ async def _maybe_repair_inflated_native_trail(
     fresh["native_trail_skip"] = None
     await state.set_position(ticker, fresh)
 
-    # Floor the new trigger at the old (too-loose) stopPrice if we can read it,
-    # otherwise at the journaled stop — never loosen what little protection
-    # the swapped trail still had.
-    min_trigger = base_stop if base_stop > 0 else None
+    # Floor at the tightest of the old stop, the journaled stop, and the fill.
+    # A repair that only cleared the swapped stop could re-arm under entry.
+    floors = [v for v in (base_stop, entry) if v > 0]
+    min_trigger = max(floors) if floors else None
     try:
         resp = await _reconcile_fetch_orders()
         for order in reconciliation.parse_open_orders(resp):
@@ -37579,10 +37636,12 @@ async def _maybe_repair_inflated_native_trail(
                 continue
             old_stop = order.get("stop_price")
             if old_stop is not None and float(old_stop) > 0:
-                min_trigger = max(float(min_trigger or 0), float(old_stop)) or float(old_stop)
+                min_trigger = max(float(min_trigger or 0), float(old_stop))
             break
     except Exception:
         pass
+    if min_trigger is not None and min_trigger <= 0:
+        min_trigger = None
 
     try:
         await _arm_native_trail(ticker, min_trigger=min_trigger, source="repair")
@@ -37688,13 +37747,22 @@ async def _maybe_hand_off_native_trail(
         breakeven_locked=be_locked,
         mark=bid if bid > 0 else entry,
         option=is_option,
+        entry=entry if entry > 0 else None,
     )
     if not plan["arm"]:
         await _remember_native_skip(ticker, pos, str(plan["reason"]), str(plan["detail"]))
         return False
 
+    # Clear both the resting stop and the fill. Breakeven can already be
+    # locked while the fixed stop is still ~20% under entry, because this
+    # runs before the ratchet moves it. A decline leaves that stop resting.
+    floor = max(base_stop, entry)
     try:
-        await _arm_native_trail(ticker, min_trigger=base_stop, source="auto")
+        await _arm_native_trail(
+            ticker,
+            min_trigger=floor if floor > 0 else None,
+            source="auto",
+        )
     except NativeTrailRefused as e:
         await _remember_native_skip(ticker, pos, "refused", str(e))
         return True
@@ -37944,9 +38012,10 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         return
 
     # Hand the resting fixed stop to E*TRADE once the spread supports a trail
-    # that is at least as tight. The next pass stands down and lets that
-    # order sell. A book that is too wide, or a trigger that would loosen the
-    # stop, falls through to the engine ratchet below.
+    # that is at least as tight as the stop and the fill. The next pass stands
+    # down and lets that order sell. A book that is too wide, a trigger under
+    # entry, or a trigger that would loosen the stop, falls through to the
+    # engine ratchet below. The fixed stop stays until that ratchet moves it.
     if await _maybe_hand_off_native_trail(ticker, pos, bid, spread):
         return
 
@@ -42394,7 +42463,8 @@ async def arm_native_trail(
 ):
     """Hand ONE position's protection to an E*TRADE-native trailing stop.
 
-    Body: { "ticker": "AAPL", "offset": 0.30 (optional), "dry_run": false }
+    Body: { "ticker": "AAPL", "offset": 0.30 (optional), "dry_run": false,
+            "allow_below_entry": false }
 
     With no `offset` the distance is derived from the instrument: options use
     NATIVE_TRAIL_OPTION_PCT of the live premium (at least 2×spread); equities
@@ -42407,9 +42477,11 @@ async def arm_native_trail(
 
     The trail worker also places this order on its own when NATIVE_TRAIL_AUTO
     is on, the trade has locked breakeven, and the trail trigger is at least
-    as tight as the fixed stop. A trail already resting at E*TRADE — placed
-    here, by the worker, or by hand — is adopted, and the engine trail
-    stands down.
+    as tight as the fixed stop and the entry price. A trigger under the fill
+    is refused and the fixed stop stays. ``allow_below_entry: true`` is the
+    only bypass, and it has to be the JSON boolean true. A trail already
+    resting at E*TRADE — placed here, by the worker, or by hand — is adopted,
+    and the engine trail stands down.
     """
     await _require_control_auth(x_rork_secret, "/trail/native")
     ticker = str((body or {}).get("ticker") or "").upper().strip()
@@ -42444,8 +42516,12 @@ async def arm_native_trail(
             **plan,
         }
 
+    # Same entry floor as the auto handoff. Only an explicit JSON true skips it.
+    allow_below_entry = (body or {}).get("allow_below_entry") is True
     try:
-        result = await _arm_native_trail(ticker, offset)
+        result = await _arm_native_trail(
+            ticker, offset, allow_below_entry=allow_below_entry,
+        )
     except Exception as e:
         raise HTTPException(400, detail=scrub_etrade_text(str(e)))
     return {"status": "armed", **result}

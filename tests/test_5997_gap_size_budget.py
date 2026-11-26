@@ -432,6 +432,12 @@ def test_sit_out_survives_a_restart_and_ignores_another_date(quiet_gap, monkeypa
 
 def test_unmeasured_gap_blocks_until_a_small_gap_is_measured(quiet_gap, monkeypatch):
     monkeypatch.setattr(main_bot, "_session_day_et", lambda: "2026-11-25")
+    # The unmeasured alert is withheld before 9:30 ET. Pin the clock so the
+    # assertion does not depend on when the runner starts.
+    monkeypatch.setattr(
+        main_bot, "_utcnow",
+        lambda: datetime(2026, 11, 25, 14, 31, tzinfo=timezone.utc),
+    )
     saved = main_bot.state
     main_bot.state = main_bot.StateStore(None)
     sent = []
@@ -524,6 +530,12 @@ def test_each_rejected_reference_blocks_entries(quiet_gap, monkeypatch):
 def test_nov23_stale_bar_blocks_the_five_percent_open(quiet_gap, monkeypatch):
     """724.33 vs 689.81 with the prior session high still on the bar does not trade."""
     monkeypatch.setattr(main_bot, "_session_day_et", lambda: "2026-11-23")
+    # The unmeasured alert is withheld before 9:30 ET. Pin the clock so the
+    # assertion does not depend on when the runner starts.
+    monkeypatch.setattr(
+        main_bot, "_utcnow",
+        lambda: datetime(2026, 11, 23, 14, 31, tzinfo=timezone.utc),
+    )
     quote = {
         "open": 724.33, "previous_close": 689.81, "last": 723.76,
         "high": 718.29, "low": 686.75, "realtime": True,
