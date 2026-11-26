@@ -573,3 +573,230 @@ def test_backfill_schedule_swallows_errors(monkeypatch):
         await asyncio.gather(*pending)
 
     _run(scenario())
+
+
+def _exit(event, ticker, ts, **data):
+    body = {"ticker": ticker}
+    body.update(data)
+    return (event, body, ts)
+
+
+def test_take_profit_without_position_closed_is_a_trade(trades_env):
+    # Premiums that round to the booked option formula: +13.6711% and +$714.
+    events = [
+        _exit(
+            "take_profit_closed", "AMZN", "2026-11-05T15:22:00+00:00",
+            qty=1, order_id="4241-order",
+            entry_premium=52.227, exit_premium=59.367,
+            target_premium=59.0, mark=59.367,
+        ),
+        _noise(1),
+        ("shadow_closed", {"ticker": "AMZN", "realized_pnl_pct": 99.0}, "2026-11-05T15:23:00+00:00"),
+    ]
+    _init_ledger(trades_env, events)
+
+    out = _run(main_bot.trades_review(count=50, x_rork_secret="test-secret"))
+
+    assert out["source"] == "ledger"
+    assert out["count"] == 1
+    row = out["trades"][0]
+    assert row["ticker"] == "AMZN"
+    assert row["close_event"] == "take_profit_closed"
+    assert row["realized_pnl_pct"] == 13.6711
+    assert row["realized_pnl_usd"] == 714.0
+    assert row["entry"] == 52.227
+    assert row["exit"] == 59.367
+    assert row["reason"] == "take_profit"
+    assert row["ledger_seq"] == 1
+
+
+def test_unpriced_take_profit_stays_unpriced(trades_env):
+    # The mark is what the decision saw, not a fill. It must not become P&L.
+    events = [
+        _exit(
+            "take_profit_closed", "AMZN", "2026-11-05T15:22:00+00:00",
+            qty=1, order_id="4241-order",
+            entry_premium=52.227, exit_premium=None,
+            mark=59.367,
+        ),
+    ]
+    _init_ledger(trades_env, events)
+
+    out = _run(main_bot.trades_review(count=50, x_rork_secret="test-secret"))
+
+    assert out["count"] == 1
+    row = out["trades"][0]
+    assert row["ticker"] == "AMZN"
+    assert row["realized_pnl_pct"] is None
+    assert row.get("realized_pnl_usd") is None
+    assert row.get("exit") is None
+    assert row["mark"] == 59.367
+
+
+def test_take_profit_and_position_closed_count_once(trades_env):
+    ts_tp = "2026-11-05T15:22:00+00:00"
+    ts_booked = "2026-11-05T15:22:08+00:00"
+    events = [
+        ("position_opened", {"ticker": "AMZN", "signal_id": "sig-amzn", "action": "BUY"}, "2026-11-05T14:50:00+00:00"),
+        _exit(
+            "take_profit_closed", "AMZN", ts_tp,
+            qty=1, order_id="4241-order",
+            entry_premium=52.227, exit_premium=59.367,
+        ),
+        _close("AMZN", ts_booked, 13.6711),
+    ]
+    events[-1][1]["account_pnl_pct"] = 4.25
+    events[-1][1]["reason"] = "take_profit"
+    events[-1][1]["entry"] = 52.227
+    events[-1][1]["realized_pnl_usd"] = 714.0
+    _init_ledger(trades_env, events)
+
+    out = _run(main_bot.trades_review(count=50, x_rork_secret="test-secret"))
+
+    assert out["count"] == 1
+    row = out["trades"][0]
+    assert row["ticker"] == "AMZN"
+    assert row["close_event"] == "position_closed"
+    assert row["ledger_seq"] == 3
+    assert row["account_pnl_pct"] == 4.25
+    assert row["realized_pnl_pct"] == 13.6711
+    assert row["close_id"].startswith("order:")
+
+
+def test_scheduled_exit_without_position_closed_is_a_trade(trades_env):
+    events = [
+        _exit(
+            "eod_flatten_closed", "NVDA", "2026-11-05T20:40:00+00:00",
+            qty=2, order_id="flatten-1",
+            entry_premium=1.50, exit_premium=1.20,
+        ),
+        _exit(
+            "eod_flatten_closed", "UBER", "2026-11-05T20:41:00+00:00",
+            qty=1, order_id="flatten-2",
+            entry_premium=2.0, exit_premium=1.5,
+        ),
+        _close("UBER", "2026-11-05T20:41:05+00:00", -25.0),
+    ]
+    events[-1][1]["reason"] = "eod_flatten"
+    events[-1][1]["entry"] = 2.0
+    events[-1][1]["entry_premium"] = 2.0
+    _init_ledger(trades_env, events)
+
+    out = _run(main_bot.trades_review(count=50, x_rork_secret="test-secret"))
+
+    assert [row["ticker"] for row in out["trades"]] == ["UBER", "NVDA"]
+    nvda = out["trades"][1]
+    assert nvda["close_event"] == "eod_flatten_closed"
+    assert nvda["reason"] == "eod_flatten"
+    assert nvda["realized_pnl_pct"] == round((1.20 - 1.50) / 1.50 * 100.0, 4)
+    assert nvda["realized_pnl_usd"] == round((1.20 - 1.50) * 100.0 * 2, 2)
+    uber = out["trades"][0]
+    assert uber["close_event"] == "position_closed"
+    assert uber["ledger_seq"] == 3
+
+
+def test_history_keeps_booked_closes_and_adds_the_missing_take_profit(trades_env):
+    booked = _close("INTC", "2026-11-05T15:32:00+00:00", -3.105)
+    events = [
+        booked,
+        _exit(
+            "take_profit_closed", "AMZN", "2026-11-05T15:22:00+00:00",
+            qty=1, order_id="4241-order",
+            entry_premium=52.227, exit_premium=59.367,
+        ),
+    ]
+    _init_ledger(trades_env, events)
+
+    async def seed():
+        await main_bot.state.list_push_capped(
+            main_bot.TRADES_HISTORY_KEY,
+            json.dumps({
+                "ticker": "INTC",
+                "ledger_seq": 1,
+                "ledger_ts": "2026-11-05T15:32:00+00:00",
+                "closed_at": "2026-11-05T15:32:00+00:00",
+                "realized_pnl_pct": -3.105,
+                "origin": "history",
+            }),
+            max_len=main_bot.TRADES_HISTORY_MAX,
+        )
+        return await main_bot.trades_review(count=50, x_rork_secret="test-secret")
+
+    out = _run(seed())
+
+    assert out["source"] == "history"
+    assert [row["ticker"] for row in out["trades"]] == ["INTC", "AMZN"]
+    assert out["trades"][0]["origin"] == "history"
+    assert out["trades"][1]["realized_pnl_pct"] == 13.6711
+    assert out["trades"][1]["realized_pnl_usd"] == 714.0
+
+
+def test_history_does_not_duplicate_a_booked_take_profit(trades_env):
+    events = [
+        ("position_opened", {"ticker": "AMZN", "signal_id": "sig-amzn"}, "2026-11-05T14:50:00+00:00"),
+        _exit(
+            "take_profit_closed", "AMZN", "2026-11-05T15:22:00+00:00",
+            qty=1, order_id="4241-order",
+            entry_premium=52.227, exit_premium=59.367,
+        ),
+        _close("AMZN", "2026-11-05T15:22:08+00:00", 13.6711),
+    ]
+    events[-1][1]["reason"] = "take_profit"
+    events[-1][1]["entry"] = 52.227
+    _init_ledger(trades_env, events)
+
+    async def seed():
+        await main_bot.state.list_push_capped(
+            main_bot.TRADES_HISTORY_KEY,
+            json.dumps({
+                "ticker": "AMZN",
+                "ledger_seq": 3,
+                "closed_at": "2026-11-05T15:22:08+00:00",
+                "realized_pnl_pct": 13.6711,
+                "reason": "take_profit",
+                "entry": 52.227,
+                "origin": "history",
+            }),
+            max_len=main_bot.TRADES_HISTORY_MAX,
+        )
+        return await main_bot.trades_review(count=50, x_rork_secret="test-secret")
+
+    out = _run(seed())
+
+    assert out["count"] == 1
+    assert out["trades"][0]["origin"] == "history"
+    assert out["trades"][0]["realized_pnl_pct"] == 13.6711
+
+
+def test_nov5_amzn_gap_totals_the_day(trades_env):
+    # The three Nov 5 history rows summed to -8.565%. AMZN's take-profit,
+    # +13.6711% and +$714, was the missing close. Together they are +5.106%.
+    events = [
+        _exit(
+            "take_profit_closed", "AMZN", "2026-11-05T15:22:00+00:00",
+            qty=1, order_id="4241-order",
+            entry_premium=52.227, exit_premium=59.367, mark=59.367,
+        ),
+        _close("INTC", "2026-11-05T15:32:00+00:00", -3.105),
+        _close("QQQ", "2026-11-05T16:10:00+00:00", -2.86),
+        _close("NVDA", "2026-11-05T18:05:00+00:00", -2.6),
+        _noise(9),
+    ]
+    _init_ledger(trades_env, events)
+
+    out = _run(main_bot.trades_review(count=50, x_rork_secret="test-secret"))
+    nov5 = [
+        row for row in out["trades"]
+        if str(row.get("ledger_ts") or "").startswith("2026-11-05")
+    ]
+    amzn = next(row for row in nov5 if row["ticker"] == "AMZN")
+    others = [row["realized_pnl_pct"] for row in nov5 if row["ticker"] != "AMZN"]
+
+    assert out["version"] == "5.99.11-pro-day-trader"
+    assert [row["ticker"] for row in nov5] == ["NVDA", "QQQ", "INTC", "AMZN"]
+    assert len(nov5) == 4
+    assert amzn["realized_pnl_pct"] == 13.6711
+    assert amzn["realized_pnl_usd"] == 714.0
+    assert amzn["ledger_seq"] == 1
+    assert round(sum(others), 3) == -8.565
+    assert round(sum(row["realized_pnl_pct"] for row in nov5), 3) == 5.106
