@@ -196,7 +196,7 @@ def test_report_payload_uses_the_corrected_window(tmp_path, monkeypatch):
         report = asyncio.run(main_bot._pro_trader_report_payload())
     finally:
         trade_ledger._ledger = saved
-    assert report["version"] == "5.99.10-pro-day-trader"
+    assert report["version"] == "5.99.11-pro-day-trader"
     assert report["realized_pnl_pct_sum"] == 4.0
     recon = report["reconciliation"]
     assert recon["sources"]["pro_trader_report"]["count"] == 1
