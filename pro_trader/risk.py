@@ -17,9 +17,10 @@ from typing import Any, Dict, Optional
 
 MIN_SIZE_MULTIPLIER = 0.35
 MAX_SIZE_MULTIPLIER = 1.0
-# Operator per-trade ceiling. The bot's configured risk is often already 8.
-# A policy value above this is haircut back to 8 before the regime multiplier.
-PER_TRADE_RISK_CEILING_PCT = 8.0
+# Operator per-trade ceiling. 5.99.7 lowered this from 8 so it matches the
+# policy ceiling. A policy value above this is haircut back to 5 before
+# the regime multiplier.
+PER_TRADE_RISK_CEILING_PCT = 5.0
 # Echoed, never written. The bot's open-risk gate and the historical day-halt
 # discussion both sit on 10. The engine does not move either number.
 OPEN_RISK_CEILING_PCT = 10.0
@@ -99,7 +100,7 @@ def risk_scale(
 
     `daily_loss_limit_pct` is returned unchanged so a caller can prove the
     engine did not edit the halt. Effective risk is never above the configured
-    percent and never above 8.
+    percent and never above the per-trade ceiling (5).
     """
     configured = _num(configured_risk_pct)
     if configured is None or configured <= 0:
