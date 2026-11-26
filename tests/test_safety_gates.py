@@ -259,6 +259,248 @@ def test_native_handoff_needs_a_long_with_a_resting_stop():
     assert not any(p["arm"] for p in (no_order, short, covered))
 
 
+def _entry_floor_option(ticker_extra=None):
+    pos = {
+        "action": "BUY",
+        "entry_premium": 3.0,
+        "stop_premium": 2.4,
+        "stop_order_id": "STOP-1",
+        "filled_qty": 1,
+        "qty": 1,
+        "breakeven_locked": True,
+        "contract": {
+            "right": "CALL",
+            "strike": 450.0,
+            "expiration": "2026-12-18",
+        },
+    }
+    if ticker_extra:
+        pos.update(ticker_extra)
+    return pos
+
+
+def test_native_handoff_declines_a_trigger_under_entry():
+    # Repro: entry 3.00, stop 2.40, bid 3.24. 12.5% of 3.24 rounds up to a
+    # 0.45 trail on the 0.05 tick, and the trigger floors to 2.79 — under
+    # the fill, above the still-unmoved hard stop.
+    declined = main_bot.trailing_engine.plan_native_handoff(
+        3.24, 0.10, 0.60, 2.40, tick=0.05,
+        breakeven_locked=True, option=True, mark=3.24, entry=3.00,
+    )
+    assert declined["arm"] is False
+    assert declined["reason"] == "below_entry"
+    assert declined["trigger"] is None
+    assert "native handoff declined: below_entry" in declined["detail"]
+
+    # Bid 3.45, same 0.45 trail, trigger lands on the fill.
+    armed = main_bot.trailing_engine.plan_native_handoff(
+        3.45, 0.10, 0.60, 2.40, tick=0.05,
+        breakeven_locked=True, option=True, mark=3.45, entry=3.00,
+    )
+    assert armed["arm"] is True
+    assert armed["reason"] == "arm"
+    assert armed["trigger"] >= 3.00
+
+    # entry defaults to None. Callers that omit it keep the stop-only check.
+    legacy = main_bot.trailing_engine.plan_native_handoff(
+        3.24, 0.10, 0.60, 2.40, tick=0.05,
+        breakeven_locked=True, option=True, mark=3.24,
+    )
+    assert legacy["arm"] is True
+    assert legacy["trigger"] == 2.79
+
+
+def test_maybe_hand_off_floors_at_entry_and_leaves_the_stop(monkeypatch, caplog):
+    caplog.set_level("INFO", logger="etrade-bot")
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+    monkeypatch.setattr(main_bot, "NATIVE_TRAIL_AUTO", True)
+    calls = []
+
+    async def arm(ticker, offset=None, min_trigger=None, source="operator", allow_below_entry=False):
+        calls.append({
+            "min_trigger": min_trigger,
+            "source": source,
+            "allow_below_entry": allow_below_entry,
+        })
+        return {"ticker": ticker}
+
+    monkeypatch.setattr(main_bot, "_arm_native_trail", arm)
+
+    async def scenario():
+        pos = _entry_floor_option()
+        await store.set_position("QQQ", pos)
+        declined = await main_bot._maybe_hand_off_native_trail("QQQ", pos, 3.24, 0.10)
+        assert declined is False
+        assert calls == []
+        assert pos.get("native_trail_skip") == "below_entry"
+        held = await store.get_position("QQQ")
+        assert held["stop_order_id"] == "STOP-1"
+
+        # Above $3 the live grid is $0.10, so 3.45 still trails to 2.95.
+        # 3.50 minus the 0.50 offset lands on the fill and may hand off.
+        later = _entry_floor_option()
+        await store.set_position("QQQ", later)
+        armed = await main_bot._maybe_hand_off_native_trail("QQQ", later, 3.50, 0.10)
+        assert armed is True
+
+    asyncio.run(scenario())
+    assert calls == [{
+        "min_trigger": pytest.approx(3.0),
+        "source": "auto",
+        "allow_below_entry": False,
+    }]
+    assert "native handoff declined: below_entry" in caplog.text
+
+
+def test_arm_native_trail_refuses_below_entry_before_cancel(monkeypatch, caplog):
+    caplog.set_level("INFO", logger="etrade-bot")
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+    cancelled = []
+
+    async def cancel(*args, **kwargs):
+        cancelled.append((args, kwargs))
+        raise AssertionError("cancel ran on a below-entry refusal")
+
+    async def quote(ticker, contract=None):
+        return 3.24, 3.34
+
+    def tokens():
+        raise AssertionError("token load ran on a below-entry refusal")
+
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel)
+    monkeypatch.setattr(main_bot, "_current_bid_ask", quote)
+    monkeypatch.setattr(main_bot, "load_tokens", tokens)
+
+    async def scenario():
+        await store.set_position("QQQ", _entry_floor_option())
+        for source, min_trigger in (("auto", 3.0), ("repair", 3.0), ("operator", None)):
+            with pytest.raises(main_bot.NativeTrailRefused) as exc:
+                await main_bot._arm_native_trail(
+                    "QQQ", min_trigger=min_trigger, source=source,
+                )
+            text = str(exc.value)
+            assert "native handoff declined: below_entry" in text
+            assert "oauth" not in text.lower()
+        held = await store.get_position("QQQ")
+        assert held["stop_order_id"] == "STOP-1"
+
+    asyncio.run(scenario())
+    assert cancelled == []
+    assert "native handoff declined: below_entry" in caplog.text
+
+
+def test_repair_path_floors_the_new_trigger_at_entry(monkeypatch):
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+    armed = {}
+
+    async def read_offset(order_id):
+        return 7.6
+
+    async def cancel(order_id, expected_qty=0):
+        return main_bot.CANCEL_CONFIRMED
+
+    async def fetch_orders():
+        return {
+            "OrdersResponse": {
+                "Order": {
+                    "orderId": 1598,
+                    "OrderDetail": {
+                        "status": "OPEN",
+                        "priceType": "TRAILING_STOP_CNST",
+                        "stopPrice": 2.50,
+                        "offsetValue": 7.6,
+                        "Instrument": {
+                            "orderAction": "SELL_CLOSE",
+                            "orderedQuantity": 1,
+                            "filledQuantity": 0,
+                            "Product": {"symbol": "QQQ", "securityType": "OPTN"},
+                        },
+                    },
+                }
+            }
+        }
+
+    async def arm(ticker, offset=None, min_trigger=None, source="operator", allow_below_entry=False):
+        armed["min_trigger"] = min_trigger
+        armed["source"] = source
+        armed["allow_below_entry"] = allow_below_entry
+        return {"ticker": ticker}
+
+    monkeypatch.setattr(main_bot, "_read_resting_trail_offset", read_offset)
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel)
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", fetch_orders)
+    monkeypatch.setattr(main_bot, "_arm_native_trail", arm)
+
+    async def scenario():
+        pos = _entry_floor_option({"native_trail_order_id": "1598", "stop_order_id": None})
+        await store.set_position("QQQ", pos)
+        owned = await main_bot._maybe_repair_inflated_native_trail(
+            "QQQ", pos, 3.24, 0.10, "1598",
+        )
+        assert owned is True
+
+    asyncio.run(scenario())
+    # Old stop 2.50, journaled stop 2.40, entry 3.00. The fill wins.
+    assert armed["source"] == "repair"
+    assert armed["allow_below_entry"] is False
+    assert armed["min_trigger"] == pytest.approx(3.0)
+
+
+def test_trail_native_refuses_below_entry_without_override(monkeypatch):
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+    monkeypatch.setattr(main_bot, "WEBHOOK_SECRET", "s3cret")
+    cancelled = []
+
+    async def cancel(*args, **kwargs):
+        cancelled.append(args)
+        raise AssertionError("cancel ran on a below-entry refusal")
+
+    async def quote(ticker, contract=None):
+        return 3.24, 3.34
+
+    def tokens():
+        return None
+
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel)
+    monkeypatch.setattr(main_bot, "_current_bid_ask", quote)
+    monkeypatch.setattr(main_bot, "load_tokens", tokens)
+
+    async def scenario():
+        await store.set_position("QQQ", _entry_floor_option())
+        with pytest.raises(HTTPException) as refused:
+            await main_bot.arm_native_trail({"ticker": "QQQ"}, "s3cret")
+        assert refused.value.status_code == 400
+        assert "native handoff declined: below_entry" in str(refused.value.detail)
+
+        with pytest.raises(HTTPException) as explicit_false:
+            await main_bot.arm_native_trail(
+                {"ticker": "QQQ", "allow_below_entry": False}, "s3cret",
+            )
+        assert "below_entry" in str(explicit_false.value.detail)
+
+        with pytest.raises(HTTPException) as stringy:
+            await main_bot.arm_native_trail(
+                {"ticker": "QQQ", "allow_below_entry": "true"}, "s3cret",
+            )
+        assert "below_entry" in str(stringy.value.detail)
+
+        with pytest.raises(HTTPException) as bypass:
+            await main_bot.arm_native_trail(
+                {"ticker": "QQQ", "allow_below_entry": True}, "s3cret",
+            )
+        assert bypass.value.status_code == 400
+        detail = str(bypass.value.detail)
+        assert "below_entry" not in detail
+        assert "token" in detail.lower()
+
+    asyncio.run(scenario())
+    assert cancelled == []
+
+
 def test_engine_trail_stays_at_hard_stop_until_breakeven():
     te = main_bot.trailing_engine
     early = te.compute_trail_level("BUY", 3.0, 2.4, 3.1, 2.9)
