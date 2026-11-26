@@ -143,7 +143,7 @@ def test_bogus_spy_gap_is_not_a_pause():
     assert absurd["verified"] is False
 
 
-def test_genuine_gap_pauses_the_open_and_releases_structure_later():
+def test_genuine_gap_sits_out_the_whole_session():
     raw = main_bot.portfolio_risk.gap_pct(724.33, 689.81)
     early = main_bot.portfolio_risk.assess_regime_sizing(
         _gap_ctx(raw), "calm", _tape(10, "vwap reclaim"),
@@ -151,6 +151,7 @@ def test_genuine_gap_pauses_the_open_and_releases_structure_later():
     assert early["pause"] is True
     assert early["reasons"][0].startswith("regime pause: SPY opened +5.00%")
     assert "index gap ≥ 2%" in early["reasons"][0]
+    assert "full-day sit-out" in early["reasons"][0]
 
     momentum = main_bot.portfolio_risk.assess_regime_sizing(
         _gap_ctx(raw), "calm", _tape(45, "momentum"),
@@ -166,13 +167,17 @@ def test_genuine_gap_pauses_the_open_and_releases_structure_later():
     )
     assert wide["pause"] is True
 
+    # A settled structure setup used to trade at half size. It sits out.
     settled = main_bot.portfolio_risk.assess_regime_sizing(
         _gap_ctx(raw), "calm", _tape(45, "vwap reclaim"),
     )
-    assert settled["pause"] is False
-    assert settled["weight"] == pytest.approx(0.5)
-    assert settled["weight"] <= 1.0
-    assert any("open stabilization passed" in note for note in settled["notes"])
+    assert settled["pause"] is True
+    assert settled["weight"] == 0
+    assert any("full-day sit-out" in reason for reason in settled["reasons"])
+    small = main_bot.portfolio_risk.assess_regime_sizing(
+        _gap_ctx(1.9), "calm", _tape(90, "vwap reclaim"),
+    )
+    assert small["pause"] is False
 
 
 def test_degraded_feed_keeps_the_gap_pause(monkeypatch):
