@@ -104,10 +104,10 @@ def order_effect(decision: Optional[Dict[str, Any]], qty: Any) -> Dict[str, Any]
             "reason": (decision or {}).get("summary") if isinstance(decision, dict) else "pro trader blocked",
         }
     mult = clamp_multiplier(raw_mult)
-    # risk_scale also haircuts a configured risk above 8%. The decision's
+    # risk_scale also haircuts a configured risk above 5%. The decision's
     # multiplier is already that combined scale when Desk.evaluate built it.
     # A one-lot cannot be cut to a fraction. Flooring at 1 keeps the quota
-    # alive on a single-contract account; the 8% cap still binds upstream.
+    # alive on a single-contract account; the 5% cap still binds upstream.
     if mult >= 0.999:
         return {
             "allow": True,
@@ -135,7 +135,7 @@ def evaluate(
     *,
     mode: Any = DEFAULT_MODE,
     memory: Optional[Dict[str, Any]] = None,
-    configured_risk_pct: Any = 8.0,
+    configured_risk_pct: Any = 5.0,
     daily_loss_limit_pct: Any = None,
     trades_completed: Any = 0,
     min_trades: Any = 4,
@@ -263,7 +263,7 @@ class Desk:
         candidate: Optional[Dict[str, Any]],
         *,
         mode: Any = DEFAULT_MODE,
-        configured_risk_pct: Any = 8.0,
+        configured_risk_pct: Any = 5.0,
         daily_loss_limit_pct: Any = None,
         trades_completed: Any = None,
         min_trades: Any = None,
