@@ -39355,16 +39355,36 @@ async def _remember_native_skip(ticker: str, pos: dict, reason: str, detail: str
 
 
 _REPAIR_AT_MARKET_LOG_AT: Dict[str, float] = {}
+_REPAIR_AT_MARKET_TTL_S = 3600.0
+_REPAIR_AT_MARKET_MAX_KEYS = 256
+
+
+def _evict_repair_at_market(now: float) -> None:
+    """Drop at-bid alert keys older than an hour, then the oldest past the cap."""
+    stale = [
+        key for key, stamped in _REPAIR_AT_MARKET_LOG_AT.items()
+        if now - stamped > _REPAIR_AT_MARKET_TTL_S
+    ]
+    for key in stale:
+        _REPAIR_AT_MARKET_LOG_AT.pop(key, None)
+    overflow = len(_REPAIR_AT_MARKET_LOG_AT) - _REPAIR_AT_MARKET_MAX_KEYS
+    if overflow <= 0:
+        return
+    oldest = sorted(_REPAIR_AT_MARKET_LOG_AT.items(), key=lambda item: item[1])[:overflow]
+    for key, _stamped in oldest:
+        _REPAIR_AT_MARKET_LOG_AT.pop(key, None)
 
 
 def _repair_at_market_due(ticker: str, interval_s: float = 300.0) -> bool:
     """True at most once per ticker per five minutes."""
     now = time.monotonic()
+    _evict_repair_at_market(now)
     key = str(ticker or "").upper()
     last = _REPAIR_AT_MARKET_LOG_AT.get(key)
     if last is not None and (now - last) < interval_s:
         return False
     _REPAIR_AT_MARKET_LOG_AT[key] = now
+    _evict_repair_at_market(now)
     return True
 
 
