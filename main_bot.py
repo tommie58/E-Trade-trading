@@ -4428,6 +4428,35 @@ def stops_for_contract(stops: List[dict], pos: dict, ticker: str) -> List[dict]:
     return [order for order in (stops or []) if order_same_contract(order, pos, ticker)]
 
 
+_CONTRACTLESS_ALERTED: set = set()
+
+
+def contractless_record_key(ticker: Any, pos: Any, day: str) -> str:
+    """One legacy option row, stable for the session."""
+    row = pos if isinstance(pos, dict) else {}
+    return "|".join((
+        str(day),
+        str(ticker or "").upper(),
+        str(row.get("ts") or ""),
+        str(row.get("entry_premium") or ""),
+        str(row.get("stop_premium") or ""),
+    ))
+
+
+def contractless_should_alert(ticker: Any, pos: Any, day: str) -> bool:
+    """True once per record per session. Later passes stay quiet."""
+    key = contractless_record_key(ticker, pos, day)
+    if key in _CONTRACTLESS_ALERTED:
+        return False
+    _CONTRACTLESS_ALERTED.add(key)
+    if len(_CONTRACTLESS_ALERTED) > 500:
+        prefix = str(day) + "|"
+        for old in list(_CONTRACTLESS_ALERTED):
+            if not str(old).startswith(prefix):
+                _CONTRACTLESS_ALERTED.discard(old)
+    return True
+
+
 def order_covers_position(order: dict, pos: dict, ticker: str, qty: int) -> bool:
     """A resting stop covers this position only when it is the same instrument.
 
@@ -5532,6 +5561,25 @@ async def reconcile_once(
         if not orders_ok:
             report["warnings"].append(
                 f"{ticker}: orders.json failed — re-arm deferred, no stop cancelled"
+            )
+            continue
+
+        # A legacy option row with premium fields and no contract cannot be
+        # matched to a broker stop. Alert once per record per session. Do not
+        # re-arm, and do not treat it as a fresh unprotected position.
+        if is_opt_pos and tracked_contract_key(pos) is None:
+            et_now = datetime.utcfromtimestamp(now) + timedelta(hours=ET_UTC_OFFSET_HOURS)
+            day = et_now.date().isoformat()
+            if contractless_should_alert(ticker, pos, day):
+                await _alert(
+                    "error", "option_contract_missing",
+                    f"{ticker}: option position has no contract on record — "
+                    f"a broker stop cannot be matched and one will not be placed",
+                    dedupe_key=f"contractless:{contractless_record_key(ticker, pos, day)}",
+                    dedupe_seconds=18 * 3600,
+                )
+            report["warnings"].append(
+                f"{ticker}: option position has no contract on record"
             )
             continue
 
