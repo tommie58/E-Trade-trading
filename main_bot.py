@@ -31604,6 +31604,33 @@ async def _stock_flatten_already_working(ticker: str, guard: dict) -> bool:
     return False
 
 
+def _stock_listed_sell_state(orders: list, guard: dict) -> str:
+    """``unfilled``, ``filled``, ``working``, or ``unknown``.
+
+    ``unknown`` is a lagging or empty list: the first sell is not proven
+    unfilled, so a stock must not send another.
+    """
+    client_id = str((guard or {}).get("flatten_client_id") or "").strip()
+    order_id = str((guard or {}).get("flatten_order_id") or "").strip()
+    for order in orders or []:
+        oid = str(order.get("order_id") or "").strip()
+        cid = str(order.get("client_order_id") or "").strip()
+        if not ((order_id and oid == order_id) or (client_id and cid == client_id)):
+            continue
+        status = str(order.get("status") or "").upper()
+        try:
+            filled = int(order.get("filled") or 0)
+        except (TypeError, ValueError):
+            filled = 0
+        if _filled_order_status(status) or filled > 0:
+            return "filled"
+        if status in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
+            return "unfilled"
+        if status in reconciliation._OPEN_ORDER_STATUSES:
+            return "working"
+    return "unknown"
+
+
 async def _emergency_flatten(
     ticker: str, guard: dict, qty: int, *, book: str = "required",
 ) -> Optional[str]:
@@ -31633,14 +31660,48 @@ async def _emergency_flatten(
         prior_label = str(p_status or "").upper().strip()
         if prior_label in {"", "NOT_FOUND", "UNKNOWN"}:
             is_stock = str(guard.get("kind") or "equity") != "option"
-            if is_stock and await _stock_flatten_already_working(ticker, guard):
-                logger.warning(
-                    "[FLATTEN] %s prior sell %s was not acknowledged and a "
-                    "working exit is already on the book — not selling again",
-                    ticker, prior_id or prior_client,
-                )
-                return prior_id
-            # Not sent. Fall through and place one sell of the tracked qty.
+            if is_stock:
+                if int(guard.get("flatten_stock_resends") or 0) >= 1:
+                    logger.warning(
+                        "[FLATTEN] %s stock re-send already used — not selling",
+                        ticker,
+                    )
+                    return prior_id
+                if await _stock_flatten_already_working(ticker, guard):
+                    logger.warning(
+                        "[FLATTEN] %s prior sell %s was not acknowledged and a "
+                        "working exit is already on the book — not selling again",
+                        ticker, prior_id or prior_client,
+                    )
+                    return prior_id
+                held = await _flatten_broker_held_qty(ticker, {
+                    "action": guard.get("action") or "BUY",
+                    "contract": guard.get("contract"),
+                })
+                listed = "unknown"
+                try:
+                    book_resp = await asyncio.wait_for(
+                        _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+                    )
+                    listed = _stock_listed_sell_state(
+                        reconciliation.parse_open_orders(book_resp), guard,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "stock flatten fill check failed (%s)", type(exc).__name__,
+                    )
+                if held is None or held <= 0 or listed != "unfilled":
+                    logger.warning(
+                        "[FLATTEN] %s not re-sending — holdings or fill check "
+                        "did not show the shares still held and the sell unfilled",
+                        ticker,
+                    )
+                    return prior_id
+                qty = min(int(held), int(qty))
+                await state.update_guard(ticker, flatten_stock_resends=1)
+                guard["flatten_stock_resends"] = 1
+            # Options fall through and place. A stock falls through only
+            # for this single proven re-send.
         elif _emergency_flatten_reuse(p_status, p_filled):
             # Filled (including DONE_TRADE_EXECUTED with a blank quantity),
             # partially filled, or still working — this IS the flatten.
