@@ -31232,15 +31232,19 @@ def lost_stop_match_ids(orders, guard: dict, ticker: str) -> list:
     return []
 
 
-async def _cancel_our_working_close(ticker: str, guard: dict) -> bool:
-    """Cancel the bot's own market close. Leave stops and other people's orders."""
+async def _working_close_id(ticker: str, guard: dict):
+    """Order id of our open market close, or None.
+
+    A failed read is None. That is not proof a close is resting, so a
+    definite reject with the book down can still sell.
+    """
     try:
         resp = await asyncio.wait_for(
             _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
         )
     except Exception as exc:
         logger.warning("close lookup failed (%s)", type(exc).__name__)
-        return False
+        return None
     symbol = str(ticker or "").upper()
     action = "SELL" if str((guard or {}).get("action") or "BUY").upper() == "BUY" else "BUY_TO_COVER"
     for order in reconciliation.parse_open_orders(resp):
@@ -31253,15 +31257,29 @@ async def _cancel_our_working_close(ticker: str, guard: dict) -> bool:
         if str(order.get("price_type") or "").upper() != "MARKET":
             continue
         oid = str(order.get("order_id") or "").strip()
-        if not oid:
-            continue
-        try:
-            await _cancel_order_verified(oid)
-        except Exception as exc:
-            logger.warning("close cancel failed (%s)", type(exc).__name__)
-            return False
-        return True
-    return False
+        if oid:
+            return oid
+    return None
+
+
+async def _cancel_our_working_close(ticker: str, guard: dict) -> str:
+    """Cancel the bot's own market close. Leave stops and other orders.
+
+    ``cancelled`` means the cancel was confirmed. ``refused`` means a close
+    is resting and the cancel did not confirm. ``none`` means no close was
+    listed, including when the book could not be read.
+    """
+    oid = await _working_close_id(ticker, guard)
+    if not oid:
+        return "none"
+    try:
+        outcome = await _cancel_order_verified(oid)
+    except Exception as exc:
+        logger.warning("close cancel failed (%s)", type(exc).__name__)
+        return "refused"
+    if outcome == CANCEL_CONFIRMED:
+        return "cancelled"
+    return "refused"
 
 
 async def _cancel_lost_stop_by_client(ticker: str) -> bool:
@@ -34421,8 +34439,20 @@ async def _stop_guard_worker(ticker: str) -> None:
                             else:
                                 # Case b: a reject while our own close is working.
                                 # Cancel that close, then the 60s deadline sells.
+                                # A refused cancel, or a close that is still
+                                # listed, blocks that sell.
                                 if not is_option:
-                                    await _cancel_our_working_close(ticker, guard)
+                                    close_outcome = await _cancel_our_working_close(
+                                        ticker, guard,
+                                    )
+                                    if close_outcome == "refused":
+                                        guard = await state.update_guard(
+                                            ticker, own_close_cancel_refused=True,
+                                        ) or guard
+                                    elif close_outcome == "cancelled":
+                                        guard = await state.update_guard(
+                                            ticker, own_close_cancel_refused=False,
+                                        ) or guard
                                 # The OLD stop was already cancelled above and the new one
                                 # did not stick, so nothing is resting. The guard record
                                 # still pointed at the dead order id, and the stop-placement
@@ -34606,6 +34636,16 @@ async def _stop_guard_worker(ticker: str) -> None:
                         and await _lost_stop_clearance(guard) != "clear"
                     ):
                         guard = await _page_unconfirmed_stop(ticker, guard)
+                    elif (
+                        not is_option
+                        and (
+                            guard.get("own_close_cancel_refused")
+                            or await _working_close_id(ticker, guard)
+                        )
+                    ):
+                        # Our close is still working, or its cancel was refused.
+                        guard = await _page_unconfirmed_stop(ticker, guard)
+                        held_open = True
                     else:
                         if status not in _TERMINAL_ORDER_STATUSES:
                             await _cancel_order_safe(guard.get("entry_order_id"))
