@@ -41729,7 +41729,10 @@ def _tracked_still_open_for_alert(
     return kept
 
 
-async def _alert_positions_still_open() -> None:
+STILL_OPEN_CHECK_TIMEOUT_S = 30.0
+
+
+async def _alert_positions_still_open_body() -> None:
     """Critical alert when a position is still open after 3:50 PM ET.
 
     Half days use 12:50 PM ET. Untracked names come from a broker account
@@ -41798,6 +41801,32 @@ async def _alert_positions_still_open() -> None:
                 message,
                 dedupe_key=f"open_after_flatten:untracked:{day}",
             )
+    except Exception as exc:
+        logger.error("[FLATTEN] still-open alert failed (%s)", type(exc).__name__)
+
+
+async def _alert_positions_still_open() -> None:
+    """Bound the book read so a hung broker call cannot pin the 3:50 task.
+
+    On timeout the task ends, an error alert is sent, and the next schedule
+    can run. The alert uses send_nowait.
+    """
+    try:
+        await asyncio.wait_for(
+            _alert_positions_still_open_body(),
+            STILL_OPEN_CHECK_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.error("[FLATTEN] still-open alert timed out (%s)", "TimeoutError")
+        try:
+            await alerts.send_nowait(
+                "error",
+                "position_open_after_flatten_timeout",
+                "The 3:50 open-position check timed out. The next pass will try again.",
+                dedupe_key=f"open_after_flatten_timeout:{_utcnow().date().isoformat()}",
+            )
+        except Exception as exc:
+            logger.error("[FLATTEN] timeout alert failed (%s)", type(exc).__name__)
     except Exception as exc:
         logger.error("[FLATTEN] still-open alert failed (%s)", type(exc).__name__)
 
