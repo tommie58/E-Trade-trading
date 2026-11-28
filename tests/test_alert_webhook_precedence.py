@@ -16,9 +16,11 @@ import pytest
 import main_bot
 
 
-# Obviously fake. Not a configured receiver.
-ENV_URL = "https://example.invalid/hook"
-SAVED_URL = "https://example.invalid/saved"
+# Obviously fake. Not a configured receiver. The path tail is the token
+# fragment the boot log must not keep.
+TOKEN_FRAGMENT = "tokfixture"
+ENV_URL = "https://example.invalid/hook/" + TOKEN_FRAGMENT
+SAVED_URL = "https://example.invalid/saved/" + TOKEN_FRAGMENT
 
 
 def _run(coro):
@@ -77,6 +79,7 @@ async def _boot(env, saved, min_severity="critical"):
 def _assert_url_absent(text: str):
     assert ENV_URL not in text
     assert SAVED_URL not in text
+    assert TOKEN_FRAGMENT not in text
 
 
 def test_send_keeps_dedupe_seconds_parameter():
@@ -283,3 +286,43 @@ def test_saved_url_survives_a_severity_only_update():
     assert stored["webhook_url"] == SAVED_URL
     assert stored["min_severity"] == "error"
     _assert_url_absent(json.dumps(cfg))
+
+
+def test_webhook_source_log_is_scrubber_output(caplog):
+    """Boot and update lines are the scrubber's return value, not a raw format."""
+    caplog.set_level(logging.DEBUG)
+    real = main_bot.scrub_etrade_text
+    produced = []
+
+    def _recording(text, secrets=None):
+        cleaned = real(text, secrets)
+        produced.append(cleaned)
+        return cleaned
+
+    main_bot.alerts._WEBHOOK_LINE_SCRUB = _recording
+
+    async def scenario():
+        await _boot(ENV_URL, SAVED_URL, min_severity="critical")
+        leaked = "webhook_source=env " + ENV_URL + " token " + TOKEN_FRAGMENT
+        safe = main_bot.alerts._scrub_webhook_source_line(leaked, [ENV_URL, SAVED_URL])
+        main_bot.alerts.logger.info("%s", safe)
+        main_bot.logger.info("%s", main_bot.alerts.webhook_source_log_line("update"))
+        return await main_bot.alerts_config()
+
+    try:
+        cfg = _run(scenario())
+    finally:
+        main_bot.alerts._WEBHOOK_LINE_SCRUB = main_bot.scrub_etrade_text
+
+    assert produced, "webhook source line did not reach scrub_etrade_text"
+    source_logs = [
+        rec.getMessage() for rec in caplog.records if "webhook_source=" in rec.getMessage()
+    ]
+    assert source_logs
+    assert set(source_logs).issubset(set(produced))
+    _assert_url_absent(caplog.text)
+    _assert_url_absent(json.dumps(cfg))
+    for line in produced:
+        _assert_url_absent(line)
+    assert "webhook_source=env" in caplog.text
+    assert "effective_min_severity=error" in caplog.text

@@ -2768,6 +2768,78 @@ def mask_webhook_url(url: Optional[str]) -> Optional[str]:
         return "…" + url[-4:]
 
 
+# Host installs scrub_etrade_text here. None until main_bot finishes importing.
+_WEBHOOK_LINE_SCRUB = None
+_WEBHOOK_SOURCE_WHERE = {"boot", "ready", "update"}
+
+
+def _webhook_log_secrets(urls) -> List[str]:
+    """Full receivers plus long path segments, longest first."""
+    from urllib.parse import urlparse
+
+    found: List[str] = []
+    seen = set()
+
+    def add(value: str) -> None:
+        if len(value) >= 4 and value not in seen:
+            seen.add(value)
+            found.append(value)
+
+    for url in urls:
+        text = str(url or "").strip()
+        if not text:
+            continue
+        add(text)
+        try:
+            parsed = urlparse(text)
+            blob = "/".join(part for part in (parsed.path, parsed.query, parsed.fragment) if part)
+        except Exception:
+            blob = ""
+        for segment in blob.replace("&", "/").replace("=", "/").split("/"):
+            piece = segment.strip()
+            if len(piece) >= 8:
+                add(piece)
+    found.sort(key=len, reverse=True)
+    return found
+
+
+def _mask_urls_in_line(text: str) -> str:
+    """Replace any leftover http(s) URL via mask_webhook_url."""
+    import re
+
+    def repl(match):
+        return mask_webhook_url(match.group(0)) or "…"
+
+    return re.sub(r"https?://\S+", repl, text)
+
+
+def _scrub_webhook_source_line(line: str, urls) -> str:
+    """Return a log line that has been through the shared scrubber.
+
+    scrub_etrade_text (installed on _WEBHOOK_LINE_SCRUB) strips the
+    configured receivers when they are passed as secrets. mask_webhook_url
+    then rewrites any URL that is still in the line. Callers log only this
+    return value.
+    """
+    secrets = _webhook_log_secrets(urls)
+    fn = _WEBHOOK_LINE_SCRUB if callable(_WEBHOOK_LINE_SCRUB) else _ALERT_SCRUB
+    try:
+        if callable(fn):
+            try:
+                cleaned = str(fn(line, secrets))
+            except TypeError:
+                cleaned = str(fn(line))
+                for secret in secrets:
+                    cleaned = cleaned.replace(secret, "{redacted}")
+        else:
+            cleaned = line
+            for secret in secrets:
+                cleaned = cleaned.replace(secret, "{redacted}")
+        return _mask_urls_in_line(cleaned)
+    except Exception:
+        return "alerting: webhook_source=none, effective_min_severity=warning"
+
+
 class AlertManager:
     def __init__(self, state: Any, webhook_url: Optional[str] = None,
                  dedupe_seconds: int = 300) -> None:
@@ -2833,12 +2905,8 @@ class AlertManager:
                 self._saved_webhook_url = None
             self._saved_known = True
             self._apply_webhook_precedence()
-            # Source and effective floor only. Never the URL.
-            logger.info(
-                "alerting: loaded persisted config — webhook_source=%s, effective_min_severity=%s",
-                self._webhook_source,
-                self.effective_min_severity,
-            )
+            # Scrubber output only. The URL is a secret, not a format arg.
+            logger.info("%s", webhook_source_log_line("boot"))
         except Exception:
             logger.warning("alert config load failed (using env default)")
 
@@ -3047,13 +3115,39 @@ class AlertManager:
 _manager: Optional[AlertManager] = None
 
 
+def webhook_source_log_line(where: str = "boot") -> str:
+    """Boot/config line: source and effective floor, after the shared scrubber.
+
+    Source is allowlisted to env|persisted|none. The configured URLs are
+    handed to scrub_etrade_text as secrets and are not interpolated.
+    """
+    source = "none"
+    floor = DEFAULT_MIN_SEVERITY
+    urls: List[Optional[str]] = []
+    if _manager is not None:
+        source = _manager._webhook_source
+        floor = _manager.effective_min_severity
+        urls = [
+            _manager._env_webhook_url,
+            _manager._saved_webhook_url,
+            _manager._webhook_url,
+        ]
+    source_s = source if source in {"env", "persisted", "none"} else "none"
+    floor_s = _cap_min_severity(floor)
+    where_s = where if where in _WEBHOOK_SOURCE_WHERE else "boot"
+    line = (
+        "alerting: " + where_s
+        + " webhook_source=" + source_s
+        + ", effective_min_severity=" + floor_s
+    )
+    return _scrub_webhook_source_line(line, urls)
+
+
 def init(state: Any, webhook_url: Optional[str], dedupe_seconds: int = 300) -> None:
     """Configure the module-level manager (called once at startup)."""
     global _manager
     _manager = AlertManager(state, webhook_url, dedupe_seconds)
-    logger.info(
-        f"alerting ready — webhook={'configured' if _manager.webhook_configured else 'NOT configured (log + /alerts only)'}"
-    )
+    logger.info("%s", webhook_source_log_line("ready"))
 
 
 def webhook_configured() -> bool:
@@ -27641,6 +27735,7 @@ def _install_etrade_log_redactor() -> None:
 
 _install_etrade_log_redactor()
 alerts._ALERT_SCRUB = _scrub_etrade_urls
+alerts._WEBHOOK_LINE_SCRUB = scrub_etrade_text
 
 
 async def _read_response_body(response) -> bytes:
@@ -41501,11 +41596,7 @@ async def alerts_config_set(
         cfg = await alerts.set_config(url, sev)
     except ValueError as e:
         raise HTTPException(422, str(e))
-    logger.info(
-        "Alert delivery config updated — webhook_source=%s, effective_min_severity=%s",
-        cfg.get("webhook_source"),
-        cfg.get("effective_min_severity"),
-    )
+    logger.info("%s", alerts.webhook_source_log_line("update"))
     return cfg
 
 
