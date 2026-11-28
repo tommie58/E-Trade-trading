@@ -41487,14 +41487,22 @@ def _tracked_still_open_for_alert(
 ) -> Dict[str, Any]:
     """Tracked rows the 3:50 alert may name.
 
-    Day-trade mode names every tracked position. Mode off names only a
-    tracked position that expires today. Other swings are an allowed hold.
+    Day-trade mode names every tracked position. Mode off uses the same
+    predicate as the 3:40 flatten: an option whose expiry is today or
+    earlier, or whose expiry cannot be read. A later swing is an allowed
+    hold. A row with no option right is not in the flatten set.
     """
     if day_trade_mode:
         return positions
+    today = now_et.date().isoformat()
     kept: Dict[str, Any] = {}
     for ticker, pos in positions.items():
-        if isinstance(pos, dict) and _flatten_expires_today(pos, now_et):
+        if not isinstance(pos, dict):
+            continue
+        contract = pos.get("contract") if isinstance(pos.get("contract"), dict) else {}
+        if not contract.get("right"):
+            continue
+        if trailing_engine.contract_expires_by(contract.get("expiration"), today):
             kept[ticker] = pos
     return kept
 
