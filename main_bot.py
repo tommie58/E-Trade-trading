@@ -30741,6 +30741,18 @@ async def _arm_native_trail(
         refuse("the protective stop was cancelled too often — leaving it resting")
 
     stop_order_id = pos.get("stop_order_id")
+    # Read the broker trigger before the cancel. The failure re-arm must not
+    # come back under the stop that was just working.
+    resting_stop_px = None
+    if stop_order_id:
+        try:
+            resting_stop_px = await _read_open_order_stop(str(stop_order_id))
+        except Exception as exc:
+            logger.warning(
+                "[NATIVE TRAIL] %s resting stop unreadable (%s) — "
+                "re-arm uses the saved floor",
+                ticker, type(exc).__name__,
+            )
     outcome = await _cancel_order_verified(stop_order_id, expected_qty=qty)
     if outcome == CANCEL_FILLED:
         raise Exception(f"{ticker}: the resting stop just executed — position is flat, no trail armed")
@@ -30800,7 +30812,9 @@ async def _arm_native_trail(
             fresh = await state.get_position(ticker)
             outcome = "unplaced"
             if fresh:
-                outcome = await _reconcile_rearm_guard(ticker, dict(fresh))
+                outcome = await _reconcile_rearm_guard(
+                    ticker, dict(fresh), floor_price=resting_stop_px,
+                )
             _log_rearm_outcome(ticker, outcome, "NATIVE TRAIL")
             if outcome in ("placed", "skipped_live"):
                 raise Exception(f"{ticker}: trail placement failed ({e}) — protective stop restored")

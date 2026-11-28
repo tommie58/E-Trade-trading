@@ -1274,6 +1274,84 @@ def test_different_contract_stop_does_not_cover(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_trail_failure_rearm_is_not_looser_than_the_resting_stop(monkeypatch):
+    """R3, R3i, and C1f restore at least 2.50. M10D restores at least 8.60."""
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+    placed = []
+    phase = {"cancelled": False}
+
+    async def place_opt(ticker, contract, qty, premium):
+        placed.append(round(float(premium), 2))
+        return {"order_id": "RESTORED"}
+
+    def tokens():
+        return {"oauth_token": "t", "oauth_token_secret": "s"}
+
+    async def account(tokens):
+        return "acct"
+
+    async def place_trail(*args, **kwargs):
+        raise RuntimeError("trail rejected")
+
+    async def cancel_order(order_id, expected_qty=0):
+        phase["cancelled"] = True
+        return main_bot.CANCEL_CONFIRMED
+
+    monkeypatch.setattr(main_bot, "_place_option_protective_stop", place_opt)
+    monkeypatch.setattr(main_bot, "load_tokens", tokens)
+    monkeypatch.setattr(main_bot, "_resolve_account_id_key", account)
+    monkeypatch.setattr(main_bot, "_place_verified_native_trail", place_trail)
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel_order)
+
+    async def run_case(name, pos, broker_stop, bid, floor):
+        placed.clear()
+        phase["cancelled"] = False
+        pos = dict(pos)
+        pos["stop_order_id"] = "REST-1"
+        await store.set_position("QQQ", pos)
+
+        async def quote(ticker, contract=None):
+            return bid, round(bid + 0.10, 2)
+
+        async def fetch_orders():
+            status = "CANCELLED" if phase["cancelled"] else "OPEN"
+            return {"OrdersResponse": {"Order": _stop_order(
+                "REST-1", status, 1, broker_stop,
+                strike=pos["contract"]["strike"],
+                expiration=pos["contract"]["expiration"],
+                right=pos["contract"]["right"],
+            )}}
+
+        monkeypatch.setattr(main_bot, "_current_bid_ask", quote)
+        monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", fetch_orders)
+        with pytest.raises(Exception, match="protective stop restored"):
+            await main_bot._arm_native_trail("QQQ")
+        assert placed, name
+        assert placed[-1] + 1e-9 >= floor, name
+
+    async def scenario():
+        base = _entry_floor_option()
+        # R3: saved 2.40, no trail, broker 2.50.
+        r3 = _entry_floor_option({"trail": None})
+        await run_case("R3", r3, 2.50, 4.00, 2.50)
+        # R3i: trail 2.45 still under the broker 2.50.
+        r3i = _entry_floor_option({"trail": 2.45})
+        await run_case("R3i", r3i, 2.50, 4.00, 2.50)
+        # C1f: trail sits on the saved 2.40; the broker 2.50 still binds.
+        c1f = _entry_floor_option({"trail": 2.40})
+        await run_case("C1f", c1f, 2.50, 4.00, 2.50)
+        # M10D: saved and trail 8.00, broker 8.60.
+        m10 = _entry_floor_option({
+            "entry_premium": 10.0,
+            "stop_premium": 8.0,
+            "trail": 8.0,
+        })
+        await run_case("M10D", m10, 8.60, 12.00, 8.60)
+
+    asyncio.run(scenario())
+
+
 def test_cancel_requested_stop_does_not_block_rearm(monkeypatch):
     store = main_bot.StateStore(None)
     monkeypatch.setattr(main_bot, "state", store)
