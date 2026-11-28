@@ -18399,6 +18399,11 @@ ETRADE_RETRY_MAX_SECONDS = float(os.getenv("ETRADE_RETRY_MAX_SECONDS", "8"))
 # deadline with no stop: an unfilled entry is auto-cancelled; a filled entry
 # is emergency-flattened at market (a fill cannot be cancelled). 0 disables.
 STOP_PLACEMENT_TIMEOUT_SECONDS = int(os.getenv("STOP_PLACEMENT_TIMEOUT_SECONDS", "60"))
+# After a 3004 or a lost-reply retry, the guard may hold placement while it
+# looks for a covering stop. Polls advance only once the stop deadline has
+# passed. This many polls later, the hold ends and the normal unprotected
+# path runs: a critical alert and the deadline emergency flatten.
+STOP_ALLOCATION_HELD_POLLS = 3
 # CANCEL SETTLEMENT: E*TRADE answers a cancel with CANCEL_REQUESTED, which is a
 # PENDING state — the contracts/shares stay allocated to the dying order for a
 # beat afterwards. Sending the replacement stop or the closing order inside that
@@ -30685,6 +30690,27 @@ def _place_reply_ambiguous(err: BaseException) -> bool:
     return True
 
 
+def allocation_hold_after_poll(guard: dict, now: float,
+                               max_polls: int = STOP_ALLOCATION_HELD_POLLS) -> dict:
+    """Advance the allocation hold. Polls count only after the stop deadline.
+
+    Returns ``{"polls", "expired"}``. ``expired`` means the book was given the
+    deadline plus ``max_polls`` polls and still has no adopted stop.
+    """
+    try:
+        deadline = float((guard or {}).get("stop_deadline_ts") or 0)
+    except (TypeError, ValueError):
+        deadline = 0.0
+    try:
+        polls = int((guard or {}).get("stop_allocation_held_polls") or 0)
+    except (TypeError, ValueError):
+        polls = 0
+    past = deadline <= 0 or float(now) >= deadline
+    if past:
+        polls += 1
+    return {"polls": polls, "expired": past and polls >= int(max_polls)}
+
+
 async def _adopt_covering_stop(ticker: str, pos: dict, qty: int) -> Optional[str]:
     """Order id of a live stop that already covers this position, or None.
 
@@ -32773,6 +32799,7 @@ async def _stop_guard_worker(ticker: str) -> None:
             if not guard or guard.get("done"):
                 return
             is_option = str(guard.get("kind") or "equity") == "option"
+            allocation_hold_released = False
 
             status = str(guard.get("last_status") or "OPEN")
             filled = int(guard.get("last_filled") or 0)
@@ -32941,13 +32968,17 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 await _defer_close_to_reconciler(ticker, guard.get("stop_order_id"),
                                                                  "guard stop executed — fill price unavailable")
                             return
-                    if can_place and guard.get("stop_allocation_held"):
-                        # A prior place was accepted, or the retry was rejected
-                        # 3004, and the book has not shown the order yet. Do not
-                        # rest a second stop and do not flatten over the first.
+                    if can_place and (
+                        guard.get("stop_allocation_held") or guard.get("stop_reply_lost")
+                    ):
+                        # Read the book before another place. A covering stop
+                        # — including one whose ack was lost — is adopted.
+                        # A working close or limit does not cover, so it is
+                        # not adopted.
                         adopt_pos = {
                             "action": guard.get("action") or "BUY",
                             "contract": guard.get("contract") if is_option else None,
+                            "stop": None if is_option else guard.get("stop"),
                             "stop_premium": guard.get("stop") if is_option else None,
                             "entry_premium": 1 if is_option else None,
                         }
@@ -32958,6 +32989,8 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 guarded_qty=filled,
                                 stop_order_id=adopted,
                                 stop_allocation_held=False,
+                                stop_allocation_held_polls=0,
+                                stop_reply_lost=False,
                             ) or guard
                             async with _position_section(ticker, "stop adopt"):
                                 pos = await state.get_position(ticker)
@@ -32966,7 +32999,34 @@ async def _stop_guard_worker(ticker: str) -> None:
                                     pos["filled_qty"] = filled
                                     await state.set_position(ticker, pos)
                             guarded = filled
-                        can_place = False
+                            can_place = False
+                        elif guard.get("stop_allocation_held"):
+                            step = allocation_hold_after_poll(guard, time.time())
+                            if step["expired"]:
+                                logger.warning(
+                                    "[STOP GUARD] %s allocation hold expired after %s polls",
+                                    ticker, step["polls"],
+                                )
+                                guard = await state.update_guard(
+                                    ticker,
+                                    stop_allocation_held=False,
+                                    stop_allocation_held_polls=0,
+                                    stop_reply_lost=False,
+                                ) or guard
+                                allocation_hold_released = True
+                                await alerts.send_nowait(
+                                    "critical", "position_unprotected",
+                                    f"{ticker}: no covering stop was adopted after a 3004 "
+                                    f"or a lost stop reply "
+                                    f"({STOP_ALLOCATION_HELD_POLLS} polls past the stop "
+                                    f"deadline). The position is unprotected.",
+                                    dedupe_key=f"unprotected:{ticker}",
+                                )
+                            else:
+                                guard = await state.update_guard(
+                                    ticker, stop_allocation_held_polls=step["polls"],
+                                ) or guard
+                            can_place = False
                     if can_place:
                         try:
                             raw_stop = float(guard.get("stop") or 0)
@@ -32994,6 +33054,9 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 guarded_qty=filled,
                                 stop_order_id=stop_info["order_id"],
                                 stop_client_id=stop_info["client_id"],
+                                stop_reply_lost=False,
+                                stop_allocation_held=False,
+                                stop_allocation_held_polls=0,
                             ) or guard
                             async with _position_section(ticker, "stop placement"):
                                 pos = await state.get_position(ticker)
@@ -33034,7 +33097,16 @@ async def _stop_guard_worker(ticker: str) -> None:
                                         guarded_qty=filled,
                                         stop_order_id=adopted,
                                         stop_allocation_held=False,
+                                        stop_allocation_held_polls=0,
+                                        stop_reply_lost=False,
                                     ) or guard
+                                    async with _position_section(ticker, "stop adopt"):
+                                        pos = await state.get_position(ticker)
+                                        if pos:
+                                            pos["stop_order_id"] = adopted
+                                            pos["filled_qty"] = filled
+                                            await state.set_position(ticker, pos)
+                                    guarded = filled
                             elif _place_reply_ambiguous(e):
                                 # The reply was lost. The stop may already be
                                 # resting. One retry is allowed. Flatten waits.
@@ -33289,11 +33361,11 @@ async def _stop_guard_worker(ticker: str) -> None:
                     return
                 if filled > 0 and (
                     guard.get("stop_allocation_held") or guard.get("stop_reply_lost")
-                ):
-                    # The broker may already hold the stop. Extending the
-                    # guard is not an unprotected position.
+                ) and not allocation_hold_released:
+                    # Still inside the hold: the stop deadline plus
+                    # STOP_ALLOCATION_HELD_POLLS. Expiry is handled above.
                     pass
-                elif filled > 0:
+                elif filled > 0 and not allocation_hold_released:
                     # Filled but stop never stuck — keep trying rather than walk away.
                     logger.error(f"[STOP GUARD] {ticker} UNPROTECTED at deadline — extending guard")
                     await alerts.send_nowait(
