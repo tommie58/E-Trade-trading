@@ -30934,14 +30934,27 @@ def _native_trail_floor_verdict(trigger: Any, floor: Any) -> Dict[str, Any]:
     }
 
 
+# A degraded list_orders must not hold the 3:40 flatten. Close and deadline
+# paths fail open on timeout. Re-arm paths treat it as a failed read.
+PRE_CANCEL_STOP_READ_TIMEOUT_S = 4.0
+
+
 async def _read_open_order_stop(order_id: str) -> Optional[float]:
     """Positive stopPrice on an open order.
 
     None when the order is missing or its stop is not a positive price.
-    Raises when the order book itself cannot be read — the caller treats
-    that as an uncomputable floor and does not cancel.
+    Raises when the order book itself cannot be read, including when the
+    read exceeds PRE_CANCEL_STOP_READ_TIMEOUT_S. The caller treats that as
+    an uncomputable floor and does not cancel.
     """
-    resp = await _reconcile_fetch_orders()
+    try:
+        resp = await asyncio.wait_for(
+            _reconcile_fetch_orders(),
+            PRE_CANCEL_STOP_READ_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("resting stop read failed (%s)", "TimeoutError")
+        raise
     for order in reconciliation.parse_open_orders(resp):
         if str(order.get("order_id") or "") != str(order_id):
             continue
