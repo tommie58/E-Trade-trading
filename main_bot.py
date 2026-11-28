@@ -4392,15 +4392,13 @@ def parse_open_orders(orders_resp: Dict[str, Any], *, blank_as_open: bool = True
     return out
 
 
-def order_covers_position(order: dict, pos: dict, ticker: str, qty: int) -> bool:
-    """A resting stop covers this position only when it is the same instrument.
+def order_same_contract(order: dict, pos: dict, ticker: str) -> bool:
+    """Open closing protective order on this exact contract, any positive size.
 
-    Options match symbol, expiry, strike, and right. Equities match symbol
-    and a non-option security type. The order must be open, a closing
-    protective order, and large enough for ``qty``. A different contract
-    on the same underlying does not cover.
+    A 1-lot stop matches a 2-lot position. A different strike, expiry, or
+    right does not. Equities match the symbol and a non-option security type.
     """
-    if qty < 1:
+    if _stop_remaining(order) < 1:
         return False
     if str(order.get("status") or "").upper() not in _OPEN_ORDER_STATUSES:
         return False
@@ -4408,8 +4406,6 @@ def order_covers_position(order: dict, pos: dict, ticker: str, qty: int) -> bool
         return False
     action = str(order.get("order_action") or "")
     if action and action not in _CLOSING_ACTIONS:
-        return False
-    if _stop_remaining(order) < qty:
         return False
     if not (order.get("stop_price") or order.get("offset_value")):
         return False
@@ -4425,6 +4421,26 @@ def order_covers_position(order: dict, pos: dict, ticker: str, qty: int) -> bool
     if want is None or got is None:
         return False
     return want == got
+
+
+def stops_for_contract(stops: List[dict], pos: dict, ticker: str) -> List[dict]:
+    """Protective stops that close this position's contract, not the underlying."""
+    return [order for order in (stops or []) if order_same_contract(order, pos, ticker)]
+
+
+def order_covers_position(order: dict, pos: dict, ticker: str, qty: int) -> bool:
+    """A resting stop covers this position only when it is the same instrument.
+
+    Options match symbol, expiry, strike, and right. Equities match symbol
+    and a non-option security type. The order must be open, a closing
+    protective order, and large enough for ``qty``. A different contract
+    on the same underlying does not cover.
+    """
+    if qty < 1:
+        return False
+    if not order_same_contract(order, pos, ticker):
+        return False
+    return _stop_remaining(order) >= qty
 
 
 def order_is_option(order: dict) -> bool:
@@ -5525,7 +5541,9 @@ async def reconcile_once(
         # cancel/replace an order the operator placed by hand. Stamped here,
         # in the one place that reads the broker's order book, and cleared the
         # moment the trail is gone so protection never depends on stale state.
-        leg_stops = stops_by_leg.get((ticker, is_opt_pos)) or []
+        leg_stops = stops_for_contract(
+            stops_by_leg.get((ticker, is_opt_pos)) or [], pos, ticker,
+        )
         native = native_trail_stop(leg_stops, basis_qty)
         native_id = str(native.get("order_id")) if native else None
         if str(pos.get("native_trail_order_id") or "") != (native_id or ""):
@@ -5605,7 +5623,10 @@ async def reconcile_once(
             continue  # not present on this basis — section 1 handled the ghost
         if guard_owns_stop(guards.get(ticker), now):
             continue  # a live guard owns this position's stop right now
-        stops = stops_by_leg.get((ticker, position_is_option(pos))) or []
+        leg_stops_1b = stops_by_leg.get((ticker, position_is_option(pos))) or []
+        # Two contracts on one underlying are not one stop book. A 500C stop
+        # is not surplus on a tracked 470C.
+        stops = stops_for_contract(leg_stops_1b, pos, ticker)
         position_qty = basis_qty_1b or int(pos.get("filled_qty") or 0)
         plan = plan_protection_repair(ticker, position_qty, stops,
                                       tracked_stop_id=pos.get("stop_order_id"))
