@@ -381,6 +381,7 @@ def test_account_mismatch_alert_masks_ids(monkeypatch):
     monkeypatch.setattr(main_bot, "_etrade_call", list_call)
     monkeypatch.setattr(main_bot, "_load_pinned_account", no_pin)
     monkeypatch.setattr(main_bot.alerts, "send", capture)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", capture)
     monkeypatch.setattr(main_bot, "TARGET_ACCOUNT_ID", FAKE_ACCT)
     saved_key = main_bot._resolved_account_id_key
     saved_binding = main_bot._account_binding

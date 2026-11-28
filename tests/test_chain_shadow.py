@@ -661,7 +661,7 @@ def test_pro_trader_report_includes_the_chain_shadow_block():
     assert block["live_flip"] is False
     assert block["comparison"]["min_pairs"] == 40
     assert block["comparison"]["min_pairs_is_flip_rule"] is False
-    assert report["version"] == "5.99.15-pro-day-trader"
+    assert report["version"] == "5.99.19"
 
 
 def test_chain_shadow_report_names_the_live_flag(monkeypatch):
@@ -832,6 +832,7 @@ def test_process_signal_hook_order_and_identical_orders(monkeypatch):
     monkeypatch.setattr(main_bot, "_observe_series", quiet)
     monkeypatch.setattr(main_bot, "_spawn_guard", lambda ticker: None)
     monkeypatch.setattr(main_bot.alerts, "send", quiet)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", quiet)
     monkeypatch.setattr(main_bot.pyetrade, "ETradeMarket", _Market)
     monkeypatch.setattr(main_bot, "_snap_option_contract", snap)
     monkeypatch.setattr(main_bot.massive.MassiveClient, "fetch_option_quote", fetch_quote)

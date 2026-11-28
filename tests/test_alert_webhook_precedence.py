@@ -314,7 +314,9 @@ def test_webhook_source_log_is_scrubber_output(caplog, monkeypatch):
         leaked = "webhook_source=env " + ENV_URL + " token " + TOKEN_FRAGMENT
         safe = main_bot.alerts._scrub_webhook_source_line(leaked, [ENV_URL, SAVED_URL])
         main_bot.alerts.logger.info("%s", safe)
-        main_bot.logger.info("%s", main_bot.alerts.webhook_source_log_line("update"))
+        main_bot.logger.info(
+            "%s", main_bot.alerts._manager.webhook_source_log_line("update"),
+        )
         return await main_bot.alerts_config()
 
     cfg = _run(scenario())
@@ -339,3 +341,43 @@ def test_webhook_source_log_is_scrubber_output(caplog, monkeypatch):
     assert cfg["webhook_url_masked"].endswith("…ture")
     assert "webhook_source=env" in caplog.text
     assert "effective_min_severity=error" in caplog.text
+
+
+def test_send_nowait_uses_the_effective_error_floor(monkeypatch):
+    """A saved critical floor does not drop error alerts on the nowait path."""
+    _install_http(monkeypatch)
+
+    async def scenario():
+        await _boot(ENV_URL, SAVED_URL, min_severity="critical")
+        manager = main_bot.alerts._manager
+        assert manager.effective_min_severity == "error"
+        await main_bot.alerts.send_nowait("warning", "routine_notice", "below")
+        await main_bot.alerts.send_nowait("error", "etrade_http_error", "read failed")
+        await main_bot.alerts.send_nowait("critical", "feed_down", "halted")
+        pending = list(main_bot.alerts._delivery_tasks)
+        if pending:
+            await asyncio.gather(*pending)
+        return [row["severity"] for row in _Client.posts]
+
+    assert _run(scenario()) == ["error", "critical"]
+
+
+def test_failure_text_logs_the_exception_type_only(caplog):
+    caplog.set_level(logging.DEBUG)
+    header = "Authorization: Bearer-fixture"
+
+    class _Boom(Exception):
+        pass
+
+    async def scenario():
+        await _boot(ENV_URL, SAVED_URL, min_severity="critical")
+        exc = _Boom(ENV_URL + " " + header + " " + TOKEN_FRAGMENT)
+        text = main_bot.alerts._manager._failure_text(exc)
+        main_bot.alerts.logger.warning("alert config load failed: %s", text)
+        return text
+
+    text = _run(scenario())
+    assert text == "_Boom"
+    assert header not in caplog.text
+    assert "Bearer-fixture" not in caplog.text
+    _assert_url_absent(caplog.text)

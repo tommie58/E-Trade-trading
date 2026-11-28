@@ -2692,13 +2692,24 @@ floor, NOT the dedupe key, so a re-poll of the same fill cannot double-post.
 
 Fire-and-forget by design: an alerting failure must NEVER break trading, so
 every path here swallows and logs its own errors.
+
+Order, stop, flatten, and kill paths call `send_nowait`. That still logs and
+pushes `alerts:recent` before any POST. The POST itself is a background task
+with a strong reference and a done-callback. More than 50 deliveries in flight
+drops a non-critical POST (counted). A critical delivery waits in a small
+overflow queue and starts when a slot frees. Shutdown gives in-flight posts
+at most 3 seconds to finish. `send` still awaits the POST for callers that
+need the result, including the delivery test.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
+from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("etrade-bot.alerts")
 
@@ -2737,6 +2748,31 @@ DEFAULT_MIN_SEVERITY = "warning"
 # Delivery floor cannot be stricter than error. A saved "critical" still
 # delivers error alerts; warning and info stay below an error floor.
 _MAX_MIN_SEVERITY = "error"
+_MAX_INFLIGHT_DELIVERIES = 50
+# Critical POSTs wait here instead of being dropped at the in-flight cap.
+# The queue itself stops at 150 so a stuck receiver cannot hold them forever.
+_CRITICAL_QUEUE_MAX = 150
+_DRAIN_TIMEOUT_S = 3.0
+_URL_IN_TEXT = re.compile(r"https?://\S+")
+_CRITICAL_EVENTS = {
+    "position_unprotected",
+    "stop_placement_failed",
+    "partial_fill_unprotected",
+    "native_trail_unprotected",
+    "eod_flatten_blocked",
+    "flatten_close_unsaved",
+    "kill_switch_engaged",
+    "circuit_breaker_tripped",
+}
+# Webhook POSTs. Capped so a hung receiver cannot pile tasks up.
+_delivery_tasks: set = set()
+# Tasks created by synchronous callers (they await send_nowait themselves).
+_background_tasks: set = set()
+# (coroutine, label) waiting for an in-flight slot. Critical only.
+_critical_queue: Deque[Tuple[Any, str]] = deque()
+_dropped = 0
+# Cleared during shutdown drain so a finishing task does not start another.
+_deliveries_open = True
 
 
 def _cap_min_severity(severity: str) -> str:
@@ -2751,6 +2787,173 @@ def _cap_min_severity(severity: str) -> str:
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _redact_text(text: str) -> str:
+    """Strip URLs. httpx puts the request URL in exception text."""
+    return _URL_IN_TEXT.sub("[url]", text or "")
+
+
+def _redact_exc(exc: BaseException) -> str:
+    return _redact_text(f"{type(exc).__name__}: {exc}")[:200]
+
+
+def _delivery_is_critical(severity: str, event: str) -> bool:
+    """True when this POST must not be dropped at the in-flight cap.
+
+    Severity `critical` qualifies, and so do the unprotected / flatten / kill
+    events even when one of them is labelled warning or error.
+    """
+    if str(severity or "").lower() == "critical":
+        return True
+    name = str(event or "")
+    if name in _CRITICAL_EVENTS:
+        return True
+    if name.endswith("_unprotected"):
+        return True
+    if name.startswith("stop_timeout_"):
+        return True
+    return False
+
+
+def delivery_status() -> Dict[str, int]:
+    """In-flight posts, non-critical drops, and critical deliveries waiting."""
+    return {
+        "in_flight": len(_delivery_tasks),
+        "dropped": int(_dropped),
+        "queued": len(_critical_queue),
+    }
+
+
+def _on_alert_task_done(task: "asyncio.Task") -> None:
+    _delivery_tasks.discard(task)
+    _background_tasks.discard(task)
+    if not task.cancelled():
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            exc = None
+        if exc is not None:
+            logger.warning(f"alert delivery task failed: {_redact_exc(exc)}")
+    if _deliveries_open:
+        try:
+            _drain_critical_queue()
+        except Exception as e:
+            logger.warning(f"alert queue drain failed: {_redact_exc(e)}")
+
+
+def _start_delivery(coro, label: str) -> bool:
+    """Start one POST if a slot is free. The caller still owns `coro` on False."""
+    if not _deliveries_open or len(_delivery_tasks) >= _MAX_INFLIGHT_DELIVERIES:
+        return False
+    task = asyncio.create_task(coro)
+    _delivery_tasks.add(task)
+    task.add_done_callback(_on_alert_task_done)
+    return True
+
+
+def _drain_critical_queue() -> None:
+    """Start queued critical POSTs until the in-flight cap is full again."""
+    while _critical_queue and len(_delivery_tasks) < _MAX_INFLIGHT_DELIVERIES:
+        if not _deliveries_open:
+            return
+        coro, label = _critical_queue.popleft()
+        if not _start_delivery(coro, label):
+            _critical_queue.appendleft((coro, label))
+            return
+
+
+def _close_coro(coro) -> None:
+    close = getattr(coro, "close", None)
+    if close is not None:
+        close()
+
+
+def schedule_alert(coro, *, label: str = "", critical: bool = False) -> bool:
+    """Run a delivery coroutine in the background.
+
+    Holds a strong reference until the task finishes. The done-callback logs
+    a failure at warning and does not re-raise. A critical delivery that
+    finds 50 posts already in flight is queued, not dropped, and starts when
+    a slot frees. A non-critical one is dropped and counted. Returns False
+    only when the POST was dropped.
+    """
+    global _dropped
+    keep = bool(critical) or _delivery_is_critical("", label)
+    if keep:
+        if not _critical_queue and _start_delivery(coro, label):
+            return True
+        if len(_critical_queue) >= _CRITICAL_QUEUE_MAX:
+            _dropped += 1
+            logger.warning(
+                f"critical alert queue full ({_CRITICAL_QUEUE_MAX}) "
+                f"— {label or 'alert'} dropped"
+            )
+            _close_coro(coro)
+            return False
+        _critical_queue.append((coro, label))
+        _drain_critical_queue()
+        return True
+    _drain_critical_queue()
+    if _start_delivery(coro, label):
+        return True
+    _dropped += 1
+    where = f" ({label})" if label else ""
+    logger.warning(
+        f"alert delivery dropped — {len(_delivery_tasks)} already in flight{where}"
+    )
+    _close_coro(coro)
+    return False
+
+
+async def drain(timeout: float = _DRAIN_TIMEOUT_S) -> Dict[str, int]:
+    """Finish in-flight deliveries, waiting at most `timeout` seconds.
+
+    Called on shutdown / lifespan exit. Queued critical POSTs start as slots
+    free. Whatever is still running at the deadline is cancelled so a redeploy
+    cannot hang, and anything still queued is closed and logged by event name.
+    """
+    global _deliveries_open
+    try:
+        timeout_s = max(0.0, float(timeout))
+    except (TypeError, ValueError):
+        timeout_s = _DRAIN_TIMEOUT_S
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while True:
+        _drain_critical_queue()
+        pending = [task for task in list(_delivery_tasks) if not task.done()]
+        if not pending and not _critical_queue:
+            break
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        if not pending:
+            break
+        await asyncio.wait(pending, timeout=remaining)
+    _deliveries_open = False
+    leftover = [task for task in list(_delivery_tasks) if not task.done()]
+    for task in leftover:
+        task.cancel()
+    if leftover:
+        await asyncio.wait(leftover)
+        still = [task for task in leftover if not task.done()]
+        if still:
+            logger.warning(
+                f"alert drain stopped with {len(still)} delivery(s) still in flight"
+            )
+    while _critical_queue:
+        coro, label = _critical_queue.popleft()
+        _close_coro(coro)
+        logger.warning(f"alert drain closed queued delivery ({label or 'alert'})")
+    return delivery_status()
+
+
+def retain(task: "asyncio.Task") -> "asyncio.Task":
+    """Hold a task a synchronous caller created. Exceptions log at warning."""
+    _background_tasks.add(task)
+    task.add_done_callback(_on_alert_task_done)
+    return task
 
 
 def mask_webhook_url(url: Optional[str]) -> Optional[str]:
@@ -2880,15 +3083,14 @@ class AlertManager:
             self._webhook_source = "none"
 
     def _failure_text(self, exc: BaseException) -> str:
-        """_scrub_alert_text, then #40's 'webhook delivery failed' URL hide."""
-        raw = str(exc)
-        text = _scrub_alert_text(raw)
-        for secret in (
-            self._env_webhook_url, self._saved_webhook_url, self._webhook_url,
-        ):
-            if secret and (secret in raw or secret in text):
-                return "webhook delivery failed"
-        return text
+        """Exception type only.
+
+        The message is wrapped through `_redact_exc` and `_scrub_alert_text`
+        and then discarded, so a URL, token, or header cannot reach a log
+        or an alert.
+        """
+        _scrub_alert_text(_redact_exc(exc))
+        return type(exc).__name__
 
     def _take_saved_url(self, cfg: Any) -> None:
         self._saved_webhook_url = None
@@ -2921,7 +3123,7 @@ class AlertManager:
             self._saved_known = True
             self._apply_webhook_precedence()
             # Scrubber output only. The URL is a secret, not a format arg.
-            logger.info("%s", webhook_source_log_line("boot"))
+            logger.info("%s", self.webhook_source_log_line("boot"))
         except Exception as e:
             logger.warning(
                 "alert config load failed (using env default): %s",
@@ -2943,12 +3145,36 @@ class AlertManager:
                 _scrub_alert_text(self._failure_text(e)),
             )
 
+    def webhook_source_log_line(self, where: str = "boot") -> str:
+        """Boot/config line for this manager, after the shared scrubber.
+
+        Source is allowlisted to env|persisted|none. The line is
+        mask_webhook_url plus _scrub_alert_text. URLs are not interpolated.
+        Uses this instance, not the module-level manager.
+        """
+        source_s = self._webhook_source if self._webhook_source in {
+            "env", "persisted", "none",
+        } else "none"
+        floor_s = self.effective_min_severity
+        where_s = where if where in _WEBHOOK_SOURCE_WHERE else "boot"
+        line = (
+            "alerting: " + where_s
+            + " webhook_source=" + source_s
+            + ", effective_min_severity=" + floor_s
+        )
+        return _scrub_webhook_source_line(line, [
+            self._env_webhook_url,
+            self._saved_webhook_url,
+            self._webhook_url,
+        ])
+
     async def set_config(self, webhook_url: Optional[str],
                          min_severity: Optional[str]) -> Dict[str, Any]:
         """Apply + persist a delivery config.
 
-        An empty URL clears the *saved* webhook. When the env URL is set,
-        the saved value is stored but does not replace the env URL.
+        An empty URL clears the *saved* webhook. While the env webhook URL
+        is set, this cannot switch the live webhook (the saved URL is stored
+        and does not override it) and cannot set a floor stricter than error.
         """
         if webhook_url is not None:
             url = webhook_url.strip()
@@ -2996,7 +3222,8 @@ class AlertManager:
         if self._env_webhook_url:
             result["note"] = (
                 "ALERT_WEBHOOK_URL is set; a saved webhook_url is stored "
-                "but does not override it."
+                "but does not override it. The floor cannot be set stricter "
+                "than error."
             )
         return result
 
@@ -3023,12 +3250,19 @@ class AlertManager:
         ok, detail = await self._post_webhook(record)
         return {"delivered": ok, "detail": detail}
 
-    async def send(self, severity: str, event: str, message: str,
-                   dedupe_key: Optional[str] = None,
-                   data: Optional[Dict[str, Any]] = None,
-                   force_deliver: bool = False,
-                   webhook_text: Optional[str] = None,
-                   dedupe_seconds: Optional[int] = None) -> None:
+    async def _stage(self, severity: str, event: str, message: str,
+                     dedupe_key: Optional[str] = None,
+                     data: Optional[Dict[str, Any]] = None,
+                     force_deliver: bool = False,
+                     webhook_text: Optional[str] = None,
+                     dedupe_seconds: Optional[int] = None):
+        """Dedupe, log, and store. Return the webhook payload, or None.
+
+        None means do not POST: a duplicate, no webhook, or below the severity
+        floor. The log line and `alerts:recent` write have already happened
+        unless the alert was deduped. `dedupe_seconds` overrides the manager
+        window for this key (minimum 10s), the same rule as `send`.
+        """
         severity = severity.lower() if severity.lower() in _VALID_SEVERITIES else "warning"
         record: Dict[str, Any] = {
             "ts": _utcnow_iso(),
@@ -3056,10 +3290,11 @@ class AlertManager:
                 )
                 if not fresh:
                     logger.debug(f"[ALERT][dup suppressed] {event}")
-                    return
+                    return None
             except Exception as e:
                 logger.warning(
-                    f"alert dedupe check failed (sending anyway): {_scrub_alert_text(str(e))}"
+                    "alert dedupe check failed (sending anyway): "
+                    f"{_scrub_alert_text(_redact_exc(e))}"
                 )
 
         # 1) Always log.
@@ -3074,16 +3309,32 @@ class AlertManager:
                 ALERTS_RECENT_KEY, json.dumps(record, default=str), ALERTS_RECENT_MAX,
             )
         except Exception as e:
-            logger.warning(f"alert store failed: {_scrub_alert_text(str(e))}")
+            logger.warning(f"alert store failed: {_scrub_alert_text(_redact_exc(e))}")
 
         # 3) Webhook — severity-filtered, deduped, best-effort.
         if not self._webhook_url:
-            return
+            return None
         if not force_deliver and (
             _SEVERITY_RANK.get(severity, 1) < _SEVERITY_RANK.get(self.effective_min_severity, 1)
         ):
-            return  # below the effective delivery floor — log + /alerts only
-        await self._post_webhook(record, text_override=webhook_text)
+            return None  # below the effective delivery floor — log + /alerts only
+        return record, webhook_text
+
+    async def send(self, severity: str, event: str, message: str,
+                   dedupe_key: Optional[str] = None,
+                   data: Optional[Dict[str, Any]] = None,
+                   force_deliver: bool = False,
+                   webhook_text: Optional[str] = None,
+                   dedupe_seconds: Optional[int] = None) -> None:
+        staged = await self._stage(
+            severity, event, message, dedupe_key=dedupe_key, data=data,
+            force_deliver=force_deliver, webhook_text=webhook_text,
+            dedupe_seconds=dedupe_seconds,
+        )
+        if staged is None:
+            return
+        record, text = staged
+        await self._post_webhook(record, text_override=text)
 
     async def _post_webhook(self, record: Dict[str, Any],
                             text_override: Optional[str] = None) -> tuple:
@@ -3114,7 +3365,7 @@ class AlertManager:
             # the log and into the delivery record GET /alerts/config returns.
             raw_error = str(e)
             secret = self._webhook_url or ""
-            scrubbed = _scrub_alert_text(raw_error)
+            scrubbed = _scrub_alert_text(_redact_exc(e))
             if secret and (secret in raw_error or secret in scrubbed):
                 detail = "webhook delivery failed"
             else:
@@ -3150,39 +3401,12 @@ class AlertManager:
 _manager: Optional[AlertManager] = None
 
 
-def webhook_source_log_line(where: str = "boot") -> str:
-    """Boot/config line: source and effective floor, after the shared scrubber.
-
-    Source is allowlisted to env|persisted|none. The line is
-    mask_webhook_url plus _scrub_alert_text. URLs are not interpolated.
-    """
-    source = "none"
-    floor = DEFAULT_MIN_SEVERITY
-    urls: List[Optional[str]] = []
-    if _manager is not None:
-        source = _manager._webhook_source
-        floor = _manager.effective_min_severity
-        urls = [
-            _manager._env_webhook_url,
-            _manager._saved_webhook_url,
-            _manager._webhook_url,
-        ]
-    source_s = source if source in {"env", "persisted", "none"} else "none"
-    floor_s = _cap_min_severity(floor)
-    where_s = where if where in _WEBHOOK_SOURCE_WHERE else "boot"
-    line = (
-        "alerting: " + where_s
-        + " webhook_source=" + source_s
-        + ", effective_min_severity=" + floor_s
-    )
-    return _scrub_webhook_source_line(line, urls)
-
-
 def init(state: Any, webhook_url: Optional[str], dedupe_seconds: int = 300) -> None:
     """Configure the module-level manager (called once at startup)."""
-    global _manager
+    global _manager, _deliveries_open
+    _deliveries_open = True
     _manager = AlertManager(state, webhook_url, dedupe_seconds)
-    logger.info("%s", webhook_source_log_line("ready"))
+    logger.info("%s", _manager.webhook_source_log_line("ready"))
 
 
 def webhook_configured() -> bool:
@@ -3209,7 +3433,11 @@ async def get_config() -> Dict[str, Any]:
 
 
 async def set_config(webhook_url: Optional[str], min_severity: Optional[str]) -> Dict[str, Any]:
-    """Apply + persist delivery config. Raises ValueError on bad input."""
+    """Apply + persist delivery config. Raises ValueError on bad input.
+
+    While the env webhook URL is set, this cannot switch the live webhook
+    and cannot set a floor stricter than error.
+    """
     if _manager is None:
         raise RuntimeError("alerting not initialised")
     return await _manager.set_config(webhook_url, min_severity)
@@ -3246,11 +3474,58 @@ async def send(severity: str, event: str, message: str,
                             dedupe_seconds=dedupe_seconds)
     except Exception as e:
         raw_error = str(e)
-        text = _scrub_alert_text(raw_error)
+        text = _scrub_alert_text(_redact_exc(e))
         secret = (_manager._webhook_url or "") if _manager is not None else ""
         if secret and (secret in raw_error or secret in text):
             text = "webhook delivery failed"
         logger.error(f"alert send failed ({event}): {text}")
+
+
+async def send_nowait(severity: str, event: str, message: str,
+                      dedupe_key: Optional[str] = None,
+                      data: Optional[Dict[str, Any]] = None,
+                      force_deliver: bool = False,
+                      webhook_text: Optional[str] = None,
+                      dedupe_seconds: Optional[int] = None) -> None:
+    """Write the in-app record, then POST without blocking the caller.
+
+    The log line and `alerts:recent` push finish before this returns and
+    before the POST starts. The POST is an `asyncio` task held in a set; its
+    done-callback logs failures at warning. When 50 deliveries are already in
+    flight a non-critical POST is dropped and counted. A critical one is
+    queued until a slot frees. The in-app record stays either way.
+    Never raises.
+    """
+    try:
+        if _manager is None:
+            logger.warning(f"[ALERT][{severity.upper()}] {event} — {message} (alerting not initialised)")
+            return
+        staged = await _manager._stage(
+            severity, event, message, dedupe_key=dedupe_key, data=data,
+            force_deliver=force_deliver, webhook_text=webhook_text,
+            dedupe_seconds=dedupe_seconds,
+        )
+        if staged is None:
+            return
+        record, text = staged
+        # Same effective floor as _stage. A below-floor alert never POSTs.
+        if not force_deliver and (
+            _SEVERITY_RANK.get(str(record.get("severity") or ""), 1)
+            < _SEVERITY_RANK.get(_manager.effective_min_severity, 1)
+        ):
+            return
+        schedule_alert(
+            _manager._post_webhook(record, text_override=text),
+            label=str(record.get("event") or event),
+            critical=_delivery_is_critical(record.get("severity"), record.get("event")),
+        )
+    except Exception as e:
+        raw_error = str(e)
+        text = _scrub_alert_text(_redact_exc(e))
+        secret = (_manager._webhook_url or "") if _manager is not None else ""
+        if secret and (secret in raw_error or secret in text):
+            text = "webhook delivery failed"
+        logger.warning(f"alert send_nowait failed ({event}): {text}")
 
 
 async def recent(count: int = 50) -> List[Dict[str, Any]]:
@@ -4532,6 +4807,211 @@ class BrokerSessionExpired(Exception):
     alerted ONCE at the state transition by the session tracker."""
 
 
+# One retry, then a flat inference only when every precondition holds.
+# Not an env switch. Flatten and fill-size reads do not use this path.
+PORTFOLIO_404_RETRY_SECONDS = 2.0
+# Orders used for inference must be from this same pass and no older than this.
+ORDERS_READ_MAX_AGE_SECONDS = 30.0
+# After this many inferred passes in a row, the next bare 404 is a normal error
+# until a confirmed portfolio read resets the counter.
+INFERRED_FLAT_PASS_CAP = 2
+LAST_PORTFOLIO_READ_KEY = "reconcile:last_portfolio_read"
+INFERRED_FLAT_STREAK_KEY = "reconcile:inferred_flat_streak"
+_FILLED_ORDER_STATUSES = {"EXECUTED", "FILLED", "DONE_TRADE_EXECUTED"}
+
+
+def _http_status(err: BaseException) -> int:
+    try:
+        return int(getattr(err, "status_code", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def bare_portfolio_404(err: BaseException) -> bool:
+    """HTTP 404 whose body is not an E*TRADE JSON or XML error envelope.
+
+    A 400 whose code is 404 is not this. A 404 that carries an error code is
+    not this. Tomcat HTML (no error code) is.
+    """
+    if not isinstance(err, etrade_async.ETradeAPIError):
+        return False
+    if _http_status(err) != 404:
+        return False
+    if str(getattr(err, "code", "") or "").strip():
+        return False
+    body = str(getattr(err, "body", "") or "")
+    try:
+        extracted, _msg = etrade_async._extract_error_parts(body)
+    except Exception:
+        return False
+    if str(extracted or "").strip():
+        return False
+    stripped = body.lstrip()
+    head = stripped[:240].lower()
+    if stripped.startswith("{") or stripped.startswith("["):
+        return False
+    if stripped.startswith("<?xml") or "<error" in head:
+        return False
+    return True
+
+
+def orders_read_is_fresh(received_mono: Any, now_mono: Any) -> bool:
+    """True when this pass's orders read is at most ORDERS_READ_MAX_AGE_SECONDS old."""
+    try:
+        age = float(now_mono) - float(received_mono)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(age):
+        return False
+    return 0.0 <= age <= ORDERS_READ_MAX_AGE_SECONDS
+
+
+def executed_since(orders: List[dict], since_epoch: float) -> bool:
+    """True when any filled order is at or after `since_epoch`, or untimed.
+
+    EXECUTED covers every account order in the read, including a manual one.
+    A filled row with no usable timestamp blocks inference (fail closed).
+    """
+    for order in orders or []:
+        if str(order.get("status") or "").upper() not in _FILLED_ORDER_STATUSES:
+            continue
+        try:
+            ts = float(order.get("executed_ts") or 0)
+        except (TypeError, ValueError):
+            return True
+        if not math.isfinite(ts) or ts <= 0:
+            return True
+        if ts + 1e-9 >= float(since_epoch):
+            return True
+    return False
+
+
+async def _state_text(state: StateStore, key: str) -> Tuple[Optional[str], bool]:
+    """(value, readable). A raise is unreadable, not an empty value."""
+    try:
+        return await state.get(key), True
+    except Exception as exc:
+        logger.error("[RECONCILE] state read failed (%s)", type(exc).__name__)
+        return None, False
+
+
+async def _remember_confirmed_portfolio(state: StateStore, broker_positions: Dict[str, dict]) -> None:
+    """Record whether the last confirmed portfolio read was empty.
+
+    A failed write deletes the marker so the next 404 cannot infer from a
+    stale 'empty' flag. Also resets the inferred-flat streak.
+    """
+    payload = json.dumps({
+        "empty": len(broker_positions) == 0,
+        "epoch": time.time(),
+        "positions": len(broker_positions),
+    })
+    try:
+        await state.set(LAST_PORTFOLIO_READ_KEY, payload)
+        await state.set(INFERRED_FLAT_STREAK_KEY, "0")
+    except Exception as exc:
+        logger.error("[RECONCILE] portfolio-read record failed (%s)", type(exc).__name__)
+        try:
+            await state.delete(LAST_PORTFOLIO_READ_KEY)
+        except Exception as exc2:
+            logger.error("[RECONCILE] portfolio-read clear failed (%s)", type(exc2).__name__)
+
+
+async def _infer_flat_block(
+    state: StateStore,
+    orders_resp: Any,
+    orders_err: Optional[BaseException],
+    orders_received_mono: float,
+    all_orders: List[dict],
+    live_orders: List[dict],
+    tracked: Dict[str, Any],
+    guards: Dict[str, Any],
+) -> Optional[str]:
+    """None when every inferred-flat precondition holds. Otherwise a short code.
+
+    Orders must be from this pass (`orders_err` is None and the document is an
+    OrdersResponse) and at most ORDERS_READ_MAX_AGE_SECONDS old. A failed or
+    stale orders read never infers flat.
+    """
+    if orders_err is not None or not isinstance(orders_resp, dict) or "OrdersResponse" not in orders_resp:
+        return "orders_failed"
+    if not orders_read_is_fresh(orders_received_mono, time.monotonic()):
+        return "orders_stale"
+    if live_orders:
+        return "open_orders"
+    if tracked:
+        return "tracked"
+    if guards:
+        return "guard"
+    streak_raw, streak_ok = await _state_text(state, INFERRED_FLAT_STREAK_KEY)
+    if not streak_ok:
+        return "state_unreadable"
+    try:
+        streak = int(streak_raw or 0)
+    except (TypeError, ValueError):
+        return "state_unreadable"
+    if streak >= INFERRED_FLAT_PASS_CAP:
+        return "streak_cap"
+    last_raw, last_ok = await _state_text(state, LAST_PORTFOLIO_READ_KEY)
+    if not last_ok:
+        return "state_unreadable"
+    if not last_raw:
+        return "last_read_missing"
+    try:
+        last = json.loads(last_raw)
+    except (TypeError, ValueError):
+        return "last_read_missing"
+    if not isinstance(last, dict) or last.get("empty") is not True:
+        return "last_read_not_empty"
+    try:
+        since = float(last.get("epoch") or 0)
+    except (TypeError, ValueError):
+        return "last_read_missing"
+    if not math.isfinite(since) or since <= 0:
+        return "last_read_missing"
+    if executed_since(all_orders, since):
+        return "executed_since"
+    return None
+
+
+async def _commit_inferred_flat(
+    state: StateStore,
+    alert: Callable[..., Awaitable[None]],
+) -> bool:
+    """Count one inferred pass and reset the fetch-fail streak.
+
+    False when the cap counter cannot be written — the caller must keep the
+    404 as an error so the cap cannot be skipped. A fail-streak write failure
+    still counts the inference, and sends reconcile_fetch_failed at error.
+    """
+    raw, ok = await _state_text(state, INFERRED_FLAT_STREAK_KEY)
+    if not ok:
+        return False
+    try:
+        current = int(raw or 0)
+    except (TypeError, ValueError):
+        return False
+    try:
+        await state.set(INFERRED_FLAT_STREAK_KEY, str(current + 1))
+    except Exception as exc:
+        logger.error("[RECONCILE] inferred-streak write failed (%s)", type(exc).__name__)
+        return False
+    try:
+        await state.set(RECONCILE_FETCH_FAIL_STREAK, "0")
+    except Exception as exc:
+        logger.error("[RECONCILE] fail-streak reset failed (%s)", type(exc).__name__)
+        message = "Stop-fill booking deferred — the failure count could not be recorded."
+
+        async def _fire() -> None:
+            await alert(
+                "error", "reconcile_fetch_failed", message,
+                dedupe_key="reconcile_fetch_failed:error",
+            )
+
+        etrade_async.schedule_etrade_alert(_fire())
+    return True
+
+
 async def reconcile_once(
     state: StateStore,
     fetch_portfolio: Callable[[], Awaitable[Dict[str, Any]]],
@@ -4622,6 +5102,8 @@ async def reconcile_once(
         _capture(fetch_portfolio),
         _capture(fetch_orders),
     )
+    # Age of THIS pass's orders read. A previous pass is never reused.
+    orders_received_mono = time.monotonic()
     if isinstance(portfolio_err, BrokerSessionExpired) or isinstance(orders_err, BrokerSessionExpired):
         # Known-dead session — not a new failure. The transition was already
         # alerted once; repeating an ERROR per cycle is pure noise. Do not
@@ -4631,6 +5113,16 @@ async def reconcile_once(
         await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
         logger.info(f"[RECONCILE] skipped — session expired, awaiting relink ({reason})")
         return report
+
+    # HTTP 404 only (not a 400 whose code is 404). One retry. A 200 or 204
+    # comes back as a dict, not an exception, and replaces the failure.
+    if portfolio_err is not None and _http_status(portfolio_err) == 404:
+        await asyncio.sleep(PORTFOLIO_404_RETRY_SECONDS)
+        retry_resp, retry_err = await _capture(fetch_portfolio)
+        if retry_err is None:
+            portfolio_resp, portfolio_err = retry_resp, None
+        else:
+            portfolio_resp, portfolio_err = None, retry_err
 
     if portfolio_err is None and not isinstance(portfolio_resp, dict):
         portfolio_err = etrade_async.ETradeAPIError(
@@ -4647,7 +5139,32 @@ async def reconcile_once(
 
     portfolio_ok = portfolio_err is None
     orders_ok = orders_err is None
-    if portfolio_err is not None:
+    if orders_ok:
+        all_orders = parse_open_orders(orders_resp)
+        live_orders = [o for o in all_orders if o["status"] in _OPEN_ORDER_STATUSES]
+    else:
+        all_orders = []
+        live_orders = []
+    tracked = await state.all_positions()
+    guards = await state.all_guards()
+
+    # A bare HTML 404 can be inferred flat only when this pass's own orders
+    # read is fresh and empty, the bot tracks nothing, the last confirmed
+    # portfolio read was empty, and no order has filled since that read.
+    # Two such passes in a row is the cap; the third is an ordinary error.
+    # The account snapshot is never written on this path.
+    inferred = False
+    if portfolio_err is not None and bare_portfolio_404(portfolio_err):
+        block = await _infer_flat_block(
+            state, orders_resp, orders_err, orders_received_mono,
+            all_orders, live_orders, tracked, guards,
+        )
+        if block is None and await _commit_inferred_flat(state, _alert):
+            inferred = True
+        elif block is not None:
+            report["infer_blocked"] = block
+
+    if portfolio_err is not None and not inferred:
         await _note_broker_error(
             portfolio_err, "GET", "/v1/accounts/{acct}/portfolio.json",
         )
@@ -4659,14 +5176,8 @@ async def reconcile_once(
     # A failed read is unknown, not empty. Empty would ghost the book, cancel
     # live stops, and re-arm a second stop on top of one we failed to see.
     broker_positions = parse_broker_positions(portfolio_resp) if portfolio_ok else {}
-    if orders_ok:
-        all_orders = parse_open_orders(orders_resp)
-        live_orders = [o for o in all_orders if o["status"] in _OPEN_ORDER_STATUSES]
-    else:
-        all_orders = []
-        live_orders = []
-    tracked = await state.all_positions()
-    guards = await state.all_guards()
+    if portfolio_ok:
+        await _remember_confirmed_portfolio(state, broker_positions)
 
     report["tracked_positions"] = len(tracked)
     report["broker_positions"] = len(broker_positions) if portfolio_ok else None
@@ -4676,6 +5187,23 @@ async def reconcile_once(
     # Stop-fill booking needs BOTH reads: the portfolio says the position is
     # gone, and the orders list has the fill. Either failure defers it.
     report["fill_booking"] = "ran" if (portfolio_ok and orders_ok) else "deferred"
+
+    if inferred:
+        # Not a confirmed empty read. Do not overwrite the account snapshot,
+        # do not clear an untracked-position alert, and do not page this as
+        # a broker error. The last confirmed snapshot stands.
+        report["ok"] = True
+        report["portfolio_ok"] = "inferred_flat"
+        report["broker_positions"] = 0
+        report["orders_ok"] = True
+        report["live_orders"] = 0
+        report["fill_booking"] = "inferred_flat"
+        logger.warning(
+            "[RECONCILE] portfolio HTTP 404 had no broker error code; "
+            "inferred flat from an empty confirmed book and a fresh empty orders read"
+        )
+        await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
+        return report
 
     async def _alert_reconcile_fetch_failed() -> None:
         """Monitors still key on reconcile_fetch_failed. One send, not awaited
@@ -4691,8 +5219,19 @@ async def reconcile_once(
             except (TypeError, ValueError):
                 streak = 1
             await state.set(RECONCILE_FETCH_FAIL_STREAK, str(streak))
-        except Exception:
-            logger.debug("reconcile fail-streak update failed", exc_info=True)
+        except Exception as exc:
+            logger.error("[RECONCILE] fail-streak update failed (%s)", type(exc).__name__)
+            message = etrade_async.scrub_etrade_text(
+                "Stop-fill booking deferred — the failure count could not be recorded."
+            )
+
+            async def _fire_unreadable() -> None:
+                await _alert(
+                    "error", "reconcile_fetch_failed", message,
+                    dedupe_key="reconcile_fetch_failed:error",
+                )
+
+            etrade_async.schedule_etrade_alert(_fire_unreadable())
             return
         if not tracked:
             return
@@ -15879,6 +16418,9 @@ def plan_hold_guard(*, enabled: bool, minute_et: Any, close_minute: Any, today: 
     sym = str(ticker or "").upper()
     if sym and sym in set(opt_out or ()):
         return {**base, "detail": f"{sym} opted out (HOLD_GUARD_OPT_OUT_TICKERS)"}
+    # Main's overnight exemption. The live caller passes this only when
+    # DAY_TRADE_MODE is off. While day-trade mode is on, swing_hold is not
+    # an exemption and the 3:40 flatten sells the position.
     if swing_hold is True:
         return {**base, "detail": f"{sym} flagged swing_hold"}
     reasons: List[str] = []
@@ -16510,14 +17052,16 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # entry price is declined (below_entry). The fixed stop stays and the
 # next pass retries. POST /trail/native uses the same floor unless the
 # body sets allow_below_entry true.
-# 5.99.15: a non-empty ALERT_WEBHOOK_URL wins over a saved alerts:config
+# 5.99.17: an entry is refused unless its full planned risk fits the daily
+# budget. The 1-lot unproven exemption applies only to a plan that starts at
+# 1. A bare portfolio 404 can infer flat only while the book, the orders, and
+# the last confirmed read all say empty, and only for two passes in a row.
+# 5.99.19: a non-empty ALERT_WEBHOOK_URL wins over a saved alerts:config
 # webhook. The saved URL is used only when that env var is empty, and an
-# empty saved value does not clear it. The delivery floor is at most error,
-# so a saved min_severity of critical still delivers error alerts. Dedupe
-# windows are unchanged. GET /alerts/config reports webhook_source and
-# effective_min_severity. Source lines go through _scrub_alert_text and
-# mask_webhook_url. The webhook URL is never logged.
-BOT_VERSION = "5.99.15-pro-day-trader"
+# empty saved value does not clear it. The delivery floor is at most error
+# for send and send_nowait. While the env URL is set, POST /alerts/config
+# cannot switch the webhook and cannot set a floor stricter than error.
+BOT_VERSION = "5.99.19"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -16665,11 +17209,47 @@ CHAIN_SHADOW_COMPARISON_NOTE = (
     "does not change a live order, strike, quantity, stop, trail, rail, flatten, "
     "scanner, or the VWAP gate."
 )
-# DAY-TRADE MODE — aggressive same-session book. When true (default):
-#   • 3:40 PM ET hard flatten closes EVERY open option (no overnight holds)
-#   • expression already prefers 0–7 DTE / same-day when cheapest to hold
-# Set false to restore overnight holds (EOD flatten only for expiring contracts).
-DAY_TRADE_MODE = os.getenv("DAY_TRADE_MODE", "true").strip().lower() not in {"false", "0", "no"}
+# DAY-TRADE MODE. Unset or empty stays on: 3:40 PM ET (12:40 on a half day)
+# flattens every open option, including one flagged swing_hold. Only an
+# explicit false, 0, off, or no turns it off, which restores the prior
+# swing_hold exemption. Any other value stays on and logs the variable name.
+_DAY_TRADE_OFF = frozenset({"false", "0", "off", "no"})
+_DAY_TRADE_ON = frozenset({"true", "1", "on", "yes"})
+
+
+def resolve_day_trade_mode(raw: Any) -> Tuple[bool, Optional[str]]:
+    """(enabled, warning_name). Unset, empty, and recognized on-values are on.
+
+    Only false, 0, off, and no turn it off. Anything else stays on (fail
+    closed toward the flatten) and the warning name is DAY_TRADE_MODE.
+    The raw value is not returned, so a log cannot echo it.
+    """
+    if raw is None:
+        return True, None
+    text = str(raw).strip().lower()
+    if text == "" or text in _DAY_TRADE_ON:
+        return True, None
+    if text in _DAY_TRADE_OFF:
+        return False, None
+    return True, "DAY_TRADE_MODE"
+
+
+def swing_hold_exempt(signal_swing: Any, day_trade_mode: bool) -> bool:
+    """Main's overnight exemption. Day-trade mode never grants it."""
+    return (not day_trade_mode) and signal_swing is True
+
+
+def note_day_trade_mode(raw: Any) -> bool:
+    """Effective mode for one raw env value. Logs the variable name only."""
+    enabled, warning = resolve_day_trade_mode(raw)
+    if warning:
+        logging.getLogger("etrade-bot").warning(
+            "unrecognized %s — day-trade flatten stays on", warning,
+        )
+    return enabled
+
+
+DAY_TRADE_MODE = note_day_trade_mode(os.getenv("DAY_TRADE_MODE"))
 # OPTIONS ONLY — the account trades option contracts, never shares. Every
 # ENTRY whose instrument is not "option" (or "crypto" when CRYPTO_ENABLED) is
 # refused at the last gate before the broker (closes still pass: a share
@@ -17818,6 +18398,19 @@ def _flatten_window_open(now_et: datetime) -> bool:
     minute = now_et.hour * 60 + now_et.minute
     close = _session_close_minute(now_et)
     return (close - _flatten_lead_minutes()) <= minute < close
+
+
+def position_still_open_alert_due(now_et: datetime) -> bool:
+    """True from ten minutes after the flatten through the rest of that session day.
+
+    3:50 PM ET on a full day, 12:50 PM ET on a half day. A position still open
+    then is not an overnight hold. Weekends and full holidays are not this.
+    """
+    if now_et.weekday() >= 5 or now_et.date().isoformat() in _MARKET_HOLIDAYS:
+        return False
+    minute = now_et.hour * 60 + now_et.minute
+    close = _session_close_minute(now_et)
+    return minute >= (close - 10)
 
 
 def _is_market_open_at(now_et: datetime) -> bool:
@@ -20399,8 +20992,9 @@ def assess_app_risk_gates(open_count: Any, realized_pnl_today_pct: Any, daily_lo
 def assess_remaining_daily_budget(budget: Any, requested_risk_usd: Any) -> Optional[str]:
     """The scanner's remaining-budget check, shared with app entries.
 
-    Blocks when what is left is under 25% of the requested risk. An
-    unreadable budget refuses the entry. Pure.
+    Blocks unless the FULL planned risk fits in what is left. A partial
+    remainder (including 25% of the request) is not an admit. An unreadable
+    budget refuses the entry. Pure.
     """
     if isinstance(budget, dict) and budget.get("unreadable"):
         return str(budget.get("reason") or "daily risk budget unreadable — entry refused")
@@ -20417,7 +21011,7 @@ def assess_remaining_daily_budget(budget: Any, requested_risk_usd: Any) -> Optio
         return "daily risk budget unreadable — entry refused"
     if requested < 0:
         requested = 0.0
-    if remaining < requested * 0.25:
+    if remaining < requested:
         return (
             f"daily risk budget spent: ${used:,.0f} of "
             f"${total:,.0f} committed (realized losses + open risk) — "
@@ -21061,17 +21655,49 @@ async def _announce_learning_transitions(ticker: str) -> None:
         logger.debug(f"learning transition check skipped: {e}")
 
 
+def _stamp_plan_qty(ctx: Optional[Dict[str, Any]], plan_qty: Any) -> Optional[int]:
+    """Record the pre-learning plan size. None when it is not an int."""
+    try:
+        plan_n = int(plan_qty)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if isinstance(ctx, dict):
+        ctx["plan_qty"] = plan_n
+    return plan_n
+
+
+def _log_size_decision(kind: str, symbol: str, plan_n: Optional[int],
+                       final_qty: Any, weight: Any) -> None:
+    """plan_qty, the quantity after the weight, and the weight. No account ids."""
+    logger.info(
+        "%s %s: plan_qty %s qty %s weight %s",
+        kind, symbol, plan_n, final_qty, weight,
+    )
+
+
 def _apply_learning_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]]) -> int:
     """Shrink an ENTRY's size by the learning weight; stamp what happened on
     `ctx` (it rides into the position_opened record). Never below one unit —
-    `floor_bound` records when the cut could not bite."""
+    `floor_bound` records when the cut could not bite.
+
+    `plan_qty` on `ctx` is the size before this weight. Logging it does not
+    change the quantity returned.
+    """
+    plan_n = _stamp_plan_qty(ctx, qty)
     if not ctx or not LEARNING_ENABLED:
+        if isinstance(ctx, dict):
+            _log_size_decision("LEARNING", symbol, plan_n, qty, ctx.get("weight"))
         return qty
     sized, floor_bound = learning.apply_weight(qty, float(ctx.get("weight") or 1.0))
-    ctx.update({"requested_qty": int(qty), "sized_qty": int(sized), "floor_bound": floor_bound})
+    ctx.update({
+        "requested_qty": int(qty), "sized_qty": int(sized), "floor_bound": floor_bound,
+        "plan_qty": int(qty),
+    })
+    _log_size_decision("LEARNING", symbol, int(qty), int(sized), ctx.get("weight"))
     if sized != qty or floor_bound:
         logger.warning(
-            f"🧠 LEARNING {symbol}: size {qty} → {sized} (weight {ctx.get('weight')}) "
+            f"🧠 LEARNING {symbol}: plan_qty {int(qty)} qty {sized} "
+            f"(weight {ctx.get('weight')}) "
             f"{'— one-unit floor, cut did not fully bite ' if floor_bound else ''}"
             f"— {'; '.join(ctx.get('notes') or [])}"
         )
@@ -21190,31 +21816,53 @@ def contract_qty_for_risk_weight(
     market_weight: Any = None,
     ev_weight: Any = None,
     cut: Any = None,
+    plan_qty: Any = None,
 ) -> Dict[str, Any]:
     """Size by risk weight. A product under 1 contract is a skip, not a round-up.
 
-    A plan of 1 contract ignores the unproven-EV weight (`ev_weight`). A
-    regime or gap cut (`market_weight`) can still take it under 1, and that
-    skips with no round-up. A larger plan keeps the combined `weight`,
-    including the unproven weight. A non-numeric quantity skips. A
-    non-numeric market weight, when one is supplied, skips. Pure.
+    The 1-lot exemption reads `plan_qty`, the size BEFORE the learning weight.
+    It applies only when the plan STARTS at 1 lot: the unproven-EV weight is
+    ignored and only a regime or gap cut can skip it. A 2-lot plan the
+    learning weight has already cut to 1 still takes the combined weight,
+    including the unproven 0.5, and can skip. A non-numeric quantity, an
+    inf quantity (OverflowError), or a non-numeric / non-finite combined
+    weight skips. None of those is treated as a full-weight fill. Pure.
     """
     try:
         base = int(qty)
+    except OverflowError:
+        return {
+            "qty": 0, "skipped": True, "weight": 0.0, "product": 0.0,
+            "reason": "quantity unreadable — skipped",
+        }
     except (TypeError, ValueError):
         base = 0
+    if plan_qty is None:
+        started = base
+    else:
+        try:
+            started = int(plan_qty)
+        except (TypeError, ValueError, OverflowError):
+            return {
+                "qty": 0, "skipped": True, "weight": 0.0, "product": 0.0,
+                "reason": "plan size unreadable — skipped",
+            }
     try:
         w = float(weight)
-    except (TypeError, ValueError):
-        w = 1.0
+    except (TypeError, ValueError, OverflowError):
+        w = float("nan")
     if not math.isfinite(w):
-        w = 1.0
+        return {
+            "qty": 0, "skipped": True, "weight": w if isinstance(w, float) else 0.0,
+            "product": 0.0,
+            "reason": "combined weight unreadable — skipped",
+        }
     if base < 1:
         return {
             "qty": 0, "skipped": True, "weight": w, "product": 0.0,
             "reason": "quantity under 1 contract — skipped",
         }
-    if base == 1 and market_weight is not None:
+    if started == 1 and market_weight is not None:
         try:
             market = float(market_weight)
         except (TypeError, ValueError):
@@ -21247,6 +21895,11 @@ def contract_qty_for_risk_weight(
         return {"qty": base, "skipped": False, "weight": w, "product": float(base), "reason": ""}
     w = max(0.0, w)
     product = base * w
+    if not math.isfinite(product):
+        return {
+            "qty": 0, "skipped": True, "weight": w, "product": 0.0,
+            "reason": "combined weight unreadable — skipped",
+        }
     want = math.floor(product + 1e-12)
     if want < 1:
         return {
@@ -21276,11 +21929,20 @@ def _risk_cut_label(ctx: Dict[str, Any]) -> str:
     return "regime/gap cut"
 
 
-def _apply_risk_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]]) -> int:
+def _apply_risk_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]],
+                       plan_qty: Any = None) -> int:
     """Shrink an ENTRY by the regime × evidence weight (after the learning
-    weight). A 1-contract plan does not skip on the unproven-EV weight alone.
-    Under 1 contract sets `skip_reason` and returns 0."""
+    weight). `plan_qty` is the size BEFORE the learning weight. The 1-lot
+    exemption applies only when that plan starts at 1. Under 1 contract sets
+    `skip_reason` and returns 0.
+
+    The pre-learning plan size is recorded next to the final quantity and the
+    weight. That record does not change the quantity returned.
+    """
+    plan_n = _stamp_plan_qty(ctx, qty if plan_qty is None else plan_qty)
     if not ctx or not PORTFOLIO_RISK_ENABLED:
+        if isinstance(ctx, dict):
+            _log_size_decision("RISK", symbol, plan_n, qty, ctx.get("weight"))
         return qty
     regime = ctx.get("regime") if isinstance(ctx.get("regime"), dict) else None
     market_weight = None if regime is None else regime.get("weight")
@@ -21290,6 +21952,7 @@ def _apply_risk_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]]) -> 
         market_weight=market_weight,
         ev_weight=ctx.get("ev_weight"),
         cut=_risk_cut_label(ctx) if market_weight is not None else None,
+        plan_qty=qty if plan_qty is None else plan_qty,
     )
     ctx.update({
         "requested_qty": int(qty) if isinstance(qty, int) else qty,
@@ -21298,13 +21961,19 @@ def _apply_risk_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]]) -> 
     })
     if decision["skipped"]:
         ctx["skip_reason"] = decision["reason"]
-        logger.warning(f"🧩 RISK {symbol}: {decision['reason']}")
+        _log_size_decision("RISK", symbol, ctx.get("plan_qty"), 0, ctx.get("weight"))
+        logger.warning(
+            f"🧩 RISK {symbol}: plan_qty {ctx.get('plan_qty')} qty 0 "
+            f"(weight {ctx.get('weight')}) — {decision['reason']}"
+        )
         return 0
     sized = int(decision["qty"])
     ctx.pop("skip_reason", None)
+    _log_size_decision("RISK", symbol, ctx.get("plan_qty"), sized, ctx.get("weight"))
     if sized != qty:
         logger.warning(
-            f"🧩 RISK {symbol}: size {qty} → {sized} (weight {ctx.get('weight')}) "
+            f"🧩 RISK {symbol}: plan_qty {ctx.get('plan_qty')} qty {sized} "
+            f"(weight {ctx.get('weight')}) "
             f"— {'; '.join(ctx.get('notes') or [])}"
         )
     return sized
@@ -22413,7 +23082,7 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
             # Judge the budget against what the CONTRACT risks, not what the
             # percentage wishes it risked. On 2026-08-24 those were $110 and $28.
             requested_risk = max(nominal_risk, actual_risk or 0.0)
-            if budget["remaining_usd"] < requested_risk * 0.25:
+            if budget["remaining_usd"] < requested_risk:
                 spent = (
                     f"daily risk budget spent: ${budget['used_usd']:,.0f} of "
                     f"${budget['budget_usd']:,.0f} committed (realized losses + open risk) — "
@@ -22881,6 +23550,17 @@ def _require_probeable_session() -> None:
 
 
 def _looks_like_auth_failure(err: Exception) -> bool:
+    """True on HTTP 401, or on a status-less error whose text says so.
+
+    A known status that is not 401 is not an auth failure, even when the
+    body happens to contain the digits 401 (an HTML 404 page).
+    """
+    status = getattr(err, "status_code", None)
+    if status is not None and status != "":
+        try:
+            return int(status) == 401
+        except (TypeError, ValueError):
+            pass
     text = str(err)
     return "401" in text or "oauth_problem" in text or "Unauthorized" in text
 
@@ -25084,7 +25764,7 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
         "pin_stale": bool(pinned) and source != "pinned",
     }
     if pinned and source != "pinned":
-        await alerts.send(
+        await alerts.send_nowait(
             "warning", "account_pin_stale",
             f"Pinned account {mask_account_key(pinned)} is not among the {len(account_list)} linked "
             f"accounts — orders route to ****{acct_id[-4:] or '????'} instead. "
@@ -25095,7 +25775,7 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
         # Deliberate in-app choice — nothing ambiguous to warn about.
         pass
     elif target and not matched:
-        await alerts.send(
+        await alerts.send_nowait(
             "warning", "account_binding_mismatch",
             f"ETRADE_ACCOUNT_ID ({mask_account_key(target)}) matched none of {len(account_list)} linked accounts — "
             f"orders will route to ****{acct_id[-4:] or '????'} ({chosen.get('accountDesc', 'n/a')}). "
@@ -25103,7 +25783,7 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
             dedupe_key=f"acctbind:{mask_account_key(target)}:{mask_account_key(acct_id)}",
         )
     elif not target and len(account_list) > 1:
-        await alerts.send(
+        await alerts.send_nowait(
             "warning", "account_binding_unset",
             f"ETRADE_ACCOUNT_ID is not set and {len(account_list)} accounts are linked — "
             f"orders route to the first ACTIVE one (****{acct_id[-4:] or '????'}, "
@@ -25253,7 +25933,7 @@ async def _record_api_failure(source: str, error: str) -> None:
             "source": source, "failures": fails, "last_error": str(error)[:300],
             "cooldown_seconds": CIRCUIT_BREAKER_COOLDOWN_SECONDS,
         })
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", "circuit_breaker_tripped",
             f"Order placement HALTED after {fails} consecutive API failures ({source}): {error}",
             dedupe_key="breaker_trip",
@@ -27713,6 +28393,16 @@ def scrub_etrade_text(text: str, secrets: Optional[Sequence[str]] = None) -> str
     return cleaned
 
 
+def _order_exc_text(exc: BaseException, limit: int = 80) -> str:
+    """Order-path log text. Type name plus a short scrubbed message.
+
+    The raw exception text is not logged: it can carry an account id.
+    Uses the shared scrubber, which also drops webhook URLs.
+    """
+    scrubbed = scrub_etrade_text(str(exc))[:limit]
+    return f"{type(exc).__name__}: {scrubbed}"
+
+
 def _bind_shared_scrubber() -> None:
     """Point every etrade_async module object at this one function."""
     import sys
@@ -28346,7 +29036,10 @@ async def _place_order_smart(kind: str, common: dict, tokens: Dict[str, str]) ->
         try:
             await state.set(_placement_mark_key(sig), "inflight", ex=86400)
         except Exception as mark_err:
-            logger.warning(f"placement mark failed (order still attempted): {mark_err}")
+            logger.warning(
+                "placement mark failed (order still attempted): %s",
+                _order_exc_text(mark_err),
+            )
     try:
         placed = await _place_order_smart_impl(kind, common, tokens)
     except ETradeAPIError as e:
@@ -28360,7 +29053,7 @@ async def _place_order_smart(kind: str, common: dict, tokens: Dict[str, str]) ->
         try:
             await state.set(_placement_mark_key(sig), "placed", ex=86400)
         except Exception as mark_err:
-            logger.warning(f"placed mark failed: {mark_err}")
+            logger.warning("placed mark failed: %s", _order_exc_text(mark_err))
     return placed
 
 
@@ -28390,11 +29083,14 @@ async def _place_order_smart_impl(kind: str, common: dict, tokens: Dict[str, str
             "price_type": common.get("priceType"),
             "contract": {k: common.get(k) for k in ("callPut", "strikePrice", "expiryDate")},
             "tried": {k: common.get(k) for k in ("limitPrice", "stopPrice") if common.get(k) is not None},
-            "error": text[:600], "bid": bid or None, "ask": ask or None,
+            "error": _order_exc_text(e, limit=300), "bid": bid or None, "ask": ask or None,
             "retry": (plan or {}).get("changes"),
         }
-        logger.error(f"[TICK 2040] {record['ticker']} {record['order_action']} {record['tried']} "
-                     f"rejected: {text[:300]} — quote {bid}/{ask}; retry {record['retry']}")
+        logger.error(
+            "[TICK 2040] %s %s %s rejected: %s — quote %s/%s; retry %s",
+            record["ticker"], record["order_action"], record["tried"],
+            _order_exc_text(e, limit=300), bid, ask, record["retry"],
+        )
         if plan is None:
             record["outcome"] = "no_retry"
             await trade_ledger.record("order_tick_rejected", record)
@@ -28403,7 +29099,7 @@ async def _place_order_smart_impl(kind: str, common: dict, tokens: Dict[str, str
         try:
             placed = await _place_order_once(kind, common, tokens)
         except Exception as e2:
-            record.update(outcome="retry_rejected", retry_error=str(e2)[:600])
+            record.update(outcome="retry_rejected", retry_error=_order_exc_text(e2, limit=300))
             await trade_ledger.record("order_tick_rejected", record)
             raise
         record["outcome"] = "retry_accepted"
@@ -28457,7 +29153,10 @@ async def _place_order_once(kind: str, common: dict, tokens: Dict[str, str]) -> 
                 # No pyetrade fallback for crypto — surface the broker error.
                 raise
             if _raw_place_fallback_safe(e.status_code, False):
-                logger.warning(f"RAW order path rejected ({e}) — falling back to pyetrade")
+                logger.warning(
+                    "RAW order path rejected (%s) — falling back to pyetrade",
+                    _order_exc_text(e),
+                )
             else:
                 # A 5xx on place.json may FOLLOW acceptance — re-placing through
                 # pyetrade risks a double fill. Surface the ambiguity instead.
@@ -28465,7 +29164,10 @@ async def _place_order_once(kind: str, common: dict, tokens: Dict[str, str]) -> 
         except httpx.ConnectError as e:
             if kind == "crypto":
                 raise
-            logger.warning(f"RAW order path unreachable before send ({e}) — falling back to pyetrade")
+            logger.warning(
+                "RAW order path unreachable before send (%s) — falling back to pyetrade",
+                _order_exc_text(e),
+            )
     if kind == "crypto":
         raise LocalRefusal("crypto orders require USE_RAW_ORDER_API (pyetrade has no crypto path)")
     orders = _orders_client(tokens)
@@ -29191,7 +29893,10 @@ async def _await_cancel_settled(order_id: str,
             status, filled = await _order_state(str(order_id), None)
             verdict = classify_cancel_status(status, filled, expected_qty)
         except Exception as e:
-            logger.warning(f"cancel verification unavailable for order {order_id}: {e}")
+            logger.warning(
+                "cancel verification unavailable for order %s: %s",
+                order_id, _order_exc_text(e),
+            )
             verdict, status = "working", "UNKNOWN"
         if verdict in ("filled", "partial", "terminal"):
             return verdict, filled, status
@@ -29226,7 +29931,10 @@ async def _cancel_order_call(order_id: str) -> None:
             # is transport noise worth retrying on the pyetrade path.
             if 400 <= e.status_code < 500:
                 raise
-            logger.warning(f"raw cancel path failed for {order_id} ({e}) — falling back to pyetrade")
+            logger.warning(
+                "raw cancel path failed for %s (%s) — falling back to pyetrade",
+                order_id, _order_exc_text(e),
+            )
     orders = _orders_client(tokens)
     await _etrade_call(orders.cancel_order, acct_key, int(order_id), resp_format="json", source="cancel_order")
 
@@ -29271,7 +29979,10 @@ async def _cancel_order_verified(order_id: Optional[str],
         # function stays liftable without the etrade_async import.
         code = getattr(e, "status_code", None)
         broker_answered = isinstance(code, int) and 400 <= code < 500
-        logger.warning(f"order cancel call failed ({order_id}): {e} — verifying against broker order book")
+        logger.warning(
+            "order cancel call failed (%s): %s — verifying against broker order book",
+            order_id, _order_exc_text(e),
+        )
 
     # Wait for the broker to actually retire the order. Returning on the first
     # CANCEL_REQUESTED is what caused every "not enough available contracts"
@@ -29575,7 +30286,7 @@ async def _place_option_protective_stop(ticker: str, contract: dict, qty: int, s
             # when no bid was readable — moving protection AWAY from the market
             # on no evidence at all. Keep the level, surface it, and let the
             # reconciler re-arm against a real bid.
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "option_stop_2084_no_bid",
                 f"{ticker}: protective stop {stop_px:.2f} rejected (2084 — must rest below the bid) and "
                 f"no live bid is readable — NOT loosening it blind; the reconciler re-arms on a real bid",
@@ -29919,7 +30630,7 @@ async def _arm_native_trail(
             if fresh:
                 await _reconcile_rearm_guard(ticker, dict(fresh))
         except Exception as re_arm_error:
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "native_trail_unprotected",
                 f"{ticker}: arming a native trail failed AND the protective stop could not be "
                 f"restored — verify at your broker now ({e}; re-arm: {re_arm_error})",
@@ -30210,7 +30921,7 @@ async def _place_crossing_exit(common: dict, tokens: dict, bid: float, market_ok
         })
         return await _place_order_smart("option", fallback, tokens)
     if outcome in (CANCEL_PARTIAL, CANCEL_LIVE):
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", "crossing_exit_unresolved",
             f"{common.get('symbol')}: crossing exit {order_id} did not fill in "
             f"{EXIT_CROSS_WAIT_SECONDS:.0f}s and the cancel returned {outcome} — check the position",
@@ -30256,7 +30967,7 @@ async def _place_limit_only_exit(common: dict, tokens: dict, bid: float) -> Any:
         if outcome == CANCEL_FILLED:
             return placed
         if outcome != CANCEL_CONFIRMED:
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "crossing_exit_unresolved",
                 f"{symbol}: limit exit {order_id} did not fill and the cancel returned {outcome} — check the position",
                 dedupe_key=f"cross_exit:{symbol}",
@@ -30338,7 +31049,7 @@ async def _exit_after_limit_rejection(common: dict, tokens: dict, bid: float,
         "ticker": symbol, "rejected_limit": rejected_limit, "retry_limit": tight,
         "bid": fresh_bid, "error": str(first_err)[:200],
     })
-    await alerts.send(
+    await alerts.send_nowait(
         "warning", "exit_1011_market",
         f"{symbol}: E*TRADE refused the exit limit as too far from the market (1011) — "
         f"closed at MARKET instead so the position is not left open.",
@@ -30470,12 +31181,12 @@ def _mark_trusted_for_harvest(ticker: str, contract: Optional[dict], label: str)
         f"holding rather than selling on a price that may not be real "
         f"(the stop and trail still protect this position)"
     )
-    asyncio.create_task(alerts.send(
+    alerts.retain(asyncio.create_task(alerts.send_nowait(
         "warning", "harvest_blocked_untrusted_mark",
         f"{ticker}: a take-profit/scale-out was due but the quote is not trustworthy — "
         f"{quality['detail']}. The position stays open and protected.",
         dedupe_key=f"untrustedmark:{ticker}:{quality['reason']}",
-    ))
+    )))
     return False
 
 
@@ -30553,7 +31264,7 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
                         await _reconcile_rearm_guard(ticker, dict(fresh))
                     except Exception as e:
                         logger.error(f"[SCALE-OUT] {ticker} re-arm after partial stop fill FAILED: {e}")
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "critical", "partial_fill_unprotected",
                             f"{ticker}: the protective stop filled part of the position and the "
                             f"remaining {remaining} could NOT be re-protected — close them manually: {e}",
@@ -30578,7 +31289,7 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
             await _reconcile_rearm_guard(ticker, pos)
         except Exception as re:
             logger.error(f"[SCALE-OUT] {ticker} stop re-arm after failed scale-out ALSO failed: {re}")
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "scale_out_unprotected",
                 f"{ticker}: scale-out failed AND the protective stop could not be re-armed — "
                 f"position is UNPROTECTED, manual review needed",
@@ -30621,7 +31332,7 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
         await _reconcile_rearm_guard(ticker, pos)
     except Exception as e:
         logger.error(f"[SCALE-OUT] {ticker} runner stop re-arm FAILED: {e}")
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", "scale_out_runner_unprotected",
             f"{ticker}: {runner_qty} runner contract(s) left WITHOUT a protective stop after "
             f"scale-out — manual review needed",
@@ -30778,7 +31489,7 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
                         await _reconcile_rearm_guard(ticker, dict(fresh))
                     except Exception as e:
                         logger.error(f"[TAKE PROFIT] {ticker} re-arm after partial fill FAILED: {e}")
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "critical", "partial_fill_unprotected",
                             f"{ticker}: the protective order filled part of the position while "
                             f"banking the target and the remaining {remaining} could NOT be "
@@ -30805,7 +31516,7 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
             await _reconcile_rearm_guard(ticker, pos)
         except Exception as re:
             logger.error(f"[TAKE PROFIT] {ticker} stop re-arm after failed close ALSO failed: {re}")
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "take_profit_unprotected",
                 f"{ticker}: the take-profit close failed AND the protective stop could not be "
                 f"re-armed — position is UNPROTECTED, manual review needed",
@@ -30847,7 +31558,7 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
             f"leaving the booking to the reconciler rather than inventing an exit price"
         )
     await _finish_guard(ticker, "closed_by_take_profit")
-    await alerts.send(
+    await alerts.send_nowait(
         "info", "take_profit_closed",
         f"{ticker}: take-profit target {target:.2f} tagged — {qty} contract(s) closed"
         + (f" at {fill:.2f}" if fill else " (fill pending)"),
@@ -30986,7 +31697,7 @@ async def _stop_churn_gate(ticker: str, pos: dict, who: str) -> bool:
             f"[STOP CHURN] {ticker} {who} wanted the stop off but it was cancelled "
             f"{verdict['recent']}× in {STOP_CHURN_WINDOW_SECONDS / 60:.0f} min — leaving it resting"
         )
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", "stop_churn_blocked",
             f"{ticker}: the protective stop was cancelled {verdict['recent']} times in "
             f"{STOP_CHURN_WINDOW_SECONDS / 60:.0f} minutes — the bot stopped touching it so the position "
@@ -31019,7 +31730,7 @@ async def _exit_retry_gate(ticker: str, pos: dict, reason: str) -> bool:
             f"{EXIT_RETRY_SLOW_SECONDS / 60:.0f} min"
             + (f", stop pulled up to {tightened:.2f}" if tightened else ", stop unchanged")
         )
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", f"{reason}_gave_up",
             f"{ticker}: the {reason.replace('_', ' ')} close failed {retry['fails']} times. The bot now "
             f"retries once every {EXIT_RETRY_SLOW_SECONDS / 60:.0f} minutes"
@@ -31211,7 +31922,8 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
             close_minute=_session_close_minute(now_et), today=now_et.date().isoformat(),
             expiry=contract.get("expiration"), ticker=ticker, holidays=_MARKET_HOLIDAYS,
             events_for_day=econ_calendar.events_for_day,
-            earnings_date=sig.get("earnings_date"), swing_hold=sig.get("swing_hold") is True,
+            earnings_date=sig.get("earnings_date"),
+            swing_hold=swing_hold_exempt(sig.get("swing_hold"), DAY_TRADE_MODE),
             opt_out=HOLD_GUARD_OPT_OUT_TICKERS,
         )
         if hg["fire"]:
@@ -31274,7 +31986,7 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
                 f"({outcome}) — not risking a double sale"
             )
             if reason == "eod_flatten":
-                await alerts.send(
+                await alerts.send_nowait(
                     "critical", "eod_flatten_blocked",
                     f"{ticker}: the 3:40 PM ET flatten could NOT run — the resting protective "
                     f"order could not be confirmed cancelled ({outcome}). Close this manually "
@@ -31311,7 +32023,7 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
                 await state.set_position(ticker, pos)
             except Exception:
                 pass
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", f"{reason}_failed",
             f"{ticker}: the {reason.replace('_', ' ')} close FAILED ({e}) — "
             + ("this position may expire worthless; close it manually."
@@ -31358,7 +32070,7 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
             f"leaving the booking to the reconciler rather than inventing an exit price"
         )
     await _finish_guard(ticker, f"closed_by_{reason}")
-    await alerts.send(
+    await alerts.send_nowait(
         "info", f"{reason}_closed",
         f"{ticker}: {verdict['detail']} — {qty} contract(s) closed"
         + (f" at {fill:.2f}" if fill else " (fill pending)"),
@@ -31462,7 +32174,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                     confirmed, guard = await _note_broker_zero(ticker, guard)
                     if confirmed:
                         if not guard.get("unreadable_fill_alerted"):
-                            await alerts.send(
+                            await alerts.send_nowait(
                                 "critical", "entry_fill_qty_unreadable",
                                 f"{ticker}: entry is {status} and the broker holding "
                                 f"stayed 0 — no protective stop. The position stays tracked.",
@@ -31489,7 +32201,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                             f"[STOP GUARD] {ticker} could not stamp the sized fill: {e}"
                         )
                     if not guard.get("unreadable_fill_alerted"):
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "critical", "entry_fill_qty_unreadable",
                             f"{ticker}: entry is {status} but the filled quantity was "
                             f"0 or missing — protective stop sized at {sized}. "
@@ -31500,7 +32212,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                             ticker, unreadable_fill_alerted=True,
                         ) or guard
                 elif not guard.get("unreadable_fill_alerted"):
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "critical", "entry_fill_qty_unreadable",
                         f"{ticker}: entry is {status} but the filled quantity was "
                         f"0 or missing — no size was available for a protective stop. "
@@ -31528,126 +32240,135 @@ async def _stop_guard_worker(ticker: str) -> None:
             # so every downstream P&L number measures from reality. `trued_qty`
             # re-arms the true-up when partials grow the position (the average
             # price moves with each partial).
+            pending_entry_alert = None
             if filled > int(guard.get("trued_qty") or 0):
                 if await _true_up_entry_fill(ticker, guard):
                     guard = await state.update_guard(ticker, trued_qty=filled) or guard
-                    # BUY ALERT — fired here, not at placement: this is the first
-                    # moment a real average execution price exists. The dedupe key
-                    # carries the cumulative qty, so a re-poll cannot double-post
-                    # while a growing partial still announces itself.
-                    await _alert_entry_fill(ticker, guard, filled)
+                    # BUY ALERT — the average price exists, but the protective
+                    # stop is placed first. Delivery is scheduled after that
+                    # stop and does not block it. The dedupe key carries the
+                    # cumulative qty, so a re-poll cannot double-post while a
+                    # growing partial still announces itself.
+                    pending_entry_alert = (guard, filled)
 
-            guarded = int(guard.get("guarded_qty") or 0)
-            if filled > guarded:
-                # (Re)place the protective stop for the total filled quantity.
-                can_place = True
-                if guard.get("stop_order_id"):
-                    # Replace flow: only place a new stop if the old one is truly
-                    # cancelled — never risk two live stops double-selling, and
-                    # never re-arm behind a stop that already filled.
-                    replace_outcome = await _cancel_order_verified(
-                        guard.get("stop_order_id"), expected_qty=guarded,
-                    )
-                    can_place = replace_outcome == CANCEL_CONFIRMED
-                    if replace_outcome == CANCEL_PARTIAL:
-                        # The stop sold part of the position. The guard's model
-                        # (entry filled N, stop covers N) no longer describes
-                        # reality, and placing a stop for `filled` would
-                        # over-commit and be rejected 3004. Book the slice and
-                        # hand the remainder to the reconciler's re-arm path,
-                        # which sizes from the position itself.
-                        remaining = await _handle_partial_stop_fill(
-                            ticker, guard.get("stop_order_id"), guard.get("stop"),
-                            "guard_stop_partial",
+            try:
+                guarded = int(guard.get("guarded_qty") or 0)
+                if filled > guarded:
+                    # (Re)place the protective stop for the total filled quantity.
+                    can_place = True
+                    if guard.get("stop_order_id"):
+                        # Replace flow: only place a new stop if the old one is truly
+                        # cancelled — never risk two live stops double-selling, and
+                        # never re-arm behind a stop that already filled.
+                        replace_outcome = await _cancel_order_verified(
+                            guard.get("stop_order_id"), expected_qty=guarded,
                         )
-                        if remaining <= 0:
-                            await _finish_guard(ticker, "closed_by_stop")
+                        can_place = replace_outcome == CANCEL_CONFIRMED
+                        if replace_outcome == CANCEL_PARTIAL:
+                            # The stop sold part of the position. The guard's model
+                            # (entry filled N, stop covers N) no longer describes
+                            # reality, and placing a stop for `filled` would
+                            # over-commit and be rejected 3004. Book the slice and
+                            # hand the remainder to the reconciler's re-arm path,
+                            # which sizes from the position itself.
+                            remaining = await _handle_partial_stop_fill(
+                                ticker, guard.get("stop_order_id"), guard.get("stop"),
+                                "guard_stop_partial",
+                            )
+                            if remaining <= 0:
+                                await _finish_guard(ticker, "closed_by_stop")
+                                return
+                            fresh = await state.get_position(ticker)
+                            try:
+                                if fresh:
+                                    await _reconcile_rearm_guard(ticker, dict(fresh))
+                                await _finish_guard(ticker, "partial_fill_reprotected")
+                            except Exception as e:
+                                logger.error(
+                                    f"[STOP GUARD] {ticker} re-arm after partial stop fill FAILED: {e}"
+                                )
+                                # Finish the guard anyway: while it stays un-done
+                                # `guard_owns_stop` keeps the reconciler's
+                                # UNPROTECTED sweep from touching this position,
+                                # and that sweep is the safety net that re-arms it.
+                                await _finish_guard(ticker, "partial_fill_unprotected")
+                                await alerts.send_nowait(
+                                    "critical", "partial_fill_unprotected",
+                                    f"{ticker}: the protective stop filled part of the position and the "
+                                    f"remaining {remaining} could NOT be re-protected — the reconciler "
+                                    f"will retry, but verify at your broker now: {e}",
+                                    dedupe_key=f"partial_unprotected:{ticker}",
+                                )
                             return
-                        fresh = await state.get_position(ticker)
+                        if replace_outcome == CANCEL_FILLED:
+                            logger.warning(
+                                f"[STOP GUARD] {ticker} protective stop already executed — position closed, "
+                                f"not re-arming"
+                            )
+                            await _finish_guard(ticker, "closed_by_stop")
+                            stop_fill = await _resolve_exit_fill(guard.get("stop_order_id"))
+                            payload_g = {"ticker": ticker, "action": guard.get("action") or "BUY"}
+                            if stop_fill and is_option:
+                                await _record_close(ticker, None, payload_g, exit_premium=stop_fill, close_reason="stop_fill")
+                            elif stop_fill:
+                                await _record_close(ticker, stop_fill, payload_g, close_reason="stop_fill")
+                            else:
+                                await _defer_close_to_reconciler(ticker, guard.get("stop_order_id"),
+                                                                 "guard stop executed — fill price unavailable")
+                            return
+                    if can_place:
                         try:
-                            if fresh:
-                                await _reconcile_rearm_guard(ticker, dict(fresh))
-                            await _finish_guard(ticker, "partial_fill_reprotected")
+                            if is_option:
+                                stop_info = await _place_option_protective_stop(
+                                    ticker, dict(guard.get("contract") or {}), filled,
+                                    float(guard.get("stop") or 0),
+                                )
+                            else:
+                                stop_info = await _place_protective_stop(
+                                    ticker, str(guard.get("action") or "BUY"), filled,
+                                    float(guard.get("stop") or 0),
+                                )
+                            guard = await state.update_guard(
+                                ticker,
+                                guarded_qty=filled,
+                                stop_order_id=stop_info["order_id"],
+                                stop_client_id=stop_info["client_id"],
+                            ) or guard
+                            async with _position_section(ticker, "stop placement"):
+                                pos = await state.get_position(ticker)
+                                if pos:
+                                    pos["stop_order_id"] = stop_info["order_id"]
+                                    pos["filled_qty"] = filled
+                                    await state.set_position(ticker, pos)
+                            await settle_heat_after_stop_armed(ticker)
+                            guarded = filled
                         except Exception as e:
-                            logger.error(
-                                f"[STOP GUARD] {ticker} re-arm after partial stop fill FAILED: {e}"
+                            # The OLD stop was already cancelled above and the new one
+                            # did not stick, so nothing is resting. The guard record
+                            # still pointed at the dead order id, and the stop-placement
+                            # timeout breaker below only fires when `stop_order_id` is
+                            # falsy — so a stale-truthy id disarmed the one control that
+                            # emergency-flattens an unprotected fill. Clear it: the guard
+                            # must describe what is ACTUALLY resting at the broker.
+                            guard = await state.update_guard(ticker, stop_order_id=None,
+                                                             stop_client_id=None) or guard
+                            async with _position_section(ticker, "stop id clear"):
+                                pos = await state.get_position(ticker)
+                                if pos and pos.get("stop_order_id"):
+                                    pos["stop_order_id"] = None
+                                    await state.set_position(ticker, pos)
+                            logger.error(f"[STOP GUARD] {ticker} stop placement FAILED (will retry): {e}")
+                            await alerts.send_nowait(
+                                "critical", "stop_placement_failed",
+                                f"{ticker}: protective stop placement failed (guard will retry): {e}",
+                                dedupe_key=f"guard_fail:{ticker}",
                             )
-                            # Finish the guard anyway: while it stays un-done
-                            # `guard_owns_stop` keeps the reconciler's
-                            # UNPROTECTED sweep from touching this position,
-                            # and that sweep is the safety net that re-arms it.
-                            await _finish_guard(ticker, "partial_fill_unprotected")
-                            await alerts.send(
-                                "critical", "partial_fill_unprotected",
-                                f"{ticker}: the protective stop filled part of the position and the "
-                                f"remaining {remaining} could NOT be re-protected — the reconciler "
-                                f"will retry, but verify at your broker now: {e}",
-                                dedupe_key=f"partial_unprotected:{ticker}",
-                            )
-                        return
-                    if replace_outcome == CANCEL_FILLED:
-                        logger.warning(
-                            f"[STOP GUARD] {ticker} protective stop already executed — position closed, "
-                            f"not re-arming"
-                        )
-                        await _finish_guard(ticker, "closed_by_stop")
-                        stop_fill = await _resolve_exit_fill(guard.get("stop_order_id"))
-                        payload_g = {"ticker": ticker, "action": guard.get("action") or "BUY"}
-                        if stop_fill and is_option:
-                            await _record_close(ticker, None, payload_g, exit_premium=stop_fill, close_reason="stop_fill")
-                        elif stop_fill:
-                            await _record_close(ticker, stop_fill, payload_g, close_reason="stop_fill")
-                        else:
-                            await _defer_close_to_reconciler(ticker, guard.get("stop_order_id"),
-                                                             "guard stop executed — fill price unavailable")
-                        return
-                if can_place:
-                    try:
-                        if is_option:
-                            stop_info = await _place_option_protective_stop(
-                                ticker, dict(guard.get("contract") or {}), filled,
-                                float(guard.get("stop") or 0),
-                            )
-                        else:
-                            stop_info = await _place_protective_stop(
-                                ticker, str(guard.get("action") or "BUY"), filled,
-                                float(guard.get("stop") or 0),
-                            )
-                        guard = await state.update_guard(
-                            ticker,
-                            guarded_qty=filled,
-                            stop_order_id=stop_info["order_id"],
-                            stop_client_id=stop_info["client_id"],
-                        ) or guard
-                        async with _position_section(ticker, "stop placement"):
-                            pos = await state.get_position(ticker)
-                            if pos:
-                                pos["stop_order_id"] = stop_info["order_id"]
-                                pos["filled_qty"] = filled
-                                await state.set_position(ticker, pos)
-                        await settle_heat_after_stop_armed(ticker)
-                        guarded = filled
-                    except Exception as e:
-                        # The OLD stop was already cancelled above and the new one
-                        # did not stick, so nothing is resting. The guard record
-                        # still pointed at the dead order id, and the stop-placement
-                        # timeout breaker below only fires when `stop_order_id` is
-                        # falsy — so a stale-truthy id disarmed the one control that
-                        # emergency-flattens an unprotected fill. Clear it: the guard
-                        # must describe what is ACTUALLY resting at the broker.
-                        guard = await state.update_guard(ticker, stop_order_id=None,
-                                                         stop_client_id=None) or guard
-                        async with _position_section(ticker, "stop id clear"):
-                            pos = await state.get_position(ticker)
-                            if pos and pos.get("stop_order_id"):
-                                pos["stop_order_id"] = None
-                                await state.set_position(ticker, pos)
-                        logger.error(f"[STOP GUARD] {ticker} stop placement FAILED (will retry): {e}")
-                        await alerts.send(
-                            "critical", "stop_placement_failed",
-                            f"{ticker}: protective stop placement failed (guard will retry): {e}",
-                            dedupe_key=f"guard_fail:{ticker}",
-                        )
+
+            finally:
+                if pending_entry_alert is not None:
+                    alert_guard, alert_filled = pending_entry_alert
+                    pending_entry_alert = None
+                    await _alert_entry_fill(ticker, alert_guard, alert_filled)
 
             guard = await state.update_guard(ticker, last_filled=filled, last_status=status) or guard
 
@@ -31717,7 +32438,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 # no exposure. Loud anyway: a signal was accepted
                                 # and now has NOTHING working at the broker.
                                 logger.error(f"[ENTRY CHASE] {ticker} reprice FAILED after cancel: {e}")
-                                await alerts.send(
+                                await alerts.send_nowait(
                                     "critical", "entry_chase_failed",
                                     f"{ticker}: the entry was cancelled to reprice at "
                                     f"{float(chase['next_limit']):.2f} and the replacement FAILED ({e}) — "
@@ -31778,7 +32499,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                             "ticker": ticker, "qty": filled, "flatten_order_id": flatten_id,
                             "timeout_seconds": STOP_PLACEMENT_TIMEOUT_SECONDS,
                         })
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "critical", "stop_timeout_flattened",
                             f"{ticker}: no protective stop resting {STOP_PLACEMENT_TIMEOUT_SECONDS}s after entry "
                             f"— position flattened at market (qty={filled}, order={flatten_id})",
@@ -31787,7 +32508,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                         return
                     except Exception as e:
                         logger.error(f"[STOP GUARD] {ticker} emergency flatten FAILED (will retry): {e}")
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "critical", "stop_timeout_flatten_failed",
                             f"{ticker}: UNPROTECTED past the {STOP_PLACEMENT_TIMEOUT_SECONDS}s stop deadline and "
                             f"the emergency flatten failed (guard keeps retrying): {e}",
@@ -31815,7 +32536,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                             "ticker": ticker, "entry_order_id": guard.get("entry_order_id"),
                             "timeout_seconds": STOP_PLACEMENT_TIMEOUT_SECONDS,
                         })
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "warning", "stop_timeout_entry_cancelled",
                             f"{ticker}: entry unfilled and no protective stop within "
                             f"{STOP_PLACEMENT_TIMEOUT_SECONDS}s — entry auto-cancelled",
@@ -31856,7 +32577,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                 if filled > 0:
                     # Filled but stop never stuck — keep trying rather than walk away.
                     logger.error(f"[STOP GUARD] {ticker} UNPROTECTED at deadline — extending guard")
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "critical", "position_unprotected",
                         f"{ticker}: filled entry still has NO resting stop at the guard deadline — guard extended, retrying",
                         dedupe_key=f"unprotected:{ticker}",
@@ -32147,21 +32868,20 @@ def format_fill_alert(fill: dict) -> dict:
             pass
     return {
         "event": "trade_buy_filled" if side == "BUY" else "trade_sell_filled",
-        "severity": "info",
+        "severity": "critical",
         "headline": headline,
         "text": "\n".join(lines),
     }
 
 
 async def _alert_fill(fill: dict, dedupe_key: Optional[str] = None) -> None:
-    """Deliver a fill notice. `force_deliver` is required: a fill is honestly
-    `info` severity, and the default webhook floor is `warning` — without the
-    bypass the one alert the operator actually wants would be logged and then
-    dropped. Never raises: alerting must not be able to break trading."""
+    """Deliver a fill notice. Fills are critical so a full in-flight cap queues
+    them instead of dropping the POST. `force_deliver` still skips the severity
+    floor. Never raises: alerting must not be able to break trading."""
     try:
         fill = {**fill, "live": LIVE_TRADING and not is_sandbox, "sandbox": is_sandbox}
         rendered = format_fill_alert(fill)
-        await alerts.send(
+        await alerts.send_nowait(
             rendered["severity"], rendered["event"], rendered["headline"],
             dedupe_key=dedupe_key,
             data={k: v for k, v in fill.items() if k != "contract"} | {"contract": fill.get("contract")},
@@ -32744,7 +33464,7 @@ def _payload_edge(payload: dict) -> Dict[str, Any]:
     if isinstance(learned, dict):
         feats["learning"] = {
             k: learned.get(k) for k in
-            ("weight", "cells", "notes", "requested_qty", "sized_qty", "floor_bound")
+            ("weight", "cells", "notes", "plan_qty", "requested_qty", "sized_qty", "floor_bound")
         }
     # The portfolio-risk verdict: evidence class (so live outcomes can be split
     # proven vs permitted), regime/gap weight, correlated exposure, capacity.
@@ -32762,6 +33482,7 @@ def _payload_edge(payload: dict) -> Dict[str, Any]:
             "cluster": corr.get("cluster"),
             "correlated_pct": corr.get("correlated_pct"),
             "capacity": risk.get("capacity"),
+            "plan_qty": risk.get("plan_qty"),
             "requested_qty": risk.get("requested_qty"),
             "sized_qty": risk.get("sized_qty"),
             "floor_bound": risk.get("floor_bound"),
@@ -33196,7 +33917,10 @@ async def _filled_qty_of(order_id: Optional[str]) -> int:
         _status, filled = await _order_state(str(order_id), None)
         return max(0, int(filled or 0))
     except Exception as e:
-        logger.warning(f"could not read filled quantity for order {order_id}: {e}")
+        logger.warning(
+            "could not read filled quantity for order %s: %s",
+            order_id, _order_exc_text(e),
+        )
         return 0
 
 
@@ -35922,7 +36646,7 @@ async def execute_live_order(payload: dict):
             "origin": str(payload.get(DISPATCH_ORIGIN_FIELD) or "") or None,
             "reason": origin_reason,
         })
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", "entry_refused_origin",
             f"{ticker} {action}: {origin_reason}",
             dedupe_key=f"origin:{ticker}",
@@ -36083,8 +36807,11 @@ async def execute_live_order(payload: dict):
             # before an order could ever be placed.
             sym_u = str(symbol).upper()
             if not is_exit:
+                qty_before_learning = quantity
                 quantity = _apply_learning_weight(sym_u, quantity, learning_ctx)
-                quantity = _apply_risk_weight(sym_u, quantity, risk_ctx)
+                quantity = _apply_risk_weight(
+                    sym_u, quantity, risk_ctx, plan_qty=qty_before_learning,
+                )
                 weight_skip = _risk_weight_skip(risk_ctx)
                 if weight_skip:
                     await _record_entry_skipped(payload, "risk_weight_under_one", weight_skip)
@@ -36242,7 +36969,7 @@ async def execute_live_order(payload: dict):
                         "ticker": sym_u, "expiry": expiry, "strike": strike,
                         "delta": new_delta, "dte": check["dte"], "reason": check["reason"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_expression_refused",
                         f"{symbol}: no live ticket — {check['reason']}.",
                         dedupe_key=f"expression_refused:{symbol}",
@@ -36315,7 +37042,7 @@ async def execute_live_order(payload: dict):
                 })
                 if not zd["allowed"]:
                     logger.warning(f"⛔ {symbol} {zd['reason']}")
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "zero_dte_cap",
                         f"{symbol}: no live ticket — {zd['reason']}.",
                         dedupe_key=f"zero_dte_cap:{symbol}:{today_iso_0dte}",
@@ -36342,7 +37069,7 @@ async def execute_live_order(payload: dict):
                         "ticker": sym_u, "bid": real_bid, "ask": real_ask,
                         "cost": cost_model.summary(cost_verdict["cost"]),
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_cost_refused",
                         f"{symbol}: no live ticket — {reason}.",
                         dedupe_key=f"cost_refused:{symbol}",
@@ -36502,7 +37229,7 @@ async def execute_live_order(payload: dict):
                         "ticker": sym_u, "real_bid": real_bid or None, "real_ask": real_ask or None,
                         "spread_pct": spread_gate["spread_pct"], "ceiling_pct": spread_gate["ceiling"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_spread_refused",
                         f"{symbol}: no live ticket — {spread_gate['reason']}.",
                         dedupe_key=f"spread_refused:{symbol}",
@@ -36595,7 +37322,7 @@ async def execute_live_order(payload: dict):
                         "intended_usd": reprice["intended_usd"],
                         "one_contract_usd": reprice["actual_unit_usd"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_reprice_rejected",
                         f"{symbol}: entry REJECTED — real premium is {reprice['drift_pct']:.0f}% above the "
                         f"app's estimate (≈${reprice['actual_unit_usd']:.0f}/contract vs "
@@ -36622,7 +37349,7 @@ async def execute_live_order(payload: dict):
                         "drift_pct": reprice["drift_pct"],
                         "intended_usd": reprice["intended_usd"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_repriced",
                         f"{symbol}: real premium {reprice['drift_pct']:.0f}% above the app's estimate — "
                         f"resized {quantity} → {reprice['qty']} contract(s) to hold the intended "
@@ -36650,7 +37377,7 @@ async def execute_live_order(payload: dict):
                         "etrade_ask": real_ask or None,
                         "etrade_quote_type": contract_liquidity.get("quote_type"),
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_quote_refused",
                         f"{symbol}: no live ticket — {pq['reason']}.",
                         dedupe_key=f"quote_refused:{symbol}",
@@ -36673,7 +37400,7 @@ async def execute_live_order(payload: dict):
                         "spread_pct": live_spread["spread_pct"], "ceiling_pct": live_spread["ceiling"],
                         "quote_source": pq["source"], "app_decides": bool(app_decides),
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_spread_refused",
                         f"{symbol}: no live ticket — {reason}.",
                         dedupe_key=f"spread_refused:{symbol}",
@@ -36704,7 +37431,7 @@ async def execute_live_order(payload: dict):
                         "payoff_r": shape["payoff_r"],
                         "qty_requested": quantity,
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_shape_refused",
                         f"{symbol}: no live ticket — {shape['reason']}. Paper it instead.",
                         dedupe_key=f"shape_refused:{symbol}",
@@ -36741,7 +37468,7 @@ async def execute_live_order(payload: dict):
                         "risk_usd": risk_check["risk_usd"],
                         "ceiling_usd": risk_check["ceiling_usd"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_risk_rejected",
                         f"{symbol}: entry REFUSED — {risk_check['reason']}.",
                         dedupe_key=f"priced_risk_reject:{symbol}",
@@ -36762,7 +37489,7 @@ async def execute_live_order(payload: dict):
                         "requested_risk_usd": risk_check["requested_risk_usd"],
                         "ceiling_usd": risk_check["ceiling_usd"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_risk_resized",
                         f"{symbol}: real contract risks more than the day can spend — "
                         f"resized {quantity} → {risk_check['qty']} contract(s) "
@@ -36783,7 +37510,7 @@ async def execute_live_order(payload: dict):
                         "ticker": sym_u, "qty_requested": quantity,
                         "caps": capacity["caps"], "inputs": capacity["inputs"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_capacity_refused",
                         f"{symbol}: no live ticket — {capacity['reason']}.",
                         dedupe_key=f"capacity_refused:{symbol}",
@@ -36816,7 +37543,7 @@ async def execute_live_order(payload: dict):
                         "notional_usd": cap["notional_usd"], "notional_cap_usd": cap["notional_cap_usd"],
                         "app_decides": bool(app_decides),
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "critical", "entry_hard_cap_refused",
                         f"{symbol}: entry REFUSED — {cap['reason']}.",
                         dedupe_key=f"hard_cap:{symbol}",
@@ -36843,7 +37570,7 @@ async def execute_live_order(payload: dict):
                             "ticker": sym_u, "premium": cap_premium or None, "stop_premium": cap_stop,
                             "qty": quantity, "reason": heat_reason,
                         })
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "warning", "entry_app_open_risk_refused",
                             f"{symbol}: app entry REFUSED — {heat_reason}.",
                             dedupe_key=f"app_open_risk:{symbol}",
@@ -37397,8 +38124,11 @@ async def execute_live_order(payload: dict):
                         "fail-closed sizing: position_size_shares missing/invalid and cannot size "
                         "from live equity — refusing to default to 1 share"
                     )
+            qty_before_learning = quantity
             quantity = _apply_learning_weight(symbol, quantity, learning_ctx)
-            quantity = _apply_risk_weight(symbol, quantity, risk_ctx)
+            quantity = _apply_risk_weight(
+                symbol, quantity, risk_ctx, plan_qty=qty_before_learning,
+            )
             weight_skip = _risk_weight_skip(risk_ctx)
             if weight_skip:
                 await _record_entry_skipped(payload, "risk_weight_under_one", weight_skip)
@@ -37497,7 +38227,10 @@ async def execute_live_order(payload: dict):
                     )
                     await state.set("otoco:unsupported", "1", ex=OTOCO_UNSUPPORTED_TTL)
                 except ETradeAPIError as e:
-                    logger.warning(f"OTOCO attempt failed ({e}) — falling back to entry + stop guard")
+                    logger.warning(
+                        "OTOCO attempt failed (%s) — falling back to entry + stop guard",
+                        _order_exc_text(e),
+                    )
 
             logger.info(f"📤 Placing EQUITY: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
             # Per-share cost for the pre-flight funds clamp — the limit price
@@ -37537,24 +38270,25 @@ async def execute_live_order(payload: dict):
         # Only genuine broker/API failures feed the circuit breaker — our own
         # gate refusals are working-as-intended, not signs of a sick broker.
         local = _is_local_refusal(e)
+        safe_exc = _order_exc_text(e, limit=300)
         if local:
-            logger.info(f"↩︎ {ticker} refused locally (breaker untouched): {e}")
+            logger.info("↩︎ %s refused locally (breaker untouched): %s", ticker, safe_exc)
         else:
-            await _record_api_failure("order_placement", f"{type(e).__name__}: {e}")
+            await _record_api_failure("order_placement", safe_exc)
         await trade_ledger.record("order_failed", {
             "ticker": ticker, "action": action, "instrument": instrument,
-            "error": str(e)[:300],
+            "error": safe_exc,
             # Which failures fed the breaker — so a trip can be audited
             # against the exact errors that caused it.
             "error_type": type(e).__name__,
             "counted_toward_breaker": not local,
         })
-        await alerts.send(
+        await alerts.send_nowait(
             "error", "order_failed",
-            f"{ticker} {action} ({instrument}) failed: {e}",
+            f"{ticker} {action} ({instrument}) failed: {safe_exc}",
             dedupe_key=f"order_failed:{ticker}",
         )
-        logger.error(f"❌ LIVE TRADE FAILED: {e}")
+        logger.error("LIVE TRADE FAILED: %s", safe_exc)
         raise
     finally:
         _placement_sig.set(None)
@@ -38046,7 +38780,7 @@ async def _maybe_repair_inflated_native_trail(
         try:
             await _reconcile_rearm_guard(ticker, dict(await state.get_position(ticker) or fresh))
         except Exception as re_arm_error:
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "native_trail_repair_unprotected",
                 f"{ticker}: inflated trail cancelled, repair refused, and fixed stop "
                 f"re-arm failed — verify at your broker ({e}; re-arm: {re_arm_error})",
@@ -38064,7 +38798,7 @@ async def _maybe_repair_inflated_native_trail(
         try:
             await _reconcile_rearm_guard(ticker, dict(fresh))
         except Exception as re_arm_error:
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "native_trail_repair_unprotected",
                 f"{ticker}: inflated trail cancelled and repair failed — verify at your "
                 f"broker now ({e}; re-arm: {re_arm_error})",
@@ -38171,7 +38905,7 @@ async def _maybe_hand_off_native_trail(
             ).isoformat()
             fresh["native_trail_skip"] = str(e)[:240]
             await state.set_position(ticker, fresh)
-        await alerts.send(
+        await alerts.send_nowait(
             "warning", "native_trail_auto_failed",
             f"{ticker}: could not place the E*TRADE trailing stop ({e}). "
             f"The fixed stop stays the protection; the bot tries the trail again in "
@@ -38483,7 +39217,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
                     await _reconcile_rearm_guard(ticker, dict(fresh))
                 except Exception as e:
                     logger.error(f"[TRAIL] {ticker} re-arm after partial stop fill FAILED: {e}")
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "critical", "partial_fill_unprotected",
                         f"{ticker}: the trailing stop filled part of the position and the "
                         f"remaining {remaining} could NOT be re-protected — close them manually: {e}",
@@ -38513,7 +39247,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         await trade_ledger.record("trail_stop_executed", {
             "ticker": ticker, "stop": plan["current_stop"], "order_id": stop_order_id,
         })
-        await alerts.send(
+        await alerts.send_nowait(
             "info", "trail_stop_executed",
             f"{ticker}: trailing stop filled at the broker around {float(plan['current_stop']):.2f} — position closed.",
             dedupe_key=f"trail_hit:{ticker}",
@@ -38576,7 +39310,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
             f"[TRAIL] {ticker} ratchet to {new_stop:.2f} failed — protection restored at "
             f"{float(stop_info['stop']):.2f} (order={stop_info['order_id']}), will retry next pass"
         )
-        await alerts.send(
+        await alerts.send_nowait(
             "warning", "trail_ratchet_recovered",
             f"{ticker}: could not tighten the stop to {new_stop:.2f} — the previous stop at "
             f"{float(stop_info['stop']):.2f} is resting again, so the position stayed protected. "
@@ -38594,7 +39328,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         await trade_ledger.record("trail_ratchet_failed", {
             "ticker": ticker, "new_stop": new_stop, "error": str(last_err),
         })
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", "trail_ratchet_failed",
             f"{ticker}: trailing ratchet cancelled the old stop but the new stop at {new_stop:.2f} "
             f"failed to rest — position unprotected until the reconciler re-arms: {last_err}",
@@ -38622,7 +39356,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         "order_id": stop_info["order_id"],
     })
     if tier != prev_tier:
-        await alerts.send(
+        await alerts.send_nowait(
             "info", "trail_tier_advanced",
             f"{ticker}: {trailing_engine.TRAIL_TIER_LABEL.get(tier, tier)} — stop now {float(stop_info['stop']):.2f} "
             f"(+{plan['trail']['r_multiple']:.2f}R shown)",
@@ -39127,7 +39861,7 @@ async def _flatten_save(ticker: str, pos: dict) -> None:
     order_id = _flatten_sent_order_id(pos) or "unknown"
     message = f"{ticker}: close sent, order id not saved ({order_id})"
     logger.error(f"[FLATTEN REPLACE] {message}")
-    await alerts.send(
+    await alerts.send_nowait(
         "error", "flatten_close_unsaved", message,
         dedupe_key=f"flatten_unsaved:{ticker}:{order_id}",
     )
@@ -39164,7 +39898,7 @@ async def _alert_flatten(
         await _flatten_save(ticker, pos)
         return
     event = "unfilled_flatten_manual" if once else "unfilled_flatten_replace"
-    await alerts.send(
+    await alerts.send_nowait(
         "critical", event, message,
         dedupe_key=f"unfilled_flatten:{ticker}:{condition}",
     )
@@ -39884,6 +40618,32 @@ async def _trail_pass() -> None:
         except Exception as e:
             logger.warning(f"[TRAIL] {ticker} pass failed: {e}")
 
+async def _alert_positions_still_open() -> None:
+    """Critical alert when any tracked position is still open after 3:50 PM ET.
+
+    Half days use 12:50 PM ET, ten minutes after the 12:40 flatten. Deduped
+    once per session day. Does not place, cancel, or delay an order.
+    """
+    now_et = _utcnow().astimezone(_ET_ZONE)
+    if not position_still_open_alert_due(now_et):
+        return
+    try:
+        positions = await state.all_positions()
+    except Exception as exc:
+        logger.error("[FLATTEN] open-book read failed (%s)", type(exc).__name__)
+        return
+    if not positions:
+        return
+    names = ", ".join(sorted(str(ticker) for ticker in positions))
+    when = "12:50 PM ET" if _session_close_minute(now_et) == 13 * 60 else "3:50 PM ET"
+    await alerts.send(
+        "critical",
+        "position_open_after_flatten",
+        f"Position(s) still open after {when}: {names}. No overnight hold.",
+        dedupe_key=f"open_after_flatten:{now_et.date().isoformat()}",
+    )
+
+
 async def trailing_worker():
     """Continuous server-side trail. Runs each pass under the distributed
     `lock:trail_engine` so exactly one worker trails at a time."""
@@ -39899,6 +40659,10 @@ async def trailing_worker():
             # Guardian beat: this loop is alive (in session or not).
             await state.set(GUARDIAN_TRAIL_BEAT_KEY, f"{time.time():.3f}",
                             ex=max(600, GUARDIAN_STALE_SECONDS * 5))
+            try:
+                await _alert_positions_still_open()
+            except Exception as exc:
+                logger.error("[FLATTEN] still-open alert failed (%s)", type(exc).__name__)
             if _is_market_open() and load_tokens() is not None:
                 lock = state.lock("trail_engine", ttl_ms=max(60_000, TRAIL_INTERVAL_SECONDS * 2000))
                 if await lock.try_acquire():
@@ -39966,7 +40730,7 @@ async def _app_eyes_pass() -> None:
                 f"[EXIT AUTHORITY] 👁️ {ticker} — {lapse}; broker stop re-tightened "
                 f"to the app's tactical level {tactical:.2f} (order={stop_info['order_id']})"
             )
-            await alerts.send(
+            await alerts.send_nowait(
                 "warning", "exit_authority_reverted",
                 f"{ticker}: {lapse}, so it can no longer manage this exit — the "
                 f"protective stop was re-tightened to {tactical:.2f} at the broker.",
@@ -39974,7 +40738,7 @@ async def _app_eyes_pass() -> None:
             )
         except Exception as e:
             logger.error(f"[EXIT AUTHORITY] {ticker} re-tighten FAILED: {e}")
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "exit_authority_retighten_failed",
                 f"{ticker}: {lapse} and the protective stop could NOT be "
                 f"re-tightened to {tactical:.2f} — verify at your broker now: {e}",
@@ -40648,8 +41412,13 @@ async def _announce_preflight() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    """Lifespan exit. In-flight alert posts get at most 3s, then state closes."""
     global _worker_stop
     _worker_stop = True
+    try:
+        await alerts.drain(alerts._DRAIN_TIMEOUT_S)
+    except Exception as e:
+        logger.warning(f"alert drain failed: {type(e).__name__}")
     await _close_study_page_engine()
     await state.close()
 
@@ -41614,6 +42383,69 @@ async def healthz():
     }
 
 
+# A confirmed-empty portfolio read older than this is not "fresh".
+# /status then leaves account_flat null instead of calling the account flat.
+ACCOUNT_FLAT_FRESH_SECONDS = 20 * 60
+
+
+def reconcile_report_is_fresh(report: Any, now_epoch: Any = None) -> bool:
+    """True when the reconcile report's own timestamp is within the fresh window."""
+    if not isinstance(report, dict):
+        return False
+    raw = report.get("ts")
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    try:
+        now = float(time.time() if now_epoch is None else now_epoch)
+        age = now - ts.timestamp()
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(age) or age < -5:
+        return False
+    return age <= ACCOUNT_FLAT_FRESH_SECONDS
+
+
+def status_book_flags(
+    last_reconcile: Any,
+    open_positions: Any,
+    now_epoch: Any = None,
+) -> Dict[str, Any]:
+    """How /status names the book. Never the plain word flat.
+
+    account_flat is true only for a fresh confirmed-empty portfolio read
+    (`portfolio_ok is True` and `broker_positions == 0`). A failed, inferred,
+    stale, or missing read leaves it null. A fresh confirmed read that found
+    positions sets it false. bot_flat is the bot's own tracked book.
+    """
+    bot_flat = None
+    if isinstance(open_positions, dict):
+        bot_flat = len(open_positions) == 0
+    portfolio_ok = None
+    account_flat = None
+    if isinstance(last_reconcile, dict):
+        portfolio_ok = last_reconcile.get("portfolio_ok")
+        if reconcile_report_is_fresh(last_reconcile, now_epoch) and portfolio_ok is True:
+            try:
+                count = int(last_reconcile.get("broker_positions"))
+            except (TypeError, ValueError):
+                count = None
+            if count == 0:
+                account_flat = True
+            elif count is not None and count > 0:
+                account_flat = False
+    return {
+        "portfolio_ok": portfolio_ok,
+        "account_flat": account_flat,
+        "bot_flat": bot_flat,
+    }
+
+
 @app.get("/status")
 async def status():
     """Broker-state snapshot polled by the app's Reconciliation engine. The
@@ -41629,6 +42461,8 @@ async def status():
             last_reconcile = json.loads(raw_report)
         except json.JSONDecodeError:
             last_reconcile = None
+    open_positions = await state.all_positions()
+    book = status_book_flags(last_reconcile, open_positions)
     return {
         "killed": await state.is_killed(),
         "env": ENV,
@@ -41643,12 +42477,17 @@ async def status():
             "min_entry_premium_usd": MIN_ENTRY_PREMIUM_USD,
         },
         "market_open": _is_market_open(),
-        "open_positions": await state.all_positions(),
+        "open_positions": open_positions,
         # Same book, as a list with status/side/qty. The app journal maps
         # this. Reporting only — it does not change a position or a stop.
-        "positions_open": positions_open_view(await state.all_positions()),
+        "positions_open": positions_open_view(open_positions),
         # Which rulebook each open position follows (app_decides vs legacy_bot).
-        "exit_rules": summarize_exit_rules(await state.all_positions(), APP_DECIDES),
+        "exit_rules": summarize_exit_rules(open_positions, APP_DECIDES),
+        # portfolio_ok is true, false, or "inferred_flat". account_flat is
+        # true only for a fresh confirmed-empty read; otherwise false or null.
+        "portfolio_ok": book["portfolio_ok"],
+        "account_flat": book["account_flat"],
+        "bot_flat": book["bot_flat"],
         "stop_guards": await state.all_guards(),
         "trades_today": daily["trades_today"],
         "realized_pnl_today_pct": daily["realized_pnl_today_pct"],
@@ -41673,6 +42512,7 @@ async def status():
         },
         "pro_trader": _pro_trader_status_payload(daily.get("trades_today")),
         "alert_webhook_configured": alerts.webhook_configured(),
+        "alert_delivery": alerts.delivery_status(),
         "account_binding": _account_binding,
         "crypto_account_binding": _crypto_account_binding,
         "crypto_enabled": CRYPTO_ENABLED,
@@ -41709,6 +42549,7 @@ async def status():
             # option entries re-expressed ITM, best expiry in 0–7 DTE.
             "core_book_enabled": CORE_BOOK_ENABLED,
             "itm_expression_enabled": ITM_EXPRESSION_ENABLED,
+            # Effective DAY_TRADE_MODE. Unset stays true. Only false, 0, off, or no is false.
             "day_trade_mode": DAY_TRADE_MODE,
             # Read-only. Import-time constant the running gate uses.
             # mode is fail_closed only while that constant is on.
@@ -41781,9 +42622,10 @@ async def alerts_config_set(
     Body: { "webhook_url": "https://…" | "" , "min_severity": "warning" }.
     Accepts Slack, Discord, ntfy, or any generic JSON receiver URL.
 
-    When ALERT_WEBHOOK_URL is set, the saved URL is stored but does not
-    override the env URL. The response says so (webhook_source=env) and
-    never includes the raw URL. The delivery floor is capped at error.
+    When ALERT_WEBHOOK_URL is set, this cannot switch the live webhook
+    (the saved URL is stored but does not override the env URL) and cannot
+    set a floor stricter than error. The response says so
+    (webhook_source=env) and never includes the raw URL.
     """
     await _require_control_auth(x_rork_secret, "/alerts/config")
     url = body.get("webhook_url")
@@ -41796,7 +42638,7 @@ async def alerts_config_set(
         cfg = await alerts.set_config(url, sev)
     except ValueError as e:
         raise HTTPException(422, scrub_etrade_text(str(e)))
-    logger.info("%s", alerts.webhook_source_log_line("update"))
+    logger.info("%s", alerts._manager.webhook_source_log_line("update"))
     return cfg
 
 
@@ -42936,7 +43778,7 @@ async def kill(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"
     logger.warning("KILL SWITCH activated (distributed — all workers respect it)")
     open_tickers = await state.position_tickers()
     await trade_ledger.record("kill_switch_engaged", {"open_positions": open_tickers})
-    await alerts.send(
+    await alerts.send_nowait(
         "critical", "kill_switch_engaged",
         f"KILL SWITCH engaged — all entries halted. Open positions: {', '.join(open_tickers) or 'none'}",
         dedupe_key="kill_switch",
@@ -43065,7 +43907,7 @@ async def _flatten_book(trigger: str) -> Dict[str, Any]:
     await trade_ledger.record("flatten_all", {"trigger": trigger, "results": results})
     headline = ("DAILY LOSS LIMIT BREACHED - the risk desk flattened the book"
                 if trigger == "daily_loss" else "PANIC EXIT")
-    await alerts.send(
+    await alerts.send_nowait(
         "critical", "flatten_all",
         f"{headline} - entries halted. "
         f"Closing: {', '.join(closing) or 'none'}. "

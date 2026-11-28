@@ -215,6 +215,7 @@ def _arm(monkeypatch, when: datetime, pos: dict, *, enabled=None, held=None):
     monkeypatch.setattr(main_bot, "_refresh_trail_eyes", eyes)
     monkeypatch.setattr(main_bot, "_resolve_exit_fill", resolve)
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
     monkeypatch.setattr(main_bot.trade_ledger, "record", record)
     return {
         "book": book, "calls": calls, "alerts": alerts, "orders": orders,
@@ -674,6 +675,7 @@ def test_at_and_after_the_bell_nothing_runs(when, monkeypatch):
     monkeypatch.setattr(main_bot, "_place_order_smart", boom)
     monkeypatch.setattr(main_bot, "_place_option_protective_stop", boom)
     monkeypatch.setattr(main_bot.alerts, "send", boom)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", boom)
     _run()
 
     if not main_bot._is_market_open():
@@ -730,6 +732,7 @@ def test_scheduled_exit_records_the_pending_close_without_a_stop_snapshot(monkey
     monkeypatch.setattr(main_bot, "_place_option_market_close", place_close)
     monkeypatch.setattr(main_bot, "_resolve_exit_fill", resolve)
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
 
     closed = asyncio.run(main_bot._maybe_scheduled_exit("SPY", dict(pos), 1.25))
     assert closed is True
@@ -1463,6 +1466,7 @@ def test_eod_flatten_over_a_resting_stop_keeps_the_pending_close(monkeypatch):
     monkeypatch.setattr(main_bot, "_place_option_market_close", place)
     monkeypatch.setattr(main_bot, "_resolve_exit_fill", none)
     monkeypatch.setattr(main_bot.alerts, "send", none)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", none)
     monkeypatch.setattr(main_bot.trade_ledger, "record", none)
 
     async def scenario():
@@ -1644,6 +1648,7 @@ def test_unlocked_writer_between_repeat_writes_keeps_the_close(monkeypatch):
     monkeypatch.setattr(main_bot, "_refresh_trail_eyes", same_pos)
     monkeypatch.setattr(main_bot, "_app_owns_exit", no)
     monkeypatch.setattr(main_bot.alerts, "send", none)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", none)
     monkeypatch.setattr(main_bot.trade_ledger, "record", none)
     monkeypatch.setattr(main_bot.trailing_engine, "observe_water_mark", water)
     monkeypatch.setattr(main_bot.trailing_engine, "plan_ratchet", ratchet)
@@ -1845,6 +1850,7 @@ def test_unsaved_close_id_retries_once_then_alerts(monkeypatch, caplog):
 
     monkeypatch.setattr(main_bot, "_flatten_merge_changed", boom)
     monkeypatch.setattr(main_bot.alerts, "send", fake_send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", fake_send)
 
     async def scenario():
         store = main_bot.StateStore(None)
@@ -1917,6 +1923,7 @@ def test_close_id_retry_that_lands_does_not_alert(monkeypatch):
 
     monkeypatch.setattr(main_bot, "_flatten_merge_changed", flaky)
     monkeypatch.setattr(main_bot.alerts, "send", fake_send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", fake_send)
 
     async def scenario():
         store = main_bot.StateStore(None)

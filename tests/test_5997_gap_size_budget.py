@@ -148,7 +148,84 @@ def _calm_tape():
     }
 
 
-def test_one_lot_unproven_weight_stays_one_contract():
+def test_sizing_log_records_plan_qty_beside_final_qty_and_weight(caplog):
+    """Logging the pre-learning plan size does not change the cut."""
+    learning = {"weight": 0.5, "notes": ["cell"]}
+    with caplog.at_level("INFO", logger="etrade-bot"):
+        sized = main_bot._apply_learning_weight("AMZN", 2, learning)
+    assert sized == 1
+    assert learning["plan_qty"] == 2
+    assert learning["sized_qty"] == 1
+    assert "plan_qty 2" in caplog.text
+    assert "qty 1" in caplog.text
+    assert "weight 0.5" in caplog.text
+    risk = {
+        "weight": 0.5,
+        "ev_weight": 0.5,
+        "regime": {"weight": 1.0},
+        "notes": ["permitted, not proven → ×0.5 (unproven)"],
+    }
+    with caplog.at_level("INFO", logger="etrade-bot"):
+        final = main_bot._apply_risk_weight("AMZN", sized, risk, plan_qty=2)
+    assert final == 0
+    assert risk["plan_qty"] == 2
+    assert risk["sized_qty"] == 0
+    assert risk["weight"] == 0.5
+    text = caplog.text
+    assert "RISK AMZN: plan_qty 2 qty 0 weight 0.5" in text
+    edge = main_bot._payload_edge({
+        "_learning": learning, "_risk": risk, "action": "BUY",
+    })
+    assert edge["learning"]["plan_qty"] == 2
+    assert edge["learning"]["sized_qty"] == 1
+    assert edge["learning"]["weight"] == 0.5
+    assert edge["risk"]["plan_qty"] == 2
+    assert edge["risk"]["sized_qty"] == 0
+    assert edge["risk"]["weight"] == 0.5
+    native = {"weight": 0.5, "notes": []}
+    kept = main_bot._apply_learning_weight("AMZN", 1, native)
+    assert kept == 1 and native["plan_qty"] == 1
+    one = {
+        "weight": 0.5, "ev_weight": 0.5,
+        "regime": {"weight": 1.0}, "notes": [],
+    }
+    assert main_bot._apply_risk_weight("AMZN", kept, one, plan_qty=1) == 1
+    assert one["plan_qty"] == 1 and one["sized_qty"] == 1
+    native = main_bot.contract_qty_for_risk_weight(
+        1, 0.5, market_weight=1.0, ev_weight=0.5, plan_qty=1,
+    )
+    assert native["skipped"] is False and native["qty"] == 1
+    cut = main_bot.contract_qty_for_risk_weight(
+        1, 0.5, market_weight=1.0, ev_weight=0.5, plan_qty=2,
+    )
+    assert cut["skipped"] is True and cut["qty"] == 0
+    assert "not rounded up" in cut["reason"]
+    ctx = {
+        "weight": 0.5,
+        "ev_weight": 0.5,
+        "regime": {"weight": 1.0},
+        "notes": ["permitted, not proven → ×0.5 (unproven)"],
+    }
+    learning = {"weight": 0.5, "notes": ["learning"]}
+    stayed = main_bot._apply_learning_weight("AMZN", 1, learning)
+    assert stayed == 1
+    assert main_bot._apply_risk_weight("AMZN", stayed, ctx, plan_qty=1) == 1
+    shrunk = main_bot._apply_learning_weight("AMZN", 2, {"weight": 0.5, "notes": []})
+    assert shrunk == 1
+    assert main_bot._apply_risk_weight("AMZN", shrunk, ctx, plan_qty=2) == 0
+
+
+def test_nonfinite_weight_or_inf_quantity_skips():
+    for weight in (float("nan"), float("inf"), "nope", None):
+        decision = main_bot.contract_qty_for_risk_weight(
+            1, weight, market_weight=1.0, ev_weight=0.5, plan_qty=1,
+        )
+        assert decision["skipped"] is True
+        assert decision["qty"] == 0
+        assert "unreadable" in decision["reason"]
+    inf_qty = main_bot.contract_qty_for_risk_weight(float("inf"), 1.0, plan_qty=1)
+    assert inf_qty["skipped"] is True and inf_qty["qty"] == 0
+    assert "unreadable" in inf_qty["reason"]
     decision = main_bot.contract_qty_for_risk_weight(
         1, 0.5, market_weight=1.0, ev_weight=0.5,
     )
@@ -254,11 +331,17 @@ def test_app_budget_and_priced_risk_refuse_and_fail_closed(monkeypatch):
         1000,
     )
     assert over_budget and "100" in over_budget and "1,000" in over_budget
-    inside = main_bot.assess_remaining_daily_budget(
+    partial = main_bot.assess_remaining_daily_budget(
         {"remaining_usd": 200, "used_usd": 100, "budget_usd": 300},
         400,
     )
-    assert inside is None
+    # 200 is half the request. The old 25% rule admitted it. Full fit refuses.
+    assert partial and "200" in partial and "400" in partial
+    fits = main_bot.assess_remaining_daily_budget(
+        {"remaining_usd": 400, "used_usd": 100, "budget_usd": 500},
+        400,
+    )
+    assert fits is None
     assert main_bot.assess_remaining_daily_budget(None, 10).startswith("daily risk budget unreadable")
     assert main_bot.assess_remaining_daily_budget(
         {"remaining_usd": "nope", "used_usd": 1, "budget_usd": 1}, 1,
