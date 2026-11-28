@@ -21,8 +21,8 @@ A value set on the host overrides these.
 
 | Variable | Code default |
 | --- | --- |
-| `RISK_PER_TRADE_PCT` | `8` |
-| `DAILY_LOSS_LIMIT_PCT` | `20` |
+| `RISK_PER_TRADE_PCT` | `5` |
+| `DAILY_LOSS_LIMIT_PCT` | `10` |
 | `MIN_SCORE` | `70` |
 | `MIN_SCORE_TRENDING` | `65` |
 | `MIN_RVOL` | `0.9` |

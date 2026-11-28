@@ -661,7 +661,7 @@ def test_pro_trader_report_includes_the_chain_shadow_block():
     assert block["live_flip"] is False
     assert block["comparison"]["min_pairs"] == 40
     assert block["comparison"]["min_pairs_is_flip_rule"] is False
-    assert report["version"] == "5.99.15-pro-day-trader"
+    assert report["version"] == "5.99.13-pro-day-trader"
 
 
 def test_chain_shadow_report_names_the_live_flag(monkeypatch):
@@ -782,6 +782,10 @@ def test_process_signal_hook_order_and_identical_orders(monkeypatch):
     async def filters(p, *, dry_run=False):
         return True, []
 
+    async def full_weight(payload, *args, **kwargs):
+        # This test checks the shadow hook, not the under-1-contract skip.
+        return {"allowed": True, "weight": 1.0, "notes": [], "reasons": []}
+
     async def account_key(tokens):
         return "acct"
 
@@ -821,6 +825,7 @@ def test_process_signal_hook_order_and_identical_orders(monkeypatch):
         return {"results": [], "pages": 1}
 
     monkeypatch.setattr(main_bot, "_passes_entry_filters", filters)
+    monkeypatch.setattr(main_bot, "_assess_portfolio_risk", full_weight)
     monkeypatch.setattr(main_bot, "_resolve_account_id_key", account_key)
     monkeypatch.setattr(main_bot, "_live_equity", equity)
     monkeypatch.setattr(main_bot, "_index_vwap_quotes", quiet)
@@ -889,6 +894,10 @@ def test_process_signal_hook_order_and_identical_orders(monkeypatch):
     monkeypatch.setattr(main_bot, "_place_order_smart", place_order)
 
     async def drive(signal_id, enabled):
+        main_bot.portfolio_risk.clear_spy_gap_sit_out()
+        main_bot.portfolio_risk.note_spy_gap_session(
+            0.4, True, main_bot._session_day_et(),
+        )
         monkeypatch.setenv("CHAIN_SHADOW_ENABLED", "true" if enabled else "false")
         store = main_bot.StateStore(None)
         main_bot.state = store
@@ -930,6 +939,7 @@ def test_process_signal_hook_order_and_identical_orders(monkeypatch):
         main_bot.massive_client = saved["client"]
         main_bot.trade_ledger._ledger = saved["ledger"]
         main_bot._CHAIN_SHADOW_CACHE.clear()
+        main_bot.portfolio_risk.clear_spy_gap_sit_out()
 
     assert off["status"] == "processed_directly", off
     assert off["result"]["status"] == "success", off
