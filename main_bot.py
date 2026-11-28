@@ -4374,6 +4374,9 @@ def parse_open_orders(orders_resp: Dict[str, Any], *, blank_as_open: bool = True
                         expiry = ""
                 out.append({
                     "order_id": order_id,
+                    "client_order_id": str(
+                        order.get("clientOrderId") or detail.get("clientOrderId") or ""
+                    ),
                     "symbol": str(product.get("symbol") or "").upper(),
                     "security_type": str(product.get("securityType") or "EQ").upper(),
                     "status": status,
@@ -30551,6 +30554,14 @@ async def _etrade_bid_ask(ticker: str, contract: Optional[dict] = None) -> Tuple
     return 0.0, 0.0
 
 
+# The id the stop guard is about to send. Saved on the guard before the
+# broker call so a lost reply can be found by clientOrderId. The place
+# helpers read it; callers that do not set it still mint their own id.
+_PENDING_STOP_CLIENT_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "pending_stop_client_id", default=None,
+)
+
+
 async def _place_protective_stop(ticker: str, action: str, qty: int, stop_price: float) -> dict:
     """Rest a protective STOP order at E*TRADE for a filled equity entry."""
     tokens = load_tokens()
@@ -30558,7 +30569,7 @@ async def _place_protective_stop(ticker: str, action: str, qty: int, stop_price:
         raise Exception("E*TRADE tokens not set")
     acct_key = await _resolve_account_id_key(tokens)
     exit_side = "SELL" if action == "BUY" else "BUY_TO_COVER"
-    client_id = str(uuid.uuid4().int)[:18]
+    client_id = str(_PENDING_STOP_CLIENT_ID.get() or "").strip() or str(uuid.uuid4().int)[:18]
     common = dict(
         resp_format="json",
         accountIdKey=acct_key,
@@ -30620,7 +30631,7 @@ async def _place_option_protective_stop(ticker: str, contract: dict, qty: int, s
     if not contract or not contract.get("right") or not contract.get("expiration"):
         raise Exception(f"option guard for {ticker} missing contract details")
     acct_key = await _resolve_account_id_key(tokens)
-    client_id = str(uuid.uuid4().int)[:18]
+    client_id = str(_PENDING_STOP_CLIENT_ID.get() or "").strip() or str(uuid.uuid4().int)[:18]
     stop_px = _round_stop_toward_market(stop_premium)
     if stop_px is None:
         raise Exception(f"option guard for {ticker}: unusable stop premium {stop_premium!r}")
@@ -30740,21 +30751,48 @@ def allocation_hold_after_poll(guard: dict, now: float,
     return {"polls": polls, "expired": past and polls >= int(max_polls)}
 
 
-async def _adopt_covering_stop(ticker: str, pos: dict, qty: int) -> Optional[str]:
-    """Order id of a live stop that already covers this position, or None.
+async def _adopt_covering_stop(
+    ticker: str, pos: dict, qty: int, *,
+    client_id: Optional[str] = None, order_id: Optional[str] = None,
+) -> dict:
+    """What the open-order book says about a stop that may already exist.
 
-    A failed book read is None. The caller does not place a second stop.
+    ``found`` carries the order id to adopt. The original clientOrderId or
+    order id is checked first; an open or working match is adopted even
+    when the rest of the row is thin. ``absent`` is a successful read that
+    shows no covering stop (the original order is gone, or there was no
+    id to wait for). ``unreadable`` is a failed or timed-out read.
+    ``inconclusive`` is a successful read that does not yet list the
+    original id — the book can lag — and is not permission to place.
     """
     try:
-        resp = await _reconcile_fetch_orders()
+        resp = await asyncio.wait_for(
+            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+        )
     except Exception as exc:
         logger.warning("covering-stop read failed (%s)", type(exc).__name__)
-        return None
-    for order in reconciliation.parse_open_orders(resp):
+        return {"status": "unreadable", "order_id": None}
+    orders = reconciliation.parse_open_orders(resp)
+    want_client = str(client_id or "").strip()
+    want_order = str(order_id or "").strip()
+    original_terminal = False
+    for order in orders:
+        oid = str(order.get("order_id") or "").strip()
+        cid = str(order.get("client_order_id") or "").strip()
+        if not ((want_order and oid == want_order) or (want_client and cid == want_client)):
+            continue
+        status = str(order.get("status") or "").upper()
+        if status in reconciliation._OPEN_ORDER_STATUSES:
+            return {"status": "found", "order_id": oid or None}
+        if status in _TERMINAL_ORDER_STATUSES:
+            original_terminal = True
+    for order in orders:
         if reconciliation.order_covers_position(order, pos, ticker, qty):
             found = str(order.get("order_id") or "").strip()
-            return found or None
-    return None
+            return {"status": "found", "order_id": found or None}
+    if (want_client or want_order) and not original_terminal:
+        return {"status": "inconclusive", "order_id": None}
+    return {"status": "absent", "order_id": None}
 
 
 class NativeTrailRefused(Exception):
@@ -31321,6 +31359,31 @@ async def _arm_native_trail(
 _MAX_FLATTEN_ATTEMPTS = 3
 
 
+def _flatten_working_exit(order: dict, ticker: str, guard: dict) -> bool:
+    """A working stop or sell that would sell this same position."""
+    if reconciliation._stop_remaining(order) < 1:
+        return False
+    if str(order.get("status") or "").upper() not in reconciliation._OPEN_ORDER_STATUSES:
+        return False
+    if str(order.get("symbol") or "").upper() != str(ticker or "").upper():
+        return False
+    action = str(order.get("order_action") or "").upper()
+    is_option = str(guard.get("kind") or "equity") == "option"
+    if is_option:
+        if action not in {"SELL_CLOSE", "BUY_CLOSE"}:
+            return False
+        pos = {"contract": guard.get("contract"), "entry_premium": 1}
+        want = reconciliation.tracked_contract_key(pos)
+        got = reconciliation.contract_key(
+            order.get("call_put"), order.get("strike"), order.get("expiration"),
+        )
+        return bool(want and got and want == got)
+    exit_side = "SELL" if str(guard.get("action") or "BUY").upper() == "BUY" else "BUY_TO_COVER"
+    if action != exit_side:
+        return False
+    return str(order.get("security_type") or "EQ").upper() not in {"OPTN", "OPTION"}
+
+
 async def _emergency_flatten(ticker: str, guard: dict, qty: int) -> Optional[str]:
     """LAST-RESORT market close of a filled-but-unprotected entry (stop
     placement timeout). Certainty of fill beats price — always MARKET.
@@ -31357,6 +31420,49 @@ async def _emergency_flatten(ticker: str, guard: dict, qty: int) -> Optional[str
             f"[FLATTEN] {ticker} prior flatten {prior_id} ended {p_status} unfilled "
             f"— placing replacement (attempt {attempts + 1}/{_MAX_FLATTEN_ATTEMPTS})"
         )
+    # A lost-ack stop may still be working. Read the book before the market
+    # sell. Cancel a working exit first; if it stays up, sell only the
+    # shares it does not already cover. An unreadable book does not sell.
+    try:
+        book = await asyncio.wait_for(
+            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.warning("flatten book read failed (%s)", type(exc).__name__)
+        await alerts.send_nowait(
+            "critical", "flatten_book_unreadable",
+            f"{ticker}: emergency flatten did not sell — the order book "
+            f"could not be read ({type(exc).__name__}).",
+            dedupe_key=f"flatten_book:{ticker}",
+        )
+        raise Exception(type(exc).__name__) from None
+    sell_qty = int(qty)
+    for order in reconciliation.parse_open_orders(book):
+        if not _flatten_working_exit(order, ticker, guard):
+            continue
+        remaining = reconciliation._stop_remaining(order)
+        try:
+            outcome = await _cancel_order_verified(
+                order.get("order_id"), expected_qty=remaining,
+            )
+        except Exception as exc:
+            logger.warning("flatten cancel failed (%s)", type(exc).__name__)
+            outcome = CANCEL_LIVE
+        if outcome != CANCEL_CONFIRMED:
+            sell_qty -= remaining
+    if sell_qty < 1:
+        logger.warning(
+            "[FLATTEN] %s working exit still covers the shares — not selling",
+            ticker,
+        )
+        await alerts.send_nowait(
+            "critical", "flatten_oversell_avoided",
+            f"{ticker}: emergency flatten did not sell — a working stop or "
+            f"sell still covers the position.",
+            dedupe_key=f"flatten_covered:{ticker}",
+        )
+        raise Exception("covered")
+    qty = sell_qty
     tokens = load_tokens()
     if not tokens:
         raise Exception("E*TRADE tokens not set")
@@ -33013,10 +33119,10 @@ async def _stop_guard_worker(ticker: str) -> None:
                     if can_place and (
                         guard.get("stop_allocation_held") or guard.get("stop_reply_lost")
                     ):
-                        # Read the book before another place. A covering stop
-                        # — including one whose ack was lost — is adopted.
-                        # A working close or limit does not cover, so it is
-                        # not adopted.
+                        # Read the book before another place. A covering stop,
+                        # or the original order still open, is adopted. A
+                        # failed or lagging read stays in the hold and does
+                        # not place. A working close or limit is not a stop.
                         adopt_pos = {
                             "action": guard.get("action") or "BUY",
                             "contract": guard.get("contract") if is_option else None,
@@ -33024,7 +33130,15 @@ async def _stop_guard_worker(ticker: str) -> None:
                             "stop_premium": guard.get("stop") if is_option else None,
                             "entry_premium": 1 if is_option else None,
                         }
-                        adopted = await _adopt_covering_stop(ticker, adopt_pos, filled)
+                        verdict = await _adopt_covering_stop(
+                            ticker, adopt_pos, filled,
+                            client_id=guard.get("stop_client_id"),
+                            order_id=guard.get("stop_order_id"),
+                        )
+                        adopted = (
+                            verdict.get("order_id")
+                            if verdict.get("status") == "found" else None
+                        )
                         if adopted:
                             guard = await state.update_guard(
                                 ticker,
@@ -33042,7 +33156,19 @@ async def _stop_guard_worker(ticker: str) -> None:
                                     await state.set_position(ticker, pos)
                             guarded = filled
                             can_place = False
-                        elif guard.get("stop_allocation_held"):
+                        elif (
+                            verdict.get("status") == "absent"
+                            and guard.get("stop_reply_lost")
+                            and not guard.get("stop_allocation_held")
+                        ):
+                            # The book was read and the original order is not
+                            # working. One retry may place.
+                            can_place = True
+                        else:
+                            if not guard.get("stop_allocation_held"):
+                                guard = await state.update_guard(
+                                    ticker, stop_allocation_held=True,
+                                ) or guard
                             step = allocation_hold_after_poll(guard, time.time())
                             if step["expired"]:
                                 logger.warning(
@@ -33070,6 +33196,11 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 ) or guard
                             can_place = False
                     if can_place:
+                        client_id = str(uuid.uuid4().int)[:18]
+                        guard = await state.update_guard(
+                            ticker, stop_client_id=client_id,
+                        ) or guard
+                        client_token = _PENDING_STOP_CLIENT_ID.set(client_id)
                         try:
                             raw_stop = float(guard.get("stop") or 0)
                             floor_pos = {
@@ -33132,7 +33263,15 @@ async def _stop_guard_worker(ticker: str) -> None:
                                     "stop_premium": guard.get("stop") if is_option else None,
                                     "entry_premium": 1 if is_option else None,
                                 }
-                                adopted = await _adopt_covering_stop(ticker, adopt_pos, filled)
+                                verdict = await _adopt_covering_stop(
+                                    ticker, adopt_pos, filled,
+                                    client_id=guard.get("stop_client_id"),
+                                    order_id=guard.get("stop_order_id"),
+                                )
+                                adopted = (
+                                    verdict.get("order_id")
+                                    if verdict.get("status") == "found" else None
+                                )
                                 if adopted:
                                     guard = await state.update_guard(
                                         ticker,
@@ -33151,9 +33290,10 @@ async def _stop_guard_worker(ticker: str) -> None:
                                     guarded = filled
                             elif _place_reply_ambiguous(e):
                                 # The reply was lost. The stop may already be
-                                # resting. One retry is allowed. Flatten waits.
+                                # resting. The next poll places only when a
+                                # successful read shows that order is gone.
                                 logger.warning(
-                                    "[STOP GUARD] %s stop place reply lost (%s) — one retry",
+                                    "[STOP GUARD] %s stop place reply lost (%s)",
                                     ticker, type(e).__name__,
                                 )
                                 guard = await state.update_guard(
@@ -33184,6 +33324,8 @@ async def _stop_guard_worker(ticker: str) -> None:
                                     f"({type(e).__name__}). The guard will retry.",
                                     dedupe_key=f"guard_fail:{ticker}",
                                 )
+                        finally:
+                            _PENDING_STOP_CLIENT_ID.reset(client_token)
 
             finally:
                 if pending_entry_alert is not None:
@@ -33334,13 +33476,20 @@ async def _stop_guard_worker(ticker: str) -> None:
                         )
                         return
                     except Exception as e:
-                        logger.error(f"[STOP GUARD] {ticker} emergency flatten FAILED (will retry): {e}")
+                        logger.error(
+                            "[STOP GUARD] %s emergency flatten FAILED (%s)",
+                            ticker, type(e).__name__,
+                        )
                         await alerts.send_nowait(
                             "critical", "stop_timeout_flatten_failed",
                             f"{ticker}: UNPROTECTED past the {STOP_PLACEMENT_TIMEOUT_SECONDS}s stop deadline and "
-                            f"the emergency flatten failed (guard keeps retrying): {e}",
+                            f"the emergency flatten failed ({type(e).__name__}). The guard keeps retrying.",
                             dedupe_key=f"stop_timeout_fail:{ticker}",
                         )
+                        if allocation_hold_released:
+                            # The lost order was never proven gone. Do not
+                            # place another stop on the next poll.
+                            await state.update_guard(ticker, stop_reply_lost=True)
                         # Fall through — next poll retries the stop placement
                         # first, then this flatten again if it still won't stick.
                 else:

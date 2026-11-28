@@ -1,6 +1,6 @@
-"""A lost stop reply retries once. A 3004 holds only through the stop
-deadline plus STOP_ALLOCATION_HELD_POLLS, then the normal unprotected
-path runs.
+"""A lost stop reply does not place again until the book shows the order
+is gone. A 3004 or an unreadable book holds only through the stop deadline
+plus STOP_ALLOCATION_HELD_POLLS, then the normal unprotected path runs.
 """
 from __future__ import annotations
 
@@ -96,7 +96,9 @@ def test_lost_stop_reply_retries_once_and_stops_on_3004(monkeypatch):
             guard["done"] = False
             await store.set_guard("QQQ", guard)
             await main_bot._stop_guard_worker("QQQ")
-        assert len(places) == 2
+        # The empty book has not shown the lost order, so there is no
+        # second place inside this window.
+        assert len(places) == 1
         assert places[0][0] == right
         assert cancels == []
         # Inside the hold the emergency flatten has not run. The hold is
@@ -252,7 +254,7 @@ def test_hold_expires_without_adoption_and_flattens(monkeypatch):
             "contract": {"right": "CALL", "strike": 450.0, "expiration": "2026-12-18"},
         })
         await store.set_guard("QQQ", _guard_for("option"))
-        await _drive(store, 2 + main_bot.STOP_ALLOCATION_HELD_POLLS)
+        await _drive(store, 1 + main_bot.STOP_ALLOCATION_HELD_POLLS)
         held = await store.get_guard("QQQ")
         return held
 
@@ -260,7 +262,7 @@ def test_hold_expires_without_adoption_and_flattens(monkeypatch):
     assert ("critical", "position_unprotected") in alerts
     assert flats == ["QQQ"]
     assert held.get("stop_allocation_held") is not True
-    assert len(places) == 2
+    assert len(places) == 1
 
 
 def test_adoption_inside_the_bound_does_not_flatten(monkeypatch):
@@ -274,10 +276,8 @@ def test_adoption_inside_the_bound_does_not_flatten(monkeypatch):
 
     async def place(ticker, contract, qty, premium):
         places.append(1)
-        if len(places) == 1:
-            raise _Gone()
         phase["show"] = True
-        raise _Allocated()
+        raise _Gone()
 
     async def flatten(*args, **kwargs):
         flats.append("flat")
@@ -313,12 +313,12 @@ def test_adoption_inside_the_bound_does_not_flatten(monkeypatch):
             "contract": {"right": "PUT", "strike": 450.0, "expiration": "2026-12-18"},
         })
         await store.set_guard("QQQ", _guard_for("option", "PUT"))
-        # Lost reply, 3004, then the next poll adopts.
-        await _drive(store, 3)
+        # Lost reply, then the next poll adopts the stop already on the book.
+        await _drive(store, 2)
         return await store.get_guard("QQQ"), await store.get_position("QQQ")
 
     guard, pos = _run(scenario())
-    assert len(places) == 2
+    assert len(places) == 1
     assert flats == []
     assert ("critical", "position_unprotected") not in alerts
     assert guard.get("stop_order_id") == "LIVE-STOP"
@@ -447,3 +447,214 @@ def test_equity_lost_reply_adopts_the_book_instead_of_replacing(monkeypatch):
     assert guard.get("stop_order_id") == "EQ-STOP"
     assert guard.get("stop_reply_lost") is not True
     assert pos.get("stop_order_id") == "EQ-STOP"
+
+
+def _wire_guard(monkeypatch, store, *, place, book, flatten=None, order_qty=1):
+    alerts = []
+    sold = []
+
+    async def send_nowait(severity, event, message, **kwargs):
+        alerts.append((severity, event))
+
+    async def order_state(order_id, client_id):
+        return "EXECUTED", order_qty
+
+    async def nap(_seconds):
+        await store.update_guard("QQQ", done=True)
+
+    async def quiet(*args, **kwargs):
+        return None
+
+    async def smart(kind, common, tokens):
+        sold.append(int(common.get("quantity") or 0))
+        return {"orderId": "MKT"}
+
+    monkeypatch.setattr(main_bot, "state", store)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)
+    monkeypatch.setattr(main_bot, "_order_state", order_state)
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", book)
+    monkeypatch.setattr(main_bot.asyncio, "sleep", nap)
+    monkeypatch.setattr(main_bot, "_resolve_exit_fill", quiet)
+    monkeypatch.setattr(main_bot, "_defer_close_to_reconciler", quiet)
+    monkeypatch.setattr(main_bot.trade_ledger, "record", quiet)
+    monkeypatch.setattr(main_bot, "_place_order_smart", smart)
+    if flatten is not None:
+        monkeypatch.setattr(main_bot, "_emergency_flatten", flatten)
+    return alerts, sold
+
+
+def test_equity_lost_reply_failed_read_holds_then_pages(monkeypatch):
+    """A failed book read after a lost equity reply does not place again."""
+    store = main_bot.StateStore(None)
+    places = []
+
+    async def place(ticker, action, qty, stop):
+        places.append(qty)
+        raise _Gone()
+
+    async def book():
+        raise RuntimeError("book down")
+
+    alerts, sold = _wire_guard(monkeypatch, store, place=place, book=book, order_qty=100)
+    monkeypatch.setattr(main_bot, "_place_protective_stop", place)
+
+    async def scenario():
+        await store.set_position("QQQ", {
+            "action": "BUY", "entry": 100.0, "stop": 90.0,
+            "filled_qty": 100, "qty": 100,
+        })
+        guard = _guard_for("equity")
+        guard["stop"] = 90.0
+        guard["trued_qty"] = 100
+        await store.set_guard("QQQ", guard)
+        await _drive(store, 2 + main_bot.STOP_ALLOCATION_HELD_POLLS)
+        return await store.get_guard("QQQ")
+
+    held = _run(scenario())
+    assert places == [100]
+    assert sold == []
+    assert ("critical", "position_unprotected") in alerts
+    assert held.get("stop_order_id") in (None, "")
+
+
+def test_equity_lost_reply_lag_adopts_on_the_third_poll(monkeypatch):
+    """Two empty polls do not place. The stop that appears on poll 3 is adopted."""
+    store = main_bot.StateStore(None)
+    places = []
+    reads = {"n": 0}
+
+    async def place(ticker, action, qty, stop):
+        places.append(qty)
+        raise _Gone()
+
+    async def book():
+        reads["n"] += 1
+        if reads["n"] < 3:
+            return {"OrdersResponse": {}}
+        return {"OrdersResponse": {"Order": _equity_stop("EQ-STOP", 100, 90.0)}}
+
+    async def flatten(*args, **kwargs):
+        raise AssertionError("flatten ran while the lost stop was still unresolved")
+
+    alerts, sold = _wire_guard(
+        monkeypatch, store, place=place, book=book, flatten=flatten, order_qty=100,
+    )
+    monkeypatch.setattr(main_bot, "_place_protective_stop", place)
+
+    async def scenario():
+        await store.set_position("QQQ", {
+            "action": "BUY", "entry": 100.0, "stop": 90.0,
+            "filled_qty": 100, "qty": 100,
+        })
+        guard = _guard_for("equity")
+        guard["stop"] = 90.0
+        guard["trued_qty"] = 100
+        await store.set_guard("QQQ", guard)
+        await _drive(store, 4)
+        return await store.get_guard("QQQ")
+
+    held = _run(scenario())
+    assert places == [100]
+    assert sold == []
+    assert held.get("stop_order_id") == "EQ-STOP"
+    assert ("critical", "position_unprotected") not in alerts
+    assert reads["n"] >= 3
+
+
+def test_option_lost_reply_failed_read_does_not_place(monkeypatch):
+    store = main_bot.StateStore(None)
+    places = []
+    flats = []
+
+    async def place(ticker, contract, qty, premium):
+        places.append((contract.get("right"), qty))
+        raise _Gone()
+
+    async def book():
+        raise RuntimeError("book down")
+
+    async def flatten(*args, **kwargs):
+        flats.append(args[0] if args else None)
+        return "FLAT"
+
+    _wire_guard(monkeypatch, store, place=place, book=book, flatten=flatten)
+    monkeypatch.setattr(main_bot, "_place_option_protective_stop", place)
+
+    async def scenario(right):
+        places.clear()
+        flats.clear()
+        await store.set_position("QQQ", {
+            "action": "BUY", "entry_premium": 3.0, "stop_premium": 2.4,
+            "filled_qty": 1, "qty": 1,
+            "contract": {"right": right, "strike": 450.0, "expiration": "2026-12-18"},
+        })
+        await store.set_guard("QQQ", _guard_for("option", right))
+        await _drive(store, 1 + main_bot.STOP_ALLOCATION_HELD_POLLS)
+        return places, flats
+
+    for right in ("CALL", "PUT"):
+        seen, flats = _run(scenario(right))
+        assert seen == [(right, 1)]
+        assert flats == ["QQQ"]
+
+
+def test_equity_flatten_does_not_sell_more_than_the_long(monkeypatch):
+    """A working 100-share stop is cancelled first. A failed cancel sells nothing."""
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+    sold = []
+    cancelled = []
+
+    async def book():
+        return {"OrdersResponse": {"Order": _equity_stop("EQ-STOP", 100, 90.0)}}
+
+    async def cancel(order_id, expected_qty=None):
+        cancelled.append((order_id, expected_qty))
+        return main_bot.CANCEL_LIVE
+
+    async def smart(kind, common, tokens):
+        sold.append(int(common.get("quantity") or 0))
+        return {"orderId": "MKT"}
+
+    async def send_nowait(*args, **kwargs):
+        return None
+
+    def tokens():
+        return {"oauth_token": "t", "oauth_token_secret": "s"}
+
+    async def account(_tokens):
+        return "acct"
+
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", book)
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel)
+    monkeypatch.setattr(main_bot, "_place_order_smart", smart)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)
+    monkeypatch.setattr(main_bot, "load_tokens", tokens)
+    monkeypatch.setattr(main_bot, "_resolve_account_id_key", account)
+
+    async def scenario():
+        await store.set_guard("QQQ", _guard_for("equity"))
+        try:
+            await main_bot._emergency_flatten("QQQ", await store.get_guard("QQQ"), 100)
+        except Exception as exc:
+            return type(exc).__name__, str(exc)
+        return "placed", ""
+
+    kind, text = _run(scenario())
+    assert sold == []
+    assert cancelled == [("EQ-STOP", 100)]
+    assert text == "covered"
+
+    async def cancel_ok(order_id, expected_qty=None):
+        cancelled.append((order_id, expected_qty))
+        return main_bot.CANCEL_CONFIRMED
+
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel_ok)
+
+    async def confirmed():
+        cancelled.clear()
+        await main_bot._emergency_flatten("QQQ", await store.get_guard("QQQ"), 100)
+        return list(sold)
+
+    assert _run(confirmed()) == [100]
+    assert sum(sold) <= 100
