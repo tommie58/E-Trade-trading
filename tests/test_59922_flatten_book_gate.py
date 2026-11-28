@@ -293,3 +293,88 @@ def test_unsold_prior_flatten_keeps_the_guard_paging(monkeypatch):
     first, second = _run(scenario())
     assert first >= 1
     assert second == first + 1
+
+
+def test_panic_lost_stock_stop_pages_a_short_and_never_buys(monkeypatch):
+    store = main_bot.StateStore(None)
+    orders = []
+    alerts = []
+    cancels = []
+    holdings = {"n": 0}
+    clock = {"t": 5_000.0}
+
+    async def held(ticker, pos):
+        holdings["n"] += 1
+        return 100 if holdings["n"] == 1 else -100
+
+    async def smart(kind, common, tokens):
+        orders.append((
+            str(common.get("orderAction") or "").upper(),
+            int(common.get("quantity") or 0),
+        ))
+        return {"orderId": "MKT-1"}
+
+    async def fetch():
+        return {"OrdersResponse": {}}
+
+    async def cancel(order_id, expected_qty=None):
+        cancels.append(order_id)
+        return main_bot.CANCEL_CONFIRMED
+
+    async def send_nowait(severity, event, message, **kwargs):
+        alerts.append((severity, event))
+
+    async def quiet(*args, **kwargs):
+        return None
+
+    def tokens():
+        return {"oauth_token": "t", "oauth_token_secret": "s"}
+
+    async def account(_tokens):
+        return "acct"
+
+    monkeypatch.setattr(main_bot.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(main_bot, "state", store)
+    monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", held)
+    monkeypatch.setattr(main_bot, "_place_order_smart", smart)
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", fetch)
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)
+    monkeypatch.setattr(main_bot, "load_tokens", tokens)
+    monkeypatch.setattr(main_bot, "_resolve_account_id_key", account)
+    monkeypatch.setattr(main_bot.trade_ledger, "record", quiet)
+    monkeypatch.setattr(main_bot, "_defer_close_to_reconciler", quiet)
+    monkeypatch.setattr(
+        main_bot.reconciliation, "parse_open_orders",
+        lambda _resp: [{"order_id": "STOP-LIVE", "symbol": "QQQ"}],
+    )
+    monkeypatch.setattr(
+        main_bot, "_arm_lost_stop_short_page", lambda ticker: alerts.append(("arm", ticker)),
+    )
+
+    async def scenario():
+        await store.set_position("QQQ", {
+            "action": "BUY", "entry": 100.0, "stop": 90.0,
+            "filled_qty": 100, "qty": 100,
+        })
+        await store.set_guard("QQQ", {
+            "done": False, "kind": "equity", "action": "BUY",
+            "stop_client_id": "LOST-CLIENT", "stop_reply_lost": True,
+        })
+        await main_bot._flatten_book("panic")
+        first = [row for row in alerts if row[1] == "position_unprotected"]
+        clock["t"] += main_bot.UNCONFIRMED_STOP_PAGE_S
+        await main_bot._page_unconfirmed_stop("QQQ", await store.get_guard("QQQ"))
+        second = [row for row in alerts if row[1] == "position_unprotected"]
+        return first, second, await store.get_guard("QQQ")
+
+    first, second, guard = _run(scenario())
+    assert orders == [("SELL", 100)]
+    assert not any(action.startswith("BUY") for action, _qty in orders)
+    assert cancels == ["STOP-LIVE"]
+    assert ("critical", "lost_stop_may_be_live") in alerts
+    assert ("arm", "QQQ") in alerts
+    assert len(first) == 1
+    assert len(second) == 2
+    assert guard.get("done") is not True
+    assert guard.get("flatten_unresolved") is True

@@ -46009,6 +46009,135 @@ async def flatten(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secr
     return await _flatten_book("panic")
 
 
+def _stock_lost_stop_unresolved(item: dict, guard: dict) -> bool:
+    """Equity whose lost stop id was never resolved. Options are not this case."""
+    if str(item.get("kind") or "") == "option":
+        return False
+    if not str((guard or {}).get("stop_client_id") or "").strip():
+        return False
+    if str(item.get("stop_order_id") or (guard or {}).get("stop_order_id") or "").strip():
+        return False
+    return bool((guard or {}).get("stop_reply_lost") or (guard or {}).get("stop_reply_bound"))
+
+
+async def _cancel_symbol_orders(ticker: str) -> None:
+    """Best-effort cancel of every open order on this symbol. Never buys."""
+    try:
+        resp = await asyncio.wait_for(
+            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.warning("symbol cancel read failed (%s)", type(exc).__name__)
+        return
+    for order in reconciliation.parse_open_orders(resp):
+        if str(order.get("symbol") or "").upper() != str(ticker or "").upper():
+            continue
+        order_id = str(order.get("order_id") or "").strip()
+        if not order_id:
+            continue
+        try:
+            await _cancel_order_verified(order_id)
+        except Exception as exc:
+            logger.warning("symbol cancel failed (%s)", type(exc).__name__)
+
+
+async def _page_lost_stop_short(ticker: str) -> None:
+    """Keep paging a short (or an unreadable holding) every 30s. Never buy."""
+    try:
+        await asyncio.sleep(UNCONFIRMED_STOP_PAGE_S)
+        guard = await state.get_guard(ticker)
+        if not guard or guard.get("done") or not guard.get("flatten_unresolved"):
+            return
+        await _page_unconfirmed_stop(ticker, guard)
+        _arm_lost_stop_short_page(ticker)
+    except Exception as exc:
+        logger.warning("lost-stop short page failed (%s)", type(exc).__name__)
+
+
+def _arm_lost_stop_short_page(ticker: str) -> None:
+    alerts.retain(asyncio.create_task(_page_lost_stop_short(ticker)))
+
+
+async def _panic_flatten_lost_stock(ticker: str, item: dict, guard: dict) -> dict:
+    """Sell a stock whose lost stop may still be live. Never buy a short back.
+
+    Cancel any known id, then sell the holding when that read works and the
+    tracked quantity when it does not. After the sell, cancel the symbol's
+    open orders and read the holding again. A short, a negative quantity, or
+    a failed read stays open and is paged every 30 seconds.
+    """
+    known = []
+    for order_id in (
+        item.get("stop_order_id"),
+        guard.get("stop_order_id"),
+        guard.get("flatten_order_id"),
+    ):
+        text = str(order_id or "").strip()
+        if text and text not in known:
+            known.append(text)
+    for order_id in known:
+        try:
+            await _cancel_order_verified(order_id, expected_qty=item.get("qty") or None)
+        except Exception as exc:
+            logger.warning("panic lost-stop cancel failed (%s)", type(exc).__name__)
+    held = await _flatten_broker_held_qty(ticker, {"action": item.get("action") or "BUY"})
+    tracked = int(item.get("qty") or 0)
+    if held is None:
+        sell_qty = tracked
+    elif held <= 0:
+        sell_qty = 0
+    else:
+        sell_qty = min(int(held), tracked)
+    await alerts.send_nowait(
+        "critical", "lost_stop_may_be_live",
+        f"{ticker}: flatten is selling while a lost stop may still be live.",
+        dedupe_key=f"lost_stop_live:{ticker}",
+    )
+    order_id = None
+    if sell_qty > 0:
+        order_id = await _emergency_flatten(
+            ticker,
+            {
+                "kind": "equity",
+                "action": item.get("action") or "BUY",
+                "stop_client_id": guard.get("stop_client_id"),
+                "stop_reply_lost": True,
+            },
+            sell_qty,
+            book="skip",
+        )
+    await _cancel_symbol_orders(ticker)
+    again = await _flatten_broker_held_qty(ticker, {"action": item.get("action") or "BUY"})
+    if again is None or again < 0:
+        await state.update_guard(
+            ticker,
+            flatten_unresolved=True,
+            stop_reply_bound=True,
+            done=False,
+        )
+        fresh = await state.get_guard(ticker) or guard
+        await _page_unconfirmed_stop(ticker, fresh)
+        _arm_lost_stop_short_page(ticker)
+        return {
+            "ticker": ticker,
+            "status": "short_watch",
+            "order_id": order_id,
+            "qty": sell_qty,
+            "kind": "equity",
+        }
+    if order_id:
+        await _finish_guard(ticker, "flattened")
+        await _defer_close_to_reconciler(ticker, order_id, "flatten close placed")
+    return {
+        "ticker": ticker,
+        "status": "closing" if order_id else "already_flat",
+        "order_id": order_id,
+        "qty": sell_qty,
+        "kind": "equity",
+        "stop": CANCEL_NONE,
+    }
+
+
 async def _flatten_book(trigger: str) -> Dict[str, Any]:
     """Kill entries, then close every tracked position. ONE implementation for
     every caller -- the panic button (`trigger='panic'`) and the risk desk's
@@ -46031,6 +46160,10 @@ async def _flatten_book(trigger: str) -> Dict[str, Any]:
             results.append({"ticker": ticker, "status": "blocked", "detail": item["blocked"]})
             continue
         try:
+            guard = dict(guards.get(ticker) or {})
+            if _stock_lost_stop_unresolved(item, guard):
+                results.append(await _panic_flatten_lost_stock(ticker, item, guard))
+                continue
             stop_outcome = CANCEL_NONE
             if item["stop_order_id"]:
                 # Compare against the CANCEL_* constants, never string literals.
@@ -46111,7 +46244,10 @@ async def _flatten_book(trigger: str) -> Dict[str, Any]:
             results.append({"ticker": ticker, "status": "failed", "detail": str(e)[:300]})
 
     closing = [r["ticker"] for r in results if r["status"] == "closing"]
-    failed = [r["ticker"] for r in results if r["status"] in {"failed", "blocked"}]
+    failed = [
+        r["ticker"] for r in results
+        if r["status"] in {"failed", "blocked", "short_watch"}
+    ]
     await trade_ledger.record("flatten_all", {"trigger": trigger, "results": results})
     headline = ("DAILY LOSS LIMIT BREACHED - the risk desk flattened the book"
                 if trigger == "daily_loss" else "PANIC EXIT")
