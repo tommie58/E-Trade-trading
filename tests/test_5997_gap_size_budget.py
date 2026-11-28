@@ -46,6 +46,7 @@ def test_gap_at_least_two_percent_sits_out_scanner_and_app_all_day(quiet_gap, mo
         return False
 
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
     saved_state = main_bot.state
     store = main_bot.StateStore(None)
     monkeypatch.setattr(store, "is_killed", not_killed)
@@ -529,6 +530,7 @@ def test_unmeasured_gap_blocks_until_a_small_gap_is_measured(quiet_gap, monkeypa
         sent.append(kwargs.get("dedupe_key"))
 
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
 
     async def scenario():
         reasons = []
@@ -634,6 +636,7 @@ def test_nov23_stale_bar_blocks_the_five_percent_open(quiet_gap, monkeypatch):
         sent.append((args[2] if len(args) > 2 else "", kwargs.get("dedupe_key")))
 
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
 
     async def scenario():
         reason = await main_bot.entry_gap_sit_out_reason(
@@ -692,6 +695,7 @@ def test_preopen_request_does_not_consume_the_unmeasured_alert(quiet_gap, monkey
         sent.append(kwargs.get("dedupe_key"))
 
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
     monkeypatch.setattr(main_bot, "_utcnow", lambda: clock["at"])
 
     async def scenario():
@@ -729,6 +733,7 @@ def test_gap_refusal_writes_one_entry_skipped_and_stops(quiet_gap, monkeypatch):
 
     monkeypatch.setattr(main_bot.trade_ledger, "record", record)
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
     monkeypatch.setattr(main_bot.state, "is_killed", not_killed)
 
     async def scenario():
@@ -758,6 +763,7 @@ def test_explain_dry_run_does_not_alert_the_sit_out(quiet_gap, monkeypatch):
         return False
 
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
     monkeypatch.setattr(main_bot.state, "is_killed", not_killed)
 
     async def scenario():
