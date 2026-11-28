@@ -30732,6 +30732,24 @@ async def _read_open_order_stop(order_id: str) -> Optional[float]:
     return None
 
 
+async def _capture_resting_stop(order_id: Any) -> Optional[float]:
+    """stopPrice of a resting order, read before that order is cancelled.
+
+    None when there is no id, the order is gone, or its stop is not a
+    positive price. A book-read failure logs the exception type and returns
+    None. Native-trail promotion and repair do not use this: they refuse
+    the trail when the read itself fails, and they leave the stop resting.
+    """
+    oid = str(order_id or "").strip()
+    if not oid:
+        return None
+    try:
+        return await _read_open_order_stop(oid)
+    except Exception as exc:
+        logger.warning("resting stop read failed (%s)", type(exc).__name__)
+        return None
+
+
 async def _live_resting_stop_price(pos: dict) -> Optional[float]:
     """Tightest live stopPrice on this position's resting protective orders.
 
@@ -31602,6 +31620,8 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
     # close, or the stop and the scale-out can both fill and oversell into a
     # naked short. CANCEL_FILLED means the stop beat us — the position is flat
     # and there is nothing left to scale.
+    # Read the broker stopPrice before the cancel so a re-arm cannot loosen it.
+    pre_cancel_floor = await _capture_resting_stop(stop_order_id)
     if stop_order_id:
         outcome = await _cancel_order_verified(stop_order_id, expected_qty=qty)
         if outcome == CANCEL_FILLED:
@@ -31620,7 +31640,9 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
                 if fresh:
                     try:
                         _log_rearm_outcome(
-                            ticker, await _reconcile_rearm_guard(ticker, dict(fresh)), "SCALE-OUT",
+                            ticker, await _reconcile_rearm_guard(
+                                ticker, dict(fresh), floor_price=pre_cancel_floor,
+                            ), "SCALE-OUT",
                         )
                     except Exception as e:
                         logger.error(f"[SCALE-OUT] {ticker} re-arm after partial stop fill FAILED: {e}")
@@ -31646,7 +31668,11 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
         logger.error(f"[SCALE-OUT] {ticker} partial close FAILED: {e} — re-arming the full stop")
         await _note_exit_failure(ticker, pos, "scale_out")
         try:
-            _log_rearm_outcome(ticker, await _reconcile_rearm_guard(ticker, pos), "SCALE-OUT")
+            _log_rearm_outcome(
+                ticker, await _reconcile_rearm_guard(
+                    ticker, pos, floor_price=pre_cancel_floor,
+                ), "SCALE-OUT",
+            )
         except Exception as re:
             logger.error(f"[SCALE-OUT] {ticker} stop re-arm after failed scale-out ALSO failed: {re}")
             await alerts.send_nowait(
@@ -31689,7 +31715,11 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
     # exactly the naked-position failure the whole guard architecture exists to
     # prevent.
     try:
-        _log_rearm_outcome(ticker, await _reconcile_rearm_guard(ticker, pos), "SCALE-OUT")
+        _log_rearm_outcome(
+            ticker, await _reconcile_rearm_guard(
+                ticker, pos, floor_price=pre_cancel_floor,
+            ), "SCALE-OUT",
+        )
     except Exception as e:
         logger.error(f"[SCALE-OUT] {ticker} runner stop re-arm FAILED: {e}")
         await alerts.send_nowait(
@@ -31830,6 +31860,8 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
     if resting_id and not await _stop_churn_gate(ticker, pos, "take_profit"):
         return False
 
+    # Broker stopPrice before the cancel. A failed close re-arms at least this tight.
+    pre_cancel_floor = await _capture_resting_stop(resting_id)
     if resting_id:
         # The resting order already pledges the contracts. Selling while it
         # rests earns E*TRADE 3004 on the one exit we most wanted.
@@ -31847,7 +31879,9 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
                 if fresh:
                     try:
                         _log_rearm_outcome(
-                            ticker, await _reconcile_rearm_guard(ticker, dict(fresh)), "TAKE PROFIT",
+                            ticker, await _reconcile_rearm_guard(
+                                ticker, dict(fresh), floor_price=pre_cancel_floor,
+                            ), "TAKE PROFIT",
                         )
                     except Exception as e:
                         logger.error(f"[TAKE PROFIT] {ticker} re-arm after partial fill FAILED: {e}")
@@ -31875,7 +31909,11 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
         logger.error(f"[TAKE PROFIT] {ticker} close FAILED: {e} — re-arming protection")
         await _note_exit_failure(ticker, pos, "take_profit")
         try:
-            _log_rearm_outcome(ticker, await _reconcile_rearm_guard(ticker, pos), "TAKE PROFIT")
+            _log_rearm_outcome(
+                ticker, await _reconcile_rearm_guard(
+                    ticker, pos, floor_price=pre_cancel_floor,
+                ), "TAKE PROFIT",
+            )
         except Exception as re:
             logger.error(f"[TAKE PROFIT] {ticker} stop re-arm after failed close ALSO failed: {re}")
             await alerts.send_nowait(
@@ -32151,6 +32189,7 @@ async def _tighten_stop_after_giveup(ticker: str, pos: dict, reason: str) -> Opt
         return None
     if not await _stop_churn_gate(ticker, pos, f"{reason}_giveup_tighten"):
         return None
+    pre_cancel_floor = await _capture_resting_stop(stop_id)
     outcome = await _cancel_order_verified(stop_id, expected_qty=qty)
     if outcome == CANCEL_FILLED:
         await _finish_guard(ticker, "closed_by_stop")
@@ -32167,19 +32206,24 @@ async def _tighten_stop_after_giveup(ticker: str, pos: dict, reason: str) -> Opt
             fresh = await state.get_position(ticker)
             if fresh:
                 _log_rearm_outcome(
-                    ticker, await _reconcile_rearm_guard(ticker, dict(fresh)), reason.upper(),
+                    ticker, await _reconcile_rearm_guard(
+                        ticker, dict(fresh), floor_price=pre_cancel_floor,
+                    ), reason.upper(),
                 )
         else:
             await _finish_guard(ticker, "closed_by_stop")
         return None
     if outcome != CANCEL_CONFIRMED:
         return None
+    place_at = _combine_rearm_floors(pos, target, pre_cancel_floor) or target
     try:
-        info = await _place_option_protective_stop(ticker, contract, qty, target)
+        info = await _place_option_protective_stop(ticker, contract, qty, place_at)
     except Exception as e:
         logger.error(f"[{reason.upper()}] {ticker} tighter stop {target:.2f} rejected ({e})")
         _log_rearm_outcome(
-            ticker, await _reconcile_rearm_guard(ticker, dict(pos)), reason.upper(),
+            ticker, await _reconcile_rearm_guard(
+                ticker, dict(pos), floor_price=pre_cancel_floor,
+            ), reason.upper(),
         )
         return None
     pos["stop_order_id"] = info["order_id"]
@@ -32322,6 +32366,7 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
     resting_id = pos.get("stop_order_id") or pos.get("native_trail_order_id")
     if resting_id and not deadline and not await _stop_churn_gate(ticker, pos, reason):
         return False
+    pre_cancel_floor = await _capture_resting_stop(resting_id)
     if resting_id:
         # Same cancel-before-close discipline as every other exit: the resting
         # order pledges the contracts, so selling under it earns E*TRADE 3004.
@@ -32339,7 +32384,9 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
                 if fresh:
                     try:
                         _log_rearm_outcome(
-                            ticker, await _reconcile_rearm_guard(ticker, dict(fresh)), reason.upper(),
+                            ticker, await _reconcile_rearm_guard(
+                                ticker, dict(fresh), floor_price=pre_cancel_floor,
+                            ), reason.upper(),
                         )
                     except Exception as e:
                         logger.error(f"[{reason.upper()}] {ticker} re-arm after partial fill FAILED: {e}")
@@ -32384,7 +32431,11 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
         logger.error(f"[{reason.upper()}] {ticker} close FAILED: {e}")
         pos["exit_retry"] = record_exit_failure(pos.get("exit_retry"), reason, time.time())
         try:
-            _log_rearm_outcome(ticker, await _reconcile_rearm_guard(ticker, pos), reason.upper())
+            _log_rearm_outcome(
+                ticker, await _reconcile_rearm_guard(
+                    ticker, pos, floor_price=pre_cancel_floor,
+                ), reason.upper(),
+            )
         except Exception as re:
             logger.error(f"[{reason.upper()}] {ticker} stop re-arm after failed close ALSO failed: {re}")
             try:
@@ -32624,10 +32675,12 @@ async def _stop_guard_worker(ticker: str) -> None:
                 if filled > guarded:
                     # (Re)place the protective stop for the total filled quantity.
                     can_place = True
+                    pre_cancel_floor = None
                     if guard.get("stop_order_id"):
                         # Replace flow: only place a new stop if the old one is truly
                         # cancelled — never risk two live stops double-selling, and
                         # never re-arm behind a stop that already filled.
+                        pre_cancel_floor = await _capture_resting_stop(guard.get("stop_order_id"))
                         replace_outcome = await _cancel_order_verified(
                             guard.get("stop_order_id"), expected_qty=guarded,
                         )
@@ -32650,7 +32703,9 @@ async def _stop_guard_worker(ticker: str) -> None:
                             try:
                                 outcome = "unplaced"
                                 if fresh:
-                                    outcome = await _reconcile_rearm_guard(ticker, dict(fresh))
+                                    outcome = await _reconcile_rearm_guard(
+                                        ticker, dict(fresh), floor_price=pre_cancel_floor,
+                                    )
                                 _log_rearm_outcome(ticker, outcome, "STOP GUARD")
                                 if outcome == "lock_timeout":
                                     await _finish_guard(ticker, "partial_fill_unprotected")
@@ -32691,15 +32746,25 @@ async def _stop_guard_worker(ticker: str) -> None:
                             return
                     if can_place:
                         try:
+                            raw_stop = float(guard.get("stop") or 0)
+                            floor_pos = {
+                                "action": guard.get("action") or "BUY",
+                                "contract": guard.get("contract") if is_option else None,
+                                "stop": raw_stop,
+                                "stop_premium": raw_stop if is_option else None,
+                            }
+                            place_at = _combine_rearm_floors(
+                                floor_pos, raw_stop, pre_cancel_floor,
+                            ) or raw_stop
                             if is_option:
                                 stop_info = await _place_option_protective_stop(
                                     ticker, dict(guard.get("contract") or {}), filled,
-                                    float(guard.get("stop") or 0),
+                                    place_at,
                                 )
                             else:
                                 stop_info = await _place_protective_stop(
                                     ticker, str(guard.get("action") or "BUY"), filled,
-                                    float(guard.get("stop") or 0),
+                                    place_at,
                                 )
                             guard = await state.update_guard(
                                 ticker,
@@ -37508,6 +37573,7 @@ async def execute_live_order(payload: dict):
                     common["quantity"] = quantity
                 opt_guard = await state.get_guard(sym_u) or {}
                 resting_stop_id = pos.get("stop_order_id") or opt_guard.get("stop_order_id")
+                close_floor = await _capture_resting_stop(resting_stop_id)
                 if pos and APP_CLOSE_RETRY_GATES:
                     # 5.82.1 — the same close-failure backoff and stop-churn limit
                     # the bot-owned exits use. Refusals are RETURNED (no breaker
@@ -37984,7 +38050,9 @@ async def execute_live_order(payload: dict):
                             logger.warning(f"[CLOSE] {sym_u} close-failure stamp not persisted: {stamp_err}")
                     if pos:
                         try:
-                            outcome = await _reconcile_rearm_guard(sym_u, dict(pos))
+                            outcome = await _reconcile_rearm_guard(
+                                sym_u, dict(pos), floor_price=close_floor,
+                            )
                             if outcome == "placed":
                                 logger.warning(
                                     f"[CLOSE] {sym_u} close placement failed — protective stop re-armed"
@@ -38408,6 +38476,7 @@ async def execute_live_order(payload: dict):
                 guard = await state.get_guard(symbol) or {}
                 stop_order_id = pos.get("stop_order_id") or guard.get("stop_order_id")
                 tracked_cover = int(pos.get("filled_qty") or pos.get("qty") or 0)
+                close_floor = await _capture_resting_stop(stop_order_id)
                 stop_outcome = await _cancel_order_verified(
                     stop_order_id, expected_qty=tracked_cover or None,
                 )
@@ -38478,7 +38547,9 @@ async def execute_live_order(payload: dict):
                     # leave the position naked until the next reconcile pass.
                     if pos:
                         try:
-                            outcome = await _reconcile_rearm_guard(symbol, dict(pos))
+                            outcome = await _reconcile_rearm_guard(
+                                symbol, dict(pos), floor_price=close_floor,
+                            )
                             if outcome == "placed":
                                 logger.warning(
                                     f"[CLOSE] {symbol} close placement failed — protective stop re-armed"
@@ -39901,6 +39972,8 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
 
     # Cancel/replace: never leave two live stops, and only place after the
     # cancel is confirmed against the broker's own order book.
+    # The broker stopPrice is the floor for every re-arm on this pass.
+    pre_cancel_floor = await _capture_resting_stop(stop_order_id)
     outcome = await _cancel_order_verified(stop_order_id, expected_qty=qty)
     if outcome == CANCEL_PARTIAL:
         # The stop sold PART of the position and then died. Booking the whole
@@ -39914,7 +39987,9 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
             if fresh:
                 try:
                     _log_rearm_outcome(
-                        ticker, await _reconcile_rearm_guard(ticker, dict(fresh)), "TRAIL",
+                        ticker, await _reconcile_rearm_guard(
+                            ticker, dict(fresh), floor_price=pre_cancel_floor,
+                        ), "TRAIL",
                     )
                 except Exception as e:
                     logger.error(f"[TRAIL] {ticker} re-arm after partial stop fill FAILED: {e}")
@@ -39964,6 +40039,8 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
     stop_info = None
     last_err: Optional[Exception] = None
     used_fallback = False
+    # Never rest a replacement under the stop that was just cancelled.
+    new_stop = _combine_rearm_floors(pos, new_stop, pre_cancel_floor) or float(new_stop)
     for attempt in (1, 2):
         try:
             if is_option:
@@ -39981,14 +40058,17 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         # sit naked until the next reconcile pass, immediately re-arm at the
         # level that WAS resting — worse protection than intended still beats
         # none at all.
+        fallback_px = _combine_rearm_floors(
+            pos, plan["current_stop"], pre_cancel_floor,
+        ) or float(plan["current_stop"])
         try:
             if is_option:
                 stop_info = await _place_option_protective_stop(
-                    ticker, dict(contract), qty, float(plan["current_stop"]),
+                    ticker, dict(contract), qty, fallback_px,
                 )
             else:
                 stop_info = await _place_protective_stop(
-                    ticker, str(pos.get("action") or "BUY"), qty, float(plan["current_stop"]),
+                    ticker, str(pos.get("action") or "BUY"), qty, fallback_px,
                 )
         except Exception as e:
             logger.error(f"[TRAIL] {ticker} fallback re-arm at previous level also failed: {e}")
@@ -41484,6 +41564,15 @@ async def _app_eyes_pass() -> None:
         if not await lock.try_acquire():
             continue
         try:
+            try:
+                pre_cancel_floor = await _read_open_order_stop(str(pos.get("stop_order_id") or ""))
+            except Exception as exc:
+                logger.warning(
+                    "[EXIT AUTHORITY] %s resting stop unreadable (%s) — leaving it",
+                    ticker, type(exc).__name__,
+                )
+                continue
+            place_at = _combine_rearm_floors(pos, tactical, pre_cancel_floor) or tactical
             outcome = await _cancel_order_verified(
                 pos.get("stop_order_id"), expected_qty=qty,
             )
@@ -41493,10 +41582,10 @@ async def _app_eyes_pass() -> None:
                 # second one would double-sell.
                 continue
             stop_info = await _place_option_protective_stop(
-                ticker, dict(contract), qty, tactical,
+                ticker, dict(contract), qty, place_at,
             )
             pos["stop_order_id"] = stop_info["order_id"]
-            pos["stop_premium"] = tactical
+            pos["stop_premium"] = float(stop_info.get("stop") or place_at)
             pos["stop_tier"] = "tactical"
             await state.set_position(ticker, pos)
             logger.warning(
@@ -41510,11 +41599,26 @@ async def _app_eyes_pass() -> None:
                 dedupe_key=f"eyes:{ticker}",
             )
         except Exception as e:
-            logger.error(f"[EXIT AUTHORITY] {ticker} re-tighten FAILED: {e}")
+            logger.error(
+                "[EXIT AUTHORITY] %s re-tighten FAILED (%s)",
+                ticker, type(e).__name__,
+            )
+            try:
+                fresh = await state.get_position(ticker) or pos
+                _log_rearm_outcome(
+                    ticker, await _reconcile_rearm_guard(
+                        ticker, dict(fresh), floor_price=pre_cancel_floor,
+                    ), "EXIT AUTHORITY",
+                )
+            except Exception as re_err:
+                logger.error(
+                    "[EXIT AUTHORITY] %s re-arm after failed tighten FAILED (%s)",
+                    ticker, type(re_err).__name__,
+                )
             await alerts.send_nowait(
                 "critical", "exit_authority_retighten_failed",
                 f"{ticker}: {lapse} and the protective stop could NOT be "
-                f"re-tightened to {tactical:.2f} — verify at your broker now: {e}",
+                f"re-tightened to {tactical:.2f} — verify at your broker now: {type(e).__name__}",
                 dedupe_key=f"eyes_fail:{ticker}",
             )
         finally:
