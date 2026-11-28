@@ -164,8 +164,8 @@ def _book(untracked, *, age_s=5.0, positions=None, epoch=True) -> str:
     return json.dumps(body)
 
 
-def _dedupe_key(day: str = "2026-11-18") -> str:
-    return f"alert:dedupe:open_after_flatten:{day}"
+def _dedupe_key(day: str = "2026-11-18", kind: str = "tracked") -> str:
+    return f"alert:dedupe:open_after_flatten:{kind}:{day}"
 
 
 def test_open_after_flatten_names_include_untracked_broker_legs():
@@ -223,12 +223,13 @@ def test_still_open_alert_names_tracked_and_untracked_together(isolated, monkeyp
         return await main_bot.alerts.recent(5)
 
     recent = _run(scenario())
-    message = recent[0]["message"]
-    assert "QQQ" in message
-    assert "IWM (untracked)" in message
-    assert "QQQ (untracked)" not in message
-    assert "Broker snapshot age" in message
-    assert "12:50 PM ET" in message
+    text = " ".join(item["message"] for item in recent)
+    assert "QQQ" in text
+    assert "IWM (untracked)" in text
+    assert "QQQ (untracked)" not in text
+    assert "Broker snapshot age" in text
+    assert "12:50 PM ET" in text
+    assert len(recent) == 2
 
 
 def test_mode_off_alerts_a_tracked_0dte_and_skips_swings_and_untracked(isolated, monkeypatch):
@@ -295,11 +296,13 @@ def test_mode_on_names_swings_and_a_fresh_untracked_book(isolated, monkeypatch):
         await main_bot._alert_positions_still_open()
         return await main_bot.alerts.recent(5)
 
-    message = _run(scenario())[0]["message"]
-    assert "QQQ" in message and "IWM" in message
-    assert "AMD (untracked)" in message
-    assert "QQQ (untracked)" not in message
-    assert "Broker snapshot age" in message
+    recent = _run(scenario())
+    text = " ".join(item["message"] for item in recent)
+    assert "QQQ" in text and "IWM" in text
+    assert "AMD (untracked)" in text
+    assert "QQQ (untracked)" not in text
+    assert "Broker snapshot age" in text
+    assert len(recent) == 2
 
 
 def test_stale_snapshot_does_not_name_untracked_or_take_the_dedupe_key(isolated, monkeypatch, caplog):
@@ -360,6 +363,29 @@ def test_unknown_snapshot_age_skips_untracked_names(isolated, monkeypatch, caplo
     assert "AMZN" not in caplog.text
 
 
+def test_tracked_page_does_not_suppress_a_later_untracked_page(isolated, monkeypatch):
+    """Each class pages once per day. The tracked key must not eat the other."""
+    _freeze(monkeypatch, FULL_DAY)
+    store = isolated
+
+    async def scenario():
+        main_bot.alerts.init(store, None)
+        await store.set_position("QQQ", _option("2026-11-18"))
+        await main_bot._alert_positions_still_open()
+        await store.set(
+            main_bot.reconciliation.ACCOUNT_SNAPSHOT_KEY,
+            _book(["AMD"]),
+        )
+        await main_bot._alert_positions_still_open()
+        return await main_bot.alerts.recent(5)
+
+    recent = _run(scenario())
+    text = " ".join(item["message"] for item in recent)
+    assert "QQQ" in text
+    assert "AMD (untracked)" in text
+    assert len(recent) == 2
+
+
 def test_still_open_alert_waits_until_350(isolated, monkeypatch):
     _freeze(monkeypatch, FULL_DAY.replace(minute=49))
     store = isolated
@@ -417,7 +443,8 @@ def test_slow_or_failing_webhook_does_not_delay_the_still_open_alert(isolated, m
             json.dumps({"untracked": ["AMD"]}),
         )
         # Fresh dedupe key per mode: the day key is the session date.
-        await store.delete("alert:dedupe:open_after_flatten:2026-11-18")
+        await store.delete("alert:dedupe:open_after_flatten:tracked:2026-11-18")
+        await store.delete("alert:dedupe:open_after_flatten:untracked:2026-11-18")
         started = time.perf_counter()
         await main_bot._alert_positions_still_open()
         elapsed[mode] = time.perf_counter() - started

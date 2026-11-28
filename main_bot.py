@@ -41770,21 +41770,34 @@ async def _alert_positions_still_open() -> None:
                     shown,
                 )
         labels = open_after_flatten_names(tracked, usable_snapshot)
-        if not labels:
+        tracked_labels = [label for label in labels if not str(label).endswith("(untracked)")]
+        untracked_labels = [label for label in labels if str(label).endswith("(untracked)")]
+        if not tracked_labels and not untracked_labels:
             return
         when = "12:50 PM ET" if _session_close_minute(now_et) == 13 * 60 else "3:50 PM ET"
-        message = (
-            f"Position(s) still open after {when}: {', '.join(labels)}. "
-            "No overnight hold."
-        )
-        if age is not None and any(label.endswith("(untracked)") for label in labels):
-            message += f" Broker snapshot age {age:.1f}s."
-        await alerts.send_nowait(
-            "critical",
-            "position_open_after_flatten",
-            message,
-            dedupe_key=f"open_after_flatten:{now_et.date().isoformat()}",
-        )
+        day = now_et.date().isoformat()
+        # Separate keys so a tracked page does not swallow a later untracked page.
+        if tracked_labels:
+            await alerts.send_nowait(
+                "critical",
+                "position_open_after_flatten",
+                f"Position(s) still open after {when}: {', '.join(tracked_labels)}. "
+                "No overnight hold.",
+                dedupe_key=f"open_after_flatten:tracked:{day}",
+            )
+        if untracked_labels:
+            message = (
+                f"Position(s) still open after {when}: {', '.join(untracked_labels)}. "
+                "No overnight hold."
+            )
+            if age is not None:
+                message += f" Broker snapshot age {age:.1f}s."
+            await alerts.send_nowait(
+                "critical",
+                "position_open_after_flatten",
+                message,
+                dedupe_key=f"open_after_flatten:untracked:{day}",
+            )
     except Exception as exc:
         logger.error("[FLATTEN] still-open alert failed (%s)", type(exc).__name__)
 
