@@ -517,3 +517,40 @@ def test_option_deadline_still_sells_when_the_book_is_down(monkeypatch):
 
     fills = _run(scenario())
     assert fills and fills[0][0] == "SELL_CLOSE" and fills[0][1] == 2
+
+
+def test_panic_after_the_lost_sell_does_not_sell_a_flat_or_short(monkeypatch):
+    store = main_bot.StateStore(None)
+    sold = _install(monkeypatch, store)
+    alerts = []
+    mode = {"held": 0}
+
+    async def held(ticker, pos):
+        return mode["held"]
+
+    async def send_nowait(severity, event, message, **kwargs):
+        alerts.append(event)
+
+    monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", held)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)
+
+    async def scenario(value):
+        sold.clear()
+        alerts.clear()
+        mode["held"] = value
+        await store.set_position("QQQ", {
+            "action": "BUY", "entry": 100.0, "stop": 90.0,
+            "filled_qty": 100, "qty": 100,
+        })
+        await store.set_guard("QQQ", {
+            "done": False, "kind": "equity", "action": "BUY",
+            "stop_lost_flatten_sent": True, "flatten_client_id": "FLAT",
+        })
+        await main_bot._flatten_book("panic")
+        return list(sold), list(alerts)
+
+    flat_sold, flat_alerts = _run(scenario(0))
+    assert flat_sold == []
+    short_sold, short_alerts = _run(scenario(-100))
+    assert short_sold == []
+    assert "position_unprotected" in short_alerts

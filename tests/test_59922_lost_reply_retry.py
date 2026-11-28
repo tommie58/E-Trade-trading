@@ -209,7 +209,7 @@ def test_stock_never_listed_lost_stop_does_not_retry_or_rearm(monkeypatch):
         await store.set_position("QQQ", pos)
         await store.set_guard("QQQ", guard)
         await _poll(store, clock, 0)
-        await _poll(store, clock, 10)
+        await _poll(store, clock, 60)
         await _poll(store, clock, 10)
         held = await store.get_guard("QQQ")
         async def rearm(ticker, position):
@@ -318,8 +318,8 @@ def test_stock_clean_read_path_keeps_paging_every_30s(monkeypatch):
         await store.set_position("QQQ", _position("equity", 100))
         await store.set_guard("QQQ", _guard("equity", 100))
         await _poll(store, clock, 0)
-        await _poll(store, clock, 10)
-        await _poll(store, clock, 0)  # retry also lost
+        await _poll(store, clock, 60)
+        await _poll(store, clock, 0)  # second clean read, past 60s
         first = [row for row in alerts if row[1] == "position_unprotected"]
         clock["t"] += main_bot.UNCONFIRMED_STOP_PAGE_S
         await _poll(store, clock, 0)
@@ -686,8 +686,11 @@ async def _two_clean_reads(store, clock):
     guard["stop_reply_lost"] = True
     guard["stop_deadline_ts"] = 1_000_000.0
     guard["deadline_ts"] = 1_000_000.0
+    guard["stop_sent_ts"] = clock["t"] - 60
+    guard["lost_stop_qty"] = 100
+    guard["lost_stop_price"] = 90
     await store.set_guard("QQQ", guard)
-    for step in (0, 10, 0):
+    for step in (0, 60, 0):
         held = await store.get_guard("QQQ")
         held["done"] = False
         await store.set_guard("QQQ", held)
@@ -740,29 +743,28 @@ def test_late_lost_stop_is_cancelled_by_client_id_and_the_flatten_is_not(monkeyp
     store = main_bot.StateStore(None)
     phase = {"listed": False}
 
-    def _row(order_id, client_id):
-        return {
-            "orderId": order_id,
-            "clientOrderId": client_id,
-            "OrderDetail": {
-                "status": "OPEN",
-                "priceType": "STOP",
-                "stopPrice": 90,
-                "Instrument": {
-                    "orderAction": "SELL",
-                    "orderedQuantity": 100,
-                    "filledQuantity": 0,
-                    "Product": {"symbol": "QQQ", "securityType": "EQ"},
-                },
+    def _row(order_id, price_type):
+        detail = {
+            "status": "OPEN",
+            "priceType": price_type,
+            "placedTime": 1_700_000_000_000,
+            "Instrument": {
+                "orderAction": "SELL",
+                "orderedQuantity": 100,
+                "filledQuantity": 0,
+                "Product": {"symbol": "QQQ", "securityType": "EQ"},
             },
         }
+        if price_type == "STOP":
+            detail["stopPrice"] = 90
+        return {"orderId": order_id, "OrderDetail": detail}
 
     async def book():
         if not phase["listed"]:
             return {"OrdersResponse": {}}
         return {"OrdersResponse": {"Order": [
-            _row("LOST-1", "LOST-CLIENT"),
-            _row("MKT-1", "FLAT-CLIENT"),
+            _row("LOST-1", "STOP"),
+            _row("MKT-1", "MARKET"),
         ]}}
 
     orders, cancels, _alerts, clock = _lost_stock(
@@ -872,4 +874,463 @@ def test_a_lost_reply_on_the_flatten_sell_is_not_resent(monkeypatch):
         return list(calls)
 
     assert _run(scenario()) == [100]
+
+
+def test_readable_holding_sells_min_of_held_and_tracked(monkeypatch):
+    store = main_bot.StateStore(None)
+
+    async def book():
+        return {"OrdersResponse": {}}
+
+    orders, _c, _a, clock = _lost_stock(
+        monkeypatch, store, held={"n": 200}, book=book,
+    )
+
+    async def scenario():
+        await _two_clean_reads(store, clock)
+        return list(orders)
+
+    assert _run(scenario()) == [("SELL", 100)]
+
+
+def test_unreadable_holding_sells_tracked_once_and_not_again(monkeypatch):
+    store = main_bot.StateStore(None)
+    calls = []
+
+    async def book():
+        return {"OrdersResponse": {}}
+
+    async def flatten(ticker, guard, qty, book="required"):
+        calls.append(int(qty))
+        return "MKT-1"
+
+    _lost_stock(monkeypatch, store, held={"n": None}, book=book)
+    monkeypatch.setattr(main_bot, "_emergency_flatten", flatten)
+
+    async def scenario():
+        await store.set_position("QQQ", _position("equity", 100))
+        guard = _guard("equity", 100)
+        guard["stop_client_id"] = "LOST-CLIENT"
+        await store.set_guard("QQQ", guard)
+        await main_bot._stock_lost_reply_flatten_once("QQQ", guard, 100)
+        fresh = await store.get_guard("QQQ")
+        await main_bot._stock_lost_after_sell("QQQ", fresh, None, 100)
+        return list(calls)
+
+    assert _run(scenario()) == [100]
+
+
+def test_later_readable_holding_sells_min_once(monkeypatch):
+    store = main_bot.StateStore(None)
+    calls = []
+
+    async def book():
+        return {"OrdersResponse": {}}
+
+    async def flatten(ticker, guard, qty, book="required"):
+        calls.append(int(qty))
+        return "MKT-1"
+
+    _lost_stock(monkeypatch, store, held={"n": None}, book=book)
+    monkeypatch.setattr(main_bot, "_emergency_flatten", flatten)
+
+    async def scenario():
+        await store.set_position("QQQ", _position("equity", 100))
+        guard = _guard("equity", 100)
+        guard["stop_client_id"] = "LOST-CLIENT"
+        await store.set_guard("QQQ", guard)
+        await main_bot._stock_lost_reply_flatten_once("QQQ", guard, 100)
+        fresh = await store.get_guard("QQQ")
+        await main_bot._stock_lost_after_sell("QQQ", fresh, 80, 100)
+        fresh = await store.get_guard("QQQ")
+        await main_bot._stock_lost_after_sell("QQQ", fresh, 80, 100)
+        return list(calls)
+
+    assert _run(scenario()) == [100, 80]
+
+
+def test_slow_holdings_read_keeps_page_gaps_at_30s(monkeypatch):
+    store = main_bot.StateStore(None)
+    pages = []
+    clock = {"t": 10_000.0}
+    real_wait = main_bot.asyncio.wait_for
+    timeouts = []
+
+    async def wait_for(awaitable, timeout):
+        timeouts.append(timeout)
+        if timeout == main_bot.PRE_CANCEL_STOP_READ_TIMEOUT_S:
+            awaitable.close()
+            raise asyncio.TimeoutError()
+        return await real_wait(awaitable, timeout)
+
+    async def book():
+        return {"OrdersResponse": {}}
+
+    async def nap(seconds):
+        clock["t"] += float(seconds)
+        if clock["t"] >= 10_090:
+            await store.update_guard("QQQ", done=True)
+
+    async def send_nowait(severity, event, message, **kwargs):
+        if event == "position_unprotected":
+            pages.append(clock["t"])
+
+    async def quiet(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main_bot.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(main_bot, "state", store)
+    monkeypatch.setattr(main_bot.asyncio, "wait_for", wait_for)
+    monkeypatch.setattr(main_bot.asyncio, "sleep", nap)
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", book)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)
+    monkeypatch.setattr(main_bot, "_order_state", quiet)
+    monkeypatch.setattr(main_bot.trade_ledger, "record", quiet)
+    monkeypatch.setattr(main_bot, "_cancel_order_safe", quiet)
+
+    async def slow():
+        await asyncio.sleep(90)
+        return {"PortfolioResponse": {"AccountPortfolio": []}}
+
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_portfolio", slow)
+
+    async def scenario():
+        await store.set_position("QQQ", _position("equity", 100))
+        await store.set_guard("QQQ", {
+            "done": False, "kind": "equity", "action": "BUY", "stop": 90.0,
+            "stop_lost_flatten_sent": True, "stop_lost_qty_confirmed": True,
+            "lost_stop_cancel_pending": True, "lost_stop_watch_until": 0,
+            "fill_detected_ts": 1, "stop_deadline_ts": 1_000_000.0,
+            "deadline_ts": 1_000_000.0, "guarded_qty": 100, "trued_qty": 100,
+            "entry_order_id": "ENTRY-1", "stop_reply_bound": True,
+        })
+        await main_bot._stop_guard_worker("QQQ")
+        return list(pages)
+
+    times = _run(scenario())
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    assert main_bot.PRE_CANCEL_STOP_READ_TIMEOUT_S in timeouts
+    assert len(times) >= 3
+    assert gaps and max(gaps) <= 30
+
+
+def _stop_payload(order_id, *, price_type="STOP", qty=100, stop=90, action="SELL",
+                  symbol="QQQ", include_qty=True, client_id=None):
+    inst = {
+        "orderAction": action,
+        "filledQuantity": 0,
+        "Product": {"symbol": symbol, "securityType": "EQ"},
+    }
+    if include_qty:
+        inst["orderedQuantity"] = qty
+    detail = {
+        "status": "OPEN", "priceType": price_type, "Instrument": inst,
+        "placedTime": 1_700_000_000_000,
+    }
+    if price_type in {"STOP", "STOP_LIMIT"} and stop is not None:
+        detail["stopPrice"] = stop
+    order = {"orderId": order_id, "OrderDetail": detail}
+    if client_id:
+        order["clientOrderId"] = client_id
+    return order
+
+
+def test_matching_stop_without_client_order_id_is_not_a_miss():
+    guard = {
+        "action": "BUY", "lost_stop_qty": 100, "lost_stop_price": 90, "stop": 90,
+        "stop_sent_ts": 1_600_000_000,
+    }
+    payload = {"OrdersResponse": {"Order": [_stop_payload("STOP-9")]}}
+    orders = main_bot.reconciliation.parse_open_orders(payload)
+    assert orders[0]["client_order_id"] == ""
+    assert main_bot.lost_stop_book_status(orders, guard, "QQQ") == "match"
+
+
+def test_missing_order_field_is_not_a_miss():
+    payload = {"OrdersResponse": {"Order": [_stop_payload("STOP-9", include_qty=False)]}}
+    assert main_bot._raw_open_order_missing_match_field(payload) is True
+
+
+def test_clean_non_matching_book_is_a_miss():
+    guard = {"action": "BUY", "lost_stop_qty": 100, "lost_stop_price": 90}
+    payload = {"OrdersResponse": {"Order": [
+        _stop_payload("LMT-1", price_type="LIMIT", stop=None, qty=100),
+    ]}}
+    orders = main_bot.reconciliation.parse_open_orders(payload)
+    assert main_bot._raw_open_order_missing_match_field(payload) is False
+    assert main_bot.lost_stop_book_status(orders, guard, "QQQ") == "miss"
+
+
+def test_two_matching_stops_are_not_cancelled():
+    guard = {
+        "action": "BUY", "lost_stop_qty": 100, "lost_stop_price": 90,
+        "stop_sent_ts": 1_600_000_000,
+    }
+    payload = {"OrdersResponse": {"Order": [
+        _stop_payload("A"), _stop_payload("B"),
+    ]}}
+    orders = main_bot.reconciliation.parse_open_orders(payload)
+    assert main_bot.lost_stop_book_status(orders, guard, "QQQ") == "possible"
+    assert main_bot.lost_stop_match_ids(orders, guard, "QQQ") == []
+
+
+def test_stop_on_page_two_is_not_absent():
+    guard = {
+        "action": "BUY", "lost_stop_qty": 100, "lost_stop_price": 90,
+        "stop_sent_ts": 1_600_000_000,
+    }
+    filler = _stop_payload("LMT-{}", price_type="LIMIT", stop=None)
+    page1 = {"OrdersResponse": {"Order": [
+        {**_stop_payload(f"LMT-{i}", price_type="LIMIT", stop=None), "orderId": f"LMT-{i}"}
+        for i in range(25)
+    ], "next": "page-2"}}
+    page2 = {"OrdersResponse": {"Order": [_stop_payload("STOP-9")]}}
+
+    async def fetch(marker):
+        return page2 if marker == "page-2" else page1
+
+    async def scenario():
+        merged = await main_bot.gather_order_pages(fetch, 25)
+        orders = main_bot.reconciliation.parse_open_orders(merged)
+        return main_bot.lost_stop_book_status(orders, guard, "QQQ")
+
+    assert _run(scenario()) == "match"
+
+
+def test_full_page_without_a_next_marker_is_not_absent():
+    page = {"OrdersResponse": {"Order": [
+        _stop_payload(f"LMT-{i}", price_type="LIMIT", stop=None) for i in range(25)
+    ]}}
+
+    async def fetch(marker):
+        return page
+
+    async def scenario():
+        try:
+            await main_bot.gather_order_pages(fetch, 25)
+        except main_bot.OrdersReadInconclusive:
+            return "inconclusive"
+        return "clean"
+
+    assert _run(scenario()) == "inconclusive"
+
+
+def test_orders_shape_log_has_no_account_or_values(caplog):
+    import logging
+    main_bot._ORDERS_SHAPE_AT = 0.0
+    main_bot._RECENT_ORDER_CLIENTS.clear()
+    payload = {"OrdersResponse": {"Order": [{
+        "orderId": "999888777",
+        "accountId": "12345678",
+        "OrderDetail": [{
+            "accountId": "12345678",
+            "status": "OPEN",
+            "priceType": "STOP",
+            "stopPrice": 590.25,
+            "placedTime": 1,
+        }],
+    }]}}
+    with caplog.at_level(logging.INFO):
+        main_bot._note_orders_shape(payload)
+    text = caplog.text
+    assert "accountId" not in text
+    assert "12345678" not in text
+    assert "590.25" not in text
+    assert "999888777" not in text
+    assert "cid_rows=0" in text
+    assert "orders-shape" in text
+
+
+def test_stock_sell_waits_until_60s_after_the_stop(monkeypatch):
+    store = main_bot.StateStore(None)
+
+    async def book():
+        return {"OrdersResponse": {}}
+
+    orders, _c, _a, clock = _lost_stock(
+        monkeypatch, store, held={"n": 100}, book=book,
+    )
+
+    async def scenario():
+        await store.set_position("QQQ", _position("equity", 100))
+        guard = _guard("equity", 100)
+        guard.update({
+            "stop_client_id": "LOST", "stop_reply_lost": True,
+            "stop_reply_clean_reads": 1,
+            "stop_reply_clean_read_ts": clock["t"] - 10,
+            "stop_sent_ts": clock["t"],
+            "lost_stop_qty": 100, "lost_stop_price": 90,
+            "stop_deadline_ts": 1_000_000.0, "deadline_ts": 1_000_000.0,
+        })
+        await store.set_guard("QQQ", guard)
+        held = await store.get_guard("QQQ")
+        held["done"] = False
+        await store.set_guard("QQQ", held)
+        await main_bot._stop_guard_worker("QQQ")
+        early = list(orders)
+        clock["t"] += 60
+        held = await store.get_guard("QQQ")
+        held["done"] = False
+        await store.set_guard("QQQ", held)
+        await main_bot._stop_guard_worker("QQQ")
+        return early, list(orders)
+
+    early, later = _run(scenario())
+    assert early == []
+    assert later == [("SELL", 100)]
+
+
+def test_lost_reply_with_the_book_down_sells_at_120s(monkeypatch):
+    store = main_bot.StateStore(None)
+    orders = []
+    alerts = []
+    clock = {"t": 5_000.0}
+
+    async def book():
+        raise RuntimeError("book down")
+
+    async def smart(kind, common, tokens):
+        orders.append((str(common.get("orderAction") or ""), int(common.get("quantity") or 0)))
+        return {"orderId": "MKT"}
+
+    async def send_nowait(severity, event, message, **kwargs):
+        alerts.append(event)
+
+    async def nap(_seconds):
+        await store.update_guard("QQQ", done=True)
+
+    async def quiet(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main_bot.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(main_bot, "state", store)
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", book)
+    monkeypatch.setattr(main_bot, "_place_order_smart", smart)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)
+    monkeypatch.setattr(main_bot.asyncio, "sleep", nap)
+    monkeypatch.setattr(main_bot, "_order_state", lambda *a, **k: _async_exec())
+    monkeypatch.setattr(main_bot.trade_ledger, "record", quiet)
+    monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", lambda *a, **k: _async_none())
+    monkeypatch.setattr(main_bot, "load_tokens", lambda: {"oauth_token": "t", "oauth_token_secret": "s"})
+    monkeypatch.setattr(main_bot, "_resolve_account_id_key", lambda *_a, **_k: _async_acct())
+    monkeypatch.setattr(main_bot, "_cancel_order_safe", quiet)
+    monkeypatch.setattr(main_bot, "_true_up_entry_fill", quiet)
+
+    async def scenario():
+        await store.set_position("QQQ", _position("equity", 100))
+        await store.set_guard("QQQ", {
+            "done": False, "kind": "equity", "action": "BUY", "stop": 90.0,
+            "stop_reply_lost": True, "stop_client_id": "LOST",
+            "stop_sent_ts": clock["t"], "fill_detected_ts": 1,
+            "guarded_qty": 100, "trued_qty": 100, "entry_order_id": "E",
+            "stop_deadline_ts": 1_000_000.0, "deadline_ts": 1_000_000.0,
+        })
+        await main_bot._stop_guard_worker("QQQ")
+        early = list(orders)
+        clock["t"] += 120
+        guard = await store.get_guard("QQQ")
+        guard["done"] = False
+        await store.set_guard("QQQ", guard)
+        await main_bot._stop_guard_worker("QQQ")
+        return early, list(orders), list(alerts)
+
+    early, later, events = _run(scenario())
+    assert early == []
+    assert later == [("SELL", 100)]
+    assert "lost_stop_may_be_live" in events
+    assert not any(action.startswith("BUY") for action, _q in later)
+
+
+def test_case_b_cancels_our_close_then_sells_at_60s(monkeypatch):
+    store = main_bot.StateStore(None)
+    sold = []
+    cancelled = []
+    clock = {"t": 8_000.0}
+    live = {"on": True}
+
+    async def place(*args, **kwargs):
+        raise main_bot.ETradeAPIError(400, "rejected")
+
+    async def book():
+        if not live["on"]:
+            return {"OrdersResponse": {}}
+        return {"OrdersResponse": {"Order": [{
+            "orderId": "CLOSE-1",
+            "OrderDetail": {
+                "status": "OPEN", "priceType": "MARKET",
+                "Instrument": {
+                    "orderAction": "SELL", "orderedQuantity": 100,
+                    "Product": {"symbol": "QQQ", "securityType": "EQ"},
+                },
+            },
+        }]}}
+
+    async def cancel(order_id, expected_qty=None):
+        cancelled.append(order_id)
+        live["on"] = False
+        return main_bot.CANCEL_CONFIRMED
+
+    async def smart(kind, common, tokens):
+        sold.append((clock["t"], str(common.get("orderAction") or ""), int(common.get("quantity") or 0)))
+        return {"orderId": "MKT"}
+
+    async def nap(seconds):
+        clock["t"] += float(seconds)
+        if sold or clock["t"] > 8_200:
+            await store.update_guard("QQQ", done=True)
+
+    async def order_state(*args, **kwargs):
+        return "EXECUTED", 100
+
+    async def quiet(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main_bot.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(main_bot, "state", store)
+    monkeypatch.setattr(main_bot, "_place_protective_stop", place)
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", book)
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel)
+    monkeypatch.setattr(main_bot, "_place_order_smart", smart)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", quiet)
+    monkeypatch.setattr(main_bot.asyncio, "sleep", nap)
+    monkeypatch.setattr(main_bot, "_order_state", order_state)
+    monkeypatch.setattr(main_bot.trade_ledger, "record", quiet)
+    monkeypatch.setattr(main_bot, "_true_up_entry_fill", quiet)
+    monkeypatch.setattr(main_bot, "_cancel_order_safe", quiet)
+    monkeypatch.setattr(main_bot, "load_tokens", lambda: {"oauth_token": "t", "oauth_token_secret": "s"})
+
+    async def account(*_a, **_k):
+        return "acct"
+
+    monkeypatch.setattr(main_bot, "_resolve_account_id_key", account)
+    monkeypatch.setattr(main_bot, "_resolve_exit_fill", quiet)
+    monkeypatch.setattr(main_bot, "_defer_close_to_reconciler", quiet)
+
+    async def scenario():
+        await store.set_position("QQQ", _position("equity", 100))
+        await store.set_guard("QQQ", {
+            "done": False, "kind": "equity", "action": "BUY", "stop": 90.0,
+            "guarded_qty": 0, "trued_qty": 100, "entry_order_id": "E",
+            "fill_detected_ts": 1, "stop_deadline_ts": clock["t"] + 60,
+            "deadline_ts": 1_000_000.0, "stop_sent_ts": clock["t"],
+        })
+        await main_bot._stop_guard_worker("QQQ")
+        return list(cancelled), list(sold)
+
+    cancelled_ids, fills = _run(scenario())
+    assert "CLOSE-1" in cancelled_ids
+    assert fills and fills[0][0] >= 8_060
+    assert fills[0][1:] == ("SELL", 100)
+
+
+async def _async_exec():
+    return "EXECUTED", 100
+
+
+async def _async_none():
+    return None
+
+
+async def _async_acct():
+    return "acct"
 
