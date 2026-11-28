@@ -5570,10 +5570,23 @@ async def reconcile_once(
         guard = guards.get(ticker)
         guard_active = guard_owns_stop(guards.get(ticker), now)
         # A stop on a different contract of the same underlying is not cover.
-        has_leg_stop = any(
-            order_covers_position(order, pos, ticker, basis_qty or 1) for order in leg_stops
-        )
-        if not has_leg_stop and not guard_active and protective_level(pos) > 0:
+        # A smaller stop on THIS contract is partial cover, not "no stop".
+        need = basis_qty if basis_qty > 0 else 1
+        covered_qty = sum(_stop_remaining(order) for order in leg_stops)
+        has_leg_stop = covered_qty >= need
+        partial_cover = 0 < covered_qty < need
+        if partial_cover and not guard_active:
+            msg = (
+                f"{ticker}: resting stop covers {covered_qty} of {need} — "
+                f"not placing a duplicate full-qty stop"
+            )
+            report["warnings"].append(msg)
+            logger.warning(f"[RECONCILE] {msg}")
+            await _alert(
+                "warning", "protection_partial", msg,
+                dedupe_key=f"partial_cover:{ticker}",
+            )
+        elif not has_leg_stop and not guard_active and protective_level(pos) > 0:
             msg = f"{ticker}: UNPROTECTED — position at broker with no live stop and no active guard"
             report["warnings"].append(msg)
             logger.error(f"[RECONCILE] 🚨 {msg}")
