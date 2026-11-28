@@ -30623,6 +30623,52 @@ async def _place_option_protective_stop(ticker: str, contract: dict, qty: int, s
     return {"order_id": order_id, "client_id": client_id, "qty": int(qty), "stop": stop_px}
 
 
+_ALLOCATION_REJECT_RE = re.compile(
+    r"(?:\b(?:code|error)\W{0,8}3004\b)"
+    r"|(?:\b3004\b.{0,48}allocat)"
+    r"|(?:allocat\w*.{0,48}\b3004\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _allocation_reject(err: BaseException) -> bool:
+    """E*TRADE 3004: the contracts are already pledged to a resting order."""
+    if str(getattr(err, "code", "") or "") == "3004":
+        return True
+    return bool(_ALLOCATION_REJECT_RE.search(str(err or "")))
+
+
+def _place_reply_ambiguous(err: BaseException) -> bool:
+    """True when the broker may already have accepted the stop.
+
+    A timeout, a dropped connection, or a 5xx can follow acceptance. A
+    definite 4xx other than 3004 means the order was rejected.
+    """
+    if _allocation_reject(err):
+        return True
+    code = _http_status_of(err)
+    if code is not None and 400 <= code < 500:
+        return False
+    return True
+
+
+async def _adopt_covering_stop(ticker: str, pos: dict, qty: int) -> Optional[str]:
+    """Order id of a live stop that already covers this position, or None.
+
+    A failed book read is None. The caller does not place a second stop.
+    """
+    try:
+        resp = await _reconcile_fetch_orders()
+    except Exception as exc:
+        logger.warning("covering-stop read failed (%s)", type(exc).__name__)
+        return None
+    for order in reconciliation.parse_open_orders(resp):
+        if reconciliation.order_covers_position(order, pos, ticker, qty):
+            found = str(order.get("order_id") or "").strip()
+            return found or None
+    return None
+
+
 class NativeTrailRefused(Exception):
     """Handoff declined before the resting stop was touched."""
 
@@ -32862,6 +32908,32 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 await _defer_close_to_reconciler(ticker, guard.get("stop_order_id"),
                                                                  "guard stop executed — fill price unavailable")
                             return
+                    if can_place and guard.get("stop_allocation_held"):
+                        # A prior place was accepted, or the retry was rejected
+                        # 3004, and the book has not shown the order yet. Do not
+                        # rest a second stop and do not flatten over the first.
+                        adopt_pos = {
+                            "action": guard.get("action") or "BUY",
+                            "contract": guard.get("contract") if is_option else None,
+                            "stop_premium": guard.get("stop") if is_option else None,
+                            "entry_premium": 1 if is_option else None,
+                        }
+                        adopted = await _adopt_covering_stop(ticker, adopt_pos, filled)
+                        if adopted:
+                            guard = await state.update_guard(
+                                ticker,
+                                guarded_qty=filled,
+                                stop_order_id=adopted,
+                                stop_allocation_held=False,
+                            ) or guard
+                            async with _position_section(ticker, "stop adopt"):
+                                pos = await state.get_position(ticker)
+                                if pos:
+                                    pos["stop_order_id"] = adopted
+                                    pos["filled_qty"] = filled
+                                    await state.set_position(ticker, pos)
+                            guarded = filled
+                        can_place = False
                     if can_place:
                         try:
                             raw_stop = float(guard.get("stop") or 0)
@@ -32899,26 +32971,72 @@ async def _stop_guard_worker(ticker: str) -> None:
                             await settle_heat_after_stop_armed(ticker)
                             guarded = filled
                         except Exception as e:
-                            # The OLD stop was already cancelled above and the new one
-                            # did not stick, so nothing is resting. The guard record
-                            # still pointed at the dead order id, and the stop-placement
-                            # timeout breaker below only fires when `stop_order_id` is
-                            # falsy — so a stale-truthy id disarmed the one control that
-                            # emergency-flattens an unprotected fill. Clear it: the guard
-                            # must describe what is ACTUALLY resting at the broker.
-                            guard = await state.update_guard(ticker, stop_order_id=None,
-                                                             stop_client_id=None) or guard
-                            async with _position_section(ticker, "stop id clear"):
-                                pos = await state.get_position(ticker)
-                                if pos and pos.get("stop_order_id"):
-                                    pos["stop_order_id"] = None
-                                    await state.set_position(ticker, pos)
-                            logger.error(f"[STOP GUARD] {ticker} stop placement FAILED (will retry): {e}")
-                            await alerts.send_nowait(
-                                "critical", "stop_placement_failed",
-                                f"{ticker}: protective stop placement failed (guard will retry): {e}",
-                                dedupe_key=f"guard_fail:{ticker}",
-                            )
+                            if _allocation_reject(e) or (
+                                _place_reply_ambiguous(e) and guard.get("stop_reply_lost")
+                            ):
+                                # The broker already has the stop, or the one
+                                # retry after a lost reply was not a clean
+                                # reject. One 3004 is the whole retry. Do not
+                                # place again and do not flatten.
+                                logger.warning(
+                                    "[STOP GUARD] %s stop place not confirmed (%s) — "
+                                    "not placing again while the book lags",
+                                    ticker, type(e).__name__,
+                                )
+                                guard = await state.update_guard(
+                                    ticker,
+                                    stop_allocation_held=True,
+                                    stop_reply_lost=False,
+                                ) or guard
+                                adopt_pos = {
+                                    "action": guard.get("action") or "BUY",
+                                    "contract": guard.get("contract") if is_option else None,
+                                    "stop_premium": guard.get("stop") if is_option else None,
+                                    "entry_premium": 1 if is_option else None,
+                                }
+                                adopted = await _adopt_covering_stop(ticker, adopt_pos, filled)
+                                if adopted:
+                                    guard = await state.update_guard(
+                                        ticker,
+                                        guarded_qty=filled,
+                                        stop_order_id=adopted,
+                                        stop_allocation_held=False,
+                                    ) or guard
+                            elif _place_reply_ambiguous(e):
+                                # The reply was lost. The stop may already be
+                                # resting. One retry is allowed. Flatten waits.
+                                logger.warning(
+                                    "[STOP GUARD] %s stop place reply lost (%s) — one retry",
+                                    ticker, type(e).__name__,
+                                )
+                                guard = await state.update_guard(
+                                    ticker, stop_reply_lost=True,
+                                ) or guard
+                            else:
+                                # The OLD stop was already cancelled above and the new one
+                                # did not stick, so nothing is resting. The guard record
+                                # still pointed at the dead order id, and the stop-placement
+                                # timeout breaker below only fires when `stop_order_id` is
+                                # falsy — so a stale-truthy id disarmed the one control that
+                                # emergency-flattens an unprotected fill. Clear it: the guard
+                                # must describe what is ACTUALLY resting at the broker.
+                                guard = await state.update_guard(ticker, stop_order_id=None,
+                                                                 stop_client_id=None) or guard
+                                async with _position_section(ticker, "stop id clear"):
+                                    pos = await state.get_position(ticker)
+                                    if pos and pos.get("stop_order_id"):
+                                        pos["stop_order_id"] = None
+                                        await state.set_position(ticker, pos)
+                                logger.error(
+                                    "[STOP GUARD] %s stop placement FAILED (%s) — will retry",
+                                    ticker, type(e).__name__,
+                                )
+                                await alerts.send_nowait(
+                                    "critical", "stop_placement_failed",
+                                    f"{ticker}: protective stop placement failed "
+                                    f"({type(e).__name__}). The guard will retry.",
+                                    dedupe_key=f"guard_fail:{ticker}",
+                                )
 
             finally:
                 if pending_entry_alert is not None:
@@ -33027,7 +33145,13 @@ async def _stop_guard_worker(ticker: str) -> None:
             # The stop-placement attempt above always runs FIRST, so this only
             # fires when protection genuinely failed to stick in time.
             stop_deadline = float(guard.get("stop_deadline_ts") or 0)
-            if stop_deadline and not guard.get("stop_order_id") and time.time() >= stop_deadline:
+            if (
+                stop_deadline
+                and not guard.get("stop_order_id")
+                and not guard.get("stop_allocation_held")
+                and not guard.get("stop_reply_lost")
+                and time.time() >= stop_deadline
+            ):
                 if filled <= 0 and _filled_order_status(status):
                     # Sized above when a quantity existed. Still no cancel
                     # and no delete. The alert already fired once.
@@ -33130,7 +33254,13 @@ async def _stop_guard_worker(ticker: str) -> None:
                 if filled > 0 and guarded >= filled:
                     await _finish_guard(ticker, "partial_fill_protected")
                     return
-                if filled > 0:
+                if filled > 0 and (
+                    guard.get("stop_allocation_held") or guard.get("stop_reply_lost")
+                ):
+                    # The broker may already hold the stop. Extending the
+                    # guard is not an unprotected position.
+                    pass
+                elif filled > 0:
                     # Filled but stop never stuck — keep trying rather than walk away.
                     logger.error(f"[STOP GUARD] {ticker} UNPROTECTED at deadline — extending guard")
                     await alerts.send_nowait(
