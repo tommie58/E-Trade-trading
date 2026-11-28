@@ -48,7 +48,7 @@ def _logs(caplog) -> str:
 
 
 def test_bot_version_is_5_99_18():
-    assert main_bot.BOT_VERSION == "5.99.19-pro-day-trader"
+    assert main_bot.BOT_VERSION == "5.99.20-pro-day-trader"
     assert main_bot.reconciliation.ORDERS_READ_MAX_AGE_SECONDS == 30
     assert main_bot.reconciliation.INFERRED_FLAT_PASS_CAP == 2
     assert main_bot.reconciliation.PORTFOLIO_404_RETRY_SECONDS == 2
