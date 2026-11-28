@@ -28898,19 +28898,32 @@ _REDIS_ENDPOINT_RE = re.compile(
 _REDIS_EXC_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*Error)\b")
 
 
+# A host is an IPv4 address or a name that contains a letter and a dot.
+# The lookbehind keeps a decimal price (590.25:590.30), a ticker:qty,
+# a price:qty, and a clock (09:31:00) intact.
 _HOSTPORT_RE = re.compile(
-    r"\b(?:\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?"
-    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)+):\d{2,5}\b"
+    r"(?<![\d.])(?:"
+    r"\d{1,3}(?:\.\d{1,3}){3}"
+    r"|[A-Za-z0-9-]*[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]*[A-Za-z][A-Za-z0-9-]*)+"
+    r"):\d{2,5}\b"
 )
 _URL_CRED_RE = re.compile(
     r"([a-z][a-z0-9+.-]*://)([^/\s:@]+):([^@\s/]+)@",
     re.I,
 )
+# asyncpg reports the server as ('10.0.0.1', 5432).
+_ASYNCPG_ADDR_RE = re.compile(
+    r"\(\s*['\"](?:"
+    r"\d{1,3}(?:\.\d{1,3}){3}"
+    r"|[^'\"]*[A-Za-z][^'\"]*\.[^'\"]*"
+    r")['\"]\s*,\s*\d{2,5}\s*\)"
+)
 
 
 def _redact_log_endpoints(text: str) -> str:
-    """Drop host:port and URL user:password from a log line."""
+    """Drop host:port, URL user:password, and asyncpg address tuples."""
     cleaned = _URL_CRED_RE.sub(r"\1***:***@", str(text or ""))
+    cleaned = _ASYNCPG_ADDR_RE.sub("('<redacted>', <redacted>)", cleaned)
     return _HOSTPORT_RE.sub("<redacted>", cleaned)
 
 
@@ -28924,15 +28937,21 @@ class _EndpointLogFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            rendered = record.getMessage()
+            try:
+                rendered = record.getMessage()
+            except Exception:
+                # A raising __str__ must not take logging down with it.
+                record.msg = "log message omitted"
+                record.args = ()
+                return True
+            cleaned = _redact_log_endpoints(rendered)
+            if cleaned != rendered:
+                record.msg = cleaned
+                record.args = ()
+            if record.exc_text:
+                record.exc_text = _redact_log_endpoints(record.exc_text)
         except Exception:
-            rendered = str(record.msg)
-        cleaned = _redact_log_endpoints(rendered)
-        if cleaned != rendered:
-            record.msg = cleaned
-            record.args = ()
-        if record.exc_text:
-            record.exc_text = _redact_log_endpoints(record.exc_text)
+            return True
         return True
 
 

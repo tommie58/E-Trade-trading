@@ -167,3 +167,25 @@ def test_endpoint_filter_redacts_a_redis_timeout_message(caplog):
     assert "6379" not in caplog.text
     assert "s3cret" not in caplog.text
     assert "TimeoutError" in caplog.text or "state get failed" in caplog.text
+
+
+def test_endpoint_filter_keeps_prices_and_redacts_asyncpg_tuples(caplog):
+    main_bot._install_etrade_log_redactor()
+    log = logging.getLogger("etrade-bot.redact-test")
+
+    class _Boom:
+        def __str__(self):
+            raise RuntimeError("unprintable")
+
+    with caplog.at_level(logging.WARNING):
+        log.warning("trail 590.25:590.30 qty QQQ:100 price:qty 590.25:100 at 09:31:00")
+        log.warning("asyncpg connect failed %s", "('10.1.2.3', 5432)")
+        log.warning("bad arg %s", _Boom())
+    text = caplog.text
+    assert "590.25:590.30" in text
+    assert "QQQ:100" in text
+    assert "590.25:100" in text
+    assert "09:31:00" in text
+    assert "10.1.2.3" not in text
+    assert "5432" not in text
+    assert "log message omitted" in text
