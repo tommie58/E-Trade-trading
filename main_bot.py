@@ -5201,6 +5201,21 @@ async def reconcile_once(
         except Exception:
             logger.debug("reconcile alert delivery failed", exc_info=True)
 
+    async def _alert_untracked_check_unavailable(kind: str) -> None:
+        """Portfolio failed, including when nothing is tracked.
+
+        Manual positions cannot be seen. Error, once per 30 minutes.
+        The callback in production is send_nowait.
+        """
+        await _alert(
+            "error",
+            "untracked_check_unavailable",
+            f"Portfolio read failed ({kind}). "
+            f"Manual or untracked positions cannot be checked.",
+            dedupe_key="untracked_check_unavailable",
+            dedupe_seconds=1800,
+        )
+
     async def _note_broker_error(err: BaseException, fallback_method: str,
                                  fallback_path: str) -> None:
         """Log and alert one failed read. The path is the redacted endpoint."""
@@ -5265,7 +5280,13 @@ async def reconcile_once(
         reason = portfolio_err or orders_err
         report["warnings"].append(f"skipped — broker session expired, awaiting relink: {reason}")
         await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
-        logger.info(f"[RECONCILE] skipped — session expired, awaiting relink ({reason})")
+        logger.info(
+            "[RECONCILE] skipped — session expired, awaiting relink (%s)",
+            type(reason).__name__ if reason else "BrokerSessionExpired",
+        )
+        await _alert_untracked_check_unavailable(
+            type(reason).__name__ if reason else "BrokerSessionExpired",
+        )
         return report
 
     # HTTP 404 only (not a 400 whose code is 404). One retry. A 200 or 204
@@ -5388,6 +5409,8 @@ async def reconcile_once(
             etrade_async.schedule_etrade_alert(_fire_unreadable())
             return
         if not tracked:
+            if not portfolio_ok:
+                await _alert_untracked_check_unavailable("portfolio")
             return
         failed_reads = []
         if not portfolio_ok:
