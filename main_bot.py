@@ -30732,6 +30732,18 @@ async def _read_open_order_stop(order_id: str) -> Optional[float]:
     return None
 
 
+def _page_native_trail_unreadable(ticker: str) -> None:
+    """Error, rate-limited. Does not wait on the webhook."""
+    alerts.retain(asyncio.create_task(alerts.send_nowait(
+        "error",
+        "native_trail_stop_unreadable",
+        f"{ticker}: the resting stop price could not be read — "
+        f"the trail was not armed and the resting stop was left in place",
+        dedupe_key=f"native_trail_unreadable:{ticker}",
+        dedupe_seconds=300,
+    )))
+
+
 async def _capture_resting_stop(order_id: Any) -> Optional[float]:
     """stopPrice of a resting order, read before that order is cancelled.
 
@@ -30917,15 +30929,20 @@ async def _arm_native_trail(
     # resting order is the native trail, so stop_order_id is empty.
     resting_stop_px = None
     resting_id = str(stop_order_id or pos.get("native_trail_order_id") or "").strip()
+    read_failed = False
     if resting_id:
         try:
             resting_stop_px = await _read_open_order_stop(resting_id)
         except Exception as exc:
+            read_failed = True
             logger.warning(
-                "[NATIVE TRAIL] %s resting stop unreadable (%s) — "
-                "re-arm uses the saved floor",
+                "[NATIVE TRAIL] %s resting stop unreadable (%s)",
                 ticker, type(exc).__name__,
             )
+    # Promotion and repair must not cancel a stop whose price they could not read.
+    if read_failed and source in ("auto", "repair"):
+        _page_native_trail_unreadable(ticker)
+        refuse("resting stop price could not be read — leaving the resting stop")
     outcome = await _cancel_order_verified(stop_order_id, expected_qty=qty)
     if outcome == CANCEL_FILLED:
         raise Exception(f"{ticker}: the resting stop just executed — position is flat, no trail armed")
@@ -39407,10 +39424,15 @@ async def _maybe_repair_inflated_native_trail(
         bid, float(floor["offset"]), option=is_option,
     )
     old_stop = None
+    read_failed = False
     try:
         old_stop = await _read_open_order_stop(str(native_trail_id))
-    except Exception:
-        old_stop = None
+    except Exception as exc:
+        read_failed = True
+        logger.warning(
+            "[NATIVE TRAIL] %s repair stop read failed (%s)",
+            ticker, type(exc).__name__,
+        )
     if old_stop is None:
         price_floor = None
     else:
@@ -39451,6 +39473,10 @@ async def _maybe_repair_inflated_native_trail(
             f"trigger={verdict['trigger']} floor={verdict['floor']} — "
             f"leaving resting stop {native_trail_id}"
         )
+        if read_failed:
+            # The price could not be read. Do not cancel. Error, not a warning.
+            _page_native_trail_unreadable(ticker)
+            return True
         alerts.retain(asyncio.create_task(alerts.send_nowait(
             "warning",
             "native_trail_repair_floor",
