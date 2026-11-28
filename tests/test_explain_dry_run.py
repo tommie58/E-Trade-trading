@@ -165,8 +165,8 @@ async def _seed_store(store):
     await store.queue_push("seed:list", "delta")
 
 
-def test_bot_version_is_pro_day_trader_59918():
-    assert main_bot.BOT_VERSION == "5.99.18-pro-day-trader"
+def test_bot_version_is_pro_day_trader_59914():
+    assert main_bot.BOT_VERSION == "5.99.14-pro-day-trader"
 
 
 def test_dry_run_is_keyword_only_and_defaults_false():
@@ -216,6 +216,8 @@ def test_explain_leaves_memory_desk_and_ledger_unchanged(monkeypatch):
             "last": "seeded", "at": "seed-at", "fallback_reason": "seed-reason",
         })
         await _seed_store(store)
+        main_bot.portfolio_risk.clear_spy_gap_sit_out()
+        main_bot.portfolio_risk.note_spy_gap_session(0.4, True, main_bot._session_day_et())
         with tempfile.TemporaryDirectory() as tmp:
             ledger_path = Path(tmp) / "ledger.jsonl"
             ledger_path.write_bytes(b'{"event":"seed"}\n')
@@ -229,7 +231,7 @@ def test_explain_leaves_memory_desk_and_ledger_unchanged(monkeypatch):
 
             result = await main_bot.explain_signal(_payload())
 
-            assert result["bot_version"] == "5.99.18-pro-day-trader"
+            assert result["bot_version"] == "5.99.14-pro-day-trader"
             assert result["dry_run"] is True
             assert result["placed"] is False
             assert isinstance(result.get("pro_trader"), dict)
@@ -249,6 +251,7 @@ def test_explain_leaves_memory_desk_and_ledger_unchanged(monkeypatch):
     try:
         _run(scenario())
     finally:
+        main_bot.portfolio_risk.clear_spy_gap_sit_out()
         _restore(saved)
 
 
@@ -291,6 +294,8 @@ def test_live_filter_path_still_persists_desk_and_feed(monkeypatch):
         before_calls = client.calls
         before_desk = copy.deepcopy(desk.snapshot())
         payload = _payload()
+        main_bot.portfolio_risk.clear_spy_gap_sit_out()
+        main_bot.portfolio_risk.note_spy_gap_session(0.4, True, main_bot._session_day_et())
 
         await main_bot._passes_entry_filters(payload)
 
@@ -312,6 +317,7 @@ def test_live_filter_path_still_persists_desk_and_feed(monkeypatch):
     try:
         _run(scenario())
     finally:
+        main_bot.portfolio_risk.clear_spy_gap_sit_out()
         _restore(saved)
 
 

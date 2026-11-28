@@ -92,7 +92,7 @@ def _run_session(regime, mode="active"):
             _tape(regime, minute_et=minute),
             _candidate(regime, setup, score, minute),
             mode=mode,
-            configured_risk_pct=8.0,
+            configured_risk_pct=5.0,
             daily_loss_limit_pct=10.0,
             realized_pnl_today_pct=0.0,
         )
@@ -172,7 +172,7 @@ def test_session_finds_at_least_four_without_breaking_rails(regime):
         assert effect["qty"] <= 2
         if decision["verdict"] != "BLOCK":
             assert 0.35 <= decision["size_multiplier"] <= 1.0
-            assert decision["risk"]["effective_risk_pct"] <= 8.0 + 1e-6
+            assert decision["risk"]["effective_risk_pct"] <= 5.0 + 1e-6
             assert decision["risk"]["daily_loss_limit_mutated"] is False
             assert decision["risk"]["daily_loss_limit_pct"] == 10.0
             assert decision["exit_alignment"]["sequence"] == ["STOP", "breakeven_locked", "TRAILING_STOP_CNST"]
@@ -204,7 +204,7 @@ def test_pacing_admits_bplus_only_when_behind_and_never_lifts_rails():
         _tape("CHOP_RANGE", minute_et=10 * 60),
         _candidate("CHOP_RANGE", "mean reversion", 76, 10 * 60),
         mode="active", trades_completed=0, min_trades=4,
-        configured_risk_pct=8, daily_loss_limit_pct=10,
+        configured_risk_pct=5, daily_loss_limit_pct=10,
     )
     assert early["verdict"] == "BLOCK"
     assert "below_playbook_score" in early["reason_codes"]
@@ -213,7 +213,7 @@ def test_pacing_admits_bplus_only_when_behind_and_never_lifts_rails():
         _tape("CHOP_RANGE", minute_et=14 * 60),
         _candidate("CHOP_RANGE", "mean reversion", 76, 14 * 60),
         mode="active", trades_completed=0, min_trades=4,
-        configured_risk_pct=8, daily_loss_limit_pct=10,
+        configured_risk_pct=5, daily_loss_limit_pct=10,
     )
     assert late["verdict"] == "REDUCE"
     assert late["pacing"]["applied"] is True
@@ -266,14 +266,14 @@ def test_shadow_order_effect_matches_baseline_including_blocks():
             assert again["applied"] is False
 
 
-def test_size_never_exceeds_configured_or_eight_percent():
+def test_size_never_exceeds_configured_or_five_percent():
     scaled = pro_trader.risk_scale(8.0, 1.5, daily_loss_limit_pct=10)
     assert scaled["size_multiplier"] <= 1.0
-    assert scaled["effective_risk_pct"] <= 8.0
+    assert scaled["effective_risk_pct"] <= 5.0
     assert scaled["daily_loss_limit_pct"] == 10
     assert scaled["daily_loss_limit_mutated"] is False
     over = pro_trader.risk_scale(10.0, 1.0, daily_loss_limit_pct=10)
-    assert over["effective_risk_pct"] <= 8.0
+    assert over["effective_risk_pct"] <= 5.0
     assert over["size_multiplier"] <= 1.0
     assert HARD_RAILS["engine_may_raise_daily_loss_limit"] is False
     assert HARD_RAILS["engine_may_raise_risk"] is False

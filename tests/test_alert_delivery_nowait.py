@@ -390,34 +390,85 @@ def test_queued_critical_starts_when_a_slot_frees(monkeypatch):
     assert status["dropped"] == 0
 
 
-def test_critical_queue_above_bound_is_kept(monkeypatch, caplog):
+def test_critical_queue_caps_at_150(monkeypatch, caplog):
     saved_alerts = main_bot.alerts._manager
     _install_client(monkeypatch, hang=False)
     caplog.set_level(logging.WARNING, logger="etrade-bot.alerts")
     release = asyncio.Event()
-    extra = main_bot.alerts._CRITICAL_QUEUE_BOUND + 1
+    cap = main_bot.alerts._CRITICAL_QUEUE_MAX
 
     async def scenario():
         store = main_bot.StateStore(None)
         main_bot.alerts.init(store, _WEBHOOK)
         _fill_inflight(release)
-        for i in range(extra):
+        for i in range(cap + 1):
             await main_bot.alerts.send_nowait(
                 "critical", "native_trail_unprotected", f"queued {i}",
                 dedupe_key=f"overflow:{i}",
             )
-        return main_bot.alerts.delivery_status()
+        posted = list(_Client.events)
+        main_bot.alerts._deliveries_open = False
+        return main_bot.alerts.delivery_status(), posted
 
     try:
-        status = asyncio.run(scenario())
+        status, posted = asyncio.run(scenario())
     finally:
         _restore_alerts(saved_alerts)
 
-    assert status["queued"] == extra
-    assert status["dropped"] == 0
+    assert cap == 150
+    assert status["queued"] == cap
+    assert status["dropped"] == 1
     assert status["in_flight"] == 50
-    assert any("above bound" in rec.getMessage() for rec in caplog.records)
+    assert posted == []
+    assert any("queue full" in rec.getMessage() for rec in caplog.records)
     assert "hook-secret-do-not-log" not in caplog.text
+
+
+def test_dedupe_seconds_window_suppresses_then_delivers(monkeypatch):
+    """A per-call window is accepted, holds the key, and opens again after it."""
+    import time as time_mod
+    clock = {"t": 1_800_000_000.0}
+    monkeypatch.setattr(time_mod, "time", lambda: clock["t"])
+    saved_alerts = main_bot.alerts._manager
+    _install_client(monkeypatch, hang=False)
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        main_bot.alerts.init(store, _WEBHOOK, dedupe_seconds=300)
+        key = {"dedupe_key": "etrade:GET /orders", "dedupe_seconds": 10}
+        await main_bot.alerts.send(
+            "error", "etrade_http_error", "first", **key,
+        )
+        await asyncio.sleep(0)
+        await main_bot.alerts.send(
+            "error", "etrade_http_error", "second", **key,
+        )
+        await asyncio.sleep(0)
+        mid_posts = list(_Client.events)
+        mid_recent = await main_bot.alerts.recent(10)
+        clock["t"] += 11
+        await main_bot.alerts.send(
+            "error", "etrade_http_error", "third", **key,
+        )
+        await asyncio.sleep(0)
+        await main_bot.alerts.send_nowait(
+            "error", "etrade_http_error", "other key",
+            dedupe_key="etrade:GET /portfolio", dedupe_seconds=10,
+        )
+        await asyncio.sleep(0)
+        return mid_posts, list(_Client.events), mid_recent, await main_bot.alerts.recent(10)
+
+    try:
+        mid_posts, posts, mid_recent, recent = asyncio.run(scenario())
+    finally:
+        _restore_alerts(saved_alerts)
+
+    assert mid_posts == ["etrade_http_error"]
+    assert [item.get("message") for item in mid_recent] == ["first"]
+    assert posts == ["etrade_http_error", "etrade_http_error", "etrade_http_error"]
+    messages = [item.get("message") for item in recent]
+    assert "second" not in messages
+    assert "first" in messages and "third" in messages and "other key" in messages
 
 
 def test_drain_finishes_a_fast_post_and_bounds_a_hung_one(monkeypatch):
