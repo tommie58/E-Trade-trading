@@ -116,3 +116,36 @@ def test_postgres_startup_log_omits_the_pooler_user(monkeypatch, caplog):
     assert "postgres.projref123" not in caplog.text
     assert "s3cret-pg" not in caplog.text
     assert "pooler.supabase.com" not in caplog.text
+
+
+def test_redis_failure_log_has_no_host_or_port(caplog):
+    class _Redis:
+        async def eval(self, *args, **kwargs):
+            raise ConnectionError(
+                "Error 111 connecting to redis.example.internal:6379. Connection refused."
+            )
+
+        async def rpush(self, *args, **kwargs):
+            raise ConnectionError(
+                "Error 111 connecting to redis.example.internal:6379. Connection refused."
+            )
+
+    store = main_bot.StateStore(_Redis())
+
+    async def scenario():
+        await store._release_lock("lock:guard", "token")
+        try:
+            await store.queue_push("queue:orders", "{}")
+        except ConnectionError as exc:
+            main_bot.logger.warning(
+                "Redis push failed, processing directly (%s)", type(exc).__name__,
+            )
+
+    with caplog.at_level(logging.WARNING):
+        _run(scenario())
+    assert "redis.example.internal" not in caplog.text
+    assert "6379" not in caplog.text
+    assert "ConnectionError" in caplog.text
+    source = open(main_bot.__file__, encoding="utf-8").read()
+    assert 'Redis push failed, processing directly: {e}' not in source
+    assert 'Redis push failed, processing directly (%s)' in source

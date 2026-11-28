@@ -925,7 +925,7 @@ class StateStore:
         try:
             await self._persistence.save(key, kind, value)
         except Exception as e:
-            logger.warning(f"state persistence save failed for {key} (non-fatal): {e}")
+            logger.warning("state persistence save failed (%s)", type(e).__name__)
 
     async def _persist_delete(self, key: str) -> None:
         if self._persistence is None:
@@ -933,7 +933,7 @@ class StateStore:
         try:
             await self._persistence.delete(key)
         except Exception as e:
-            logger.warning(f"state persistence delete failed for {key} (non-fatal): {e}")
+            logger.warning("state persistence delete failed (%s)", type(e).__name__)
 
     async def _persist_set_members(self, key: str) -> None:
         members = await self._memory.smembers(key)
@@ -951,7 +951,7 @@ class StateStore:
         try:
             rows = await self._persistence.load_all()
         except Exception as e:
-            logger.error(f"state hydration failed — starting empty: {e}")
+            logger.error("state hydration failed (%s) — starting empty", type(e).__name__)
             return 0
         count = 0
         for key, kind, value in rows:
@@ -975,7 +975,7 @@ class StateStore:
                 res = await self.redis.eval(_RELEASE_LUA, 1, key, token)
                 return bool(res)
             except Exception as e:
-                logger.warning(f"lock release failed for {key}: {e}")
+                logger.warning("lock release failed (%s)", type(e).__name__)
                 return False
         return await self._memory.eval_compare_del(key, token)
 
@@ -985,7 +985,7 @@ class StateStore:
                 res = await self.redis.eval(_EXTEND_LUA, 1, key, token, px)
                 return bool(res)
             except Exception as e:
-                logger.warning(f"lock extend failed for {key}: {e}")
+                logger.warning("lock extend failed (%s)", type(e).__name__)
                 return False
         return await self._memory.eval_compare_extend(key, token, px)
 
@@ -1095,7 +1095,7 @@ class StateStore:
             try:
                 return await self.redis.lmove(src, dest, "LEFT", "RIGHT")
             except Exception as e:
-                logger.warning(f"StateStore: LMOVE unavailable ({e}); pop then push")
+                logger.warning("StateStore: LMOVE unavailable (%s); pop then push", type(e).__name__)
                 item = await self.redis.lpop(src)
                 if item is None:
                     return None
@@ -1557,7 +1557,7 @@ class StateStore:
         try:
             await self._bump_hash(f"daily_et:{et_day}", field, amount, DAILY_TTL_SECONDS)
         except Exception as e:
-            logger.warning(f"ET trading-day counter {field} not updated (non-fatal): {e}")
+            logger.warning("ET trading-day counter not updated (%s)", type(e).__name__)
 
     async def _hash_fields(self, key: str) -> Dict[str, str]:
         if self.redis is not None:
@@ -23988,7 +23988,7 @@ def save_tokens(token: str, token_secret: str):
         try:
             asyncio.create_task(_save_tokens_to_db(token, token_secret))
         except Exception as e:
-            logger.warning(f"Failed to persist tokens to DB: {e}")
+            logger.warning("Failed to persist tokens to DB (%s)", type(e).__name__)
 
 
 async def _save_tokens_to_state(token: str, token_secret: str) -> None:
@@ -24001,7 +24001,7 @@ async def _save_tokens_to_state(token: str, token_secret: str) -> None:
         }))
         logger.info(f"✅ Tokens saved to state store ({state.backend_name})")
     except Exception as e:
-        logger.warning(f"Failed to persist tokens to state store: {e}")
+        logger.warning("Failed to persist tokens to state store (%s)", type(e).__name__)
 
 
 async def _load_tokens_from_state() -> Optional[Dict[str, str]]:
@@ -24009,7 +24009,7 @@ async def _load_tokens_from_state() -> Optional[Dict[str, str]]:
     try:
         raw = await state.get(TOKENS_KEY)
     except Exception as e:
-        logger.warning(f"could not read tokens from state store: {e}")
+        logger.warning("could not read tokens from state store (%s)", type(e).__name__)
         return None
     if not raw:
         return None
@@ -24035,7 +24035,7 @@ async def _save_tokens_to_db(token: str, token_secret: str):
                 await session.merge(state)
         logger.info("✅ Tokens saved to database")
     except Exception as e:
-        logger.error(f"Error saving tokens to DB: {e}")
+        logger.error("Error saving tokens to DB (%s)", type(e).__name__)
 
 
 def load_tokens() -> Optional[Dict[str, str]]:
@@ -24071,7 +24071,7 @@ async def _load_tokens_from_db():
             if state:
                 return {"oauth_token": state.oauth_token, "oauth_token_secret": state.oauth_token_secret}
     except Exception as e:
-        logger.error(f"Error loading tokens from DB: {e}")
+        logger.error("Error loading tokens from DB (%s)", type(e).__name__)
     return None
 
 
@@ -24108,7 +24108,7 @@ async def preload_tokens():
                 await _save_tokens_to_state(tokens["oauth_token"], tokens["oauth_token_secret"])
                 return
         except Exception as e:
-            logger.warning(f"Could not preload tokens from DB: {e}")
+            logger.warning("Could not preload tokens from DB (%s)", type(e).__name__)
     env_token = os.getenv("ETRADE_ACCESS_TOKEN")
     if env_token and _dead_env_token_fp and _token_fingerprint(env_token) == _dead_env_token_fp:
         logger.warning(
@@ -25550,7 +25550,7 @@ async def init_db():
             engine = create_async_engine("sqlite+aiosqlite:///etrade_cache.db", echo=False)
             _db_backend = "sqlite"
         except Exception as sqlite_err:
-            logger.error(f"Even the SQLite fallback failed: {sqlite_err}")
+            logger.error("SQLite fallback failed (%s)", type(sqlite_err).__name__)
             _db_backend = "none"
             _db_error = _db_error or f"sqlite fallback failed: {sqlite_err}"
             engine = None
@@ -25563,7 +25563,7 @@ async def init_db():
             await conn.run_sync(Base.metadata.create_all)
         logger.info(f"✅ Database ready (backend: {_db_backend})")
     except Exception as e:
-        logger.error(f"Database table creation / sessionmaker error: {e}")
+        logger.error("Database table creation failed (%s)", type(e).__name__)
         _db_error = _db_error or f"{type(e).__name__}: {e}"
         async_session = None  # downstream checks must see the failure
 
@@ -25698,7 +25698,7 @@ async def _init_durable_state() -> Optional[PgStatePersistence]:
         _state_persistence = PgStatePersistence(engine)
         return _state_persistence
     except Exception as e:
-        logger.error(f"durable state init failed — falling back to plain memory: {e}")
+        logger.error("durable state init failed (%s)", type(e).__name__)
         return None
 
 
@@ -25729,7 +25729,7 @@ async def _restore_ledger_from_db() -> None:
         if lines:
             trade_ledger.restore_lines(TRADE_LEDGER_FILE, lines)
     except Exception as e:
-        logger.error(f"ledger restore from DB failed (non-fatal): {e}")
+        logger.error("ledger restore from DB failed (%s)", type(e).__name__)
 
 
 def plan_ledger_memory(
@@ -25918,7 +25918,7 @@ async def _announce_ledger_memory() -> None:
                     state_rows = int((await conn.execute(
                         sql_text(f"SELECT COUNT(*) FROM {_bt('bot_state')}"))).scalar() or 0)
             except Exception as e:
-                logger.warning(f"ledger memory: mirror count unavailable ({e})")
+                logger.warning("ledger memory: mirror count unavailable (%s)", type(e).__name__)
         _, local_records, _ = trade_ledger.verify()
         verdict = plan_ledger_memory(
             db_configured=bool(DATABASE_URL),
@@ -25948,7 +25948,7 @@ async def _announce_ledger_memory() -> None:
         else:
             logger.info(f"[ledger] {verdict['message']}")
     except Exception as e:
-        logger.error(f"ledger memory check failed (non-fatal): {e}")
+        logger.error("ledger memory check failed (%s)", type(e).__name__)
 
 
 # ==================== ACCOUNT KEY RESOLUTION ====================
@@ -43952,7 +43952,7 @@ async def process_signal(pd: dict, replay: bool = False) -> dict:
             await _record_dispatch_verdict(pd, "queued", "live" if live_intent else "non-live payload")
             return {"status": "queued", "signal_id": sig_key}
         except Exception as e:
-            logger.warning(f"Redis push failed, processing directly: {e}")
+            logger.warning("Redis push failed, processing directly (%s)", type(e).__name__)
     try:
         result = await execute_live_order(pd)
         await state.set(sig_key, str(result.get("status") or "processed"), ex=86400)
