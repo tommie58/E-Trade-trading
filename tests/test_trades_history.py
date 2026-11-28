@@ -792,7 +792,7 @@ def test_nov5_amzn_gap_totals_the_day(trades_env):
     amzn = next(row for row in nov5 if row["ticker"] == "AMZN")
     others = [row["realized_pnl_pct"] for row in nov5 if row["ticker"] != "AMZN"]
 
-    assert out["version"] == "5.99.13-pro-day-trader"
+    assert out["version"] == "5.99.16-pro-day-trader"
     assert [row["ticker"] for row in nov5] == ["NVDA", "QQQ", "INTC", "AMZN"]
     assert len(nov5) == 4
     assert amzn["realized_pnl_pct"] == 13.6711

@@ -16310,7 +16310,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # entry price is declined (below_entry). The fixed stop stays and the
 # next pass retries. POST /trail/native uses the same floor unless the
 # body sets allow_below_entry true.
-BOT_VERSION = "5.99.13-pro-day-trader"
+BOT_VERSION = "5.99.16-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -29514,6 +29514,88 @@ async def _place_verified_native_trail(
     return placed, order_id, "counter_swap"
 
 
+def _native_trail_initial_trigger(bid: Any, offset: Any, *, option: bool) -> Optional[float]:
+    """Initial trigger the placer would send. None when it cannot be priced."""
+    try:
+        bid_f = float(bid)
+        off = float(offset)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(bid_f) or not math.isfinite(off) or bid_f <= 0 or off <= 0:
+        return None
+    if option:
+        trigger = _round_stop_toward_market(bid_f - off, bid_f) or 0.0
+    else:
+        trigger = round(bid_f - off, 2)
+    if not math.isfinite(trigger) or trigger <= 0:
+        return None
+    return float(trigger)
+
+
+def _native_trail_price_floor(*levels: Any) -> Optional[float]:
+    """Tightest positive price among the levels. None when none are usable."""
+    vals: List[float] = []
+    for level in levels:
+        try:
+            value = float(level)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            vals.append(value)
+    if not vals:
+        return None
+    return max(vals)
+
+
+def _native_trail_floor_verdict(trigger: Any, floor: Any) -> Dict[str, Any]:
+    """``trigger``, ``floor``, and ``floor_check`` of pass, fail, or uncomputable."""
+    try:
+        trig = float(trigger)
+    except (TypeError, ValueError):
+        trig = None
+    if trig is None or not math.isfinite(trig) or trig <= 0:
+        trig = None
+    try:
+        fl = float(floor)
+    except (TypeError, ValueError):
+        fl = None
+    if fl is None or not math.isfinite(fl) or fl <= 0:
+        fl = None
+    if trig is None or fl is None:
+        result = "uncomputable"
+    elif trig + 1e-9 < fl:
+        result = "fail"
+    else:
+        result = "pass"
+    return {
+        "trigger": None if trig is None else round(trig, 4),
+        "floor": None if fl is None else round(fl, 4),
+        "floor_check": result,
+    }
+
+
+async def _read_open_order_stop(order_id: str) -> Optional[float]:
+    """Positive stopPrice on an open order.
+
+    None when the order is missing or its stop is not a positive price.
+    Raises when the order book itself cannot be read — the caller treats
+    that as an uncomputable floor and does not cancel.
+    """
+    resp = await _reconcile_fetch_orders()
+    for order in reconciliation.parse_open_orders(resp):
+        if str(order.get("order_id") or "") != str(order_id):
+            continue
+        raw = order.get("stop_price")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if math.isfinite(value) and value > 0:
+            return value
+        return None
+    return None
+
+
 async def _arm_native_trail(
     ticker: str,
     offset: Optional[float] = None,
@@ -29594,17 +29676,16 @@ async def _arm_native_trail(
             )
         rationale = "operator-specified"
 
-    if bid <= 0:
-        refuse("no live bid — cannot set the trail's initial trigger")
     # E*TRADE rejects stopPrice: 0 (error 7), so the initial trigger is sent
     # explicitly: one full offset below the bid the trail references.
-    trigger = ((_round_stop_toward_market(bid - offset_value, bid) or 0.0)
-               if is_option else round(bid - offset_value, 2))
-    if trigger <= 0:
+    trigger = _native_trail_initial_trigger(bid, offset_value, option=is_option)
+    if trigger is None:
+        if bid <= 0:
+            refuse("no live bid — cannot set the trail's initial trigger")
         refuse(f"trail offset {offset_value:.2f} exceeds the {bid:.2f} bid")
     # BEFORE any cancel. A refusal here leaves the fixed stop resting.
-    # Auto and repair pass min_trigger at max(stop, entry); the position's
-    # own entry is enforced even when a caller forgets that floor.
+    # Auto, repair, and POST /trail/native pass min_trigger at the resting
+    # stop. Entry is enforced too, unless the operator set allow_below_entry.
     stop_floor = None
     if min_trigger is not None:
         try:
@@ -37746,18 +37827,42 @@ async def _maybe_repair_inflated_native_trail(
     bid: float,
     spread: Optional[float],
     native_trail_id: str,
-) -> bool:
+    dry_run: bool = False,
+):
     """Re-arm a broker trail whose Stop Val is clearly the swapped trigger.
 
     Live 2026-11-13 GOOGL/SMCI rested T-Stop distances of 7.6 / 1.85 while
     2×spread wanted ~0.80 / ~0.30. Those legs stay "protected" in name only
     until the inflated offset is cancelled and a verified trail is placed.
-    Returns True when this pass owns the stop (repair attempted or declined
-    with a sticky skip) so the engine ratchet does not also touch it.
+
+    The price floor — the tightest of the resting order's stop, the journaled
+    stop, and the fill — is computed and checked BEFORE that order is
+    cancelled. A failed or uncomputable check leaves the resting stop in
+    place and logs the trigger, the floor, and the floor-check result.
+    ``dry_run`` returns those three fields and does not cancel, place, alert,
+    or write state.
+
+    The live path returns True when this pass owns the stop (repair attempted
+    or declined) so the engine ratchet does not also touch it.
     """
+    def _dry(trigger: Any, floor: Any, floor_check: str, detail: Optional[str] = None) -> dict:
+        out = {
+            "dry_run": True,
+            "trigger": trigger,
+            "floor": floor,
+            "floor_check": floor_check,
+        }
+        if detail:
+            out["detail"] = detail
+        return out
+
     if _native_trail_retry_waiting(pos):
+        if dry_run:
+            return _dry(None, None, "uncomputable", "retry waiting")
         return True
     if pos.get("native_trail_skip") == "inflated_offset_ok":
+        if dry_run:
+            return _dry(None, None, "uncomputable", "resting offset already checked")
         return True
 
     contract = pos.get("contract") or {}
@@ -37775,23 +37880,64 @@ async def _maybe_repair_inflated_native_trail(
         mark=bid if bid > 0 else entry, option=is_option,
     )
     if not floor["ok"]:
+        if dry_run:
+            return _dry(None, None, "uncomputable", str(floor.get("detail") or ""))
         return True
 
     resting_offset = await _read_resting_trail_offset(str(native_trail_id))
     if resting_offset is None:
+        if dry_run:
+            return _dry(None, None, "uncomputable", "resting offset unreadable")
         return True
     if not trailing_engine.native_trail_offset_looks_inflated(
         resting_offset, floor["offset"],
     ):
+        if dry_run:
+            return _dry(None, None, "uncomputable", "resting offset is not inflated")
         if pos.get("native_trail_skip") != "inflated_offset_ok":
             pos["native_trail_skip"] = "inflated_offset_ok"
             pos["native_trail_offset"] = resting_offset
             await state.set_position(ticker, pos)
         return True
 
+    # Price the replacement and read the resting stop BEFORE any cancel.
+    # A floor that fails, or that cannot be read, leaves this order working.
+    trigger = _native_trail_initial_trigger(
+        bid, float(floor["offset"]), option=is_option,
+    )
+    old_stop = None
+    try:
+        old_stop = await _read_open_order_stop(str(native_trail_id))
+    except Exception:
+        old_stop = None
+    if old_stop is None:
+        price_floor = None
+    else:
+        price_floor = _native_trail_price_floor(base_stop, entry, old_stop)
+    verdict = _native_trail_floor_verdict(trigger, price_floor)
+    if dry_run:
+        return {"dry_run": True, **verdict}
+    if verdict["floor_check"] != "pass":
+        logger.warning(
+            f"[NATIVE TRAIL] {ticker} repair floor_check={verdict['floor_check']} "
+            f"trigger={verdict['trigger']} floor={verdict['floor']} — "
+            f"leaving resting stop {native_trail_id}"
+        )
+        await alerts.send(
+            "warning",
+            "native_trail_repair_floor",
+            f"{ticker}: inflated trail left resting — "
+            f"floor_check={verdict['floor_check']} "
+            f"trigger={verdict['trigger']} floor={verdict['floor']}",
+            dedupe_key=f"native_trail_repair_floor:{ticker}:{verdict['floor_check']}",
+        )
+        return True
+
     qty = int(pos.get("filled_qty") or pos.get("qty") or 0)
     logger.warning(
-        f"[NATIVE TRAIL] {ticker} resting offset {resting_offset:.2f} is inflated vs "
+        f"[NATIVE TRAIL] {ticker} repair floor_check=pass "
+        f"trigger={verdict['trigger']} floor={verdict['floor']} — "
+        f"resting offset {resting_offset:.2f} is inflated vs "
         f"intended {float(floor['offset']):.2f} ({floor['detail']}) — cancelling "
         f"{native_trail_id} and re-arming with verified fields"
     )
@@ -37814,23 +37960,9 @@ async def _maybe_repair_inflated_native_trail(
     fresh["native_trail_skip"] = None
     await state.set_position(ticker, fresh)
 
-    # Floor at the tightest of the old stop, the journaled stop, and the fill.
-    # A repair that only cleared the swapped stop could re-arm under entry.
-    floors = [v for v in (base_stop, entry) if v > 0]
-    min_trigger = max(floors) if floors else None
-    try:
-        resp = await _reconcile_fetch_orders()
-        for order in reconciliation.parse_open_orders(resp):
-            if str(order.get("order_id") or "") != str(native_trail_id):
-                continue
-            old_stop = order.get("stop_price")
-            if old_stop is not None and float(old_stop) > 0:
-                min_trigger = max(float(min_trigger or 0), float(old_stop))
-            break
-    except Exception:
-        pass
-    if min_trigger is not None and min_trigger <= 0:
-        min_trigger = None
+    # The floor was checked before the cancel. Pass the same number through
+    # so the placer refuses again if the fresh quote would now sit under it.
+    min_trigger = verdict["floor"]
 
     try:
         await _arm_native_trail(ticker, min_trigger=min_trigger, source="repair")
@@ -42645,6 +42777,96 @@ async def learning_reset(
     return {"status": "probation", "cell": key}
 
 
+async def _manual_native_trail_preview(
+    ticker: str,
+    pos: dict,
+    offset: Optional[float],
+    *,
+    allow_below_entry: bool,
+) -> Dict[str, Any]:
+    """Price a manual native trail without cancelling anything.
+
+    The floor is the resting stop, and the fill as well unless the operator
+    set ``allow_below_entry``. The resting stop is never dropped from the floor.
+    """
+    contract = dict(pos.get("contract") or {})
+    is_option = bool(contract.get("right")) or pos.get("entry_premium") is not None
+    entry = float(pos.get("entry_premium") if is_option else (pos.get("entry") or 0) or 0)
+    base_stop = float(pos.get("stop_premium" if is_option else "stop") or 0)
+    risk = (entry - base_stop) if (entry > 0 and base_stop > 0) else None
+    bid, ask = await _current_bid_ask(ticker, contract if is_option else None)
+    spread = (ask - bid) if (bid > 0 and ask > 0 and ask >= bid) else None
+    tick = (
+        (_option_tick_from_quote(bid or entry, bid, ask) or _safe_option_tick(bid or entry))
+        if is_option else 0.01
+    )
+    plan = trailing_engine.native_trail_offset(
+        spread, risk=risk, tick=tick,
+        mark=bid if bid > 0 else entry, option=is_option,
+    )
+    used = None
+    if offset is not None:
+        requested = round(float(offset), 2)
+        if requested > 0 and not (plan["ok"] and requested < float(plan["offset"])):
+            used = requested
+    elif plan["ok"]:
+        used = float(plan["offset"])
+    trigger = (
+        _native_trail_initial_trigger(bid, used, option=is_option)
+        if used is not None else None
+    )
+    if base_stop > 0 and allow_below_entry:
+        price_floor = base_stop
+    elif base_stop > 0:
+        price_floor = _native_trail_price_floor(base_stop, entry)
+    else:
+        price_floor = None
+    verdict = _native_trail_floor_verdict(trigger, price_floor)
+    return {
+        "dry_run": True,
+        "ticker": ticker,
+        "bid": round(bid, 4) if bid > 0 else None,
+        "ask": round(ask, 4) if ask > 0 else None,
+        "spread": None if spread is None else round(spread, 4),
+        "risk": None if risk is None else round(risk, 4),
+        **plan,
+        **verdict,
+    }
+
+
+def _native_trail_floor_refusal(
+    ticker: str,
+    preview: Dict[str, Any],
+    pos: dict,
+    allow_below_entry: bool,
+) -> str:
+    """Why a manual trail must not replace the resting stop. Prices only."""
+    trigger = preview.get("trigger")
+    floor = preview.get("floor")
+    if preview.get("floor_check") != "fail" or trigger is None or floor is None:
+        return (
+            f"{ticker}: native trail floor could not be computed — "
+            f"resting stop left in place"
+        )
+    contract = dict(pos.get("contract") or {})
+    is_option = bool(contract.get("right")) or pos.get("entry_premium") is not None
+    entry = float(pos.get("entry_premium") if is_option else (pos.get("entry") or 0) or 0)
+    if (
+        not allow_below_entry
+        and entry > 0
+        and float(trigger) + 1e-9 < entry
+        and entry + 1e-9 >= float(floor)
+    ):
+        return (
+            f"{ticker}: native handoff declined: below_entry — trigger {float(trigger):.2f} "
+            f"sits under entry {entry:.2f}"
+        )
+    return (
+        f"{ticker}: native trigger {float(trigger):.2f} would loosen the resting stop "
+        f"{float(floor):.2f}"
+    )
+
+
 @app.post("/trail/native")
 async def arm_native_trail(
     body: dict = Body(...),
@@ -42661,16 +42883,21 @@ async def arm_native_trail(
     only if it clears that same floor — a trail tighter than the noise band
     is not a tighter stop, it is a guaranteed exit on the next quote wobble.
 
-    `dry_run` prices the trail and returns the number WITHOUT touching the
-    resting stop, so the offset can be inspected before anything moves.
+    `dry_run` prices the trail and returns the computed trigger, the floor,
+    and the floor-check result (pass, fail, or uncomputable) WITHOUT touching
+    the resting stop.
+
+    The effective trigger is never looser than the resting stop. That stop is
+    the minimum protection on this path, including when ``allow_below_entry``
+    is the JSON boolean true — that flag skips only the entry half of the
+    floor. A trigger under the floor is refused and the resting stop stays.
 
     The trail worker also places this order on its own when NATIVE_TRAIL_AUTO
     is on, the trade has locked breakeven, and the trail trigger is at least
     as tight as the fixed stop and the entry price. A trigger under the fill
-    is refused and the fixed stop stays. ``allow_below_entry: true`` is the
-    only bypass, and it has to be the JSON boolean true. A trail already
-    resting at E*TRADE — placed here, by the worker, or by hand — is adopted,
-    and the engine trail stands down.
+    is refused and the fixed stop stays. A trail already resting at E*TRADE —
+    placed here, by the worker, or by hand — is adopted, and the engine trail
+    stands down.
     """
     await _require_control_auth(x_rork_secret, "/trail/native")
     ticker = str((body or {}).get("ticker") or "").upper().strip()
@@ -42678,38 +42905,29 @@ async def arm_native_trail(
         raise HTTPException(400, "ticker is required")
     raw_offset = (body or {}).get("offset")
     offset = float(raw_offset) if raw_offset is not None else None
-
-    if bool((body or {}).get("dry_run")):
-        pos = await state.get_position(ticker)
-        if not pos:
-            raise HTTPException(404, f"{ticker}: no tracked position")
-        contract = dict(pos.get("contract") or {})
-        is_option = bool(contract.get("right")) or pos.get("entry_premium") is not None
-        entry = float(pos.get("entry_premium") if is_option else (pos.get("entry") or 0) or 0)
-        base_stop = float(pos.get("stop_premium" if is_option else "stop") or 0)
-        risk = (entry - base_stop) if (entry > 0 and base_stop > 0) else None
-        bid, ask = await _current_bid_ask(ticker, contract if is_option else None)
-        spread = (ask - bid) if (bid > 0 and ask > 0 and ask >= bid) else None
-        tick = (_option_tick_from_quote(bid or entry, bid, ask)
-                or _safe_option_tick(bid or entry)) if is_option else 0.01
-        plan = trailing_engine.native_trail_offset(
-            spread, risk=risk, tick=tick,
-            mark=bid if bid > 0 else entry, option=is_option,
-        )
-        return {
-            "dry_run": True, "ticker": ticker,
-            "bid": round(bid, 4) if bid > 0 else None,
-            "ask": round(ask, 4) if ask > 0 else None,
-            "spread": None if spread is None else round(spread, 4),
-            "risk": None if risk is None else round(risk, 4),
-            **plan,
-        }
-
-    # Same entry floor as the auto handoff. Only an explicit JSON true skips it.
     allow_below_entry = (body or {}).get("allow_below_entry") is True
+
+    pos = await state.get_position(ticker)
+    if not pos:
+        raise HTTPException(404, f"{ticker}: no tracked position")
+    preview = await _manual_native_trail_preview(
+        ticker, pos, offset, allow_below_entry=allow_below_entry,
+    )
+    if bool((body or {}).get("dry_run")):
+        return preview
+    if preview["floor_check"] != "pass":
+        raise HTTPException(
+            400,
+            detail=scrub_etrade_text(
+                _native_trail_floor_refusal(ticker, preview, pos, allow_below_entry)
+            ),
+        )
     try:
         result = await _arm_native_trail(
-            ticker, offset, allow_below_entry=allow_below_entry,
+            ticker,
+            offset,
+            min_trigger=preview["floor"],
+            allow_below_entry=allow_below_entry,
         )
     except Exception as e:
         raise HTTPException(400, detail=scrub_etrade_text(str(e)))
