@@ -1341,15 +1341,75 @@ def test_repair_rearm_is_not_looser_than_the_native_trail(monkeypatch):
         await main_bot._maybe_repair_inflated_native_trail(
             "QQQ", pos, 4.00, 0.10, "1598",
         )
-        assert placed, name
-        assert all(price + 1e-9 >= floor for _right, price in placed), (name, placed)
-        assert placed[0][0] == right
+        assert placed == [(right, floor)], (name, placed)
 
     async def scenario():
         for right in ("CALL", "PUT"):
             await run_case(f"R3 {right}", right, None, 2.50)
             await run_case(f"R3i {right}", right, 2.45, 2.50)
             await run_case(f"C1f {right}", right, 2.40, 2.50)
+
+    asyncio.run(scenario())
+
+
+def test_repair_does_not_place_again_after_protective_stop_restored(monkeypatch):
+    """ProtectiveStopRestored means the stop is already back. No second place."""
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+    placed = []
+    rearm_calls = []
+
+    async def read_offset(order_id):
+        return 7.6
+
+    async def arm(ticker, offset=None, min_trigger=None, source="operator", allow_below_entry=False, floor_price=None):
+        placed.append((source, floor_price))
+        raise main_bot.ProtectiveStopRestored(
+            f"{ticker}: trail placement failed — protective stop restored"
+        )
+
+    async def rearm(ticker, pos, floor_price=None):
+        rearm_calls.append((ticker, floor_price))
+        placed.append(("rearm", floor_price))
+        return "placed"
+
+    async def cancel_order(order_id, expected_qty=0):
+        return main_bot.CANCEL_CONFIRMED
+
+    monkeypatch.setattr(main_bot, "_read_resting_trail_offset", read_offset)
+    monkeypatch.setattr(main_bot, "_arm_native_trail", arm)
+    monkeypatch.setattr(main_bot, "_reconcile_rearm_guard", rearm)
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel_order)
+
+    async def run_case(right):
+        placed.clear()
+        rearm_calls.clear()
+        pos = _entry_floor_option({
+            "stop_order_id": None,
+            "native_trail_order_id": "1598",
+            "contract": {
+                "right": right,
+                "strike": 450.0,
+                "expiration": "2026-12-18",
+            },
+        })
+        await store.set_position("QQQ", pos)
+
+        async def fetch_orders():
+            return {"OrdersResponse": {"Order": _stop_order(
+                "1598", "OPEN", 1, 2.50, right=right,
+            )}}
+
+        monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", fetch_orders)
+        await main_bot._maybe_repair_inflated_native_trail(
+            "QQQ", pos, 4.00, 0.10, "1598",
+        )
+        assert placed == [("repair", 2.50)], (right, placed)
+        assert rearm_calls == [], (right, rearm_calls)
+
+    async def scenario():
+        for right in ("CALL", "PUT"):
+            await run_case(right)
 
     asyncio.run(scenario())
 

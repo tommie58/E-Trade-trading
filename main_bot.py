@@ -30392,6 +30392,14 @@ class NativeTrailRefused(Exception):
     """Handoff declined before the resting stop was touched."""
 
 
+class ProtectiveStopRestored(Exception):
+    """Trail placement failed after the fixed stop was put back.
+
+    Callers that catch arm failures must not place another stop: one is
+    already resting. A second SELL_CLOSE is a 3004 reject or a double fill.
+    """
+
+
 NATIVE_TRAIL_VERIFY_ATTEMPTS = 5
 NATIVE_TRAIL_VERIFY_SLEEP_SECONDS = 0.45
 
@@ -30825,10 +30833,14 @@ async def _arm_native_trail(
                 )
             _log_rearm_outcome(ticker, outcome, "NATIVE TRAIL")
             if outcome in ("placed", "skipped_live"):
-                raise Exception(f"{ticker}: trail placement failed ({e}) — protective stop restored")
+                raise ProtectiveStopRestored(
+                    f"{ticker}: trail placement failed ({e}) — protective stop restored"
+                )
             raise Exception(
                 f"{ticker}: trail placement failed ({e}) — re-arm {outcome}, stop not confirmed"
             )
+        except ProtectiveStopRestored:
+            raise
         except Exception as re_arm_error:
             if "stop not confirmed" in str(re_arm_error) or "protective stop restored" in str(re_arm_error):
                 raise
@@ -39305,8 +39317,25 @@ async def _maybe_repair_inflated_native_trail(
                 dedupe_key=f"native_trail_repair:{ticker}",
             )
         return True
+    except ProtectiveStopRestored as e:
+        # _arm_native_trail already put the fixed stop back. Do not place again.
+        logger.error(
+            "[NATIVE TRAIL] %s inflated-trail repair failed (%s) — "
+            "protective stop already restored",
+            ticker, type(e).__name__,
+        )
+        fresh = await state.get_position(ticker) or fresh
+        fresh["native_trail_retry_after"] = (
+            _utcnow() + timedelta(seconds=NATIVE_TRAIL_RETRY_SECONDS)
+        ).isoformat()
+        fresh["native_trail_skip"] = str(e)[:240]
+        await state.set_position(ticker, fresh)
+        return True
     except Exception as e:
-        logger.error(f"[NATIVE TRAIL] {ticker} inflated-trail repair failed: {e}")
+        logger.error(
+            "[NATIVE TRAIL] %s inflated-trail repair failed (%s)",
+            ticker, type(e).__name__,
+        )
         fresh = await state.get_position(ticker) or fresh
         fresh["native_trail_retry_after"] = (
             _utcnow() + timedelta(seconds=NATIVE_TRAIL_RETRY_SECONDS)
