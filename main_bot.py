@@ -853,9 +853,9 @@ class StateStore:
                 # Say what was corrected. A silently-repaired value that then
                 # fails for a DIFFERENT reason is impossible to debug.
                 logger.warning(
-                    f"StateStore: REDIS_URL needed repair before use ({', '.join(repairs)}) — "
-                    f"using {_redact_redis_url(clean_url)}. Store just the URL itself in the "
-                    f"env var, not the surrounding shell command."
+                    "redis: configured — REDIS_URL needed repair before use (%s). "
+                    "Store just the URL itself in the env var, not the surrounding shell command.",
+                    ", ".join(repairs),
                 )
             holes = unreplaced_placeholders(clean_url)
             if holes:
@@ -866,10 +866,8 @@ class StateStore:
                     f"URL still contains unreplaced placeholder(s): {', '.join(holes)}"
                 )
                 logger.error(
-                    f"⛔ StateStore: REDIS_URL is a TEMPLATE, not a connection string — "
-                    f"{', '.join(holes)} was never replaced with a real value "
-                    f"({_redact_redis_url(clean_url)}). Copy the URL from your Redis provider's "
-                    f"dashboard and set REDIS_URL to that exact value."
+                    "redis: configured — REDIS_URL is a template (%s was never replaced)",
+                    ", ".join(holes),
                 )
             elif not clean_url:
                 redis_error = "REDIS_URL is set but empty after trimming"
@@ -885,18 +883,13 @@ class StateStore:
                         health_check_interval=30,
                     )
                     await client.ping()
-                    logger.info(
-                        f"✅ StateStore: Redis connected ({_redact_redis_url(clean_url)}) — "
-                        f"distributed state + locks active"
-                    )
+                    logger.info("redis: configured")
                     return cls(client)
                 except Exception as e:
-                    redis_error = f"{type(e).__name__}: {e}"
+                    redis_error = type(e).__name__
                     logger.error(
-                        f"⛔ StateStore: REDIS_URL is set ({_redact_redis_url(clean_url)}) but Redis is "
-                        f"UNREACHABLE ({redis_error}) — falling back to "
-                        f"{'DURABLE memory (persistence adapter)' if persistence is not None else 'in-memory state — NOT safe for multi-worker deployments'}. "
-                        f"Check the host/port/password and that this host is allow-listed at the Redis provider."
+                        "redis: configured but unreachable (%s)",
+                        type(e).__name__,
                     )
         store = cls(None, persistence=persistence)
         store.redis_error = redis_error
@@ -25468,13 +25461,12 @@ async def init_db():
 
     if DATABASE_URL:
         url, connect_args, notes = _normalize_db_url(DATABASE_URL)
-        masked = _mask_db_url(url)
         repairs = [n for n in notes if "removed" in n]
         if repairs:
             logger.warning(
-                f"DATABASE_URL needed repair before use ({', '.join(repairs)}) — using "
-                f"{masked}. Store just the URL itself in the env var, not the surrounding "
-                f"shell command."
+                "postgres: configured — DATABASE_URL needed repair before use (%s). "
+                "Store just the URL itself in the env var, not the surrounding shell command.",
+                ", ".join(repairs),
             )
         holes = unreplaced_placeholders(url)
         driver_missing = False
@@ -25491,12 +25483,8 @@ async def init_db():
             # re-reading their own env var.
             _db_error = f"URL still contains unreplaced placeholder(s): {', '.join(holes)}"
             logger.error(
-                f"⛔ DATABASE_URL is a TEMPLATE, not a connection string — "
-                f"{', '.join(holes)} was never replaced with a real value ({masked}). "
-                f"Copy the URI from Supabase → Project Settings → Database → Connection "
-                f"string, replace the password, and set DATABASE_URL to that exact value. "
-                f"Falling back to SQLite on an ephemeral disk: tokens, durable state and "
-                f"the trade ledger will NOT survive a restart."
+                "postgres: configured — DATABASE_URL is a template (%s was never replaced)",
+                ", ".join(holes),
             )
         elif driver_missing:
             _db_error = "asyncpg is not installed on this server"
@@ -25532,25 +25520,18 @@ async def init_db():
                 # Scope the ORM token table to the private schema (see the class
                 # note — it stays schema-less so SQLite can share create_all).
                 ETradeSessionState.__table__.schema = _BOT_SCHEMA
-                suffix = f" [{', '.join(notes)}]" if notes else ""
-                logger.info(f"✅ Postgres connected @ {masked}{suffix}")
+                logger.info("postgres: configured")
             except Exception as conn_err:
-                _db_error = f"{type(conn_err).__name__}: {conn_err}"
+                _db_error = type(conn_err).__name__
                 if engine is not None:
                     try:
                         await engine.dispose()
                     except Exception:
                         pass
                 engine = None
-                hint = _db_failure_hint(url, _db_error)
-                if hint:
-                    _db_error = f"{_db_error} | {hint}"
                 logger.error(
-                    f"❌ DATABASE_URL is set but Postgres is UNREACHABLE @ {masked} — "
-                    f"{type(conn_err).__name__}: {conn_err}. "
-                    + (f"{hint} " if hint else "")
-                    + f"Falling back to SQLite on an ephemeral disk: tokens, durable "
-                    f"state and the trade ledger will NOT survive a restart."
+                    "postgres: configured but unreachable (%s)",
+                    type(conn_err).__name__,
                 )
         if _db_backend == "postgres" and engine is not None:
             # Separate from the engine above. A failure here must not
@@ -28892,6 +28873,41 @@ class _EtradeLogRedactor(logging.Filter):
 _ETRADE_LOG_REDACTOR = _EtradeLogRedactor()
 _ETRADE_HANDLER_PATCHED = False
 
+# redis-py logs the host on connection errors ("Error connecting to host:port").
+_REDIS_ENDPOINT_RE = re.compile(
+    r"(?:rediss?://|(?:\d{1,3}\.){3}\d{1,3}|\b[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)+\b)",
+)
+_REDIS_EXC_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*Error)\b")
+
+
+class _RedisConnectionLogFilter(logging.Filter):
+    """Redis library connection logs keep the exception type and drop the host."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not str(getattr(record, "name", "")).startswith("redis"):
+            return True
+        exc_name = None
+        if record.exc_info and record.exc_info[0] is not None:
+            exc_name = record.exc_info[0].__name__
+        try:
+            rendered = record.getMessage()
+        except Exception:
+            rendered = str(record.msg)
+        if exc_name is None:
+            match = _REDIS_EXC_RE.search(rendered)
+            if match:
+                exc_name = match.group(1)
+        if exc_name or _REDIS_ENDPOINT_RE.search(rendered):
+            record.msg = f"redis connection error ({exc_name or 'Error'})"
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+        return True
+
+
+_REDIS_LOG_FILTER = _RedisConnectionLogFilter()
+
 
 def _install_etrade_log_redactor() -> None:
     global _ETRADE_HANDLER_PATCHED
@@ -28903,6 +28919,8 @@ def _install_etrade_log_redactor() -> None:
         seen.add(id(obj))
         if not any(isinstance(existing, _EtradeLogRedactor) for existing in obj.filters):
             obj.addFilter(_ETRADE_LOG_REDACTOR)
+        if not any(isinstance(existing, _RedisConnectionLogFilter) for existing in obj.filters):
+            obj.addFilter(_REDIS_LOG_FILTER)
 
     def _arm_handler(hdlr) -> None:
         if hdlr is None:
@@ -28910,6 +28928,8 @@ def _install_etrade_log_redactor() -> None:
         filters = getattr(hdlr, "filters", ())
         if not any(isinstance(existing, _EtradeLogRedactor) for existing in filters):
             hdlr.addFilter(_ETRADE_LOG_REDACTOR)
+        if not any(isinstance(existing, _RedisConnectionLogFilter) for existing in filters):
+            hdlr.addFilter(_REDIS_LOG_FILTER)
 
     def _arm_logger(obj: logging.Logger) -> None:
         _arm(obj)
@@ -28924,7 +28944,10 @@ def _install_etrade_log_redactor() -> None:
     # Created here if uvicorn has not configured logging yet. dictConfig may
     # later replace logger filters; handlers added after this patch still
     # receive the redactor.
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "httpx", "httpcore"):
+    for name in (
+        "uvicorn", "uvicorn.error", "uvicorn.access", "httpx", "httpcore",
+        "redis", "redis.connection", "redis.asyncio",
+    ):
         _arm_logger(logging.getLogger(name))
 
     manager = logging.Logger.manager
