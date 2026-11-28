@@ -18429,6 +18429,9 @@ STOP_PLACEMENT_TIMEOUT_SECONDS = int(os.getenv("STOP_PLACEMENT_TIMEOUT_SECONDS",
 # passed. This many polls later, the hold ends and the normal unprotected
 # path runs: a critical alert and the deadline emergency flatten.
 STOP_ALLOCATION_HELD_POLLS = 3
+# After the hold ends with the book still unreadable, page again at this
+# interval until a stop is adopted or the option is flattened.
+UNCONFIRMED_STOP_PAGE_S = 30.0
 # CANCEL SETTLEMENT: E*TRADE answers a cancel with CANCEL_REQUESTED, which is a
 # PENDING state — the contracts/shares stay allocated to the dying order for a
 # beat afterwards. Sending the replacement stop or the closing order inside that
@@ -30774,6 +30777,28 @@ def allocation_hold_after_poll(guard: dict, now: float,
     return {"polls": polls, "expired": past and polls >= int(max_polls)}
 
 
+async def _page_unconfirmed_stop(ticker: str, guard: dict) -> dict:
+    """Critical page for a lost stop that is still not confirmed resting.
+
+    At most once per UNCONFIRMED_STOP_PAGE_S. Returns the guard.
+    """
+    now = time.time()
+    try:
+        last = float((guard or {}).get("stop_reply_paged_at") or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    if last > 0 and (now - last) < UNCONFIRMED_STOP_PAGE_S:
+        return guard
+    await alerts.send_nowait(
+        "critical", "position_unprotected",
+        f"{ticker}: no covering stop was confirmed after a lost stop reply. "
+        f"The position is unprotected.",
+        dedupe_key=f"unprotected:{ticker}",
+        dedupe_seconds=int(UNCONFIRMED_STOP_PAGE_S),
+    )
+    return await state.update_guard(ticker, stop_reply_paged_at=now) or guard
+
+
 async def _adopt_covering_stop(
     ticker: str, pos: dict, qty: int, *,
     client_id: Optional[str] = None, order_id: Optional[str] = None,
@@ -33202,31 +33227,37 @@ async def _stop_guard_worker(ticker: str) -> None:
                             # working. One retry may place.
                             can_place = True
                         else:
-                            if not guard.get("stop_allocation_held"):
+                            if not guard.get("stop_allocation_held") and not guard.get("stop_reply_bound"):
                                 guard = await state.update_guard(
                                     ticker, stop_allocation_held=True,
                                 ) or guard
                             step = allocation_hold_after_poll(guard, time.time())
-                            if step["expired"]:
+                            bound = bool(guard.get("stop_reply_bound")) or step["expired"]
+                            if bound:
                                 logger.warning(
                                     "[STOP GUARD] %s allocation hold expired after %s polls",
                                     ticker, step["polls"],
                                 )
-                                guard = await state.update_guard(
-                                    ticker,
-                                    stop_allocation_held=False,
-                                    stop_allocation_held_polls=0,
-                                    stop_reply_lost=False,
-                                ) or guard
-                                allocation_hold_released = True
-                                await alerts.send_nowait(
-                                    "critical", "position_unprotected",
-                                    f"{ticker}: no covering stop was adopted after a 3004 "
-                                    f"or a lost stop reply "
-                                    f"({STOP_ALLOCATION_HELD_POLLS} polls past the stop "
-                                    f"deadline). The position is unprotected.",
-                                    dedupe_key=f"unprotected:{ticker}",
-                                )
+                                guard = await _page_unconfirmed_stop(ticker, guard)
+                                # Options sell the tracked long. A broker 3004
+                                # blocks an oversell. Stocks only page: a blind
+                                # sell can open a short.
+                                if is_option:
+                                    guard = await state.update_guard(
+                                        ticker,
+                                        stop_allocation_held=False,
+                                        stop_allocation_held_polls=0,
+                                        stop_reply_lost=False,
+                                        stop_reply_bound=True,
+                                    ) or guard
+                                    allocation_hold_released = True
+                                else:
+                                    guard = await state.update_guard(
+                                        ticker,
+                                        stop_allocation_held=False,
+                                        stop_reply_lost=True,
+                                        stop_reply_bound=True,
+                                    ) or guard
                             else:
                                 guard = await state.update_guard(
                                     ticker, stop_allocation_held_polls=step["polls"],
@@ -33491,7 +33522,8 @@ async def _stop_guard_worker(ticker: str) -> None:
                         await _cancel_order_safe(guard.get("entry_order_id"))
                     try:
                         flatten_id = await _emergency_flatten(
-                            ticker, guard, filled, book="required",
+                            ticker, guard, filled,
+                            book="best_effort" if allocation_hold_released else "required",
                         )
                         exit_fill = await _resolve_exit_fill(flatten_id)
                         payload_g = {"ticker": ticker, "action": guard.get("action") or "BUY"}
