@@ -30732,6 +30732,17 @@ async def _read_open_order_stop(order_id: str) -> Optional[float]:
     return None
 
 
+def _page_repair_unplaced(ticker: str) -> None:
+    """Critical, and it does not wait on the webhook."""
+    alerts.retain(asyncio.create_task(alerts.send_nowait(
+        "critical",
+        "position_unprotected",
+        f"{ticker}: the repair cancel left no resting stop and the replacement "
+        f"did not place. Check the position at the broker.",
+        dedupe_key=f"repair_unplaced:{ticker}",
+    )))
+
+
 def _page_native_trail_unreadable(ticker: str) -> None:
     """Error, rate-limited. Does not wait on the webhook."""
     alerts.retain(asyncio.create_task(alerts.send_nowait(
@@ -39170,9 +39181,27 @@ def _log_rearm_outcome(ticker: str, result: Any, label: str) -> str:
         logger.info(
             f"[{label}] {ticker} re-arm skipped_live — a live stop already covers the position"
         )
+    elif outcome == "unplaced":
+        # Not a restored stop. Never describe this as re-armed.
+        logger.error(f"[{label}] {ticker} stop not confirmed — replacement did not place")
     else:
         logger.warning(f"[{label}] {ticker} re-arm {outcome}")
     return outcome
+
+
+async def _rearm_after_repair_cancel(ticker: str, pos: dict, floor_price: Optional[float]) -> str:
+    """Re-arm after a repair cancel. An unplaced result is a critical alert.
+
+    The log never calls an unplaced result re-armed. The alert is send_nowait.
+    """
+    logged = _log_rearm_outcome(
+        ticker,
+        await _reconcile_rearm_guard(ticker, pos, floor_price=floor_price),
+        "NATIVE TRAIL",
+    )
+    if logged == "unplaced":
+        _page_repair_unplaced(ticker)
+    return logged
 
 
 async def _acquire_rearm_lock(ticker: str):
@@ -39507,11 +39536,7 @@ async def _maybe_repair_inflated_native_trail(
             return True
         fresh = await state.get_position(ticker) or pos
         try:
-            _log_rearm_outcome(
-                ticker,
-                await _reconcile_rearm_guard(ticker, dict(fresh), floor_price=old_stop),
-                "NATIVE TRAIL",
-            )
+            await _rearm_after_repair_cancel(ticker, dict(fresh), old_stop)
         except Exception as re_arm_error:
             await alerts.send_nowait(
                 "critical", "native_trail_repair_unprotected",
@@ -39546,13 +39571,8 @@ async def _maybe_repair_inflated_native_trail(
     except NativeTrailRefused as e:
         await _remember_native_skip(ticker, fresh, "repair_refused", str(e))
         try:
-            _log_rearm_outcome(
-                ticker,
-                await _reconcile_rearm_guard(
-                    ticker, dict(await state.get_position(ticker) or fresh),
-                    floor_price=old_stop,
-                ),
-                "NATIVE TRAIL",
+            await _rearm_after_repair_cancel(
+                ticker, dict(await state.get_position(ticker) or fresh), old_stop,
             )
         except Exception as re_arm_error:
             await alerts.send_nowait(
@@ -39588,11 +39608,7 @@ async def _maybe_repair_inflated_native_trail(
         fresh["native_trail_skip"] = str(e)[:240]
         await state.set_position(ticker, fresh)
         try:
-            _log_rearm_outcome(
-                ticker,
-                await _reconcile_rearm_guard(ticker, dict(fresh), floor_price=old_stop),
-                "NATIVE TRAIL",
-            )
+            await _rearm_after_repair_cancel(ticker, dict(fresh), old_stop)
         except Exception as re_arm_error:
             await alerts.send_nowait(
                 "critical", "native_trail_repair_unprotected",
