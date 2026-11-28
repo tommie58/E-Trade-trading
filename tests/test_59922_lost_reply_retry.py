@@ -197,6 +197,10 @@ def test_stock_never_listed_lost_stop_does_not_retry_or_rearm(monkeypatch):
     places, sold, alerts, _cancels, clock = _install(
         monkeypatch, store, kind="equity", qty=100, book=book,
     )
+    armed = []
+    monkeypatch.setattr(
+        main_bot, "_arm_option_surplus_watch", lambda ticker: armed.append(ticker),
+    )
 
     async def scenario():
         pos = _position("equity", 100)
@@ -227,6 +231,7 @@ def test_stock_never_listed_lost_stop_does_not_retry_or_rearm(monkeypatch):
     assert places == [100]
     assert sold == []
     assert rearms == []
+    assert armed == []
     assert held.get("stop_reply_lost") is True
     assert any(event == "position_unprotected" for _sev, event in alerts)
 
@@ -384,4 +389,98 @@ def test_option_replace_reject_clears_the_stale_reply_bound(monkeypatch):
     assert mid.get("stop_reply_retried") is False
     assert sold_qty == [2]
     assert ("critical", "stop_timeout_flattened") in sent
+
+
+def _option_stop(order_id):
+    return {
+        "order_id": order_id,
+        "symbol": "QQQ",
+        "status": "OPEN",
+        "price_type": "STOP",
+        "order_action": "SELL_CLOSE",
+        "stop_price": 2.4,
+        "security_type": "OPTN",
+        "call_put": "CALL",
+        "strike": 450.0,
+        "expiration": "2026-12-18",
+        "ordered": 2,
+        "filled": 0,
+    }
+
+
+def test_option_surplus_cancels_the_extra_stop_at_10s_and_on_a_later_listing(monkeypatch):
+    store = main_bot.StateStore(None)
+    cancelled = []
+    listed = {"rows": []}
+
+    async def fetch():
+        return {"OrdersResponse": {}}
+
+    async def cancel(order_id, expected_qty=None):
+        cancelled.append(order_id)
+        listed["rows"] = [
+            row for row in listed["rows"] if row["order_id"] != order_id
+        ]
+        return main_bot.CANCEL_CONFIRMED
+
+    monkeypatch.setattr(main_bot, "state", store)
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", fetch)
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel)
+    monkeypatch.setattr(
+        main_bot.reconciliation, "parse_open_orders", lambda _resp: list(listed["rows"]),
+    )
+
+    async def scenario():
+        await store.set_position("QQQ", {
+            **_position("option", 2),
+            "stop_order_id": "RETRY",
+        })
+        # The +10s pass: the original stop has listed beside the retry.
+        listed["rows"] = [_option_stop("ORIGINAL"), _option_stop("RETRY")]
+        await main_bot._option_surplus_once("QQQ")
+        after_first = list(cancelled)
+        # A later listing of that same original id is cancelled again.
+        listed["rows"] = [_option_stop("ORIGINAL"), _option_stop("RETRY")]
+        await main_bot._option_surplus_once("QQQ")
+        return after_first, list(cancelled)
+
+    first, both = _run(scenario())
+    assert first == ["ORIGINAL"]
+    assert both == ["ORIGINAL", "ORIGINAL"]
+    assert main_bot._OPTION_SURPLUS_DELAYS == (10.0, 30.0)
+
+
+def test_option_retry_schedules_the_10s_and_30s_surplus_checks(monkeypatch):
+    store = main_bot.StateStore(None)
+
+    async def book():
+        return {"OrdersResponse": {}}
+
+    places, _sold, _alerts, _cancels, clock = _install(
+        monkeypatch, store, kind="option", qty=2, book=book, clearance="clear",
+    )
+    delays = []
+    real_create = main_bot.asyncio.create_task
+
+    def spy(coro):
+        if getattr(getattr(coro, "cr_code", None), "co_name", "") == "_option_surplus_after":
+            delays.append(coro.cr_frame.f_locals.get("delay"))
+            coro.close()
+            fut = asyncio.get_running_loop().create_future()
+            fut.set_result(None)
+            return fut
+        return real_create(coro)
+
+    monkeypatch.setattr(main_bot.asyncio, "create_task", spy)
+
+    async def scenario():
+        await store.set_position("QQQ", _position("option", 2))
+        await store.set_guard("QQQ", _guard("option", 2))
+        await _poll(store, clock, 0)
+        await _poll(store, clock, 10)
+        await _poll(store, clock, 0)
+        return list(places)
+
+    assert _run(scenario()) == [2, 2]
+    assert delays == [10.0, 30.0]
 

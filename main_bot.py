@@ -33246,6 +33246,64 @@ async def _finish_guard(ticker: str, result: str) -> None:
     await trade_ledger.record("guard_finished", {"ticker": ticker, "result": result})
 
 
+async def _option_surplus_once(ticker: str) -> None:
+    """Cancel every resting option stop on this contract except the tracked one.
+
+    A lost-reply retry can leave the original stop beside the new one. The
+    extra is cancelled as soon as it lists, so a second stop never rests
+    even when the broker does not reject it with 3004.
+    """
+    pos = await state.get_position(ticker)
+    if not isinstance(pos, dict) or not reconciliation.position_is_option(pos):
+        return
+    tracked = str(pos.get("stop_order_id") or "").strip()
+    if not tracked:
+        return
+    try:
+        resp = await asyncio.wait_for(
+            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.warning("option surplus read failed (%s)", type(exc).__name__)
+        return
+    extras = []
+    for order in reconciliation.parse_open_orders(resp):
+        if not reconciliation.order_same_contract(order, pos, ticker):
+            continue
+        order_id = str(order.get("order_id") or "").strip()
+        if order_id and order_id != tracked:
+            extras.append(order_id)
+    for order_id in extras:
+        try:
+            await _cancel_order_verified(order_id)
+        except Exception as exc:
+            logger.warning("option surplus cancel failed (%s)", type(exc).__name__)
+        else:
+            logger.warning(
+                "[STOP GUARD] %s cancelled surplus option stop %s",
+                ticker, order_id,
+            )
+
+
+async def _option_surplus_after(ticker: str, delay: float) -> None:
+    try:
+        await asyncio.sleep(delay)
+        await _option_surplus_once(ticker)
+    except Exception as exc:
+        logger.warning("option surplus check failed (%s)", type(exc).__name__)
+
+
+# The two passes after an option retry. A listing of the original id on
+# either pass is cancelled immediately.
+_OPTION_SURPLUS_DELAYS = (10.0, 30.0)
+
+
+def _arm_option_surplus_watch(ticker: str) -> None:
+    """Options only. Stocks do not retry a lost stop, so they grow no watch."""
+    for delay in _OPTION_SURPLUS_DELAYS:
+        alerts.retain(asyncio.create_task(_option_surplus_after(ticker, delay)))
+
+
 async def _stop_guard_worker(ticker: str) -> None:
     """Poll the entry order; once (partially) filled, rest a protective STOP at
     the broker sized to the filled quantity (equity STOP, or SELL_CLOSE STOP on
@@ -33652,6 +33710,8 @@ async def _stop_guard_worker(ticker: str) -> None:
                                     pos["filled_qty"] = filled
                                     await state.set_position(ticker, pos)
                             await settle_heat_after_stop_armed(ticker)
+                            if is_option and guard.get("stop_reply_retried"):
+                                _arm_option_surplus_watch(ticker)
                             guarded = filled
                         except Exception as e:
                             replacing = bool(str(guard.get("stop_order_id") or "").strip())
