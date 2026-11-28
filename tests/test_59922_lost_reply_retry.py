@@ -326,3 +326,62 @@ def test_stock_clean_read_path_keeps_paging_every_30s(monkeypatch):
     assert sold == []
     assert len(first) >= 1
     assert len(second) == len(first) + 1
+
+
+def test_option_replace_reject_clears_the_stale_reply_bound(monkeypatch):
+    """h4: lost reply, accepted retry, fill growth, then a 4xx replace.
+
+    The stale bound and the used retry must clear with the dead stop id,
+    so the option flattens once the stop deadline arrives.
+    """
+    store = main_bot.StateStore(None)
+
+    async def book():
+        return {"OrdersResponse": {}}
+
+    places, sold, alerts, cancels, clock = _install(
+        monkeypatch, store, kind="option", qty=2, book=book,
+    )
+
+    async def reject(*args, **kwargs):
+        places.append(2)
+        raise main_bot.ETradeAPIError(400, "rejected")
+
+    async def capture(_order_id):
+        return None
+
+    async def cancel(order_id, expected_qty=None):
+        cancels.append(order_id)
+        return main_bot.CANCEL_CONFIRMED
+
+    monkeypatch.setattr(main_bot, "_place_option_protective_stop", reject)
+    monkeypatch.setattr(main_bot, "_capture_resting_stop", capture)
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel)
+
+    async def scenario():
+        await store.set_position("QQQ", _position("option", 2))
+        guard = _guard("option", 2)
+        guard.update({
+            "guarded_qty": 1,
+            "trued_qty": 2,
+            "stop_order_id": "RETRY",
+            "stop_client_id": "LOST-CLIENT",
+            "stop_reply_retried": True,
+            "stop_reply_bound": True,
+            "stop_reply_lost": False,
+            "stop_deadline_ts": clock["t"] + 20,
+            "fill_detected_ts": 1,
+        })
+        await store.set_guard("QQQ", guard)
+        await _poll(store, clock, 20)
+        mid = await store.get_guard("QQQ")
+        await _poll(store, clock, 0)
+        return mid, list(sold), list(alerts)
+
+    mid, sold_qty, sent = _run(scenario())
+    assert mid.get("stop_order_id") in (None, "")
+    assert mid.get("stop_reply_bound") is False
+    assert mid.get("stop_reply_retried") is False
+    assert sold_qty == [2]
+    assert ("critical", "stop_timeout_flattened") in sent
+

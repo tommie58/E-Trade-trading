@@ -33654,9 +33654,16 @@ async def _stop_guard_worker(ticker: str) -> None:
                             await settle_heat_after_stop_armed(ticker)
                             guarded = filled
                         except Exception as e:
-                            if guard.get("stop_reply_retried"):
+                            replacing = bool(str(guard.get("stop_order_id") or "").strip())
+                            definite_reject = (
+                                not _allocation_reject(e)
+                                and not _place_reply_ambiguous(e)
+                            )
+                            if guard.get("stop_reply_retried") and not (replacing and definite_reject):
                                 # The one retry did not rest a stop. Do not
                                 # place another. Options flatten; stocks page.
+                                # A later replace that the broker rejected is
+                                # not this case: the old stop is already gone.
                                 logger.warning(
                                     "[STOP GUARD] %s stop retry failed (%s)",
                                     ticker, type(e).__name__,
@@ -33744,8 +33751,13 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 # falsy — so a stale-truthy id disarmed the one control that
                                 # emergency-flattens an unprotected fill. Clear it: the guard
                                 # must describe what is ACTUALLY resting at the broker.
-                                guard = await state.update_guard(ticker, stop_order_id=None,
-                                                                 stop_client_id=None) or guard
+                                guard = await state.update_guard(
+                                    ticker,
+                                    stop_order_id=None,
+                                    stop_client_id=None,
+                                    stop_reply_bound=False,
+                                    stop_reply_retried=False,
+                                ) or guard
                                 async with _position_section(ticker, "stop id clear"):
                                     pos = await state.get_position(ticker)
                                     if pos and pos.get("stop_order_id"):
