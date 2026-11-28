@@ -894,7 +894,15 @@ def test_rearm_uses_the_tight_price_and_one_place(monkeypatch):
                             "orderAction": "SELL_CLOSE",
                             "orderedQuantity": 2,
                             "filledQuantity": 0,
-                            "Product": {"symbol": "QQQ", "securityType": "OPTN"},
+                            "Product": {
+                                "symbol": "QQQ",
+                                "securityType": "OPTN",
+                                "callPut": "CALL",
+                                "strikePrice": 450,
+                                "expiryYear": 2026,
+                                "expiryMonth": 12,
+                                "expiryDay": 18,
+                            },
                         },
                     },
                 }
@@ -1012,7 +1020,11 @@ def _qqq_portfolio(qty=1):
     }
 
 
-def _stop_order(order_id, status, qty, stop, symbol="QQQ"):
+def _stop_order(
+    order_id, status, qty, stop, symbol="QQQ",
+    right="CALL", strike=450, expiration="2026-12-18",
+):
+    year, month, day = str(expiration).split("-")
     return {
         "orderId": order_id,
         "OrderDetail": {
@@ -1023,7 +1035,15 @@ def _stop_order(order_id, status, qty, stop, symbol="QQQ"):
                 "orderAction": "SELL_CLOSE",
                 "orderedQuantity": qty,
                 "filledQuantity": 0,
-                "Product": {"symbol": symbol, "securityType": "OPTN"},
+                "Product": {
+                    "symbol": symbol,
+                    "securityType": "OPTN",
+                    "callPut": right,
+                    "strikePrice": strike,
+                    "expiryYear": int(year),
+                    "expiryMonth": int(month),
+                    "expiryDay": int(day),
+                },
             },
         },
     }
@@ -1169,6 +1189,89 @@ def test_live_resting_stop_is_not_placed_twice(monkeypatch):
 
     assert asyncio.run(scenario()) == "skipped_live"
     assert placed == []
+
+
+def test_different_contract_stop_does_not_cover(monkeypatch):
+    """A stop on another SPY/QQQ contract is not this position's protection."""
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+    placed = []
+
+    async def place_opt(ticker, contract, qty, premium):
+        placed.append((ticker, round(float(premium), 2)))
+        return {"order_id": "NEW-1"}
+
+    async def alert(*args, **kwargs):
+        return None
+
+    async def cancel(order_id):
+        return True
+
+    monkeypatch.setattr(main_bot, "_place_option_protective_stop", place_opt)
+
+    async def arm_against(book_order):
+        placed.clear()
+        await store.set_position("QQQ", _dead_stop_option())
+
+        async def fetch_orders():
+            return {"OrdersResponse": {"Order": book_order}}
+
+        async def quote(ticker, contract=None):
+            return 4.00, 4.10
+
+        def tokens():
+            return {"oauth_token": "t", "oauth_token_secret": "s"}
+
+        async def account(tokens):
+            return "acct"
+
+        async def place_trail(*args, **kwargs):
+            raise RuntimeError("trail rejected")
+
+        async def cancel_order(order_id, expected_qty=0):
+            return main_bot.CANCEL_CONFIRMED
+
+        monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", fetch_orders)
+        monkeypatch.setattr(main_bot, "_current_bid_ask", quote)
+        monkeypatch.setattr(main_bot, "load_tokens", tokens)
+        monkeypatch.setattr(main_bot, "_resolve_account_id_key", account)
+        monkeypatch.setattr(main_bot, "_place_verified_native_trail", place_trail)
+        monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel_order)
+        with pytest.raises(Exception, match="protective stop restored"):
+            await main_bot._arm_native_trail("QQQ")
+
+    async def heal_against(book_order):
+        placed.clear()
+        await store.set_position("QQQ", _dead_stop_option())
+
+        async def fetch_orders():
+            return {"OrdersResponse": {"Order": book_order}}
+
+        monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", fetch_orders)
+        await main_bot.reconciliation.reconcile_once(
+            store,
+            _portfolio,
+            fetch_orders,
+            cancel,
+            rearm_guard=main_bot._reconcile_rearm_guard,
+            alert=alert,
+        )
+
+    async def _portfolio():
+        return _qqq_portfolio(1)
+
+    async def scenario():
+        other_strike = _stop_order("OTHER-1", "OPEN", 1, 2.4, strike=410)
+        await arm_against(other_strike)
+        assert placed == [("QQQ", 2.8)]
+        await heal_against(other_strike)
+        assert placed == [("QQQ", 2.8)]
+        await arm_against(_stop_order("OTHER-2", "OPEN", 1, 2.4, expiration="2026-12-19"))
+        assert placed == [("QQQ", 2.8)]
+        await arm_against(_stop_order("OTHER-3", "OPEN", 1, 2.4, right="PUT"))
+        assert placed == [("QQQ", 2.8)]
+
+    asyncio.run(scenario())
 
 
 def test_cancel_requested_stop_does_not_block_rearm(monkeypatch):

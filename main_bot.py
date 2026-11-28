@@ -4301,6 +4301,14 @@ def parse_open_orders(orders_resp: Dict[str, Any], *, blank_as_open: bool = True
                     stop_px = float(detail.get("stopPrice") or 0)
                 except (TypeError, ValueError):
                     stop_px = 0.0
+                expiry = str(product.get("expiryDate") or "")[:10]
+                if len(expiry) != 10:
+                    try:
+                        expiry = (f"{int(product.get('expiryYear')):04d}-"
+                                  f"{int(product.get('expiryMonth')):02d}-"
+                                  f"{int(product.get('expiryDay')):02d}")
+                    except (TypeError, ValueError):
+                        expiry = ""
                 out.append({
                     "order_id": order_id,
                     "symbol": str(product.get("symbol") or "").upper(),
@@ -4314,8 +4322,46 @@ def parse_open_orders(orders_resp: Dict[str, Any], *, blank_as_open: bool = True
                     "executed_ts": executed_ts,
                     "stop_price": stop_px if stop_px > 0 else None,
                     "offset_value": offset_value,
+                    "call_put": str(product.get("callPut") or "").upper(),
+                    "strike": product.get("strikePrice"),
+                    "expiration": expiry,
                 })
     return out
+
+
+def order_covers_position(order: dict, pos: dict, ticker: str, qty: int) -> bool:
+    """A resting stop covers this position only when it is the same instrument.
+
+    Options match symbol, expiry, strike, and right. Equities match symbol
+    and a non-option security type. The order must be open, a closing
+    protective order, and large enough for ``qty``. A different contract
+    on the same underlying does not cover.
+    """
+    if qty < 1:
+        return False
+    if str(order.get("status") or "").upper() not in _OPEN_ORDER_STATUSES:
+        return False
+    if order.get("price_type") not in _PROTECTIVE_PRICE_TYPES:
+        return False
+    action = str(order.get("order_action") or "")
+    if action and action not in _CLOSING_ACTIONS:
+        return False
+    if _stop_remaining(order) < qty:
+        return False
+    if not (order.get("stop_price") or order.get("offset_value")):
+        return False
+    if str(order.get("symbol") or "").upper() != str(ticker or "").upper():
+        return False
+    is_option = position_is_option(pos)
+    if order_is_option(order) != is_option:
+        return False
+    if not is_option:
+        return str(order.get("security_type") or "EQ").upper() not in {"OPTN", "OPTION"}
+    want = tracked_contract_key(pos)
+    got = contract_key(order.get("call_put"), order.get("strike"), order.get("expiration"))
+    if want is None or got is None:
+        return False
+    return want == got
 
 
 def order_is_option(order: dict) -> bool:
@@ -5442,7 +5488,10 @@ async def reconcile_once(
         # active guard.
         guard = guards.get(ticker)
         guard_active = guard_owns_stop(guards.get(ticker), now)
-        has_leg_stop = bool(leg_stops)
+        # A stop on a different contract of the same underlying is not cover.
+        has_leg_stop = any(
+            order_covers_position(order, pos, ticker, basis_qty or 1) for order in leg_stops
+        )
         if not has_leg_stop and not guard_active and protective_level(pos) > 0:
             msg = f"{ticker}: UNPROTECTED — position at broker with no live stop and no active guard"
             report["warnings"].append(msg)
@@ -38782,27 +38831,22 @@ async def _book_shows_covering_stop(ticker: str, pos: dict, qty: int) -> bool:
     """
     resp = await _reconcile_fetch_orders()
     orders = reconciliation.parse_open_orders(resp)
-    symbol = str(ticker or "").upper()
-    is_option = reconciliation.position_is_option(pos)
+    own_ids = {
+        str(pos.get(key) or "").strip()
+        for key in ("stop_order_id", "native_trail_order_id")
+    }
+    own_ids.discard("")
+    # Prefer the position's own order id, but only when that order is this
+    # contract. Any other same-contract resting stop is the fallback. A
+    # different strike, expiry, or right does not cover.
+    same_contract = False
     for order in orders:
-        if str(order.get("symbol") or "").upper() != symbol:
+        if not reconciliation.order_covers_position(order, pos, ticker, qty):
             continue
-        # Only a genuinely resting order covers the leg. CANCEL_REQUESTED
-        # is already dying and must not block the re-arm for the next pass.
-        if str(order.get("status") or "").upper() not in reconciliation._OPEN_ORDER_STATUSES:
-            continue
-        if order.get("price_type") not in reconciliation._PROTECTIVE_PRICE_TYPES:
-            continue
-        action = str(order.get("order_action") or "")
-        if action and action not in reconciliation._CLOSING_ACTIONS:
-            continue
-        if reconciliation.order_is_option(order) != is_option:
-            continue
-        if reconciliation._stop_remaining(order) < qty:
-            continue
-        if order.get("stop_price") or order.get("offset_value"):
+        if str(order.get("order_id") or "") in own_ids:
             return True
-    return False
+        same_contract = True
+    return same_contract
 
 
 def _log_rearm_outcome(ticker: str, result: Any, label: str) -> str:
