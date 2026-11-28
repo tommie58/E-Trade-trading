@@ -5344,6 +5344,15 @@ async def reconcile_once(
             method="GET", path="/v1/accounts/{acct}/orders.json",
         )
         orders_resp = None
+    # An explicit incomplete flag is a failed read. An empty Order list
+    # here would be treated as "no stop" and a second stop would be placed.
+    if (
+        orders_err is None
+        and isinstance(orders_resp, dict)
+        and orders_resp.get("_orders_inconclusive")
+    ):
+        orders_err = RuntimeError("incomplete order read")
+        orders_resp = None
 
     portfolio_ok = portfolio_err is None
     orders_ok = orders_err is None
@@ -5355,6 +5364,7 @@ async def reconcile_once(
         live_orders = []
     tracked = await state.all_positions()
     guards = await state.all_guards()
+    _lost_stop_handled = set()
 
     # A bare HTML 404 can be inferred flat only when this pass's own orders
     # read is fresh and empty, the bot tracks nothing, the last confirmed
@@ -5588,9 +5598,18 @@ async def reconcile_once(
                                      dedupe_key=f"fill_capture:{ticker}")
                     continue
             await state.delete_position(ticker)
-            await release_closed_heat(pos, ticker=str(ticker).upper(), reason="close")
+            import sys as _heat_sys
+            _heat_mb = _heat_sys.modules.get("main_bot")
+            if _heat_mb is not None:
+                await _heat_mb.release_closed_heat(
+                    pos, ticker=str(ticker).upper(), reason="close",
+                )
             guard = guards.get(ticker)
-            if guard and not guard.get("done"):
+            if (
+                guard
+                and not guard.get("done")
+                and not guard.get("lost_stop_cancel_pending")
+            ):
                 await state.update_guard(ticker, done=True, result="reconciled_ghost")
             report["healed"].append(f"{ticker}: ghost position removed (not at broker)")
             logger.warning(f"[RECONCILE] 👻 {ticker} ghost position removed — not present at broker")
@@ -5682,6 +5701,7 @@ async def reconcile_once(
             and guard.get("lost_stop_cancel_pending")
             and not position_is_option(pos)
         ):
+            _lost_stop_handled.add(ticker)
             import sys as _sys
             _mb = _sys.modules.get("main_bot")
             match_ids = []
@@ -5914,6 +5934,42 @@ async def reconcile_once(
         # contracts must raise both, not have the second suppressed as a dupe.
         await _alert("critical", "untracked_position", msg,
                      dedupe_key=f"untracked:{symbol}:{leg}")
+
+    # A lost-stop cancel outlives the position. The loop above drops a
+    # sold-out stock before it would have cancelled, so the pending record
+    # is applied on its own.
+    if orders_ok:
+        for _ls_ticker, _ls_guard in list(guards.items()):
+            if _ls_ticker in _lost_stop_handled:
+                continue
+            if not isinstance(_ls_guard, dict) or not _ls_guard.get("lost_stop_cancel_pending"):
+                continue
+            if str(_ls_guard.get("kind") or "equity") == "option":
+                continue
+            import sys as _ls_sys
+            _ls_mb = _ls_sys.modules.get("main_bot")
+            _ls_ids = []
+            if _ls_mb is not None:
+                _ls_ids = _ls_mb.lost_stop_match_ids(all_orders, _ls_guard, _ls_ticker)
+            _ls_confirmed = False
+            for _ls_oid in _ls_ids:
+                try:
+                    _ls_outcome = await cancel_order(_ls_oid)
+                except Exception as _ls_exc:
+                    logger.warning(
+                        "lost-stop cancel failed (%s)", type(_ls_exc).__name__,
+                    )
+                    _ls_outcome = False
+                if _ls_outcome is True or _ls_outcome in ("cancelled", "filled"):
+                    _ls_confirmed = True
+            if _ls_confirmed:
+                _ls_guard["lost_stop_cancel_pending"] = False
+                _ls_guard["lost_stop_cancel_done"] = True
+                await state.update_guard(
+                    _ls_ticker,
+                    lost_stop_cancel_pending=False,
+                    lost_stop_cancel_done=True,
+                )
 
     # --- 2) orphaned protective stops (stop order live, no tracked position,
     #        no broker position) ---
@@ -25151,7 +25207,8 @@ async def get_etrade_positions(refresh: bool = Query(False)):
     if refresh:
         try:
             portfolio_resp, orders_resp = await asyncio.gather(
-                _reconcile_fetch_portfolio(), _reconcile_fetch_orders(),
+                _reconcile_fetch_portfolio(),
+                _read_order_book(status="OPEN"),
             )
             snapshot = reconciliation.build_account_snapshot(
                 reconciliation.parse_broker_positions(portfolio_resp),
@@ -29856,6 +29913,22 @@ async def _order_state(order_id: Optional[str], client_id: Optional[str]) -> Tup
         raise Exception("E*TRADE tokens not set")
     acct_key = await _resolve_account_id_key(tokens)
     orders = _orders_client(tokens)
+
+    def _is_match(raw) -> bool:
+        if not isinstance(raw, dict):
+            return False
+        if order_id and str(raw.get("orderId") or "") == str(order_id):
+            return True
+        if not client_id:
+            return False
+        details = raw.get("OrderDetail") or []
+        if isinstance(details, dict):
+            details = [details]
+        return any(
+            str(d.get("clientOrderId") or "") == client_id
+            for d in details if isinstance(d, dict)
+        )
+
     async def _page(marker):
         kwargs = {"resp_format": "json", "count": 25}
         if marker:
@@ -29864,48 +29937,30 @@ async def _order_state(order_id: Optional[str], client_id: Optional[str]) -> Tup
             orders.list_orders, acct_key, source="list_orders", **kwargs,
         )
 
-    try:
-        resp = await gather_order_pages(_page, 25)
-    except OrdersReadInconclusive:
-        raise
-    root = (resp or {}).get("OrdersResponse", {}) if isinstance(resp, dict) else {}
-    order_list = root.get("Order") or []
-    if isinstance(order_list, dict):
-        order_list = [order_list]
-    for o in order_list:
-        if not isinstance(o, dict):
+    # Stop on the first page that has the order. History after that page
+    # is not read, so a long book cannot turn a page-1 hit into a failure.
+    found = await find_listed_order(_page, 25, _is_match)
+    if not isinstance(found, dict):
+        return "NOT_FOUND", 0
+    details = found.get("OrderDetail") or []
+    if isinstance(details, dict):
+        details = [details]
+    status = _order_detail_status(details)
+    filled = 0
+    for d in details:
+        if not isinstance(d, dict):
             continue
-        oid = str(o.get("orderId") or "")
-        details = o.get("OrderDetail") or []
-        if isinstance(details, dict):
-            details = [details]
-        matches = bool(order_id) and oid == str(order_id)
-        if not matches and client_id:
-            matches = any(
-                str(d.get("clientOrderId") or "") == client_id
-                for d in details if isinstance(d, dict)
-            )
-        if not matches:
-            continue
-        # Blank status is UNKNOWN, not a live OPEN. Filled quantity is
-        # still summed so a real fill is not dropped.
-        status = _order_detail_status(details)
-        filled = 0
-        for d in details:
-            if not isinstance(d, dict):
+        instruments = d.get("Instrument") or []
+        if isinstance(instruments, dict):
+            instruments = [instruments]
+        for inst in instruments:
+            if not isinstance(inst, dict):
                 continue
-            instruments = d.get("Instrument") or []
-            if isinstance(instruments, dict):
-                instruments = [instruments]
-            for inst in instruments:
-                if not isinstance(inst, dict):
-                    continue
-                try:
-                    filled += int(float(inst.get("filledQuantity") or 0))
-                except (TypeError, ValueError):
-                    pass
-        return status, filled
-    return "NOT_FOUND", 0
+            try:
+                filled += int(float(inst.get("filledQuantity") or 0))
+            except (TypeError, ValueError):
+                pass
+    return status, filled
 
 
 # ---- Close-fill truth --------------------------------------------------------
@@ -29932,7 +29987,10 @@ async def _resolve_exit_fill(order_id, timeout_s: float = EXIT_FILL_TIMEOUT_SECO
     deadline = time.monotonic() + max(0.0, float(timeout_s))
     while True:
         try:
-            resp = await _reconcile_fetch_orders()
+            resp = await asyncio.wait_for(
+                _read_order_book(bounded=True),
+                PRE_CANCEL_STOP_READ_TIMEOUT_S,
+            )
             for order in reconciliation.parse_open_orders(resp):
                 if str(order.get("order_id") or "") != str(order_id):
                     continue
@@ -30293,7 +30351,10 @@ async def _true_up_entry_fill(ticker: str, guard: dict) -> bool:
         return False
     actual = 0.0
     try:
-        resp = await _reconcile_fetch_orders()
+        resp = await asyncio.wait_for(
+            _read_order_book(bounded=True),
+            PRE_CANCEL_STOP_READ_TIMEOUT_S,
+        )
         for order in reconciliation.parse_open_orders(resp):
             if str(order.get("order_id") or "") != str(entry_order_id):
                 continue
@@ -30972,6 +31033,12 @@ def _note_place_shape(resp, client_id: str = "") -> None:
     now = time.time()
     if client_id:
         _RECENT_ORDER_CLIENTS.append((now, str(client_id)))
+        fresh = [
+            (ts, cid) for ts, cid in _RECENT_ORDER_CLIENTS
+            if cid and now - ts <= 300
+        ]
+        del _RECENT_ORDER_CLIENTS[:]
+        _RECENT_ORDER_CLIENTS.extend(fresh[-50:])
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if day == _PLACE_SHAPE_DAY:
         return
@@ -31091,6 +31158,12 @@ def lost_reply_clean_read(guard: dict, now: float, *, ok: bool) -> dict:
 _LOST_STOP_PRICE_TYPES = {"STOP", "STOP_LIMIT"}
 
 
+def _stop_family(price_type) -> bool:
+    """STOP, STOP_LIMIT, or any TRAILING_STOP_*."""
+    price = str(price_type or "").upper()
+    return price in _LOST_STOP_PRICE_TYPES or price.startswith("TRAILING_STOP")
+
+
 def _order_match_field_missing(order: dict) -> bool:
     """An open order we cannot prove is a different order."""
     if not str((order or {}).get("symbol") or "").strip():
@@ -31155,9 +31228,8 @@ def classify_lost_stop(orders, guard: dict, ticker: str) -> dict:
         want_qty = int((guard or {}).get("lost_stop_qty"))
     except (TypeError, ValueError):
         want_qty = None
+    # The price that was sent. guard['stop'] can be a different floor.
     want_px = (guard or {}).get("lost_stop_price")
-    if want_px in ("", None):
-        want_px = (guard or {}).get("stop")
     action = "SELL" if str((guard or {}).get("action") or "BUY").upper() == "BUY" else "BUY_TO_COVER"
     start = _guard_start_ts(guard)
     matches = []
@@ -31184,31 +31256,39 @@ def classify_lost_stop(orders, guard: dict, ticker: str) -> dict:
         if known and oid == known:
             matches.append(oid)
             continue
-        if _order_match_field_missing(order) or order.get("placed_ts") in (None, 0, 0.0):
-            possibles += 1
-            continue
         price = str(order.get("price_type") or "").upper()
         side = str(order.get("order_action") or "").upper()
-        try:
-            ordered = int(order.get("ordered"))
-        except (TypeError, ValueError):
-            possibles += 1
+        # Any open stop on this symbol and exit side, other than our own
+        # flatten, close, or take-profit, is at least a possible match.
+        # A reprice, a short clock skew, or a trail must not read as "absent".
+        if side == action and _stop_family(price):
+            exact = False
+            if (
+                oid
+                and not _order_match_field_missing(order)
+                and order.get("placed_ts") not in (None, 0, 0.0)
+            ):
+                try:
+                    ordered = int(order.get("ordered"))
+                except (TypeError, ValueError):
+                    ordered = None
+                placed = float(order.get("placed_ts") or 0)
+                exact = bool(
+                    price in _LOST_STOP_PRICE_TYPES
+                    and want_qty is not None
+                    and ordered == want_qty
+                    and want_px not in (None, "")
+                    and _prices_match(order.get("stop_price"), want_px)
+                    and start > 0
+                    and placed + 1 >= start
+                )
+            if exact:
+                matches.append(oid)
+            else:
+                possibles += 1
             continue
-        placed = float(order.get("placed_ts") or 0)
-        qty_ok = want_qty is not None and ordered == want_qty
-        px_ok = want_px not in (None, "") and _prices_match(order.get("stop_price"), want_px)
-        time_ok = start > 0 and placed + 1 >= start
-        if (
-            side == action
-            and price in _LOST_STOP_PRICE_TYPES
-            and qty_ok
-            and px_ok
-            and time_ok
-            and oid
-        ):
-            matches.append(oid)
-        # A fully described order that is not our stop is neither a match
-        # nor a possible.
+        if _order_match_field_missing(order):
+            possibles += 1
     if len(matches) == 1 and possibles == 0:
         return {"verdict": "match", "cancel_id": matches[0]}
     if not matches and possibles == 0:
@@ -31232,44 +31312,74 @@ def lost_stop_match_ids(orders, guard: dict, ticker: str) -> list:
     return []
 
 
-async def _working_close_id(ticker: str, guard: dict):
-    """Order id of our open market close, or None.
+def _our_close_order_ids(guard: dict) -> set:
+    found = set()
+    for key in ("flatten_order_id", "close_order_id", "tp_order_id"):
+        value = str((guard or {}).get(key) or "").strip()
+        if value:
+            found.add(value)
+    return found
 
-    A failed read is None. That is not proof a close is resting, so a
-    definite reject with the book down can still sell.
+
+def _our_close_client_ids(guard: dict) -> set:
+    found = set()
+    for key in ("flatten_client_id", "close_client_id", "tp_client_id"):
+        value = str((guard or {}).get(key) or "").strip()
+        if value:
+            found.add(value)
+    return found
+
+
+async def _working_close_id(ticker: str, guard: dict):
+    """Order id of our working close, ``""`` when a clean read shows none.
+
+    None means the read failed. That is unknown, not proof the close is gone.
+    A close is ours by a known order id, or else by symbol, exit side, and
+    one of our close client ids. Market, limit, take-profit, and flatten
+    all count. Stops do not.
     """
     try:
         resp = await asyncio.wait_for(
-            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+            _read_order_book(bounded=True, status="OPEN"), PRE_CANCEL_STOP_READ_TIMEOUT_S,
         )
     except Exception as exc:
         logger.warning("close lookup failed (%s)", type(exc).__name__)
         return None
     symbol = str(ticker or "").upper()
     action = "SELL" if str((guard or {}).get("action") or "BUY").upper() == "BUY" else "BUY_TO_COVER"
+    known_ids = _our_close_order_ids(guard)
+    known_clients = _our_close_client_ids(guard)
     for order in reconciliation.parse_open_orders(resp):
         if str(order.get("symbol") or "").upper() != symbol:
             continue
         if str(order.get("status") or "").upper() not in reconciliation._OPEN_ORDER_STATUSES:
             continue
-        if str(order.get("order_action") or "").upper() != action:
-            continue
-        if str(order.get("price_type") or "").upper() != "MARKET":
+        if _stop_family(order.get("price_type")):
             continue
         oid = str(order.get("order_id") or "").strip()
-        if oid:
+        cid = str(order.get("client_order_id") or "").strip()
+        price = str(order.get("price_type") or "").upper()
+        if oid and oid in known_ids:
             return oid
-    return None
+        side = str(order.get("order_action") or "").upper()
+        if side == action and (
+            (cid and cid in known_clients) or price == "MARKET"
+        ):
+            return oid or None
+    return ""
 
 
 async def _cancel_our_working_close(ticker: str, guard: dict) -> str:
-    """Cancel the bot's own market close. Leave stops and other orders.
+    """Cancel our working close and confirm it is gone.
 
-    ``cancelled`` means the cancel was confirmed. ``refused`` means a close
-    is resting and the cancel did not confirm. ``none`` means no close was
-    listed, including when the book could not be read.
+    ``cancelled`` means the cancel was confirmed and a later read does not
+    list it. ``refused`` means it is still there or the cancel did not
+    confirm. ``none`` is a clean read with no close. ``unreadable`` is a
+    failed read and is not proof the close is gone.
     """
     oid = await _working_close_id(ticker, guard)
+    if oid is None:
+        return "unreadable"
     if not oid:
         return "none"
     try:
@@ -31277,9 +31387,58 @@ async def _cancel_our_working_close(ticker: str, guard: dict) -> str:
     except Exception as exc:
         logger.warning("close cancel failed (%s)", type(exc).__name__)
         return "refused"
-    if outcome == CANCEL_CONFIRMED:
-        return "cancelled"
-    return "refused"
+    if outcome != CANCEL_CONFIRMED:
+        return "refused"
+    again = await _working_close_id(ticker, guard)
+    if again:
+        return "refused"
+    if again is None:
+        return "refused"
+    return "cancelled"
+
+
+async def _settle_case_b(ticker: str, guard: dict, *, must_clear_close: bool) -> dict:
+    """Cancel our close, then let the 60s deadline sell once it is gone.
+
+    A 3004 requires that confirmation. A definite reject still sells when
+    the book shows no close. Retries back off after a refusal.
+    """
+    try:
+        next_try = float((guard or {}).get("own_close_cancel_next") or 0)
+    except (TypeError, ValueError):
+        next_try = 0.0
+    if next_try and time.time() < next_try:
+        return await state.update_guard(
+            ticker, own_close_cancel_refused=True,
+        ) or guard
+    outcome = await _cancel_our_working_close(ticker, guard)
+    if outcome == "cancelled":
+        return await state.update_guard(
+            ticker,
+            own_close_cancel_refused=False,
+            own_close_cleared=True,
+            own_close_cancel_misses=0,
+            own_close_cancel_next=0,
+        ) or guard
+    if outcome == "none" and (
+        not must_clear_close or (guard or {}).get("own_close_cleared")
+    ):
+        return await state.update_guard(
+            ticker, own_close_cancel_refused=False,
+        ) or guard
+    if outcome == "unreadable" and not must_clear_close:
+        return guard
+    try:
+        misses = int((guard or {}).get("own_close_cancel_misses") or 0) + 1
+    except (TypeError, ValueError):
+        misses = 1
+    delay = min(300.0, 20.0 * (2 ** (misses - 1)))
+    return await state.update_guard(
+        ticker,
+        own_close_cancel_refused=True,
+        own_close_cancel_misses=misses,
+        own_close_cancel_next=time.time() + delay,
+    ) or guard
 
 
 async def _cancel_lost_stop_by_client(ticker: str) -> bool:
@@ -31291,7 +31450,7 @@ async def _cancel_lost_stop_by_client(ticker: str) -> bool:
     guard = await state.get_guard(ticker) or {}
     try:
         resp = await asyncio.wait_for(
-            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+            _read_order_book(bounded=True, status="OPEN"), PRE_CANCEL_STOP_READ_TIMEOUT_S,
         )
     except Exception as exc:
         logger.warning("lost-stop lookup failed (%s)", type(exc).__name__)
@@ -31364,7 +31523,7 @@ async def _stock_lost_book_status(ticker: str, guard: dict) -> str:
     """``miss``, ``match``, ``possible``, ``terminal``, or ``unreadable``."""
     try:
         resp = await asyncio.wait_for(
-            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+            _read_order_book(bounded=True, status="OPEN"), PRE_CANCEL_STOP_READ_TIMEOUT_S,
         )
     except OrdersReadInconclusive:
         return "inconclusive"
@@ -31408,21 +31567,56 @@ async def _stock_lost_after_sell(ticker: str, guard: dict, held, tracked: int) -
         ) or guard
         return guard
     # The first sell used tracked qty because holdings was unreadable.
-    # A later sell waits until a read shows shares still held.
+    # A later sell waits until that order is terminal and a holdings read
+    # taken after that confirmation still shows shares.
     if (
-        held_n is not None
-        and held_n > 0
-        and not guard.get("stop_lost_qty_confirmed")
+        not guard.get("stop_lost_qty_confirmed")
         and not guard.get("stop_lost_confirmed_sell")
     ):
-        qty = stock_sell_qty(held_n, tracked, first=False)
-        if qty > 0:
-            try:
-                await _emergency_flatten(ticker, guard, qty, book="skip")
-            except Exception as exc:
-                logger.warning("confirmed-qty sell failed (%s)", type(exc).__name__)
-            await state.update_guard(ticker, stop_lost_confirmed_sell=True, stop_lost_qty_confirmed=True)
+        terminal = await _first_sell_is_terminal(guard)
+        fresh_held = None
+        if terminal:
+            fresh_held = await _flatten_broker_held_qty(ticker, {
+                "action": guard.get("action") or "BUY",
+                "contract": guard.get("contract"),
+            })
+        try:
+            fresh_n = int(fresh_held) if fresh_held is not None else None
+        except (TypeError, ValueError):
+            fresh_n = None
+        if terminal and fresh_n is not None and fresh_n > 0:
+            qty = stock_sell_qty(fresh_n, tracked, first=False)
+            if qty > 0:
+                try:
+                    await _emergency_flatten(ticker, guard, qty, book="skip")
+                except Exception as exc:
+                    logger.warning("confirmed-qty sell failed (%s)", type(exc).__name__)
+                await state.update_guard(
+                    ticker, stop_lost_confirmed_sell=True, stop_lost_qty_confirmed=True,
+                )
+        else:
+            guard = await _page_unconfirmed_stop(ticker, guard)
     return await state.get_guard(ticker) or guard
+
+
+async def _first_sell_is_terminal(guard: dict) -> bool:
+    """True when the first stock sell is filled, cancelled, or rejected."""
+    order_id = str((guard or {}).get("flatten_order_id") or "").strip()
+    client_id = str((guard or {}).get("flatten_client_id") or "").strip()
+    if not order_id and not client_id:
+        return False
+    try:
+        status, _qty = await asyncio.wait_for(
+            _order_state(order_id or None, client_id or None),
+            PRE_CANCEL_STOP_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.warning("first-sell status failed (%s)", type(exc).__name__)
+        return False
+    label = str(status or "").upper()
+    if _filled_order_status(label):
+        return True
+    return label in {"CANCELLED", "CANCELED", "REJECTED"}
 
 
 async def _stock_lost_reply_flatten_once(ticker: str, guard: dict, tracked: int) -> dict:
@@ -31449,7 +31643,7 @@ async def _stock_lost_reply_flatten_once(ticker: str, guard: dict, tracked: int)
         lost_stop_cancel_pending=True,
         lost_stop_watch_until=time.time() + LOST_STOP_WATCH_S,
         lost_stop_qty=int(tracked),
-        lost_stop_price=guard.get("stop") or guard.get("lost_stop_price"),
+        lost_stop_price=guard.get("lost_stop_price"),
         stop_reply_retried=True,
         stop_reply_lost=True,
         stop_reply_bound=True,
@@ -31466,6 +31660,10 @@ async def _stock_lost_reply_flatten_once(ticker: str, guard: dict, tracked: int)
                 ticker, flatten_unresolved=True, stop_reply_bound=True,
             ) or guard
             guard = await _page_unconfirmed_stop(ticker, guard)
+        else:
+            guard = await state.update_guard(
+                ticker, flatten_order_id=str(order_id),
+            ) or guard
     await _cancel_lost_stop_by_client(ticker)
     again = await _flatten_broker_held_qty(ticker, {
         "action": guard.get("action") or "BUY",
@@ -31480,6 +31678,44 @@ async def _stock_lost_reply_flatten_once(ticker: str, guard: dict, tracked: int)
         ) or guard
         guard = await _page_unconfirmed_stop(ticker, guard)
     return await state.get_guard(ticker) or guard
+
+
+_LOST_STOP_PAGERS = set()
+
+
+def _arm_lost_stop_pager(ticker: str) -> None:
+    """Page every 30s from its own task, not from the guard loop.
+
+    A read inside the loop can sit for the whole timeout. This task still
+    fires, and it stops once the guard is done or the lost-stop cancel is
+    confirmed.
+    """
+    if ticker in _LOST_STOP_PAGERS:
+        return
+    _LOST_STOP_PAGERS.add(ticker)
+
+    async def _run() -> None:
+        try:
+            while True:
+                await asyncio.sleep(UNCONFIRMED_STOP_PAGE_S)
+                guard = await state.get_guard(ticker) or {}
+                if guard.get("lost_stop_cancel_done"):
+                    return
+                if not guard or (
+                    guard.get("done") and not guard.get("lost_stop_cancel_pending")
+                ):
+                    return
+                if not (
+                    guard.get("stop_lost_flatten_sent")
+                    or guard.get("stop_reply_lost")
+                    or guard.get("flatten_unresolved")
+                ):
+                    return
+                await _page_unconfirmed_stop(ticker, guard)
+        finally:
+            _LOST_STOP_PAGERS.discard(ticker)
+
+    alerts.retain(asyncio.create_task(_run()))
 
 
 async def _page_unconfirmed_stop(ticker: str, guard: dict) -> dict:
@@ -31519,7 +31755,7 @@ async def _lost_stop_clearance(guard: dict) -> str:
     found = None
     try:
         resp = await asyncio.wait_for(
-            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+            _read_order_book(bounded=True), PRE_CANCEL_STOP_READ_TIMEOUT_S,
         )
     except Exception as exc:
         logger.warning("lost-stop lookup failed (%s)", type(exc).__name__)
@@ -31573,7 +31809,7 @@ async def _adopt_covering_stop(
     """
     try:
         resp = await asyncio.wait_for(
-            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+            _read_order_book(bounded=True, status="OPEN"), PRE_CANCEL_STOP_READ_TIMEOUT_S,
         )
     except Exception as exc:
         logger.warning("covering-stop read failed (%s)", type(exc).__name__)
@@ -31627,7 +31863,10 @@ async def _read_resting_trail_offset(order_id: Optional[str]) -> Optional[float]
         return None
     for attempt in range(NATIVE_TRAIL_VERIFY_ATTEMPTS):
         try:
-            resp = await _reconcile_fetch_orders()
+            resp = await asyncio.wait_for(
+                _read_order_book(bounded=True, status="OPEN"),
+                PRE_CANCEL_STOP_READ_TIMEOUT_S,
+            )
             for order in reconciliation.parse_open_orders(resp):
                 if str(order.get("order_id") or "") != str(order_id):
                     continue
@@ -31793,7 +32032,7 @@ async def _read_open_order_stop(order_id: str) -> Optional[float]:
     """
     try:
         resp = await asyncio.wait_for(
-            _reconcile_fetch_orders(),
+            _read_order_book(bounded=True, status="OPEN"),
             PRE_CANCEL_STOP_READ_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
@@ -32165,6 +32404,24 @@ async def _arm_native_trail(
 _MAX_FLATTEN_ATTEMPTS = 3
 
 
+async def _open_exit_sell_qty(ticker: str, guard: dict):
+    """Shares already in a working exit, or None when that read fails."""
+    try:
+        resp = await asyncio.wait_for(
+            _read_order_book(bounded=True, status="OPEN"),
+            PRE_CANCEL_STOP_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.warning("working-sell read failed (%s)", type(exc).__name__)
+        return None
+    total = 0
+    for order in reconciliation.parse_open_orders(resp):
+        if not _flatten_working_exit(order, ticker, guard):
+            continue
+        total += int(reconciliation._stop_remaining(order) or 0)
+    return total
+
+
 def _flatten_working_exit(order: dict, ticker: str, guard: dict) -> bool:
     """A working stop or sell that would sell this same position."""
     if reconciliation._stop_remaining(order) < 1:
@@ -32278,7 +32535,7 @@ async def _emergency_flatten(
     if book != "skip":
         try:
             book_resp = await asyncio.wait_for(
-                _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+                _read_order_book(bounded=True, status="OPEN"), PRE_CANCEL_STOP_READ_TIMEOUT_S,
             )
         except Exception as exc:
             logger.warning("flatten book read failed (%s)", type(exc).__name__)
@@ -33813,7 +34070,7 @@ async def _option_surplus_once(ticker: str) -> None:
         return
     try:
         resp = await asyncio.wait_for(
-            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+            _read_order_book(bounded=True, status="OPEN"), PRE_CANCEL_STOP_READ_TIMEOUT_S,
         )
     except Exception as exc:
         logger.warning("option surplus read failed (%s)", type(exc).__name__)
@@ -33884,14 +34141,24 @@ async def _stop_guard_worker(ticker: str) -> None:
 
             status = str(guard.get("last_status") or "OPEN")
             filled = int(guard.get("last_filled") or 0)
+            if not is_option and (
+                guard.get("stop_lost_flatten_sent")
+                or guard.get("stop_reply_lost")
+                or guard.get("flatten_unresolved")
+            ):
+                _arm_lost_stop_pager(ticker)
             try:
-                status, filled = await _order_state(guard.get("entry_order_id"), guard.get("entry_client_id"))
+                status, filled = await asyncio.wait_for(
+                    _order_state(guard.get("entry_order_id"), guard.get("entry_client_id")),
+                    PRE_CANCEL_STOP_READ_TIMEOUT_S,
+                )
             except Exception as e:
                 logger.warning(f"[STOP GUARD] {ticker} poll failed: {e}")
             if not is_option and guard.get("stop_lost_flatten_sent") and not guard.get("done"):
-                # Page before the holdings read so a slow portfolio call
-                # cannot stretch the 30s cadence.
-                guard = await _page_unconfirmed_stop(ticker, guard)
+                # The pager also fires on its own clock. This page still
+                # goes out before the holdings read on polls that are moving.
+                if not guard.get("lost_stop_cancel_done"):
+                    guard = await _page_unconfirmed_stop(ticker, guard)
                 try:
                     watch_until = float(guard.get("lost_stop_watch_until") or 0)
                 except (TypeError, ValueError):
@@ -34004,7 +34271,9 @@ async def _stop_guard_worker(ticker: str) -> None:
 
             try:
                 guarded = int(guard.get("guarded_qty") or 0)
-                if filled > guarded:
+                if filled > guarded and not (
+                    not is_option and guard.get("stop_lost_flatten_sent")
+                ):
                     # (Re)place the protective stop for the total filled quantity.
                     can_place = True
                     pre_cancel_floor = None
@@ -34154,6 +34423,9 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 # and not our stop.
                                 book_status = await _stock_lost_book_status(ticker, guard)
                                 clean_ok = book_status == "miss"
+                                if book_status == "possible":
+                                    can_place = False
+                                    guard = await _page_unconfirmed_stop(ticker, guard)
                             latch = lost_reply_clean_read(
                                 guard, time.time(), ok=clean_ok,
                             )
@@ -34290,7 +34562,6 @@ async def _stop_guard_worker(ticker: str) -> None:
                         if not is_option:
                             sent_fields = {
                                 "lost_stop_qty": int(filled),
-                                "lost_stop_price": float(guard.get("stop") or 0) or None,
                                 "stop_sent_ts": time.time(),
                             }
                         guard = await state.update_guard(
@@ -34308,6 +34579,11 @@ async def _stop_guard_worker(ticker: str) -> None:
                             place_at = _combine_rearm_floors(
                                 floor_pos, raw_stop, pre_cancel_floor,
                             ) or raw_stop
+                            if not is_option:
+                                guard = await state.update_guard(
+                                    ticker,
+                                    lost_stop_price=float(place_at) if place_at else None,
+                                ) or guard
                             if is_option:
                                 stop_info = await _place_option_protective_stop(
                                     ticker, dict(guard.get("contract") or {}), filled,
@@ -34368,6 +34644,26 @@ async def _stop_guard_worker(ticker: str) -> None:
                                         stop_reply_lost=True,
                                         stop_reply_bound=True,
                                     ) or guard
+                            elif _allocation_reject(e) and not is_option:
+                                # A stock 3004 means our close already has the
+                                # shares. Cancel that close, then sell at 60s.
+                                guard = await _settle_case_b(
+                                    ticker, guard, must_clear_close=True,
+                                )
+                                guard = await state.update_guard(
+                                    ticker,
+                                    stop_order_id=None,
+                                    stop_client_id=None,
+                                    stop_reply_bound=False,
+                                    stop_reply_retried=False,
+                                    stop_reply_lost=False,
+                                    stop_allocation_held=False,
+                                ) or guard
+                                async with _position_section(ticker, "stop id clear"):
+                                    pos = await state.get_position(ticker)
+                                    if pos and pos.get("stop_order_id"):
+                                        pos["stop_order_id"] = None
+                                        await state.set_position(ticker, pos)
                             elif _allocation_reject(e) or (
                                 _place_reply_ambiguous(e) and guard.get("stop_reply_lost")
                             ):
@@ -34442,17 +34738,9 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 # A refused cancel, or a close that is still
                                 # listed, blocks that sell.
                                 if not is_option:
-                                    close_outcome = await _cancel_our_working_close(
-                                        ticker, guard,
+                                    guard = await _settle_case_b(
+                                        ticker, guard, must_clear_close=False,
                                     )
-                                    if close_outcome == "refused":
-                                        guard = await state.update_guard(
-                                            ticker, own_close_cancel_refused=True,
-                                        ) or guard
-                                    elif close_outcome == "cancelled":
-                                        guard = await state.update_guard(
-                                            ticker, own_close_cancel_refused=False,
-                                        ) or guard
                                 # The OLD stop was already cancelled above and the new one
                                 # did not stick, so nothing is resting. The guard record
                                 # still pointed at the dead order id, and the stop-placement
@@ -34720,7 +35008,10 @@ async def _stop_guard_worker(ticker: str) -> None:
                     # (or the flatten branch above fires).
                     late_filled = 0
                     try:
-                        _s2, late_filled = await _order_state(guard.get("entry_order_id"), guard.get("entry_client_id"))
+                        _s2, late_filled = await asyncio.wait_for(
+                            _order_state(guard.get("entry_order_id"), guard.get("entry_client_id")),
+                            PRE_CANCEL_STOP_READ_TIMEOUT_S,
+                        )
                     except Exception as e:
                         logger.warning(f"[STOP GUARD] {ticker} post-cancel poll failed: {e}")
                     if late_filled > 0:
@@ -34743,6 +35034,7 @@ async def _stop_guard_worker(ticker: str) -> None:
 
             if (
                 not held_open
+                and not (not is_option and guard.get("stop_lost_flatten_sent"))
                 and _filled_order_status(status)
                 and filled > 0
                 and guarded >= filled
@@ -40785,7 +41077,33 @@ async def _reconcile_fetch_portfolio() -> Dict[str, Any]:
     return result
 
 
+# A guard read has four seconds. Four pages stay inside that bound.
+# Anything past the cap is an incomplete book, not an empty one.
+BOUNDED_ORDER_PAGES = 4
+ORDER_PAGE_CAP = 20
+_ORDER_READ_SPEC: contextvars.ContextVar = contextvars.ContextVar(
+    "order_read_spec", default=None,
+)
+
+
+async def _read_order_book(*, bounded: bool = False, status: Optional[str] = None):
+    """Presence and bounded reads. A replaced ``_reconcile_fetch_orders`` stays no-arg."""
+    token = _ORDER_READ_SPEC.set({"bounded": bounded, "status": status})
+    try:
+        return await _reconcile_fetch_orders()
+    finally:
+        _ORDER_READ_SPEC.reset(token)
+
+
 async def _reconcile_fetch_orders() -> Dict[str, Any]:
+    """List orders, following marker until the book is complete.
+
+    ``status="OPEN"`` (via ``_read_order_book``) is for stop-presence reads.
+    An unfinished read raises. It does not come back as an empty book.
+    """
+    spec = _ORDER_READ_SPEC.get() or {}
+    bounded = bool(spec.get("bounded"))
+    status = spec.get("status")
     tokens = load_tokens()
     if not tokens:
         raise Exception("E*TRADE not linked")
@@ -40795,11 +41113,18 @@ async def _reconcile_fetch_orders() -> Dict[str, Any]:
         client = _raw_client(tokens)
 
         async def _page(marker):
-            return await client.list_orders(acct_key, count=50, marker=marker)
+            return await client.list_orders(
+                acct_key, status=status, count=50, marker=marker,
+            )
 
-        result = await gather_order_pages(_page, 50)
-    except OrdersReadInconclusive:
-        return {"OrdersResponse": {"Order": []}, "_orders_inconclusive": True}
+        pages = gather_order_pages(
+            _page, 50,
+            max_pages=BOUNDED_ORDER_PAGES if bounded else ORDER_PAGE_CAP,
+        )
+        if bounded:
+            result = await asyncio.wait_for(pages, PRE_CANCEL_STOP_READ_TIMEOUT_S)
+        else:
+            result = await pages
     except Exception as e:
         if _looks_like_auth_failure(e):
             _mark_token_session(False, "reconcile broker fetch rejected — token expired, relink required")
@@ -40910,7 +41235,7 @@ async def _book_shows_covering_stop(
     """
     try:
         resp = await asyncio.wait_for(
-            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+            _read_order_book(bounded=True, status="OPEN"), PRE_CANCEL_STOP_READ_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
         logger.warning("covering-stop book read failed (%s)", "TimeoutError")
@@ -42115,8 +42440,29 @@ class OrdersReadInconclusive(Exception):
     """The order list is not a complete book. It cannot prove a stop is absent."""
 
 
+def _marker_from_next(value) -> str:
+    """The ``marker`` query param inside ``next``.
+
+    ``next`` may be a full URL. The raw string is never itself a marker.
+    """
+    text = str(value or "").strip()
+    if not text or "marker=" not in text:
+        return ""
+    from urllib.parse import parse_qs, urlparse
+    parsed = urlparse(text)
+    query = parsed.query
+    if not query and "?" in text:
+        query = text.split("?", 1)[1]
+    found = parse_qs(query).get("marker") or []
+    return str(found[0]).strip() if found else ""
+
+
 def _order_page_parts(resp: Any, requested_marker: Optional[str] = None) -> Tuple[list, str]:
-    """(orders, continuation marker). Prefer ``next`` over the current marker."""
+    """(orders, continuation marker).
+
+    Use the response ``marker``. When only ``next`` is present, take the
+    ``marker`` query param out of it. Never pass raw ``next`` back.
+    """
     if not isinstance(resp, dict):
         return [], ""
     root = resp.get("OrdersResponse")
@@ -42129,12 +42475,14 @@ def _order_page_parts(resp: Any, requested_marker: Optional[str] = None) -> Tupl
         orders = [orders]
     if not isinstance(orders, list):
         orders = []
-    nxt = root.get("next")
-    if not nxt:
-        marker = root.get("marker")
-        if marker and str(marker) != str(requested_marker or ""):
-            nxt = marker
-    return list(orders), (str(nxt).strip() if nxt else "")
+    sent = str(requested_marker or "")
+    marker = str(root.get("marker") or "").strip()
+    if marker and marker != sent:
+        return list(orders), marker
+    parsed = _marker_from_next(root.get("next"))
+    if parsed and parsed != sent:
+        return list(orders), parsed
+    return list(orders), ""
 
 
 def merge_listed_order_pages(pages: list, count: int) -> dict:
@@ -42152,27 +42500,53 @@ def merge_listed_order_pages(pages: list, count: int) -> dict:
     return {"OrdersResponse": {"Order": merged}}
 
 
-async def gather_order_pages(fetch, count: int) -> dict:
-    """Follow E*TRADE marker/next until the book is complete.
+async def gather_order_pages(fetch, count: int, *, max_pages: int = 20) -> dict:
+    """Follow the response marker until the book is complete.
 
     ``fetch(marker)`` returns one page. A full page with no way to continue,
-    or a failed page, is inconclusive and must not be read as 'stop absent'.
+    a page cap, or a failed page raises. The result is never an empty book
+    standing in for a read that did not finish.
     """
     merged = []
     marker = None
     seen = set()
-    for _page in range(20):
-        try:
-            resp = await fetch(marker)
-        except OrdersReadInconclusive:
-            raise
+    for _page in range(max(1, int(max_pages))):
+        resp = await fetch(marker)
         _note_orders_shape(resp)
         orders, nxt = _order_page_parts(resp, marker)
         merged.extend(orders)
-        if len(orders) >= int(count) and not nxt:
+        if nxt and nxt in seen:
             raise OrdersReadInconclusive()
-        if not nxt or nxt in seen:
+        if not nxt:
+            if len(orders) >= int(count):
+                raise OrdersReadInconclusive()
             return {"OrdersResponse": {"Order": merged}}
+        seen.add(nxt)
+        marker = nxt
+    raise OrdersReadInconclusive()
+
+
+async def find_listed_order(fetch, count: int, predicate, *, max_pages: int = 20):
+    """The first order ``predicate`` accepts, searching a page at a time.
+
+    Stops at that order. A complete book with no match returns None. An
+    unfinished book raises instead of reporting the order absent.
+    """
+    marker = None
+    seen = set()
+    for _page in range(max(1, int(max_pages))):
+        resp = await fetch(marker)
+        _note_orders_shape(resp)
+        orders, nxt = _order_page_parts(resp, marker)
+        for order in orders:
+            if predicate(order):
+                return order
+        if nxt and nxt in seen:
+            raise OrdersReadInconclusive()
+        if not nxt:
+            if len(orders) >= int(count):
+                raise OrdersReadInconclusive()
+            return None
         seen.add(nxt)
         marker = nxt
     raise OrdersReadInconclusive()
@@ -46878,7 +47252,20 @@ async def _flatten_book(trigger: str) -> Dict[str, Any]:
                         "ticker": ticker, "status": "failed", "detail": "NOT_SOLD",
                     })
                     continue
-                item["qty"] = stock_sell_qty(int(held), item.get("qty"), first=False)
+                working = await _open_exit_sell_qty(ticker, {
+                    "kind": item.get("kind"), "action": item.get("action"),
+                    "contract": item.get("contract"),
+                })
+                if working is None:
+                    fresh = await state.get_guard(ticker) or live_guard
+                    await _page_unconfirmed_stop(ticker, fresh)
+                    results.append({
+                        "ticker": ticker, "status": "failed", "detail": "NOT_SOLD",
+                    })
+                    continue
+                item["qty"] = stock_sell_qty(
+                    int(held) - int(working), item.get("qty"), first=False,
+                )
                 if item["qty"] <= 0:
                     fresh = await state.get_guard(ticker) or live_guard
                     await _page_unconfirmed_stop(ticker, fresh)
@@ -46886,8 +47273,12 @@ async def _flatten_book(trigger: str) -> Dict[str, Any]:
                         "ticker": ticker, "status": "failed", "detail": "NOT_SOLD",
                     })
                     continue
-            guard_shape = {"kind": item["kind"], "contract": item["contract"],
-                           "action": item["action"]}
+            guard_shape = {
+                "kind": item["kind"], "contract": item["contract"],
+                "action": item["action"],
+                "flatten_order_id": live_guard.get("flatten_order_id"),
+                "flatten_client_id": live_guard.get("flatten_client_id"),
+            }
             order_id = await _emergency_flatten(
                 ticker, guard_shape, item["qty"], book="skip",
             )

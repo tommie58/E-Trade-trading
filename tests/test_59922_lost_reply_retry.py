@@ -931,7 +931,7 @@ def test_later_readable_holding_sells_min_once(monkeypatch):
         calls.append(int(qty))
         return "MKT-1"
 
-    _lost_stock(monkeypatch, store, held={"n": None}, book=book)
+    _lost_stock(monkeypatch, store, held={"n": [None, None, 80]}, book=book)
     monkeypatch.setattr(main_bot, "_emergency_flatten", flatten)
 
     async def scenario():
@@ -1083,7 +1083,7 @@ def test_stop_on_page_two_is_not_absent():
     page1 = {"OrdersResponse": {"Order": [
         {**_stop_payload(f"LMT-{i}", price_type="LIMIT", stop=None), "orderId": f"LMT-{i}"}
         for i in range(25)
-    ], "next": "page-2"}}
+    ], "marker": "page-2"}}
     page2 = {"OrdersResponse": {"Order": [_stop_payload("STOP-9")]}}
 
     async def fetch(marker):
