@@ -317,7 +317,7 @@ def test_maybe_hand_off_floors_at_entry_and_leaves_the_stop(monkeypatch, caplog)
     monkeypatch.setattr(main_bot, "NATIVE_TRAIL_AUTO", True)
     calls = []
 
-    async def arm(ticker, offset=None, min_trigger=None, source="operator", allow_below_entry=False):
+    async def arm(ticker, offset=None, min_trigger=None, source="operator", allow_below_entry=False, floor_price=None):
         calls.append({
             "min_trigger": min_trigger,
             "source": source,
@@ -430,7 +430,7 @@ def _install_repair_fakes(monkeypatch, book, steps):
             raise book
         return book
 
-    async def arm(ticker, offset=None, min_trigger=None, source="operator", allow_below_entry=False):
+    async def arm(ticker, offset=None, min_trigger=None, source="operator", allow_below_entry=False, floor_price=None):
         steps.append("place")
         armed["min_trigger"] = min_trigger
         armed["source"] = source
@@ -643,7 +643,7 @@ def test_trail_native_long_premium_floors_at_the_resting_stop(monkeypatch):
     async def quote(ticker, contract=None):
         return 10.00, 10.10
 
-    async def arm(ticker, offset=None, min_trigger=None, source="operator", allow_below_entry=False):
+    async def arm(ticker, offset=None, min_trigger=None, source="operator", allow_below_entry=False, floor_price=None):
         calls.append({
             "min_trigger": min_trigger,
             "allow_below_entry": allow_below_entry,
@@ -794,7 +794,7 @@ def test_trail_native_live_read_failure_keeps_the_saved_floor(monkeypatch):
         # but the floor it passes must not be under 8.00.
         calls = []
 
-        async def arm(ticker, offset=None, min_trigger=None, source="operator", allow_below_entry=False):
+        async def arm(ticker, offset=None, min_trigger=None, source="operator", allow_below_entry=False, floor_price=None):
             calls.append(min_trigger)
             return {"ticker": ticker, "order_id": "N-2"}
 
@@ -1270,6 +1270,86 @@ def test_different_contract_stop_does_not_cover(monkeypatch):
         assert placed == [("QQQ", 2.8)]
         await arm_against(_stop_order("OTHER-3", "OPEN", 1, 2.4, right="PUT"))
         assert placed == [("QQQ", 2.8)]
+
+    asyncio.run(scenario())
+
+
+def test_repair_rearm_is_not_looser_than_the_native_trail(monkeypatch):
+    """R3, R3i, and C1f through the repair path, CALL and PUT.
+
+    stop_order_id is None. The native trail rests at 2.50. The restore
+    must not come back at the saved 2.40.
+    """
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+    placed = []
+    phase = {"cancelled": False}
+
+    async def read_offset(order_id):
+        return 7.6
+
+    async def place_opt(ticker, contract, qty, premium):
+        placed.append((str(contract.get("right")), round(float(premium), 2)))
+        return {"order_id": "RESTORED"}
+
+    async def place_trail(*args, **kwargs):
+        raise RuntimeError("trail rejected")
+
+    def tokens():
+        return {"oauth_token": "t", "oauth_token_secret": "s"}
+
+    async def account(tokens):
+        return "acct"
+
+    async def cancel_order(order_id, expected_qty=0):
+        phase["cancelled"] = True
+        return main_bot.CANCEL_CONFIRMED
+
+    monkeypatch.setattr(main_bot, "_read_resting_trail_offset", read_offset)
+    monkeypatch.setattr(main_bot, "_place_option_protective_stop", place_opt)
+    monkeypatch.setattr(main_bot, "_place_verified_native_trail", place_trail)
+    monkeypatch.setattr(main_bot, "load_tokens", tokens)
+    monkeypatch.setattr(main_bot, "_resolve_account_id_key", account)
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel_order)
+
+    async def run_case(name, right, trail, floor):
+        placed.clear()
+        phase["cancelled"] = False
+        pos = _entry_floor_option({
+            "stop_order_id": None,
+            "native_trail_order_id": "1598",
+            "trail": trail,
+            "contract": {
+                "right": right,
+                "strike": 450.0,
+                "expiration": "2026-12-18",
+            },
+        })
+        await store.set_position("QQQ", pos)
+
+        async def quote(ticker, contract=None):
+            return 4.00, 4.10
+
+        async def fetch_orders():
+            status = "CANCELLED" if phase["cancelled"] else "OPEN"
+            return {"OrdersResponse": {"Order": _stop_order(
+                "1598", status, 1, 2.50, right=right,
+            )}}
+
+        monkeypatch.setattr(main_bot, "_current_bid_ask", quote)
+        monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", fetch_orders)
+        await main_bot._maybe_repair_inflated_native_trail(
+            "QQQ", pos, 4.00, 0.10, "1598",
+        )
+        assert placed, name
+        assert all(price + 1e-9 >= floor for _right, price in placed), (name, placed)
+        assert placed[0][0] == right
+
+    async def scenario():
+        for right in ("CALL", "PUT"):
+            await run_case(f"R3 {right}", right, None, 2.50)
+            await run_case(f"R3i {right}", right, 2.45, 2.50)
+            await run_case(f"C1f {right}", right, 2.40, 2.50)
 
     asyncio.run(scenario())
 

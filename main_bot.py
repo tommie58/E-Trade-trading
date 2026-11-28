@@ -30610,6 +30610,7 @@ async def _arm_native_trail(
     min_trigger: Optional[float] = None,
     source: str = "operator",
     allow_below_entry: bool = False,
+    floor_price: Optional[float] = None,
 ) -> dict:
     """Replace this position's resting stop with a BROKER-NATIVE trailing stop,
     sized from the live spread.
@@ -30741,12 +30742,13 @@ async def _arm_native_trail(
         refuse("the protective stop was cancelled too often — leaving it resting")
 
     stop_order_id = pos.get("stop_order_id")
-    # Read the broker trigger before the cancel. The failure re-arm must not
-    # come back under the stop that was just working.
+    # Read the broker trigger before the cancel. On the repair path the
+    # resting order is the native trail, so stop_order_id is empty.
     resting_stop_px = None
-    if stop_order_id:
+    resting_id = str(stop_order_id or pos.get("native_trail_order_id") or "").strip()
+    if resting_id:
         try:
-            resting_stop_px = await _read_open_order_stop(str(stop_order_id))
+            resting_stop_px = await _read_open_order_stop(resting_id)
         except Exception as exc:
             logger.warning(
                 "[NATIVE TRAIL] %s resting stop unreadable (%s) — "
@@ -30812,8 +30814,14 @@ async def _arm_native_trail(
             fresh = await state.get_position(ticker)
             outcome = "unplaced"
             if fresh:
+                # Longs take the tightest of the broker stop, the caller's
+                # floor, the saved stop, and the trail. Shorts take the min.
+                # None, 0, and NaN are skipped.
                 outcome = await _reconcile_rearm_guard(
-                    ticker, dict(fresh), floor_price=resting_stop_px,
+                    ticker, dict(fresh),
+                    floor_price=_combine_rearm_floors(
+                        fresh, resting_stop_px, floor_price,
+                    ),
                 )
             _log_rearm_outcome(ticker, outcome, "NATIVE TRAIL")
             if outcome in ("placed", "skipped_live"):
@@ -38813,6 +38821,41 @@ async def _reconcile_record_close(ticker: str, pos: dict, resolution: dict) -> N
         await _record_close(ticker, exit_price, payload, close_reason=reason, stop_price=broker_stop)
 
 
+def _combine_rearm_floors(pos: dict, *extras: Any) -> Optional[float]:
+    """Tightest of the extra floors. Longs use max, shorts use min.
+    None, 0, and NaN are skipped. None when nothing usable remains.
+    """
+    is_option = reconciliation.position_is_option(pos)
+    is_buy = is_option or str(pos.get("action") or "BUY").upper() != "SELL"
+    levels: List[float] = []
+    for raw in extras:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            levels.append(value)
+    if not levels:
+        return None
+    return max(levels) if is_buy else min(levels)
+
+
+def _live_stop_is_looser(pos: dict, live_price: Any, floor_price: Any) -> bool:
+    """True when a resting stop is looser than the floor we must restore."""
+    try:
+        live = float(live_price)
+        floor = float(floor_price)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(live) or not math.isfinite(floor) or live <= 0 or floor <= 0:
+        return False
+    is_option = reconciliation.position_is_option(pos)
+    is_buy = is_option or str(pos.get("action") or "BUY").upper() != "SELL"
+    if is_buy:
+        return live + 1e-9 < floor
+    return live > floor + 1e-9
+
+
 def _rearm_protection_price(pos: dict, *, floor_price: Optional[float] = None) -> Optional[float]:
     """Re-arm level that is never looser than the levels we already have.
 
@@ -38836,7 +38879,9 @@ def _rearm_protection_price(pos: dict, *, floor_price: Optional[float] = None) -
     return max(levels) if is_buy else min(levels)
 
 
-async def _book_shows_covering_stop(ticker: str, pos: dict, qty: int) -> bool:
+async def _book_shows_covering_stop(
+    ticker: str, pos: dict, qty: int, *, floor_price: Optional[float] = None,
+) -> bool:
     """True only when the live open-order book has a protective stop for this
     ticker and leg whose remaining size covers ``qty``.
 
@@ -38856,6 +38901,11 @@ async def _book_shows_covering_stop(ticker: str, pos: dict, qty: int) -> bool:
     same_contract = False
     for order in orders:
         if not reconciliation.order_covers_position(order, pos, ticker, qty):
+            continue
+        # A stop under the floor we have to restore is not protection.
+        if floor_price is not None and _live_stop_is_looser(
+            pos, order.get("stop_price"), floor_price,
+        ):
             continue
         if str(order.get("order_id") or "") in own_ids:
             return True
@@ -38925,7 +38975,9 @@ async def _reconcile_rearm_guard(
         if qty < 1:
             return "unplaced"
         try:
-            covered = await _book_shows_covering_stop(ticker, pos, qty)
+            covered = await _book_shows_covering_stop(
+                ticker, pos, qty, floor_price=floor_price,
+            )
         except Exception as exc:
             # Type only. The book error can carry a URL or an account id.
             logger.warning(
@@ -39231,7 +39283,9 @@ async def _maybe_repair_inflated_native_trail(
     min_trigger = verdict["floor"]
 
     try:
-        await _arm_native_trail(ticker, min_trigger=min_trigger, source="repair")
+        await _arm_native_trail(
+            ticker, min_trigger=min_trigger, source="repair", floor_price=old_stop,
+        )
     except NativeTrailRefused as e:
         await _remember_native_skip(ticker, fresh, "repair_refused", str(e))
         try:
