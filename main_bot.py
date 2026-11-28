@@ -5665,6 +5665,33 @@ async def reconcile_once(
         # active guard.
         guard = guards.get(ticker)
         guard_active = guard_owns_stop(guards.get(ticker), now)
+        # A stock flatten may be waiting on the lost stop's own client id.
+        # Cancel that order when it lists. Never cancel the flatten itself.
+        if (
+            orders_ok
+            and isinstance(guard, dict)
+            and guard.get("lost_stop_cancel_pending")
+            and not position_is_option(pos)
+        ):
+            want = str(guard.get("lost_stop_client_id") or guard.get("stop_client_id") or "").strip()
+            flatten_id = str(guard.get("flatten_order_id") or "").strip()
+            flatten_client = str(guard.get("flatten_client_id") or "").strip()
+            for order in all_orders:
+                cid = str(order.get("client_order_id") or "").strip()
+                oid = str(order.get("order_id") or "").strip()
+                if not want or cid != want or not oid:
+                    continue
+                if oid == flatten_id or cid == flatten_client:
+                    continue
+                try:
+                    await cancel_order(oid)
+                except Exception as exc:
+                    logger.warning(
+                        "lost-stop client cancel failed (%s)", type(exc).__name__,
+                    )
+                else:
+                    guard["lost_stop_cancel_pending"] = False
+                    await state.update_guard(ticker, lost_stop_cancel_pending=False)
         # A stop on a different contract of the same underlying is not cover.
         # A smaller stop on THIS contract is partial cover, not "no stop".
         need = basis_qty if basis_qty > 0 else 1
@@ -30922,6 +30949,96 @@ def lost_reply_clean_read(guard: dict, now: float, *, ok: bool) -> dict:
     }
 
 
+async def _cancel_lost_stop_by_client(ticker: str) -> bool:
+    """Cancel the lost stop by its client id. Leave the flatten order alone."""
+    guard = await state.get_guard(ticker) or {}
+    client_id = str(
+        guard.get("lost_stop_client_id") or guard.get("stop_client_id") or ""
+    ).strip()
+    if not client_id:
+        return False
+    flatten_id = str(guard.get("flatten_order_id") or "").strip()
+    flatten_client = str(guard.get("flatten_client_id") or "").strip()
+    try:
+        resp = await asyncio.wait_for(
+            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.warning("lost-stop client lookup failed (%s)", type(exc).__name__)
+        return False
+    cancelled = False
+    for order in reconciliation.parse_open_orders(resp):
+        cid = str(order.get("client_order_id") or "").strip()
+        oid = str(order.get("order_id") or "").strip()
+        if cid != client_id or not oid:
+            continue
+        if oid == flatten_id or cid == flatten_client:
+            continue
+        try:
+            await _cancel_order_verified(oid)
+        except Exception as exc:
+            logger.warning("lost-stop client cancel failed (%s)", type(exc).__name__)
+        else:
+            cancelled = True
+    if cancelled:
+        await state.update_guard(ticker, lost_stop_cancel_pending=False)
+    return cancelled
+
+
+async def _stock_lost_reply_flatten_once(ticker: str, guard: dict, tracked: int) -> dict:
+    """One stock sell after two clean misses of the lost stop. Never a re-send."""
+    if guard.get("stop_lost_flatten_sent"):
+        return guard
+    client_id = str(guard.get("stop_client_id") or "").strip()
+    held = await _flatten_broker_held_qty(ticker, {
+        "action": guard.get("action") or "BUY",
+        "contract": guard.get("contract"),
+    })
+    sell_qty = int(held) if held is not None else int(tracked)
+    if sell_qty < 0:
+        sell_qty = 0
+    await alerts.send_nowait(
+        "critical", "lost_stop_may_be_live",
+        f"{ticker}: flatten is selling while a lost stop may still be live.",
+        dedupe_key=f"lost_stop_live:{ticker}",
+    )
+    guard = await state.update_guard(
+        ticker,
+        stop_lost_flatten_sent=True,
+        lost_stop_client_id=client_id,
+        lost_stop_cancel_pending=bool(client_id),
+        stop_reply_retried=True,
+        stop_reply_lost=True,
+        stop_reply_bound=True,
+        stop_allocation_held=False,
+    ) or guard
+    if sell_qty > 0:
+        try:
+            order_id = await _emergency_flatten(ticker, guard, sell_qty, book="skip")
+        except Exception as exc:
+            logger.warning("lost-stop flatten failed (%s)", type(exc).__name__)
+            order_id = None
+        if order_id in (None, NOT_SOLD):
+            guard = await state.update_guard(
+                ticker, flatten_unresolved=True, stop_reply_bound=True,
+            ) or guard
+            guard = await _page_unconfirmed_stop(ticker, guard)
+    await _cancel_lost_stop_by_client(ticker)
+    again = await _flatten_broker_held_qty(ticker, {
+        "action": guard.get("action") or "BUY",
+    })
+    try:
+        again_n = int(again) if again is not None else None
+    except (TypeError, ValueError):
+        again_n = None
+    if again_n is not None and again_n < 0:
+        guard = await state.update_guard(
+            ticker, flatten_unresolved=True, stop_reply_bound=True,
+        ) or guard
+        guard = await _page_unconfirmed_stop(ticker, guard)
+    return await state.get_guard(ticker) or guard
+
+
 async def _page_unconfirmed_stop(ticker: str, guard: dict) -> dict:
     """Critical page for a lost stop that is still not confirmed resting.
 
@@ -33328,6 +33445,23 @@ async def _stop_guard_worker(ticker: str) -> None:
                 status, filled = await _order_state(guard.get("entry_order_id"), guard.get("entry_client_id"))
             except Exception as e:
                 logger.warning(f"[STOP GUARD] {ticker} poll failed: {e}")
+            if not is_option and guard.get("lost_stop_cancel_pending"):
+                await _cancel_lost_stop_by_client(ticker)
+                guard = await state.get_guard(ticker) or guard
+            if not is_option and guard.get("stop_lost_flatten_sent"):
+                again = await _flatten_broker_held_qty(ticker, {
+                    "action": guard.get("action") or "BUY",
+                    "contract": guard.get("contract"),
+                })
+                try:
+                    again_n = int(again) if again is not None else None
+                except (TypeError, ValueError):
+                    again_n = None
+                if again_n is not None and again_n < 0:
+                    guard = await state.update_guard(
+                        ticker, flatten_unresolved=True, stop_reply_bound=True,
+                    ) or guard
+                    guard = await _page_unconfirmed_stop(ticker, guard)
             if (
                 is_option
                 and str(guard.get("stop_3004_state") or "")
@@ -33575,17 +33709,23 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 stop_reply_clean_read_ts=latch["ts"],
                             ) or guard
                             if latch["ready"] and not is_option:
-                                # A stock never auto-retries a lost stop.
-                                # Page until a human resolves the client id.
+                                # Two clean misses: sell once. A failed read
+                                # never reaches this branch, so it stays a page.
                                 can_place = False
-                                guard = await state.update_guard(
-                                    ticker,
-                                    stop_reply_retried=True,
-                                    stop_reply_lost=True,
-                                    stop_reply_bound=True,
-                                    stop_allocation_held=False,
-                                ) or guard
-                                guard = await _page_unconfirmed_stop(ticker, guard)
+                                fresh = await state.get_guard(ticker) or guard
+                                if not fresh.get("stop_lost_flatten_sent"):
+                                    guard = await _stock_lost_reply_flatten_once(
+                                        ticker, fresh, filled,
+                                    )
+                                else:
+                                    guard = await state.update_guard(
+                                        ticker,
+                                        stop_reply_retried=True,
+                                        stop_reply_lost=True,
+                                        stop_reply_bound=True,
+                                        stop_allocation_held=False,
+                                    ) or guard
+                                    guard = await _page_unconfirmed_stop(ticker, guard)
                             elif latch["ready"]:
                                 # Options: cancel-verified, or two clean misses
                                 # of a client id the book has never listed.
