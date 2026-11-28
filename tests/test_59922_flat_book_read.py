@@ -1,4 +1,8 @@
-"""A failed portfolio read is reported even when the tracked book is flat."""
+"""A failed portfolio read pages once per outage when the tracked book is flat.
+
+An expired session does not page here. broker_session_expired already
+covers that. A later successful read re-arms the next outage.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -10,11 +14,19 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def test_flat_book_portfolio_failure_alerts_once(monkeypatch):
+def _pages(recent):
+    return [row for row in recent if row.get("event") == "untracked_check_unavailable"]
+
+
+def test_generic_read_failure_pages_once_per_outage(monkeypatch):
     store = main_bot.StateStore(None)
     monkeypatch.setattr(main_bot, "state", store)
+    calls = {"portfolio": 0}
 
     async def portfolio():
+        calls["portfolio"] += 1
+        if calls["portfolio"] == 7:
+            return {"PortfolioResponse": {}}
         raise RuntimeError("portfolio down")
 
     async def orders():
@@ -25,21 +37,37 @@ def test_flat_book_portfolio_failure_alerts_once(monkeypatch):
 
     async def scenario():
         main_bot.alerts.init(store, None)
-        for _ in range(2):
+        for _ in range(6):
             await main_bot.reconciliation.reconcile_once(
                 store, portfolio, orders, cancel,
                 alert=main_bot.alerts.send_nowait,
             )
-        recent = await main_bot.alerts.recent(10)
-        return [row for row in recent if row.get("event") == "untracked_check_unavailable"]
+        during = _pages(await main_bot.alerts.recent(20))
+        # Successful read clears the latch.
+        await main_bot.reconciliation.reconcile_once(
+            store, portfolio, orders, cancel,
+            alert=main_bot.alerts.send_nowait,
+        )
+        after_recovery = _pages(await main_bot.alerts.recent(20))
+        # The next outage pages once more, then stays quiet.
+        for _ in range(4):
+            await main_bot.reconciliation.reconcile_once(
+                store, portfolio, orders, cancel,
+                alert=main_bot.alerts.send_nowait,
+            )
+        after_new = _pages(await main_bot.alerts.recent(20))
+        return during, after_recovery, after_new
 
-    pages = _run(scenario())
-    assert len(pages) == 1
-    assert pages[0]["severity"] == "error"
-    assert "portfolio" in pages[0]["message"]
+    during, after_recovery, after_new = _run(scenario())
+    assert len(during) == 1
+    assert during[0]["severity"] == "error"
+    assert "portfolio" in during[0]["message"]
+    assert len(after_recovery) == 1
+    assert len(after_new) == 2
+    assert after_new[-1]["severity"] == "error"
 
 
-def test_expired_session_alerts_when_the_book_is_flat(monkeypatch):
+def test_expired_session_does_not_page_untracked_check(monkeypatch):
     store = main_bot.StateStore(None)
     monkeypatch.setattr(main_bot, "state", store)
 
@@ -54,15 +82,12 @@ def test_expired_session_alerts_when_the_book_is_flat(monkeypatch):
 
     async def scenario():
         main_bot.alerts.init(store, None)
-        await main_bot.reconciliation.reconcile_once(
-            store, portfolio, orders, cancel,
-            alert=main_bot.alerts.send_nowait,
-        )
-        recent = await main_bot.alerts.recent(10)
-        return [row for row in recent if row.get("event") == "untracked_check_unavailable"]
+        for _ in range(8):
+            await main_bot.reconciliation.reconcile_once(
+                store, portfolio, orders, cancel,
+                alert=main_bot.alerts.send_nowait,
+            )
+        return _pages(await main_bot.alerts.recent(20))
 
     pages = _run(scenario())
-    assert len(pages) == 1
-    assert pages[0]["severity"] == "error"
-    assert "BrokerSessionExpired" in pages[0]["message"]
-    assert "session dead" not in pages[0]["message"]
+    assert pages == []

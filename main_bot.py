@@ -4971,6 +4971,10 @@ ORDERS_READ_MAX_AGE_SECONDS = 30.0
 INFERRED_FLAT_PASS_CAP = 2
 LAST_PORTFOLIO_READ_KEY = "reconcile:last_portfolio_read"
 INFERRED_FLAT_STREAK_KEY = "reconcile:inferred_flat_streak"
+# Once per outage. Cleared by a successful portfolio read. A continued
+# outage may remind at most this often. An expired session does not use it.
+UNTRACKED_CHECK_ALERT_KEY = "reconcile:untracked_check_alerted_at"
+UNTRACKED_CHECK_REMINDER_S = 6 * 3600
 _FILLED_ORDER_STATUSES = {"EXECUTED", "FILLED", "DONE_TRADE_EXECUTED"}
 
 
@@ -5202,19 +5206,46 @@ async def reconcile_once(
             logger.debug("reconcile alert delivery failed", exc_info=True)
 
     async def _alert_untracked_check_unavailable(kind: str) -> None:
-        """Portfolio failed, including when nothing is tracked.
+        """Portfolio failed and untracked names cannot be checked.
 
-        Manual positions cannot be seen. Error, once per 30 minutes.
-        The callback in production is send_nowait.
+        An expired session does not page here. broker_session_expired
+        already covers that, and a 30-minute repeat would run all night.
+        Any other failure pages once per outage. A successful portfolio
+        read clears the latch, so the next outage can page again. While
+        the outage continues, at most one reminder goes out every
+        UNTRACKED_CHECK_REMINDER_S. The callback in production is
+        send_nowait.
         """
+        if kind == "BrokerSessionExpired":
+            return
+        now = time.time()
+        last = 0.0
+        try:
+            raw = await state.get(UNTRACKED_CHECK_ALERT_KEY)
+            last = float(raw) if raw else 0.0
+        except (TypeError, ValueError):
+            last = 0.0
+        except Exception as exc:
+            logger.warning("untracked-check latch read failed (%s)", type(exc).__name__)
+            last = 0.0
+        if last > 0 and (now - last) < UNTRACKED_CHECK_REMINDER_S:
+            return
+        try:
+            await state.set(UNTRACKED_CHECK_ALERT_KEY, f"{now:.3f}")
+        except Exception as exc:
+            logger.warning("untracked-check latch write failed (%s)", type(exc).__name__)
         await _alert(
             "error",
             "untracked_check_unavailable",
             f"Portfolio read failed ({kind}). "
             f"Manual or untracked positions cannot be checked.",
-            dedupe_key="untracked_check_unavailable",
-            dedupe_seconds=1800,
         )
+
+    async def _clear_untracked_check_latch() -> None:
+        try:
+            await state.delete(UNTRACKED_CHECK_ALERT_KEY)
+        except Exception as exc:
+            logger.warning("untracked-check latch clear failed (%s)", type(exc).__name__)
 
     async def _note_broker_error(err: BaseException, fallback_method: str,
                                  fallback_path: str) -> None:
@@ -5284,9 +5315,6 @@ async def reconcile_once(
             "[RECONCILE] skipped — session expired, awaiting relink (%s)",
             type(reason).__name__ if reason else "BrokerSessionExpired",
         )
-        await _alert_untracked_check_unavailable(
-            type(reason).__name__ if reason else "BrokerSessionExpired",
-        )
         return report
 
     # HTTP 404 only (not a 400 whose code is 404). One retry. A 200 or 204
@@ -5353,6 +5381,7 @@ async def reconcile_once(
     broker_positions = parse_broker_positions(portfolio_resp) if portfolio_ok else {}
     if portfolio_ok:
         await _remember_confirmed_portfolio(state, broker_positions)
+        await _clear_untracked_check_latch()
 
     report["tracked_positions"] = len(tracked)
     report["broker_positions"] = len(broker_positions) if portfolio_ok else None
