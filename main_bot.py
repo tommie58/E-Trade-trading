@@ -2674,10 +2674,12 @@ Delivery (every alert, in order):
   • Pushed to the configured webhook. A non-empty env ALERT_WEBHOOK_URL
     wins over a saved alerts:config URL; the saved URL is used only when
     the env var is empty, and an empty saved value does not clear a set
-    env URL. The delivery floor is never stricter than error. The payload
-    carries `text` (Slack-compatible), `content` (Discord-compatible) AND
-    the full structured record, so one URL works for Slack, Discord, ntfy,
-    or any generic JSON receiver. The URL itself is never logged.
+    env URL. The delivery floor is never stricter than error, and that
+    cap applies even when no env webhook URL is set. A saved critical
+    floor still delivers error alerts. The payload carries `text`
+    (Slack-compatible), `content` (Discord-compatible) AND the full
+    structured record, so one URL works for Slack, Discord, ntfy, or any
+    generic JSON receiver. The URL itself is never logged.
 
 Duplicate storms are suppressed: the same `dedupe_key` reaches the webhook at
 most once per `dedupe_seconds` (Redis SET NX + TTL — multi-worker safe).
@@ -2693,7 +2695,9 @@ floor, NOT the dedupe key, so a re-poll of the same fill cannot double-post.
 Fire-and-forget by design: an alerting failure must NEVER break trading, so
 every path here swallows and logs its own errors.
 
-Order, stop, flatten, and kill paths call `send_nowait`. That still logs and
+Order, stop, flatten, and kill paths call `send_nowait`. So do the 3:50
+still-open alert, the reconcile unprotected alert, close and learning
+transitions, and the SPY-gap sit-out. That still logs and
 pushes `alerts:recent` before any POST. The POST itself is a background task
 with a strong reference and a done-callback. More than 50 deliveries in flight
 drops a non-critical POST (counted). A critical delivery waits in a small
@@ -2747,6 +2751,7 @@ _SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2, "critical": 3}
 DEFAULT_MIN_SEVERITY = "warning"
 # Delivery floor cannot be stricter than error. A saved "critical" still
 # delivers error alerts; warning and info stay below an error floor.
+# The cap applies even when no env webhook URL is set.
 _MAX_MIN_SEVERITY = "error"
 _MAX_INFLIGHT_DELIVERIES = 50
 # Critical POSTs wait here instead of being dropped at the in-flight cap.
@@ -2776,7 +2781,13 @@ _deliveries_open = True
 
 
 def _cap_min_severity(severity: str) -> str:
-    """Return the delivery floor, never stricter than error."""
+    """Return the delivery floor, never stricter than error.
+
+    Applies whether or not an env webhook URL is set. A saved critical
+    floor still delivers error alerts when the live webhook comes from
+    alerts:config, and the reported effective floor is error when the
+    saved floor is critical and nothing is configured.
+    """
     sev = str(severity or "").lower()
     if sev not in _VALID_SEVERITIES:
         sev = DEFAULT_MIN_SEVERITY
@@ -2796,6 +2807,45 @@ def _redact_text(text: str) -> str:
 
 def _redact_exc(exc: BaseException) -> str:
     return _redact_text(f"{type(exc).__name__}: {exc}")[:200]
+
+
+def _status_code_of(exc: BaseException) -> Optional[int]:
+    """HTTP status on the exception, when it is an int in range.
+
+    Reads status_code only. The body and headers are not read.
+    """
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None) if response is not None else None
+    if code is None:
+        code = getattr(exc, "status_code", None)
+    if isinstance(code, bool) or not isinstance(code, int):
+        return None
+    if 100 <= code <= 599:
+        return code
+    return None
+
+
+def _errno_of(exc: BaseException) -> Optional[int]:
+    """errno on the exception or its immediate cause. The message is not read."""
+    number = getattr(exc, "errno", None)
+    if isinstance(number, bool) or not isinstance(number, int):
+        cause = exc.__cause__ if exc.__cause__ is not None else exc.__context__
+        if isinstance(cause, BaseException) and cause is not exc:
+            number = getattr(cause, "errno", None)
+    if isinstance(number, bool) or not isinstance(number, int):
+        return None
+    return number
+
+
+def _failure_hint(exc: BaseException) -> str:
+    """HTTP status or errno. Never a URL, body, or header."""
+    status = _status_code_of(exc)
+    if status is not None:
+        return f"HTTP {status}"
+    err_no = _errno_of(exc)
+    if err_no is not None:
+        return f"errno {err_no}"
+    return ""
 
 
 def _delivery_is_critical(severity: str, event: str) -> bool:
@@ -2957,8 +3007,10 @@ def retain(task: "asyncio.Task") -> "asyncio.Task":
 
 
 def mask_webhook_url(url: Optional[str]) -> Optional[str]:
-    """Keep scheme + host; hide userinfo and the secret tail.
-    e.g. https://discord.com/api/webhooks/123…/abc… → https://discord.com/…9xYz
+    """Keep scheme + host. Hide userinfo, the path, and any token tail.
+
+    The last characters of a webhook URL are often the secret, so they
+    are not shown.
     """
     if not url:
         return None
@@ -2974,8 +3026,7 @@ def mask_webhook_url(url: Optional[str]) -> Optional[str]:
         host = p.hostname or ""
         if p.port:
             host = f"{host}:{p.port}"
-        tail = stripped[-4:] if len(stripped) > 24 else ""
-        return f"{p.scheme}://{host}/…{tail}"
+        return f"{p.scheme}://{host}/…"
     except Exception:
         return "…"
 
@@ -3038,13 +3089,13 @@ def _scrub_webhook_source_line(line: str, urls) -> str:
             if "://" in secret:
                 cleaned = cleaned.replace(secret, mask_webhook_url(secret) or "…")
             else:
-                # mask_webhook_url keeps a 4-character tail. Drop the fragment
-                # itself so that tail is not the token.
+                # A path segment can be the token. Replace the fragment
+                # itself. Do not keep a tail of it.
                 cleaned = cleaned.replace(secret, "…")
         cleaned = _mask_urls_in_line(cleaned)
         return _scrub_alert_text(cleaned)
     except Exception:
-        return "alerting: webhook_source=none, effective_min_severity=warning"
+        return "alerting: webhook_source=unknown, effective_min_severity=warning"
 
 
 class AlertManager:
@@ -3067,6 +3118,7 @@ class AlertManager:
 
     @property
     def effective_min_severity(self) -> str:
+        """Delivery floor. Capped at error even when no env webhook URL is set."""
         return _cap_min_severity(self._min_severity)
 
     def _apply_webhook_precedence(self) -> None:
@@ -3083,14 +3135,15 @@ class AlertManager:
             self._webhook_source = "none"
 
     def _failure_text(self, exc: BaseException) -> str:
-        """Exception type only.
+        """Exception type, plus an HTTP status or errno when one is present.
 
-        The message is wrapped through `_redact_exc` and `_scrub_alert_text`
-        and then discarded, so a URL, token, or header cannot reach a log
-        or an alert.
+        The message is not read. A URL, body, or header is not included.
         """
-        _scrub_alert_text(_redact_exc(exc))
-        return type(exc).__name__
+        name = type(exc).__name__
+        hint = _failure_hint(exc)
+        if hint:
+            return name + " " + hint
+        return name
 
     def _take_saved_url(self, cfg: Any) -> None:
         self._saved_webhook_url = None
@@ -3174,7 +3227,8 @@ class AlertManager:
 
         An empty URL clears the *saved* webhook. While the env webhook URL
         is set, this cannot switch the live webhook (the saved URL is stored
-        and does not override it) and cannot set a floor stricter than error.
+        and does not override it). The delivery floor is capped at error
+        even when no env webhook URL is set.
         """
         if webhook_url is not None:
             url = webhook_url.strip()
@@ -3223,7 +3277,16 @@ class AlertManager:
             result["note"] = (
                 "ALERT_WEBHOOK_URL is set; a saved webhook_url is stored "
                 "but does not override it. The floor cannot be set stricter "
-                "than error."
+                "than error. That cap applies even when no env webhook URL "
+                "is set."
+            )
+        elif (
+            _SEVERITY_RANK.get(self._min_severity, 0)
+            > _SEVERITY_RANK[_MAX_MIN_SEVERITY]
+        ):
+            result["note"] = (
+                "effective_min_severity is capped at error even when "
+                "no env webhook URL is set."
             )
         return result
 
@@ -3435,8 +3498,8 @@ async def get_config() -> Dict[str, Any]:
 async def set_config(webhook_url: Optional[str], min_severity: Optional[str]) -> Dict[str, Any]:
     """Apply + persist delivery config. Raises ValueError on bad input.
 
-    While the env webhook URL is set, this cannot switch the live webhook
-    and cannot set a floor stricter than error.
+    While the env webhook URL is set, this cannot switch the live webhook.
+    The delivery floor is capped at error even when no env webhook URL is set.
     """
     if _manager is None:
         raise RuntimeError("alerting not initialised")
@@ -3494,7 +3557,7 @@ async def send_nowait(severity: str, event: str, message: str,
     done-callback logs failures at warning. When 50 deliveries are already in
     flight a non-critical POST is dropped and counted. A critical one is
     queued until a slot frees. The in-app record stays either way.
-    Never raises.
+    Never raises. The error floor applies even when no env webhook URL is set.
     """
     try:
         if _manager is None:
@@ -5496,6 +5559,10 @@ async def reconcile_once(
             msg = f"{ticker}: UNPROTECTED — position at broker with no live stop and no active guard"
             report["warnings"].append(msg)
             logger.error(f"[RECONCILE] 🚨 {msg}")
+            # Stage this before the re-arm. Production passes send_nowait,
+            # so the webhook POST does not delay the re-arm. The re-arm
+            # itself is unchanged: fixed STOP until breakeven, then one
+            # TRAILING_STOP_CNST with a fixed-STOP fallback.
             await _alert("critical", "position_unprotected", msg,
                          dedupe_key=f"unprotected:{ticker}")
             if auto_heal and rearm_guard is not None:
@@ -17126,7 +17193,17 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # 5.99.20: a native-trail repair checks the price floor before it cancels.
 # The manual trail floor is the tightest of the saved stop, the trail, and
 # the live broker stop. A failed check leaves the resting stop in place.
-BOT_VERSION = "5.99.20-pro-day-trader"
+# 5.99.21: alert webhooks do not block the trail loop, the reconcile re-arm,
+# a close, or the SPY-gap sit-out. The 3:50 PM ET position_open_after_flatten
+# alert includes untracked broker positions from a snapshot no older than
+# 10 minutes. When DAY_TRADE_MODE is off it still pages a tracked position
+# that expires today, and it skips other tracked swings and untracked names.
+# It is sent with send_nowait. The webhook-source fallback says unknown.
+# Failure text is the exception type plus an HTTP status or errno, never a
+# URL, body, or header. effective_min_severity is capped at error even when
+# no env webhook URL is set. The DAY_TRADE_MODE parser behavior is unchanged
+# and documented: off, no, and 0 are OFF.
+BOT_VERSION = "5.99.21-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -17278,6 +17355,7 @@ CHAIN_SHADOW_COMPARISON_NOTE = (
 # flattens every open option, including one flagged swing_hold. Only an
 # explicit false, 0, off, or no turns it off, which restores the prior
 # swing_hold exemption. Any other value stays on and logs the variable name.
+# The parser behavior is unchanged and documented: off, no, and 0 are OFF.
 _DAY_TRADE_OFF = frozenset({"false", "0", "off", "no"})
 _DAY_TRADE_ON = frozenset({"true", "1", "on", "yes"})
 
@@ -17285,8 +17363,9 @@ _DAY_TRADE_ON = frozenset({"true", "1", "on", "yes"})
 def resolve_day_trade_mode(raw: Any) -> Tuple[bool, Optional[str]]:
     """(enabled, warning_name). Unset, empty, and recognized on-values are on.
 
-    Only false, 0, off, and no turn it off. Anything else stays on (fail
-    closed toward the flatten) and the warning name is DAY_TRADE_MODE.
+    Only false, 0, off, and no turn it off. off, no, and 0 are OFF. The
+    parser behavior is unchanged and documented. Anything else stays on
+    (fail closed toward the flatten) and the warning name is DAY_TRADE_MODE.
     The raw value is not returned, so a log cannot echo it.
     """
     if raw is None:
@@ -18476,6 +18555,70 @@ def position_still_open_alert_due(now_et: datetime) -> bool:
     minute = now_et.hour * 60 + now_et.minute
     close = _session_close_minute(now_et)
     return minute >= (close - 10)
+
+
+# Untracked names are the broker book only while this snapshot is fresh.
+# Older than this, or an age that cannot be read, is not a 3:50 page.
+OPEN_AFTER_FLATTEN_SNAPSHOT_MAX_AGE_S = 10 * 60
+
+
+def open_after_flatten_names(tracked: Any, snapshot: Any) -> List[str]:
+    """Tickers for the 3:50 alert: the tracked book, then untracked broker legs.
+
+    `snapshot` is a fresh account snapshot, or None when it must not contribute
+    names. Its `untracked` list and any position row with tracked false are on
+    the broker book. A symbol already listed from the tracked book is not
+    repeated, so the same symbol or contract does not appear twice. A missing
+    snapshot leaves the tracked names. Names are symbols only.
+    """
+    names: List[str] = []
+    seen = set()
+    if isinstance(tracked, dict):
+        for ticker in sorted(tracked):
+            symbol = str(ticker or "").strip().upper()
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                names.append(symbol)
+    if not isinstance(snapshot, dict):
+        return names
+    extras: List[str] = []
+    raw = snapshot.get("untracked")
+    if isinstance(raw, list):
+        for item in raw:
+            symbol = str(item or "").strip().upper()
+            if symbol:
+                extras.append(symbol)
+    rows = snapshot.get("positions")
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict) or row.get("tracked") is not False:
+                continue
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if symbol:
+                extras.append(symbol)
+    for symbol in sorted(set(extras)):
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        names.append(f"{symbol} (untracked)")
+    return names
+
+
+def still_open_snapshot_for_untracked(
+    snapshot: Any,
+) -> Tuple[Optional[dict], Optional[float]]:
+    """(snapshot, age) when untracked names may be read. Otherwise (None, age).
+
+    A missing snapshot is (None, None): nothing to warn about. A snapshot
+    whose age is unknown or older than OPEN_AFTER_FLATTEN_SNAPSHOT_MAX_AGE_S
+    is not used. Age is seconds, from `_snapshot_age`.
+    """
+    if not isinstance(snapshot, dict):
+        return None, None
+    age = _snapshot_age(snapshot)
+    if age is None or age > OPEN_AFTER_FLATTEN_SNAPSHOT_MAX_AGE_S:
+        return None, age
+    return snapshot, age
 
 
 def _is_market_open_at(now_et: datetime) -> bool:
@@ -21710,14 +21853,15 @@ async def _announce_learning_transitions(ticker: str) -> None:
             if not last or float(last["ts"]) < closed_at or last["to"] == learning.PROBATION:
                 continue
             level = "critical" if last["to"] == learning.DISABLED else "info"
-            await alerts.send(
+            # send_nowait: a close must not wait on the webhook.
+            await alerts.send_nowait(
                 level, "learning_transition",
                 f"🧠 {ticker} close moved learning cell '{key}' → {last['to'].upper()}: {last['why']}"
                 + (f" — re-test opens {learning._iso(last.get('until'))}" if last.get("until") else ""),
                 dedupe_key=f"learning:{key}:{last['to']}",
             )
-    except Exception as e:
-        logger.debug(f"learning transition check skipped: {e}")
+    except Exception as exc:
+        logger.debug("learning transition check skipped (%s)", type(exc).__name__)
 
 
 def _stamp_plan_qty(ctx: Optional[Dict[str, Any]], plan_qty: Any) -> Optional[int]:
@@ -22666,12 +22810,13 @@ async def _alert_spy_gap_sit_out_once(reason: str, *, dry_run: bool = False) -> 
     event = "spy_gap_sit_out" if kind == "sit_out" else "spy_gap_unmeasured"
     text = portfolio_risk.spy_gap_pending_alert_text() or reason
     try:
-        await alerts.send(
+        # send_nowait: an entry check must not wait on the webhook.
+        await alerts.send_nowait(
             "warning", event, text or reason,
             dedupe_key=f"{event}:{day}",
         )
-    except Exception as e:
-        logger.warning(f"SPY gap alert failed: {e}")
+    except Exception as exc:
+        logger.warning("SPY gap alert failed (%s)", type(exc).__name__)
         return
     portfolio_risk.mark_spy_gap_alert_sent(kind)
 
@@ -34089,6 +34234,7 @@ async def _record_close(ticker: str, exit_price: Optional[float], payload: dict,
             f"[STOP SLIP] {ticker} stop {_stop_slip['stop_price']:.2f} filled {_stop_slip['fill']:.2f} "
             f"({_stop_slip['slippage_pct']:+.2f}% worse, source={_stop_slip['stop_source']})"
         )
+    # Learning transition uses send_nowait, so the close does not wait on it.
     await _announce_learning_transitions(ticker)
     # SELL ALERT — every close path in the bot funnels through `_record_close`
     # (protective stop fill, signalled close, trailing exit, emergency flatten,
@@ -39048,7 +39194,9 @@ def _start_reconciler() -> None:
         offhours_interval_seconds=RECONCILE_OFFHOURS_SECONDS,
         auto_heal=RECONCILE_AUTO_HEAL,
         stop_flag=lambda: _worker_stop,
-        alert=alerts.send,
+        # send_nowait: the unprotected alert is staged before the re-arm
+        # and the webhook POST does not delay it.
+        alert=alerts.send_nowait,
         fetch_balance=_fetch_broker_balance,
     ))
 
@@ -41171,30 +41319,103 @@ async def _trail_pass() -> None:
         except Exception as e:
             logger.warning(f"[TRAIL] {ticker} pass failed: {e}")
 
-async def _alert_positions_still_open() -> None:
-    """Critical alert when any tracked position is still open after 3:50 PM ET.
+def _tracked_still_open_for_alert(
+    positions: Dict[str, Any], now_et: datetime, day_trade_mode: bool,
+) -> Dict[str, Any]:
+    """Tracked rows the 3:50 alert may name.
 
-    Half days use 12:50 PM ET, ten minutes after the 12:40 flatten. Deduped
-    once per session day. Does not place, cancel, or delay an order.
+    Day-trade mode names every tracked position. Mode off names only a
+    tracked position that expires today. Other swings are an allowed hold.
     """
-    now_et = _utcnow().astimezone(_ET_ZONE)
-    if not position_still_open_alert_due(now_et):
+    if day_trade_mode:
+        return positions
+    kept: Dict[str, Any] = {}
+    for ticker, pos in positions.items():
+        if isinstance(pos, dict) and _flatten_expires_today(pos, now_et):
+            kept[ticker] = pos
+    return kept
+
+
+async def _alert_positions_still_open() -> None:
+    """Critical alert when a position is still open after 3:50 PM ET.
+
+    Half days use 12:50 PM ET. Untracked names come from a broker account
+    snapshot no older than OPEN_AFTER_FLATTEN_SNAPSHOT_MAX_AGE_S. A stale
+    or unreadable snapshot contributes no untracked names and does not send
+    an alert that would be untracked names only. When DAY_TRADE_MODE is off,
+    only a tracked position expiring today is named. The webhook is
+    send_nowait, so a slow or failing receiver does not delay the caller.
+    Does not place or cancel an order.
+    """
+    try:
+        now_et = _utcnow().astimezone(_ET_ZONE)
+        if not position_still_open_alert_due(now_et):
+            return
+        positions: Dict[str, Any] = {}
+        try:
+            loaded = await state.all_positions()
+            if isinstance(loaded, dict):
+                positions = loaded
+        except Exception as exc:
+            logger.error("[FLATTEN] open-book read failed (%s)", type(exc).__name__)
+            positions = {}
+        tracked = _tracked_still_open_for_alert(positions, now_et, DAY_TRADE_MODE)
+        usable_snapshot = None
+        age: Optional[float] = None
+        if DAY_TRADE_MODE:
+            snapshot = None
+            try:
+                snapshot = await _load_account_snapshot()
+            except Exception as exc:
+                logger.error("[FLATTEN] broker snapshot read failed (%s)", type(exc).__name__)
+                snapshot = None
+            usable_snapshot, age = still_open_snapshot_for_untracked(snapshot)
+            if isinstance(snapshot, dict) and usable_snapshot is None:
+                shown = "unknown" if age is None else f"{age:.1f}s"
+                logger.warning(
+                    "[FLATTEN] broker snapshot age %s — untracked names skipped",
+                    shown,
+                )
+        labels = open_after_flatten_names(tracked, usable_snapshot)
+        if not labels:
+            return
+        when = "12:50 PM ET" if _session_close_minute(now_et) == 13 * 60 else "3:50 PM ET"
+        message = (
+            f"Position(s) still open after {when}: {', '.join(labels)}. "
+            "No overnight hold."
+        )
+        if age is not None and any(label.endswith("(untracked)") for label in labels):
+            message += f" Broker snapshot age {age:.1f}s."
+        await alerts.send_nowait(
+            "critical",
+            "position_open_after_flatten",
+            message,
+            dedupe_key=f"open_after_flatten:{now_et.date().isoformat()}",
+        )
+    except Exception as exc:
+        logger.error("[FLATTEN] still-open alert failed (%s)", type(exc).__name__)
+
+
+_still_open_alert_task: Optional[asyncio.Task] = None
+
+
+def _kick_positions_still_open_alert() -> None:
+    """Start the 3:50 check without waiting on the trail loop.
+
+    One check at a time. The alert uses send_nowait, so a slow webhook
+    does not delay the next trail pass either.
+    """
+    global _still_open_alert_task
+    current = _still_open_alert_task
+    if current is not None and not current.done():
         return
     try:
-        positions = await state.all_positions()
+        task = asyncio.create_task(_alert_positions_still_open())
     except Exception as exc:
-        logger.error("[FLATTEN] open-book read failed (%s)", type(exc).__name__)
+        logger.error("[FLATTEN] still-open alert failed (%s)", type(exc).__name__)
         return
-    if not positions:
-        return
-    names = ", ".join(sorted(str(ticker) for ticker in positions))
-    when = "12:50 PM ET" if _session_close_minute(now_et) == 13 * 60 else "3:50 PM ET"
-    await alerts.send(
-        "critical",
-        "position_open_after_flatten",
-        f"Position(s) still open after {when}: {names}. No overnight hold.",
-        dedupe_key=f"open_after_flatten:{now_et.date().isoformat()}",
-    )
+    _still_open_alert_task = task
+    alerts.retain(task)
 
 
 async def trailing_worker():
@@ -41212,10 +41433,9 @@ async def trailing_worker():
             # Guardian beat: this loop is alive (in session or not).
             await state.set(GUARDIAN_TRAIL_BEAT_KEY, f"{time.time():.3f}",
                             ex=max(600, GUARDIAN_STALE_SECONDS * 5))
-            try:
-                await _alert_positions_still_open()
-            except Exception as exc:
-                logger.error("[FLATTEN] still-open alert failed (%s)", type(exc).__name__)
+            # Background task plus send_nowait. The book read and the
+            # webhook do not sit on this loop.
+            _kick_positions_still_open_alert()
             if _is_market_open() and load_tokens() is not None:
                 lock = state.lock("trail_engine", ttl_ms=max(60_000, TRAIL_INTERVAL_SECONDS * 2000))
                 if await lock.try_acquire():
@@ -41562,7 +41782,7 @@ async def _startup_reconcile() -> None:
                 state, _reconcile_fetch_portfolio, _reconcile_fetch_orders,
                 _reconcile_cancel, rearm_guard=_reconcile_rearm_guard,
                 record_close=_reconcile_record_close,
-                auto_heal=RECONCILE_AUTO_HEAL, alert=alerts.send,
+                auto_heal=RECONCILE_AUTO_HEAL, alert=alerts.send_nowait,
             ),
             timeout=STARTUP_RECONCILE_TIMEOUT_SECONDS,
         )
@@ -43161,7 +43381,9 @@ async def alerts_config():
     the outcome of the most recent webhook delivery attempt.
 
     webhook_source is env, persisted, or none. effective_min_severity is the
-    floor actually applied (never stricter than error). The URL is masked.
+    floor actually applied (never stricter than error). That error cap
+    applies even when no env webhook URL is set. The URL is masked and
+    does not keep a token tail.
     """
     return await alerts.get_config()
 
@@ -43176,9 +43398,10 @@ async def alerts_config_set(
     Accepts Slack, Discord, ntfy, or any generic JSON receiver URL.
 
     When ALERT_WEBHOOK_URL is set, this cannot switch the live webhook
-    (the saved URL is stored but does not override the env URL) and cannot
-    set a floor stricter than error. The response says so
-    (webhook_source=env) and never includes the raw URL.
+    (the saved URL is stored but does not override the env URL). The
+    delivery floor is capped at error even when no env webhook URL is set.
+    The response says so (webhook_source=env when the env URL is set) and
+    never includes the raw URL.
     """
     await _require_control_auth(x_rork_secret, "/alerts/config")
     url = body.get("webhook_url")

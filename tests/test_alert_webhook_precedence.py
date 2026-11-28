@@ -336,9 +336,9 @@ def test_webhook_source_log_is_scrubber_output(caplog, monkeypatch):
         assert hidden is None or TOKEN_FRAGMENT not in hidden
         assert hidden is None or ENV_URL not in hidden
         assert hidden is None or SAVED_URL not in hidden
-    # New mask is scheme + host + ellipsis + a 4-character tail, not the path token.
-    assert cfg["webhook_url_masked"].startswith("https://example.invalid/")
-    assert cfg["webhook_url_masked"].endswith("…ture")
+    # Scheme + host + ellipsis. No token tail.
+    assert cfg["webhook_url_masked"] == "https://example.invalid/…"
+    assert not cfg["webhook_url_masked"].endswith("ture")
     assert "webhook_source=env" in caplog.text
     assert "effective_min_severity=error" in caplog.text
 

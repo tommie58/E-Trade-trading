@@ -4,6 +4,10 @@ FastAPI service that receives signals from the mobile app and places orders at E
 
 `main_bot.py` is the running source in this repo. Put secrets in the host environment. Do not put them in this file.
 
+## 5.99.21
+
+Alert webhooks do not block the trail loop, the reconcile re-arm, a close, or the SPY-gap sit-out. The 3:50 PM ET `position_open_after_flatten` alert includes untracked broker positions only from an account snapshot no older than 10 minutes. When `DAY_TRADE_MODE` is off it still alerts a tracked position that expires today, and it skips other tracked swings and untracked names. It is sent with `send_nowait`. The webhook-source fallback says `unknown`. Failure text is the exception type plus an HTTP status or errno, never a URL, body, or header. `effective_min_severity` is capped at error even when no env webhook URL is set. The `DAY_TRADE_MODE` parser behavior is unchanged and documented: `off`, `no`, and `0` are off. Risk rails are unchanged: 5% per trade, 10% daily loss, fixed STOP until breakeven then `TRAILING_STOP_CNST` with a fixed-STOP fallback, and the 3:40 PM ET flatten.
+
 ## Required environment
 
 | Variable | Purpose |
@@ -28,7 +32,7 @@ A value set on the host overrides these.
 | `MIN_RVOL` | `0.9` |
 | `MIN_MTF` | `1` |
 | `COMMISSION_PER_CONTRACT` | `0.52` |
-| `DAY_TRADE_MODE` | `true` (3:40 ET flattens every open option; 0–7 DTE expression) |
+| `DAY_TRADE_MODE` | `true` (3:40 ET flattens every open option, including `swing_hold`; `off`, `no`, and `0` turn it off; 0–7 DTE expression) |
 | `LEARNING_ENABLED` | `true` (live closes resize / disable setup×regime cells) |
 | `SCHEDULED_EXIT_ENABLED` | `true` |
 | `PRO_TRADER_MODE` | `shadow` (classify and log; no order changes until `active`) |
