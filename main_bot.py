@@ -38749,7 +38749,9 @@ async def _book_shows_covering_stop(ticker: str, pos: dict, qty: int) -> bool:
     for order in orders:
         if str(order.get("symbol") or "").upper() != symbol:
             continue
-        if str(order.get("status") or "").upper() in _TERMINAL_ORDER_STATUSES:
+        # Only a genuinely resting order covers the leg. CANCEL_REQUESTED
+        # is already dying and must not block the re-arm for the next pass.
+        if str(order.get("status") or "").upper() not in reconciliation._OPEN_ORDER_STATUSES:
             continue
         if order.get("price_type") not in reconciliation._PROTECTIVE_PRICE_TYPES:
             continue

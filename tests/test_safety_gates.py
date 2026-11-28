@@ -1171,6 +1171,30 @@ def test_live_resting_stop_is_not_placed_twice(monkeypatch):
     assert placed == []
 
 
+def test_cancel_requested_stop_does_not_block_rearm(monkeypatch):
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+    placed = []
+
+    async def place_opt(ticker, contract, qty, premium):
+        placed.append(round(float(premium), 2))
+        return {"order_id": "NEW-1"}
+
+    async def fetch_orders():
+        return {"OrdersResponse": {"Order": _stop_order("GONE-1", "CANCEL_REQUESTED", 1, 2.4)}}
+
+    monkeypatch.setattr(main_bot, "_place_option_protective_stop", place_opt)
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", fetch_orders)
+
+    async def scenario():
+        pos = _dead_stop_option()
+        await store.set_position("QQQ", pos)
+        return await main_bot._reconcile_rearm_guard("QQQ", dict(pos))
+
+    assert asyncio.run(scenario()) == "placed"
+    assert placed == [2.8]
+
+
 def test_rearm_lock_timeout_is_not_success(monkeypatch, caplog):
     caplog.set_level("ERROR")
     store = main_bot.StateStore(None)
