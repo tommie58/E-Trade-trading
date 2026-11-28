@@ -661,7 +661,7 @@ def test_pro_trader_report_includes_the_chain_shadow_block():
     assert block["live_flip"] is False
     assert block["comparison"]["min_pairs"] == 40
     assert block["comparison"]["min_pairs_is_flip_rule"] is False
-    assert report["version"] == "5.99.13-pro-day-trader"
+    assert report["version"] == "5.99.17-pro-day-trader"
 
 
 def test_chain_shadow_report_names_the_live_flag(monkeypatch):

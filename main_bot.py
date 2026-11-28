@@ -4332,6 +4332,211 @@ class BrokerSessionExpired(Exception):
     alerted ONCE at the state transition by the session tracker."""
 
 
+# One retry, then a flat inference only when every precondition holds.
+# Not an env switch. Flatten and fill-size reads do not use this path.
+PORTFOLIO_404_RETRY_SECONDS = 2.0
+# Orders used for inference must be from this same pass and no older than this.
+ORDERS_READ_MAX_AGE_SECONDS = 30.0
+# After this many inferred passes in a row, the next bare 404 is a normal error
+# until a confirmed portfolio read resets the counter.
+INFERRED_FLAT_PASS_CAP = 2
+LAST_PORTFOLIO_READ_KEY = "reconcile:last_portfolio_read"
+INFERRED_FLAT_STREAK_KEY = "reconcile:inferred_flat_streak"
+_FILLED_ORDER_STATUSES = {"EXECUTED", "FILLED", "DONE_TRADE_EXECUTED"}
+
+
+def _http_status(err: BaseException) -> int:
+    try:
+        return int(getattr(err, "status_code", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def bare_portfolio_404(err: BaseException) -> bool:
+    """HTTP 404 whose body is not an E*TRADE JSON or XML error envelope.
+
+    A 400 whose code is 404 is not this. A 404 that carries an error code is
+    not this. Tomcat HTML (no error code) is.
+    """
+    if not isinstance(err, etrade_async.ETradeAPIError):
+        return False
+    if _http_status(err) != 404:
+        return False
+    if str(getattr(err, "code", "") or "").strip():
+        return False
+    body = str(getattr(err, "body", "") or "")
+    try:
+        extracted, _msg = etrade_async._extract_error_parts(body)
+    except Exception:
+        return False
+    if str(extracted or "").strip():
+        return False
+    stripped = body.lstrip()
+    head = stripped[:240].lower()
+    if stripped.startswith("{") or stripped.startswith("["):
+        return False
+    if stripped.startswith("<?xml") or "<error" in head:
+        return False
+    return True
+
+
+def orders_read_is_fresh(received_mono: Any, now_mono: Any) -> bool:
+    """True when this pass's orders read is at most ORDERS_READ_MAX_AGE_SECONDS old."""
+    try:
+        age = float(now_mono) - float(received_mono)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(age):
+        return False
+    return 0.0 <= age <= ORDERS_READ_MAX_AGE_SECONDS
+
+
+def executed_since(orders: List[dict], since_epoch: float) -> bool:
+    """True when any filled order is at or after `since_epoch`, or untimed.
+
+    EXECUTED covers every account order in the read, including a manual one.
+    A filled row with no usable timestamp blocks inference (fail closed).
+    """
+    for order in orders or []:
+        if str(order.get("status") or "").upper() not in _FILLED_ORDER_STATUSES:
+            continue
+        try:
+            ts = float(order.get("executed_ts") or 0)
+        except (TypeError, ValueError):
+            return True
+        if not math.isfinite(ts) or ts <= 0:
+            return True
+        if ts + 1e-9 >= float(since_epoch):
+            return True
+    return False
+
+
+async def _state_text(state: StateStore, key: str) -> Tuple[Optional[str], bool]:
+    """(value, readable). A raise is unreadable, not an empty value."""
+    try:
+        return await state.get(key), True
+    except Exception as exc:
+        logger.error("[RECONCILE] state read failed (%s)", type(exc).__name__)
+        return None, False
+
+
+async def _remember_confirmed_portfolio(state: StateStore, broker_positions: Dict[str, dict]) -> None:
+    """Record whether the last confirmed portfolio read was empty.
+
+    A failed write deletes the marker so the next 404 cannot infer from a
+    stale 'empty' flag. Also resets the inferred-flat streak.
+    """
+    payload = json.dumps({
+        "empty": len(broker_positions) == 0,
+        "epoch": time.time(),
+        "positions": len(broker_positions),
+    })
+    try:
+        await state.set(LAST_PORTFOLIO_READ_KEY, payload)
+        await state.set(INFERRED_FLAT_STREAK_KEY, "0")
+    except Exception as exc:
+        logger.error("[RECONCILE] portfolio-read record failed (%s)", type(exc).__name__)
+        try:
+            await state.delete(LAST_PORTFOLIO_READ_KEY)
+        except Exception as exc2:
+            logger.error("[RECONCILE] portfolio-read clear failed (%s)", type(exc2).__name__)
+
+
+async def _infer_flat_block(
+    state: StateStore,
+    orders_resp: Any,
+    orders_err: Optional[BaseException],
+    orders_received_mono: float,
+    all_orders: List[dict],
+    live_orders: List[dict],
+    tracked: Dict[str, Any],
+    guards: Dict[str, Any],
+) -> Optional[str]:
+    """None when every inferred-flat precondition holds. Otherwise a short code.
+
+    Orders must be from this pass (`orders_err` is None and the document is an
+    OrdersResponse) and at most ORDERS_READ_MAX_AGE_SECONDS old. A failed or
+    stale orders read never infers flat.
+    """
+    if orders_err is not None or not isinstance(orders_resp, dict) or "OrdersResponse" not in orders_resp:
+        return "orders_failed"
+    if not orders_read_is_fresh(orders_received_mono, time.monotonic()):
+        return "orders_stale"
+    if live_orders:
+        return "open_orders"
+    if tracked:
+        return "tracked"
+    if guards:
+        return "guard"
+    streak_raw, streak_ok = await _state_text(state, INFERRED_FLAT_STREAK_KEY)
+    if not streak_ok:
+        return "state_unreadable"
+    try:
+        streak = int(streak_raw or 0)
+    except (TypeError, ValueError):
+        return "state_unreadable"
+    if streak >= INFERRED_FLAT_PASS_CAP:
+        return "streak_cap"
+    last_raw, last_ok = await _state_text(state, LAST_PORTFOLIO_READ_KEY)
+    if not last_ok:
+        return "state_unreadable"
+    if not last_raw:
+        return "last_read_missing"
+    try:
+        last = json.loads(last_raw)
+    except (TypeError, ValueError):
+        return "last_read_missing"
+    if not isinstance(last, dict) or last.get("empty") is not True:
+        return "last_read_not_empty"
+    try:
+        since = float(last.get("epoch") or 0)
+    except (TypeError, ValueError):
+        return "last_read_missing"
+    if not math.isfinite(since) or since <= 0:
+        return "last_read_missing"
+    if executed_since(all_orders, since):
+        return "executed_since"
+    return None
+
+
+async def _commit_inferred_flat(
+    state: StateStore,
+    alert: Callable[..., Awaitable[None]],
+) -> bool:
+    """Count one inferred pass and reset the fetch-fail streak.
+
+    False when the cap counter cannot be written — the caller must keep the
+    404 as an error so the cap cannot be skipped. A fail-streak write failure
+    still counts the inference, and sends reconcile_fetch_failed at error.
+    """
+    raw, ok = await _state_text(state, INFERRED_FLAT_STREAK_KEY)
+    if not ok:
+        return False
+    try:
+        current = int(raw or 0)
+    except (TypeError, ValueError):
+        return False
+    try:
+        await state.set(INFERRED_FLAT_STREAK_KEY, str(current + 1))
+    except Exception as exc:
+        logger.error("[RECONCILE] inferred-streak write failed (%s)", type(exc).__name__)
+        return False
+    try:
+        await state.set(RECONCILE_FETCH_FAIL_STREAK, "0")
+    except Exception as exc:
+        logger.error("[RECONCILE] fail-streak reset failed (%s)", type(exc).__name__)
+        message = "Stop-fill booking deferred — the failure count could not be recorded."
+
+        async def _fire() -> None:
+            await alert(
+                "error", "reconcile_fetch_failed", message,
+                dedupe_key="reconcile_fetch_failed:error",
+            )
+
+        etrade_async.schedule_etrade_alert(_fire())
+    return True
+
+
 async def reconcile_once(
     state: StateStore,
     fetch_portfolio: Callable[[], Awaitable[Dict[str, Any]]],
@@ -4422,6 +4627,8 @@ async def reconcile_once(
         _capture(fetch_portfolio),
         _capture(fetch_orders),
     )
+    # Age of THIS pass's orders read. A previous pass is never reused.
+    orders_received_mono = time.monotonic()
     if isinstance(portfolio_err, BrokerSessionExpired) or isinstance(orders_err, BrokerSessionExpired):
         # Known-dead session — not a new failure. The transition was already
         # alerted once; repeating an ERROR per cycle is pure noise. Do not
@@ -4431,6 +4638,16 @@ async def reconcile_once(
         await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
         logger.info(f"[RECONCILE] skipped — session expired, awaiting relink ({reason})")
         return report
+
+    # HTTP 404 only (not a 400 whose code is 404). One retry. A 200 or 204
+    # comes back as a dict, not an exception, and replaces the failure.
+    if portfolio_err is not None and _http_status(portfolio_err) == 404:
+        await asyncio.sleep(PORTFOLIO_404_RETRY_SECONDS)
+        retry_resp, retry_err = await _capture(fetch_portfolio)
+        if retry_err is None:
+            portfolio_resp, portfolio_err = retry_resp, None
+        else:
+            portfolio_resp, portfolio_err = None, retry_err
 
     if portfolio_err is None and not isinstance(portfolio_resp, dict):
         portfolio_err = etrade_async.ETradeAPIError(
@@ -4447,7 +4664,32 @@ async def reconcile_once(
 
     portfolio_ok = portfolio_err is None
     orders_ok = orders_err is None
-    if portfolio_err is not None:
+    if orders_ok:
+        all_orders = parse_open_orders(orders_resp)
+        live_orders = [o for o in all_orders if o["status"] in _OPEN_ORDER_STATUSES]
+    else:
+        all_orders = []
+        live_orders = []
+    tracked = await state.all_positions()
+    guards = await state.all_guards()
+
+    # A bare HTML 404 can be inferred flat only when this pass's own orders
+    # read is fresh and empty, the bot tracks nothing, the last confirmed
+    # portfolio read was empty, and no order has filled since that read.
+    # Two such passes in a row is the cap; the third is an ordinary error.
+    # The account snapshot is never written on this path.
+    inferred = False
+    if portfolio_err is not None and bare_portfolio_404(portfolio_err):
+        block = await _infer_flat_block(
+            state, orders_resp, orders_err, orders_received_mono,
+            all_orders, live_orders, tracked, guards,
+        )
+        if block is None and await _commit_inferred_flat(state, _alert):
+            inferred = True
+        elif block is not None:
+            report["infer_blocked"] = block
+
+    if portfolio_err is not None and not inferred:
         await _note_broker_error(
             portfolio_err, "GET", "/v1/accounts/{acct}/portfolio.json",
         )
@@ -4459,14 +4701,8 @@ async def reconcile_once(
     # A failed read is unknown, not empty. Empty would ghost the book, cancel
     # live stops, and re-arm a second stop on top of one we failed to see.
     broker_positions = parse_broker_positions(portfolio_resp) if portfolio_ok else {}
-    if orders_ok:
-        all_orders = parse_open_orders(orders_resp)
-        live_orders = [o for o in all_orders if o["status"] in _OPEN_ORDER_STATUSES]
-    else:
-        all_orders = []
-        live_orders = []
-    tracked = await state.all_positions()
-    guards = await state.all_guards()
+    if portfolio_ok:
+        await _remember_confirmed_portfolio(state, broker_positions)
 
     report["tracked_positions"] = len(tracked)
     report["broker_positions"] = len(broker_positions) if portfolio_ok else None
@@ -4476,6 +4712,23 @@ async def reconcile_once(
     # Stop-fill booking needs BOTH reads: the portfolio says the position is
     # gone, and the orders list has the fill. Either failure defers it.
     report["fill_booking"] = "ran" if (portfolio_ok and orders_ok) else "deferred"
+
+    if inferred:
+        # Not a confirmed empty read. Do not overwrite the account snapshot,
+        # do not clear an untracked-position alert, and do not page this as
+        # a broker error. The last confirmed snapshot stands.
+        report["ok"] = True
+        report["portfolio_ok"] = "inferred_flat"
+        report["broker_positions"] = 0
+        report["orders_ok"] = True
+        report["live_orders"] = 0
+        report["fill_booking"] = "inferred_flat"
+        logger.warning(
+            "[RECONCILE] portfolio HTTP 404 had no broker error code; "
+            "inferred flat from an empty confirmed book and a fresh empty orders read"
+        )
+        await state.set(RECONCILE_REPORT_KEY, json.dumps(report))
+        return report
 
     async def _alert_reconcile_fetch_failed() -> None:
         """Monitors still key on reconcile_fetch_failed. One send, not awaited
@@ -4491,8 +4744,19 @@ async def reconcile_once(
             except (TypeError, ValueError):
                 streak = 1
             await state.set(RECONCILE_FETCH_FAIL_STREAK, str(streak))
-        except Exception:
-            logger.debug("reconcile fail-streak update failed", exc_info=True)
+        except Exception as exc:
+            logger.error("[RECONCILE] fail-streak update failed (%s)", type(exc).__name__)
+            message = etrade_async.scrub_etrade_text(
+                "Stop-fill booking deferred — the failure count could not be recorded."
+            )
+
+            async def _fire_unreadable() -> None:
+                await _alert(
+                    "error", "reconcile_fetch_failed", message,
+                    dedupe_key="reconcile_fetch_failed:error",
+                )
+
+            etrade_async.schedule_etrade_alert(_fire_unreadable())
             return
         if not tracked:
             return
@@ -15679,6 +15943,9 @@ def plan_hold_guard(*, enabled: bool, minute_et: Any, close_minute: Any, today: 
     sym = str(ticker or "").upper()
     if sym and sym in set(opt_out or ()):
         return {**base, "detail": f"{sym} opted out (HOLD_GUARD_OPT_OUT_TICKERS)"}
+    # Main's overnight exemption. The live caller passes this only when
+    # DAY_TRADE_MODE is off. While day-trade mode is on, swing_hold is not
+    # an exemption and the 3:40 flatten sells the position.
     if swing_hold is True:
         return {**base, "detail": f"{sym} flagged swing_hold"}
     reasons: List[str] = []
@@ -16310,7 +16577,11 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # entry price is declined (below_entry). The fixed stop stays and the
 # next pass retries. POST /trail/native uses the same floor unless the
 # body sets allow_below_entry true.
-BOT_VERSION = "5.99.13-pro-day-trader"
+# 5.99.17: an entry is refused unless its full planned risk fits the daily
+# budget. The 1-lot unproven exemption applies only to a plan that starts at
+# 1. A bare portfolio 404 can infer flat only while the book, the orders, and
+# the last confirmed read all say empty, and only for two passes in a row.
+BOT_VERSION = "5.99.17-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -16458,11 +16729,47 @@ CHAIN_SHADOW_COMPARISON_NOTE = (
     "does not change a live order, strike, quantity, stop, trail, rail, flatten, "
     "scanner, or the VWAP gate."
 )
-# DAY-TRADE MODE — aggressive same-session book. When true (default):
-#   • 3:40 PM ET hard flatten closes EVERY open option (no overnight holds)
-#   • expression already prefers 0–7 DTE / same-day when cheapest to hold
-# Set false to restore overnight holds (EOD flatten only for expiring contracts).
-DAY_TRADE_MODE = os.getenv("DAY_TRADE_MODE", "true").strip().lower() not in {"false", "0", "no"}
+# DAY-TRADE MODE. Unset or empty stays on: 3:40 PM ET (12:40 on a half day)
+# flattens every open option, including one flagged swing_hold. Only an
+# explicit false, 0, off, or no turns it off, which restores the prior
+# swing_hold exemption. Any other value stays on and logs the variable name.
+_DAY_TRADE_OFF = frozenset({"false", "0", "off", "no"})
+_DAY_TRADE_ON = frozenset({"true", "1", "on", "yes"})
+
+
+def resolve_day_trade_mode(raw: Any) -> Tuple[bool, Optional[str]]:
+    """(enabled, warning_name). Unset, empty, and recognized on-values are on.
+
+    Only false, 0, off, and no turn it off. Anything else stays on (fail
+    closed toward the flatten) and the warning name is DAY_TRADE_MODE.
+    The raw value is not returned, so a log cannot echo it.
+    """
+    if raw is None:
+        return True, None
+    text = str(raw).strip().lower()
+    if text == "" or text in _DAY_TRADE_ON:
+        return True, None
+    if text in _DAY_TRADE_OFF:
+        return False, None
+    return True, "DAY_TRADE_MODE"
+
+
+def swing_hold_exempt(signal_swing: Any, day_trade_mode: bool) -> bool:
+    """Main's overnight exemption. Day-trade mode never grants it."""
+    return (not day_trade_mode) and signal_swing is True
+
+
+def note_day_trade_mode(raw: Any) -> bool:
+    """Effective mode for one raw env value. Logs the variable name only."""
+    enabled, warning = resolve_day_trade_mode(raw)
+    if warning:
+        logging.getLogger("etrade-bot").warning(
+            "unrecognized %s — day-trade flatten stays on", warning,
+        )
+    return enabled
+
+
+DAY_TRADE_MODE = note_day_trade_mode(os.getenv("DAY_TRADE_MODE"))
 # OPTIONS ONLY — the account trades option contracts, never shares. Every
 # ENTRY whose instrument is not "option" (or "crypto" when CRYPTO_ENABLED) is
 # refused at the last gate before the broker (closes still pass: a share
@@ -17611,6 +17918,19 @@ def _flatten_window_open(now_et: datetime) -> bool:
     minute = now_et.hour * 60 + now_et.minute
     close = _session_close_minute(now_et)
     return (close - _flatten_lead_minutes()) <= minute < close
+
+
+def position_still_open_alert_due(now_et: datetime) -> bool:
+    """True from ten minutes after the flatten through the rest of that session day.
+
+    3:50 PM ET on a full day, 12:50 PM ET on a half day. A position still open
+    then is not an overnight hold. Weekends and full holidays are not this.
+    """
+    if now_et.weekday() >= 5 or now_et.date().isoformat() in _MARKET_HOLIDAYS:
+        return False
+    minute = now_et.hour * 60 + now_et.minute
+    close = _session_close_minute(now_et)
+    return minute >= (close - 10)
 
 
 def _is_market_open_at(now_et: datetime) -> bool:
@@ -20192,8 +20512,9 @@ def assess_app_risk_gates(open_count: Any, realized_pnl_today_pct: Any, daily_lo
 def assess_remaining_daily_budget(budget: Any, requested_risk_usd: Any) -> Optional[str]:
     """The scanner's remaining-budget check, shared with app entries.
 
-    Blocks when what is left is under 25% of the requested risk. An
-    unreadable budget refuses the entry. Pure.
+    Blocks unless the FULL planned risk fits in what is left. A partial
+    remainder (including 25% of the request) is not an admit. An unreadable
+    budget refuses the entry. Pure.
     """
     if isinstance(budget, dict) and budget.get("unreadable"):
         return str(budget.get("reason") or "daily risk budget unreadable — entry refused")
@@ -20210,7 +20531,7 @@ def assess_remaining_daily_budget(budget: Any, requested_risk_usd: Any) -> Optio
         return "daily risk budget unreadable — entry refused"
     if requested < 0:
         requested = 0.0
-    if remaining < requested * 0.25:
+    if remaining < requested:
         return (
             f"daily risk budget spent: ${used:,.0f} of "
             f"${total:,.0f} committed (realized losses + open risk) — "
@@ -20854,17 +21175,49 @@ async def _announce_learning_transitions(ticker: str) -> None:
         logger.debug(f"learning transition check skipped: {e}")
 
 
+def _stamp_plan_qty(ctx: Optional[Dict[str, Any]], plan_qty: Any) -> Optional[int]:
+    """Record the pre-learning plan size. None when it is not an int."""
+    try:
+        plan_n = int(plan_qty)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if isinstance(ctx, dict):
+        ctx["plan_qty"] = plan_n
+    return plan_n
+
+
+def _log_size_decision(kind: str, symbol: str, plan_n: Optional[int],
+                       final_qty: Any, weight: Any) -> None:
+    """plan_qty, the quantity after the weight, and the weight. No account ids."""
+    logger.info(
+        "%s %s: plan_qty %s qty %s weight %s",
+        kind, symbol, plan_n, final_qty, weight,
+    )
+
+
 def _apply_learning_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]]) -> int:
     """Shrink an ENTRY's size by the learning weight; stamp what happened on
     `ctx` (it rides into the position_opened record). Never below one unit —
-    `floor_bound` records when the cut could not bite."""
+    `floor_bound` records when the cut could not bite.
+
+    `plan_qty` on `ctx` is the size before this weight. Logging it does not
+    change the quantity returned.
+    """
+    plan_n = _stamp_plan_qty(ctx, qty)
     if not ctx or not LEARNING_ENABLED:
+        if isinstance(ctx, dict):
+            _log_size_decision("LEARNING", symbol, plan_n, qty, ctx.get("weight"))
         return qty
     sized, floor_bound = learning.apply_weight(qty, float(ctx.get("weight") or 1.0))
-    ctx.update({"requested_qty": int(qty), "sized_qty": int(sized), "floor_bound": floor_bound})
+    ctx.update({
+        "requested_qty": int(qty), "sized_qty": int(sized), "floor_bound": floor_bound,
+        "plan_qty": int(qty),
+    })
+    _log_size_decision("LEARNING", symbol, int(qty), int(sized), ctx.get("weight"))
     if sized != qty or floor_bound:
         logger.warning(
-            f"🧠 LEARNING {symbol}: size {qty} → {sized} (weight {ctx.get('weight')}) "
+            f"🧠 LEARNING {symbol}: plan_qty {int(qty)} qty {sized} "
+            f"(weight {ctx.get('weight')}) "
             f"{'— one-unit floor, cut did not fully bite ' if floor_bound else ''}"
             f"— {'; '.join(ctx.get('notes') or [])}"
         )
@@ -20983,31 +21336,53 @@ def contract_qty_for_risk_weight(
     market_weight: Any = None,
     ev_weight: Any = None,
     cut: Any = None,
+    plan_qty: Any = None,
 ) -> Dict[str, Any]:
     """Size by risk weight. A product under 1 contract is a skip, not a round-up.
 
-    A plan of 1 contract ignores the unproven-EV weight (`ev_weight`). A
-    regime or gap cut (`market_weight`) can still take it under 1, and that
-    skips with no round-up. A larger plan keeps the combined `weight`,
-    including the unproven weight. A non-numeric quantity skips. A
-    non-numeric market weight, when one is supplied, skips. Pure.
+    The 1-lot exemption reads `plan_qty`, the size BEFORE the learning weight.
+    It applies only when the plan STARTS at 1 lot: the unproven-EV weight is
+    ignored and only a regime or gap cut can skip it. A 2-lot plan the
+    learning weight has already cut to 1 still takes the combined weight,
+    including the unproven 0.5, and can skip. A non-numeric quantity, an
+    inf quantity (OverflowError), or a non-numeric / non-finite combined
+    weight skips. None of those is treated as a full-weight fill. Pure.
     """
     try:
         base = int(qty)
+    except OverflowError:
+        return {
+            "qty": 0, "skipped": True, "weight": 0.0, "product": 0.0,
+            "reason": "quantity unreadable — skipped",
+        }
     except (TypeError, ValueError):
         base = 0
+    if plan_qty is None:
+        started = base
+    else:
+        try:
+            started = int(plan_qty)
+        except (TypeError, ValueError, OverflowError):
+            return {
+                "qty": 0, "skipped": True, "weight": 0.0, "product": 0.0,
+                "reason": "plan size unreadable — skipped",
+            }
     try:
         w = float(weight)
-    except (TypeError, ValueError):
-        w = 1.0
+    except (TypeError, ValueError, OverflowError):
+        w = float("nan")
     if not math.isfinite(w):
-        w = 1.0
+        return {
+            "qty": 0, "skipped": True, "weight": w if isinstance(w, float) else 0.0,
+            "product": 0.0,
+            "reason": "combined weight unreadable — skipped",
+        }
     if base < 1:
         return {
             "qty": 0, "skipped": True, "weight": w, "product": 0.0,
             "reason": "quantity under 1 contract — skipped",
         }
-    if base == 1 and market_weight is not None:
+    if started == 1 and market_weight is not None:
         try:
             market = float(market_weight)
         except (TypeError, ValueError):
@@ -21040,6 +21415,11 @@ def contract_qty_for_risk_weight(
         return {"qty": base, "skipped": False, "weight": w, "product": float(base), "reason": ""}
     w = max(0.0, w)
     product = base * w
+    if not math.isfinite(product):
+        return {
+            "qty": 0, "skipped": True, "weight": w, "product": 0.0,
+            "reason": "combined weight unreadable — skipped",
+        }
     want = math.floor(product + 1e-12)
     if want < 1:
         return {
@@ -21069,11 +21449,20 @@ def _risk_cut_label(ctx: Dict[str, Any]) -> str:
     return "regime/gap cut"
 
 
-def _apply_risk_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]]) -> int:
+def _apply_risk_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]],
+                       plan_qty: Any = None) -> int:
     """Shrink an ENTRY by the regime × evidence weight (after the learning
-    weight). A 1-contract plan does not skip on the unproven-EV weight alone.
-    Under 1 contract sets `skip_reason` and returns 0."""
+    weight). `plan_qty` is the size BEFORE the learning weight. The 1-lot
+    exemption applies only when that plan starts at 1. Under 1 contract sets
+    `skip_reason` and returns 0.
+
+    The pre-learning plan size is recorded next to the final quantity and the
+    weight. That record does not change the quantity returned.
+    """
+    plan_n = _stamp_plan_qty(ctx, qty if plan_qty is None else plan_qty)
     if not ctx or not PORTFOLIO_RISK_ENABLED:
+        if isinstance(ctx, dict):
+            _log_size_decision("RISK", symbol, plan_n, qty, ctx.get("weight"))
         return qty
     regime = ctx.get("regime") if isinstance(ctx.get("regime"), dict) else None
     market_weight = None if regime is None else regime.get("weight")
@@ -21083,6 +21472,7 @@ def _apply_risk_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]]) -> 
         market_weight=market_weight,
         ev_weight=ctx.get("ev_weight"),
         cut=_risk_cut_label(ctx) if market_weight is not None else None,
+        plan_qty=qty if plan_qty is None else plan_qty,
     )
     ctx.update({
         "requested_qty": int(qty) if isinstance(qty, int) else qty,
@@ -21091,13 +21481,19 @@ def _apply_risk_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]]) -> 
     })
     if decision["skipped"]:
         ctx["skip_reason"] = decision["reason"]
-        logger.warning(f"🧩 RISK {symbol}: {decision['reason']}")
+        _log_size_decision("RISK", symbol, ctx.get("plan_qty"), 0, ctx.get("weight"))
+        logger.warning(
+            f"🧩 RISK {symbol}: plan_qty {ctx.get('plan_qty')} qty 0 "
+            f"(weight {ctx.get('weight')}) — {decision['reason']}"
+        )
         return 0
     sized = int(decision["qty"])
     ctx.pop("skip_reason", None)
+    _log_size_decision("RISK", symbol, ctx.get("plan_qty"), sized, ctx.get("weight"))
     if sized != qty:
         logger.warning(
-            f"🧩 RISK {symbol}: size {qty} → {sized} (weight {ctx.get('weight')}) "
+            f"🧩 RISK {symbol}: plan_qty {ctx.get('plan_qty')} qty {sized} "
+            f"(weight {ctx.get('weight')}) "
             f"— {'; '.join(ctx.get('notes') or [])}"
         )
     return sized
@@ -22206,7 +22602,7 @@ async def _passes_entry_filters(p: dict, *, dry_run: bool = False) -> Tuple[bool
             # Judge the budget against what the CONTRACT risks, not what the
             # percentage wishes it risked. On 2026-08-24 those were $110 and $28.
             requested_risk = max(nominal_risk, actual_risk or 0.0)
-            if budget["remaining_usd"] < requested_risk * 0.25:
+            if budget["remaining_usd"] < requested_risk:
                 spent = (
                     f"daily risk budget spent: ${budget['used_usd']:,.0f} of "
                     f"${budget['budget_usd']:,.0f} committed (realized losses + open risk) — "
@@ -22674,6 +23070,17 @@ def _require_probeable_session() -> None:
 
 
 def _looks_like_auth_failure(err: Exception) -> bool:
+    """True on HTTP 401, or on a status-less error whose text says so.
+
+    A known status that is not 401 is not an auth failure, even when the
+    body happens to contain the digits 401 (an HTML 404 page).
+    """
+    status = getattr(err, "status_code", None)
+    if status is not None and status != "":
+        try:
+            return int(status) == 401
+        except (TypeError, ValueError):
+            pass
     text = str(err)
     return "401" in text or "oauth_problem" in text or "Unauthorized" in text
 
@@ -27506,6 +27913,16 @@ def scrub_etrade_text(text: str, secrets: Optional[Sequence[str]] = None) -> str
     return cleaned
 
 
+def _order_exc_text(exc: BaseException, limit: int = 80) -> str:
+    """Order-path log text. Type name plus a short scrubbed message.
+
+    The raw exception text is not logged: it can carry an account id.
+    Uses the shared scrubber, which also drops webhook URLs.
+    """
+    scrubbed = scrub_etrade_text(str(exc))[:limit]
+    return f"{type(exc).__name__}: {scrubbed}"
+
+
 def _bind_shared_scrubber() -> None:
     """Point every etrade_async module object at this one function."""
     import sys
@@ -28139,7 +28556,10 @@ async def _place_order_smart(kind: str, common: dict, tokens: Dict[str, str]) ->
         try:
             await state.set(_placement_mark_key(sig), "inflight", ex=86400)
         except Exception as mark_err:
-            logger.warning(f"placement mark failed (order still attempted): {mark_err}")
+            logger.warning(
+                "placement mark failed (order still attempted): %s",
+                _order_exc_text(mark_err),
+            )
     try:
         placed = await _place_order_smart_impl(kind, common, tokens)
     except ETradeAPIError as e:
@@ -28153,7 +28573,7 @@ async def _place_order_smart(kind: str, common: dict, tokens: Dict[str, str]) ->
         try:
             await state.set(_placement_mark_key(sig), "placed", ex=86400)
         except Exception as mark_err:
-            logger.warning(f"placed mark failed: {mark_err}")
+            logger.warning("placed mark failed: %s", _order_exc_text(mark_err))
     return placed
 
 
@@ -28183,11 +28603,14 @@ async def _place_order_smart_impl(kind: str, common: dict, tokens: Dict[str, str
             "price_type": common.get("priceType"),
             "contract": {k: common.get(k) for k in ("callPut", "strikePrice", "expiryDate")},
             "tried": {k: common.get(k) for k in ("limitPrice", "stopPrice") if common.get(k) is not None},
-            "error": text[:600], "bid": bid or None, "ask": ask or None,
+            "error": _order_exc_text(e, limit=300), "bid": bid or None, "ask": ask or None,
             "retry": (plan or {}).get("changes"),
         }
-        logger.error(f"[TICK 2040] {record['ticker']} {record['order_action']} {record['tried']} "
-                     f"rejected: {text[:300]} — quote {bid}/{ask}; retry {record['retry']}")
+        logger.error(
+            "[TICK 2040] %s %s %s rejected: %s — quote %s/%s; retry %s",
+            record["ticker"], record["order_action"], record["tried"],
+            _order_exc_text(e, limit=300), bid, ask, record["retry"],
+        )
         if plan is None:
             record["outcome"] = "no_retry"
             await trade_ledger.record("order_tick_rejected", record)
@@ -28196,7 +28619,7 @@ async def _place_order_smart_impl(kind: str, common: dict, tokens: Dict[str, str
         try:
             placed = await _place_order_once(kind, common, tokens)
         except Exception as e2:
-            record.update(outcome="retry_rejected", retry_error=str(e2)[:600])
+            record.update(outcome="retry_rejected", retry_error=_order_exc_text(e2, limit=300))
             await trade_ledger.record("order_tick_rejected", record)
             raise
         record["outcome"] = "retry_accepted"
@@ -28250,7 +28673,10 @@ async def _place_order_once(kind: str, common: dict, tokens: Dict[str, str]) -> 
                 # No pyetrade fallback for crypto — surface the broker error.
                 raise
             if _raw_place_fallback_safe(e.status_code, False):
-                logger.warning(f"RAW order path rejected ({e}) — falling back to pyetrade")
+                logger.warning(
+                    "RAW order path rejected (%s) — falling back to pyetrade",
+                    _order_exc_text(e),
+                )
             else:
                 # A 5xx on place.json may FOLLOW acceptance — re-placing through
                 # pyetrade risks a double fill. Surface the ambiguity instead.
@@ -28258,7 +28684,10 @@ async def _place_order_once(kind: str, common: dict, tokens: Dict[str, str]) -> 
         except httpx.ConnectError as e:
             if kind == "crypto":
                 raise
-            logger.warning(f"RAW order path unreachable before send ({e}) — falling back to pyetrade")
+            logger.warning(
+                "RAW order path unreachable before send (%s) — falling back to pyetrade",
+                _order_exc_text(e),
+            )
     if kind == "crypto":
         raise LocalRefusal("crypto orders require USE_RAW_ORDER_API (pyetrade has no crypto path)")
     orders = _orders_client(tokens)
@@ -28984,7 +29413,10 @@ async def _await_cancel_settled(order_id: str,
             status, filled = await _order_state(str(order_id), None)
             verdict = classify_cancel_status(status, filled, expected_qty)
         except Exception as e:
-            logger.warning(f"cancel verification unavailable for order {order_id}: {e}")
+            logger.warning(
+                "cancel verification unavailable for order %s: %s",
+                order_id, _order_exc_text(e),
+            )
             verdict, status = "working", "UNKNOWN"
         if verdict in ("filled", "partial", "terminal"):
             return verdict, filled, status
@@ -29019,7 +29451,10 @@ async def _cancel_order_call(order_id: str) -> None:
             # is transport noise worth retrying on the pyetrade path.
             if 400 <= e.status_code < 500:
                 raise
-            logger.warning(f"raw cancel path failed for {order_id} ({e}) — falling back to pyetrade")
+            logger.warning(
+                "raw cancel path failed for %s (%s) — falling back to pyetrade",
+                order_id, _order_exc_text(e),
+            )
     orders = _orders_client(tokens)
     await _etrade_call(orders.cancel_order, acct_key, int(order_id), resp_format="json", source="cancel_order")
 
@@ -29064,7 +29499,10 @@ async def _cancel_order_verified(order_id: Optional[str],
         # function stays liftable without the etrade_async import.
         code = getattr(e, "status_code", None)
         broker_answered = isinstance(code, int) and 400 <= code < 500
-        logger.warning(f"order cancel call failed ({order_id}): {e} — verifying against broker order book")
+        logger.warning(
+            "order cancel call failed (%s): %s — verifying against broker order book",
+            order_id, _order_exc_text(e),
+        )
 
     # Wait for the broker to actually retire the order. Returning on the first
     # CANCEL_REQUESTED is what caused every "not enough available contracts"
@@ -31004,7 +31442,8 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
             close_minute=_session_close_minute(now_et), today=now_et.date().isoformat(),
             expiry=contract.get("expiration"), ticker=ticker, holidays=_MARKET_HOLIDAYS,
             events_for_day=econ_calendar.events_for_day,
-            earnings_date=sig.get("earnings_date"), swing_hold=sig.get("swing_hold") is True,
+            earnings_date=sig.get("earnings_date"),
+            swing_hold=swing_hold_exempt(sig.get("swing_hold"), DAY_TRADE_MODE),
             opt_out=HOLD_GUARD_OPT_OUT_TICKERS,
         )
         if hg["fire"]:
@@ -32537,7 +32976,7 @@ def _payload_edge(payload: dict) -> Dict[str, Any]:
     if isinstance(learned, dict):
         feats["learning"] = {
             k: learned.get(k) for k in
-            ("weight", "cells", "notes", "requested_qty", "sized_qty", "floor_bound")
+            ("weight", "cells", "notes", "plan_qty", "requested_qty", "sized_qty", "floor_bound")
         }
     # The portfolio-risk verdict: evidence class (so live outcomes can be split
     # proven vs permitted), regime/gap weight, correlated exposure, capacity.
@@ -32555,6 +32994,7 @@ def _payload_edge(payload: dict) -> Dict[str, Any]:
             "cluster": corr.get("cluster"),
             "correlated_pct": corr.get("correlated_pct"),
             "capacity": risk.get("capacity"),
+            "plan_qty": risk.get("plan_qty"),
             "requested_qty": risk.get("requested_qty"),
             "sized_qty": risk.get("sized_qty"),
             "floor_bound": risk.get("floor_bound"),
@@ -32989,7 +33429,10 @@ async def _filled_qty_of(order_id: Optional[str]) -> int:
         _status, filled = await _order_state(str(order_id), None)
         return max(0, int(filled or 0))
     except Exception as e:
-        logger.warning(f"could not read filled quantity for order {order_id}: {e}")
+        logger.warning(
+            "could not read filled quantity for order %s: %s",
+            order_id, _order_exc_text(e),
+        )
         return 0
 
 
@@ -35876,8 +36319,11 @@ async def execute_live_order(payload: dict):
             # before an order could ever be placed.
             sym_u = str(symbol).upper()
             if not is_exit:
+                qty_before_learning = quantity
                 quantity = _apply_learning_weight(sym_u, quantity, learning_ctx)
-                quantity = _apply_risk_weight(sym_u, quantity, risk_ctx)
+                quantity = _apply_risk_weight(
+                    sym_u, quantity, risk_ctx, plan_qty=qty_before_learning,
+                )
                 weight_skip = _risk_weight_skip(risk_ctx)
                 if weight_skip:
                     await _record_entry_skipped(payload, "risk_weight_under_one", weight_skip)
@@ -37190,8 +37636,11 @@ async def execute_live_order(payload: dict):
                         "fail-closed sizing: position_size_shares missing/invalid and cannot size "
                         "from live equity — refusing to default to 1 share"
                     )
+            qty_before_learning = quantity
             quantity = _apply_learning_weight(symbol, quantity, learning_ctx)
-            quantity = _apply_risk_weight(symbol, quantity, risk_ctx)
+            quantity = _apply_risk_weight(
+                symbol, quantity, risk_ctx, plan_qty=qty_before_learning,
+            )
             weight_skip = _risk_weight_skip(risk_ctx)
             if weight_skip:
                 await _record_entry_skipped(payload, "risk_weight_under_one", weight_skip)
@@ -37290,7 +37739,10 @@ async def execute_live_order(payload: dict):
                     )
                     await state.set("otoco:unsupported", "1", ex=OTOCO_UNSUPPORTED_TTL)
                 except ETradeAPIError as e:
-                    logger.warning(f"OTOCO attempt failed ({e}) — falling back to entry + stop guard")
+                    logger.warning(
+                        "OTOCO attempt failed (%s) — falling back to entry + stop guard",
+                        _order_exc_text(e),
+                    )
 
             logger.info(f"📤 Placing EQUITY: {json.dumps({k: v for k, v in common.items() if k != 'resp_format'})}")
             # Per-share cost for the pre-flight funds clamp — the limit price
@@ -37330,13 +37782,14 @@ async def execute_live_order(payload: dict):
         # Only genuine broker/API failures feed the circuit breaker — our own
         # gate refusals are working-as-intended, not signs of a sick broker.
         local = _is_local_refusal(e)
+        safe_exc = _order_exc_text(e, limit=300)
         if local:
-            logger.info(f"↩︎ {ticker} refused locally (breaker untouched): {e}")
+            logger.info("↩︎ %s refused locally (breaker untouched): %s", ticker, safe_exc)
         else:
-            await _record_api_failure("order_placement", f"{type(e).__name__}: {e}")
+            await _record_api_failure("order_placement", safe_exc)
         await trade_ledger.record("order_failed", {
             "ticker": ticker, "action": action, "instrument": instrument,
-            "error": str(e)[:300],
+            "error": safe_exc,
             # Which failures fed the breaker — so a trip can be audited
             # against the exact errors that caused it.
             "error_type": type(e).__name__,
@@ -37344,10 +37797,10 @@ async def execute_live_order(payload: dict):
         })
         await alerts.send(
             "error", "order_failed",
-            f"{ticker} {action} ({instrument}) failed: {e}",
+            f"{ticker} {action} ({instrument}) failed: {safe_exc}",
             dedupe_key=f"order_failed:{ticker}",
         )
-        logger.error(f"❌ LIVE TRADE FAILED: {e}")
+        logger.error("LIVE TRADE FAILED: %s", safe_exc)
         raise
     finally:
         _placement_sig.set(None)
@@ -39677,6 +40130,32 @@ async def _trail_pass() -> None:
         except Exception as e:
             logger.warning(f"[TRAIL] {ticker} pass failed: {e}")
 
+async def _alert_positions_still_open() -> None:
+    """Critical alert when any tracked position is still open after 3:50 PM ET.
+
+    Half days use 12:50 PM ET, ten minutes after the 12:40 flatten. Deduped
+    once per session day. Does not place, cancel, or delay an order.
+    """
+    now_et = _utcnow().astimezone(_ET_ZONE)
+    if not position_still_open_alert_due(now_et):
+        return
+    try:
+        positions = await state.all_positions()
+    except Exception as exc:
+        logger.error("[FLATTEN] open-book read failed (%s)", type(exc).__name__)
+        return
+    if not positions:
+        return
+    names = ", ".join(sorted(str(ticker) for ticker in positions))
+    when = "12:50 PM ET" if _session_close_minute(now_et) == 13 * 60 else "3:50 PM ET"
+    await alerts.send(
+        "critical",
+        "position_open_after_flatten",
+        f"Position(s) still open after {when}: {names}. No overnight hold.",
+        dedupe_key=f"open_after_flatten:{now_et.date().isoformat()}",
+    )
+
+
 async def trailing_worker():
     """Continuous server-side trail. Runs each pass under the distributed
     `lock:trail_engine` so exactly one worker trails at a time."""
@@ -39692,6 +40171,10 @@ async def trailing_worker():
             # Guardian beat: this loop is alive (in session or not).
             await state.set(GUARDIAN_TRAIL_BEAT_KEY, f"{time.time():.3f}",
                             ex=max(600, GUARDIAN_STALE_SECONDS * 5))
+            try:
+                await _alert_positions_still_open()
+            except Exception as exc:
+                logger.error("[FLATTEN] still-open alert failed (%s)", type(exc).__name__)
             if _is_market_open() and load_tokens() is not None:
                 lock = state.lock("trail_engine", ttl_ms=max(60_000, TRAIL_INTERVAL_SECONDS * 2000))
                 if await lock.try_acquire():
@@ -41407,6 +41890,69 @@ async def healthz():
     }
 
 
+# A confirmed-empty portfolio read older than this is not "fresh".
+# /status then leaves account_flat null instead of calling the account flat.
+ACCOUNT_FLAT_FRESH_SECONDS = 20 * 60
+
+
+def reconcile_report_is_fresh(report: Any, now_epoch: Any = None) -> bool:
+    """True when the reconcile report's own timestamp is within the fresh window."""
+    if not isinstance(report, dict):
+        return False
+    raw = report.get("ts")
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    try:
+        now = float(time.time() if now_epoch is None else now_epoch)
+        age = now - ts.timestamp()
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(age) or age < -5:
+        return False
+    return age <= ACCOUNT_FLAT_FRESH_SECONDS
+
+
+def status_book_flags(
+    last_reconcile: Any,
+    open_positions: Any,
+    now_epoch: Any = None,
+) -> Dict[str, Any]:
+    """How /status names the book. Never the plain word flat.
+
+    account_flat is true only for a fresh confirmed-empty portfolio read
+    (`portfolio_ok is True` and `broker_positions == 0`). A failed, inferred,
+    stale, or missing read leaves it null. A fresh confirmed read that found
+    positions sets it false. bot_flat is the bot's own tracked book.
+    """
+    bot_flat = None
+    if isinstance(open_positions, dict):
+        bot_flat = len(open_positions) == 0
+    portfolio_ok = None
+    account_flat = None
+    if isinstance(last_reconcile, dict):
+        portfolio_ok = last_reconcile.get("portfolio_ok")
+        if reconcile_report_is_fresh(last_reconcile, now_epoch) and portfolio_ok is True:
+            try:
+                count = int(last_reconcile.get("broker_positions"))
+            except (TypeError, ValueError):
+                count = None
+            if count == 0:
+                account_flat = True
+            elif count is not None and count > 0:
+                account_flat = False
+    return {
+        "portfolio_ok": portfolio_ok,
+        "account_flat": account_flat,
+        "bot_flat": bot_flat,
+    }
+
+
 @app.get("/status")
 async def status():
     """Broker-state snapshot polled by the app's Reconciliation engine. The
@@ -41422,6 +41968,8 @@ async def status():
             last_reconcile = json.loads(raw_report)
         except json.JSONDecodeError:
             last_reconcile = None
+    open_positions = await state.all_positions()
+    book = status_book_flags(last_reconcile, open_positions)
     return {
         "killed": await state.is_killed(),
         "env": ENV,
@@ -41436,12 +41984,17 @@ async def status():
             "min_entry_premium_usd": MIN_ENTRY_PREMIUM_USD,
         },
         "market_open": _is_market_open(),
-        "open_positions": await state.all_positions(),
+        "open_positions": open_positions,
         # Same book, as a list with status/side/qty. The app journal maps
         # this. Reporting only — it does not change a position or a stop.
-        "positions_open": positions_open_view(await state.all_positions()),
+        "positions_open": positions_open_view(open_positions),
         # Which rulebook each open position follows (app_decides vs legacy_bot).
-        "exit_rules": summarize_exit_rules(await state.all_positions(), APP_DECIDES),
+        "exit_rules": summarize_exit_rules(open_positions, APP_DECIDES),
+        # portfolio_ok is true, false, or "inferred_flat". account_flat is
+        # true only for a fresh confirmed-empty read; otherwise false or null.
+        "portfolio_ok": book["portfolio_ok"],
+        "account_flat": book["account_flat"],
+        "bot_flat": book["bot_flat"],
         "stop_guards": await state.all_guards(),
         "trades_today": daily["trades_today"],
         "realized_pnl_today_pct": daily["realized_pnl_today_pct"],
@@ -41502,6 +42055,7 @@ async def status():
             # option entries re-expressed ITM, best expiry in 0–7 DTE.
             "core_book_enabled": CORE_BOOK_ENABLED,
             "itm_expression_enabled": ITM_EXPRESSION_ENABLED,
+            # Effective DAY_TRADE_MODE. Unset stays true. Only false, 0, off, or no is false.
             "day_trade_mode": DAY_TRADE_MODE,
             # Read-only. Import-time constant the running gate uses.
             # mode is fail_closed only while that constant is on.

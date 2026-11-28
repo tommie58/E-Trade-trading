@@ -554,6 +554,10 @@ def test_entry_and_ledger_observe_treat_day_vw_zero_as_unmeasured(monkeypatch):
 
 
 def test_rejected_entry_ledger_carries_unmeasured_day_vwap(monkeypatch):
+    # Mid-session ET. A real clock inside 15:40–15:59 is refused by the flatten
+    # window before this assertion can see the kill switch.
+    frozen = datetime(2026, 11, 18, 16, 30, tzinfo=timezone.utc)  # 11:30 ET
+    monkeypatch.setattr(main_bot, "_utcnow", lambda: frozen)
     saved = _save()
     quotes = [
         {"symbol": "SPY", "last": 500.0, "vwap": None, "massive_day_vwap": 0},
