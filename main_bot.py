@@ -2671,10 +2671,13 @@ Delivery (every alert, in order):
   • ALWAYS logged, greppable:  [ALERT][SEVERITY] event — message
   • Stored in the Redis capped list `alerts:recent` (newest first, last 200)
     so the app can poll GET /alerts
-  • Pushed to ALERT_WEBHOOK_URL when configured. The payload carries `text`
-    (Slack-compatible), `content` (Discord-compatible) AND the full structured
-    record, so a single URL works for Slack, Discord, ntfy, or any generic
-    JSON receiver.
+  • Pushed to the configured webhook. A non-empty env ALERT_WEBHOOK_URL
+    wins over a saved alerts:config URL; the saved URL is used only when
+    the env var is empty, and an empty saved value does not clear a set
+    env URL. The delivery floor is never stricter than error. The payload
+    carries `text` (Slack-compatible), `content` (Discord-compatible) AND
+    the full structured record, so one URL works for Slack, Discord, ntfy,
+    or any generic JSON receiver. The URL itself is never logged.
 
 Duplicate storms are suppressed: the same `dedupe_key` reaches the webhook at
 most once per `dedupe_seconds` (Redis SET NX + TTL — multi-worker safe).
@@ -2731,6 +2734,19 @@ ALERTS_RECENT_MAX = 200
 _VALID_SEVERITIES = {"info", "warning", "error", "critical"}
 _SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2, "critical": 3}
 DEFAULT_MIN_SEVERITY = "warning"
+# Delivery floor cannot be stricter than error. A saved "critical" still
+# delivers error alerts; warning and info stay below an error floor.
+_MAX_MIN_SEVERITY = "error"
+
+
+def _cap_min_severity(severity: str) -> str:
+    """Return the delivery floor, never stricter than error."""
+    sev = str(severity or "").lower()
+    if sev not in _VALID_SEVERITIES:
+        sev = DEFAULT_MIN_SEVERITY
+    if _SEVERITY_RANK[sev] > _SEVERITY_RANK[_MAX_MIN_SEVERITY]:
+        return _MAX_MIN_SEVERITY
+    return sev
 
 
 def _utcnow_iso() -> str:
@@ -2756,7 +2772,13 @@ class AlertManager:
     def __init__(self, state: Any, webhook_url: Optional[str] = None,
                  dedupe_seconds: int = 300) -> None:
         self._state = state
-        self._webhook_url = (webhook_url or "").strip() or None
+        # Env URL captured at init. A non-empty value always wins over
+        # alerts:config. Empty or whitespace is the same as unset.
+        self._env_webhook_url = (webhook_url or "").strip() or None
+        self._saved_webhook_url: Optional[str] = None
+        self._saved_known = False
+        self._webhook_url = self._env_webhook_url
+        self._webhook_source = "env" if self._env_webhook_url else "none"
         self._min_severity = DEFAULT_MIN_SEVERITY
         self._dedupe_seconds = max(10, int(dedupe_seconds))
 
@@ -2764,44 +2786,103 @@ class AlertManager:
     def webhook_configured(self) -> bool:
         return self._webhook_url is not None
 
+    @property
+    def effective_min_severity(self) -> str:
+        return _cap_min_severity(self._min_severity)
+
+    def _apply_webhook_precedence(self) -> None:
+        """Env wins when set. Saved fills in only when env is empty.
+        An empty saved value does not clear a set env URL."""
+        if self._env_webhook_url:
+            self._webhook_url = self._env_webhook_url
+            self._webhook_source = "env"
+        elif self._saved_webhook_url:
+            self._webhook_url = self._saved_webhook_url
+            self._webhook_source = "persisted"
+        else:
+            self._webhook_url = None
+            self._webhook_source = "none"
+
+    def _take_saved_url(self, cfg: Any) -> None:
+        self._saved_webhook_url = None
+        if not isinstance(cfg, dict):
+            return
+        raw_url = cfg.get("webhook_url") or ""
+        if not isinstance(raw_url, str):
+            return
+        self._saved_webhook_url = raw_url.strip() or None
+
     async def load_persisted(self) -> None:
-        """Apply a webhook config saved via POST /alerts/config (survives
-        restarts; overrides the env default when present)."""
+        """Apply alerts:config without letting it clobber a set env URL.
+
+        A non-empty env ALERT_WEBHOOK_URL always wins. The saved URL is
+        used only when the env var is empty or unset. An empty saved value
+        does not clear a set env URL. The saved severity is kept, and the
+        delivery floor is capped at error.
+        """
+        try:
+            raw = await self._state.get(ALERTS_CONFIG_KEY)
+            if raw:
+                cfg = json.loads(raw)
+                self._take_saved_url(cfg)
+                if isinstance(cfg, dict):
+                    sev = str(cfg.get("min_severity", "")).lower()
+                    if sev in _VALID_SEVERITIES:
+                        self._min_severity = sev
+            else:
+                self._saved_webhook_url = None
+            self._saved_known = True
+            self._apply_webhook_precedence()
+            # Source and effective floor only. Never the URL.
+            logger.info(
+                "alerting: loaded persisted config — webhook_source=%s, effective_min_severity=%s",
+                self._webhook_source,
+                self.effective_min_severity,
+            )
+        except Exception:
+            logger.warning("alert config load failed (using env default)")
+
+    async def _read_saved_webhook(self) -> None:
+        """Preserve a stored webhook when this update does not send one."""
+        self._saved_webhook_url = None
+        self._saved_known = True
         try:
             raw = await self._state.get(ALERTS_CONFIG_KEY)
             if not raw:
                 return
-            cfg = json.loads(raw)
-            url = (cfg.get("webhook_url") or "").strip()
-            self._webhook_url = url or None
-            sev = str(cfg.get("min_severity", "")).lower()
-            if sev in _VALID_SEVERITIES:
-                self._min_severity = sev
-            logger.info(
-                f"alerting: loaded persisted config — webhook={'configured' if self._webhook_url else 'cleared'}, "
-                f"min_severity={self._min_severity}"
-            )
-        except Exception as e:
-            logger.warning(f"alert config load failed (using env default): {e}")
+            self._take_saved_url(json.loads(raw))
+        except Exception:
+            logger.warning("alert config read failed (saved webhook left empty)")
 
     async def set_config(self, webhook_url: Optional[str],
                          min_severity: Optional[str]) -> Dict[str, Any]:
-        """Apply + persist a new delivery config. Empty/None URL clears delivery."""
+        """Apply + persist a delivery config.
+
+        An empty URL clears the *saved* webhook. When the env URL is set,
+        the saved value is stored but does not replace the env URL.
+        """
         if webhook_url is not None:
             url = webhook_url.strip()
             if url and not (url.startswith("https://") or url.startswith("http://")):
                 raise ValueError("webhook_url must start with http(s)://")
-            self._webhook_url = url or None
+            self._saved_webhook_url = url or None
+            self._saved_known = True
+        elif not self._saved_known:
+            await self._read_saved_webhook()
         if min_severity is not None:
             sev = min_severity.lower()
             if sev not in _VALID_SEVERITIES:
                 raise ValueError(f"min_severity must be one of {sorted(_VALID_SEVERITIES)}")
             self._min_severity = sev
-        payload = {"webhook_url": self._webhook_url or "", "min_severity": self._min_severity}
+        self._apply_webhook_precedence()
+        payload = {
+            "webhook_url": self._saved_webhook_url or "",
+            "min_severity": self._min_severity,
+        }
         try:
             await self._state.set(ALERTS_CONFIG_KEY, json.dumps(payload))
-        except Exception as e:
-            logger.warning(f"alert config persist failed (applied in-memory only): {e}")
+        except Exception:
+            logger.warning("alert config persist failed (applied in-memory only)")
         return await self.get_config()
 
     async def get_config(self) -> Dict[str, Any]:
@@ -2812,12 +2893,20 @@ class AlertManager:
                 last = json.loads(raw)
         except Exception:
             last = None
-        return {
+        result: Dict[str, Any] = {
             "webhook_configured": self.webhook_configured,
             "webhook_url_masked": mask_webhook_url(self._webhook_url),
             "min_severity": self._min_severity,
+            "effective_min_severity": self.effective_min_severity,
+            "webhook_source": self._webhook_source,
             "last_delivery": last,
         }
+        if self._env_webhook_url:
+            result["note"] = (
+                "ALERT_WEBHOOK_URL is set; a saved webhook_url is stored "
+                "but does not override it."
+            )
+        return result
 
     async def test_fire(self) -> Dict[str, Any]:
         """Send a test alert through the FULL delivery chain (log + recent list +
@@ -2897,9 +2986,9 @@ class AlertManager:
         if not self._webhook_url:
             return
         if not force_deliver and (
-            _SEVERITY_RANK.get(severity, 1) < _SEVERITY_RANK.get(self._min_severity, 1)
+            _SEVERITY_RANK.get(severity, 1) < _SEVERITY_RANK.get(self.effective_min_severity, 1)
         ):
-            return  # below the configured delivery floor — log + /alerts only
+            return  # below the effective delivery floor — log + /alerts only
         await self._post_webhook(record, text_override=webhook_text)
 
     async def _post_webhook(self, record: Dict[str, Any],
@@ -2979,8 +3068,14 @@ async def load_persisted() -> None:
 
 async def get_config() -> Dict[str, Any]:
     if _manager is None:
-        return {"webhook_configured": False, "webhook_url_masked": None,
-                "min_severity": DEFAULT_MIN_SEVERITY, "last_delivery": None}
+        return {
+            "webhook_configured": False,
+            "webhook_url_masked": None,
+            "min_severity": DEFAULT_MIN_SEVERITY,
+            "effective_min_severity": _cap_min_severity(DEFAULT_MIN_SEVERITY),
+            "webhook_source": "none",
+            "last_delivery": None,
+        }
     return await _manager.get_config()
 
 
@@ -16275,7 +16370,13 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # entry price is declined (below_entry). The fixed stop stays and the
 # next pass retries. POST /trail/native uses the same floor unless the
 # body sets allow_below_entry true.
-BOT_VERSION = "5.99.12-pro-day-trader"
+# 5.99.15: a non-empty ALERT_WEBHOOK_URL wins over a saved alerts:config
+# webhook. The saved URL is used only when that env var is empty, and an
+# empty saved value does not clear it. The delivery floor is at most error,
+# so a saved min_severity of critical still delivers error alerts. Dedupe
+# windows are unchanged. GET /alerts/config reports webhook_source and
+# effective_min_severity. The webhook URL is never logged.
+BOT_VERSION = "5.99.15-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -40125,8 +40226,8 @@ async def on_startup():
     # Alerting + immutable ledger come up right after state — everything
     # downstream (breaker, guards, reconciler) reports through them.
     alerts.init(state, ALERT_WEBHOOK_URL, dedupe_seconds=ALERT_DEDUPE_SECONDS)
-    # A webhook saved live via POST /alerts/config overrides the env default
-    # and survives restarts — no redeploy needed to change alert delivery.
+    # A non-empty ALERT_WEBHOOK_URL wins over a webhook saved via
+    # POST /alerts/config. The saved URL applies only when the env var is empty.
     await alerts.load_persisted()
     # Rebuild the JSONL ledger from the Postgres mirror if a redeploy wiped it,
     # then resume the hash chain and mirror every new record.
@@ -41368,7 +41469,11 @@ async def recent_alerts(count: int = Query(50, ge=1, le=200)):
 @app.get("/alerts/config")
 async def alerts_config():
     """Current alert delivery config — masked webhook URL, severity floor, and
-    the outcome of the most recent webhook delivery attempt."""
+    the outcome of the most recent webhook delivery attempt.
+
+    webhook_source is env, persisted, or none. effective_min_severity is the
+    floor actually applied (never stricter than error). The URL is masked.
+    """
     return await alerts.get_config()
 
 
@@ -41377,9 +41482,14 @@ async def alerts_config_set(
     body: dict = Body(...),
     x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"),
 ):
-    """Set (or clear) the alert delivery webhook live — no redeploy needed.
+    """Set (or clear) the saved alert webhook — no redeploy needed.
     Body: { "webhook_url": "https://…" | "" , "min_severity": "warning" }.
-    Accepts Slack, Discord, ntfy, or any generic JSON receiver URL."""
+    Accepts Slack, Discord, ntfy, or any generic JSON receiver URL.
+
+    When ALERT_WEBHOOK_URL is set, the saved URL is stored but does not
+    override the env URL. The response says so (webhook_source=env) and
+    never includes the raw URL. The delivery floor is capped at error.
+    """
     await _require_control_auth(x_rork_secret, "/alerts/config")
     url = body.get("webhook_url")
     sev = body.get("min_severity")
@@ -41392,8 +41502,9 @@ async def alerts_config_set(
     except ValueError as e:
         raise HTTPException(422, str(e))
     logger.info(
-        f"Alert delivery config updated — webhook={'configured' if cfg['webhook_configured'] else 'CLEARED'}, "
-        f"min_severity={cfg['min_severity']}"
+        "Alert delivery config updated — webhook_source=%s, effective_min_severity=%s",
+        cfg.get("webhook_source"),
+        cfg.get("effective_min_severity"),
     )
     return cfg
 
