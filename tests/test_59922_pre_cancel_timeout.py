@@ -175,3 +175,31 @@ def test_native_trail_refuses_when_the_stop_read_times_out(monkeypatch):
     elapsed = _run(scenario())
     assert cancelled == []
     assert elapsed < HANG_S
+
+
+def test_rearm_book_read_times_out_and_still_places(monkeypatch):
+    store = main_bot.StateStore(None)
+    placed = []
+
+    async def fetch():
+        await asyncio.sleep(HANG_S)
+        return {"OrdersResponse": {}}
+
+    async def place(ticker, contract, qty, price):
+        placed.append(price)
+        return {"order_id": "NEW-STOP"}
+
+    monkeypatch.setattr(main_bot, "state", store)
+    monkeypatch.setattr(main_bot, "PRE_CANCEL_STOP_READ_TIMEOUT_S", BOUND_S)
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", fetch)
+    monkeypatch.setattr(main_bot, "_place_option_protective_stop", place)
+
+    async def scenario():
+        started = time.monotonic()
+        result = await main_bot._reconcile_rearm_guard("QQQ", _pos())
+        return result, time.monotonic() - started
+
+    result, elapsed = _run(scenario())
+    assert result == "placed"
+    assert placed == [TRAIL_STOP]
+    assert elapsed < BOUND_S + 1.0

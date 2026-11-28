@@ -39922,7 +39922,13 @@ async def _book_shows_covering_stop(
     A stored ``stop_order_id`` is not evidence. Raises when the book cannot
     be read — the caller places anyway (fail toward protection).
     """
-    resp = await _reconcile_fetch_orders()
+    try:
+        resp = await asyncio.wait_for(
+            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("covering-stop book read failed (%s)", "TimeoutError")
+        raise
     orders = reconciliation.parse_open_orders(resp)
     own_ids = {
         str(pos.get(key) or "").strip()
