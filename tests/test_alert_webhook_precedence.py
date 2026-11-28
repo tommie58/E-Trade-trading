@@ -288,18 +288,26 @@ def test_saved_url_survives_a_severity_only_update():
     _assert_url_absent(json.dumps(cfg))
 
 
-def test_webhook_source_log_is_scrubber_output(caplog):
-    """Boot and update lines are the scrubber's return value, not a raw format."""
+def test_webhook_source_log_is_scrubber_output(caplog, monkeypatch):
+    """Source lines are _scrub_alert_text output. The new mask hides the token."""
     caplog.set_level(logging.DEBUG)
-    real = main_bot.scrub_etrade_text
+    real_scrub = main_bot.alerts._scrub_alert_text
+    real_mask = main_bot.alerts.mask_webhook_url
     produced = []
+    masked = []
 
-    def _recording(text, secrets=None):
-        cleaned = real(text, secrets)
+    def _recording(message):
+        cleaned = real_scrub(message)
         produced.append(cleaned)
         return cleaned
 
-    main_bot.alerts._WEBHOOK_LINE_SCRUB = _recording
+    def _recording_mask(url):
+        hidden = real_mask(url)
+        masked.append(hidden)
+        return hidden
+
+    monkeypatch.setattr(main_bot.alerts, "_scrub_alert_text", _recording)
+    monkeypatch.setattr(main_bot.alerts, "mask_webhook_url", _recording_mask)
 
     async def scenario():
         await _boot(ENV_URL, SAVED_URL, min_severity="critical")
@@ -309,12 +317,10 @@ def test_webhook_source_log_is_scrubber_output(caplog):
         main_bot.logger.info("%s", main_bot.alerts.webhook_source_log_line("update"))
         return await main_bot.alerts_config()
 
-    try:
-        cfg = _run(scenario())
-    finally:
-        main_bot.alerts._WEBHOOK_LINE_SCRUB = main_bot.scrub_etrade_text
+    cfg = _run(scenario())
 
-    assert produced, "webhook source line did not reach scrub_etrade_text"
+    assert produced, "webhook source line did not reach _scrub_alert_text"
+    assert masked, "mask_webhook_url was not used"
     source_logs = [
         rec.getMessage() for rec in caplog.records if "webhook_source=" in rec.getMessage()
     ]
@@ -324,5 +330,12 @@ def test_webhook_source_log_is_scrubber_output(caplog):
     _assert_url_absent(json.dumps(cfg))
     for line in produced:
         _assert_url_absent(line)
+    for hidden in masked:
+        assert hidden is None or TOKEN_FRAGMENT not in hidden
+        assert hidden is None or ENV_URL not in hidden
+        assert hidden is None or SAVED_URL not in hidden
+    # New mask is scheme + host + ellipsis + a 4-character tail, not the path token.
+    assert cfg["webhook_url_masked"].startswith("https://example.invalid/")
+    assert cfg["webhook_url_masked"].endswith("…ture")
     assert "webhook_source=env" in caplog.text
     assert "effective_min_severity=error" in caplog.text

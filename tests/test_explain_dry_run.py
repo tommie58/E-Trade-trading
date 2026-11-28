@@ -165,7 +165,7 @@ async def _seed_store(store):
     await store.queue_push("seed:list", "delta")
 
 
-def test_bot_version_is_pro_day_trader_5996():
+def test_bot_version_is_pro_day_trader_59915():
     assert main_bot.BOT_VERSION == "5.99.15-pro-day-trader"
 
 
