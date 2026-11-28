@@ -17308,7 +17308,17 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # URL, body, or header. effective_min_severity is capped at error even when
 # no env webhook URL is set. The DAY_TRADE_MODE parser behavior is unchanged
 # and documented: off, no, and 0 are OFF.
-BOT_VERSION = "5.99.21-pro-day-trader"
+# 5.99.22: every cancel-then-re-arm reads the resting stopPrice first and
+# will not rest a looser stop. A native-trail promotion or repair that cannot
+# read that price leaves the stop in place and sends a rate-limited error.
+# An unplaced re-arm after a repair cancel is a critical position_unprotected
+# via send_nowait, and it is not logged as re-armed. Surplus repair is keyed
+# by strike, expiry, and right. Mode-off 3:50 uses contract_expires_by.
+# Snapshot ages that are NaN, infinite, in the future, or millisecond epochs
+# are unknown. A 1-lot stop on a 2-lot position is partial cover. A
+# contract-less option row alerts once per session. A lost stop reply retries
+# once and stops on 3004. A flat book still reports a failed portfolio read.
+BOT_VERSION = "5.99.22-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against

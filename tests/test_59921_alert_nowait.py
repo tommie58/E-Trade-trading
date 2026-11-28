@@ -131,7 +131,7 @@ def test_version_pins_the_day_trade_off_parser_and_the_rails():
 
     The 5% and 10% rails are unchanged.
     """
-    assert main_bot.BOT_VERSION == "5.99.21-pro-day-trader"
+    assert main_bot.BOT_VERSION == "5.99.22-pro-day-trader"
     assert main_bot.RISK_PER_TRADE_PCT == 5.0
     assert main_bot.DAILY_LOSS_LIMIT_PCT == 10.0
     for raw in ("off", "OFF", "no", "No", "0"):
