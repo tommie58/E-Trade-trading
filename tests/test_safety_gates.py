@@ -1260,6 +1260,7 @@ def test_partial_fill_handler_clears_the_native_trail_id(monkeypatch):
         pos = _dead_stop_option()
         pos["native_trail_order_id"] = "TRAIL-1"
         pos["native_trail_price_type"] = "TRAILING_STOP_CNST"
+        pos["native_trail_field_mode"] = "documented"
         pos["filled_qty"] = 2
         pos["qty"] = 2
         await store.set_position("QQQ", pos)
@@ -1272,6 +1273,7 @@ def test_partial_fill_handler_clears_the_native_trail_id(monkeypatch):
     remaining, held = asyncio.run(scenario())
     assert remaining == 1
     assert held["native_trail_order_id"] is None
+    assert held["native_trail_field_mode"] is None
     assert held["stop_order_id"] is None
     assert held["filled_qty"] == 1
 
@@ -1322,22 +1324,29 @@ def test_repair_does_not_send_a_floor_at_or_above_the_bid(monkeypatch):
     alerts = []
 
     async def send_nowait(*args, **kwargs):
-        alerts.append(args)
+        alerts.append((args, kwargs))
 
     monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)
 
     async def scenario():
         pos = _entry_floor_option({"native_trail_order_id": "1598", "stop_order_id": None})
         await store.set_position("QQQ", pos)
-        owned = await main_bot._maybe_repair_inflated_native_trail(
+        first = await main_bot._maybe_repair_inflated_native_trail(
+            "QQQ", pos, 3.24, 0.10, "1598",
+        )
+        second = await main_bot._maybe_repair_inflated_native_trail(
             "QQQ", pos, 3.24, 0.10, "1598",
         )
         await asyncio.sleep(0)
-        return owned
+        return first, second
 
-    assert asyncio.run(scenario()) is True
+    first, second = asyncio.run(scenario())
+    assert first is True and second is True
     assert steps == []
-    assert alerts and alerts[0][1] == "native_trail_repair_floor_at_market"
+    assert len(alerts) == 1
+    assert alerts[0][0][0] == "error"
+    assert alerts[0][0][1] == "native_trail_repair_floor_at_market"
+    assert alerts[0][1]["dedupe_seconds"] == 300
 
 
 def test_engine_trail_stays_at_hard_stop_until_breakeven():

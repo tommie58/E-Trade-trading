@@ -30746,12 +30746,21 @@ async def _arm_native_trail(
         # go on (or was cancelled after a bad Stop Val). Restore protection
         # before surfacing the failure — returning an error with the position
         # unprotected is the worst possible outcome.
-        logger.error(f"[NATIVE TRAIL] {ticker} placement FAILED ({e}) — restoring the protective stop")
+        logger.error(f"[NATIVE TRAIL] {ticker} placement FAILED ({e})")
         try:
             fresh = await state.get_position(ticker)
+            outcome = "unplaced"
             if fresh:
-                await _reconcile_rearm_guard(ticker, dict(fresh))
+                outcome = await _reconcile_rearm_guard(ticker, dict(fresh))
+            _log_rearm_outcome(ticker, outcome, "NATIVE TRAIL")
+            if outcome in ("placed", "skipped_live"):
+                raise Exception(f"{ticker}: trail placement failed ({e}) — protective stop restored")
+            raise Exception(
+                f"{ticker}: trail placement failed ({e}) — re-arm {outcome}, stop not confirmed"
+            )
         except Exception as re_arm_error:
+            if "stop not confirmed" in str(re_arm_error) or "protective stop restored" in str(re_arm_error):
+                raise
             await alerts.send_nowait(
                 "critical", "native_trail_unprotected",
                 f"{ticker}: arming a native trail failed AND the protective stop could not be "
@@ -30759,7 +30768,6 @@ async def _arm_native_trail(
                 dedupe_key=f"native_trail_unprotected:{ticker}",
             )
             raise Exception(f"{ticker}: trail failed and re-arm FAILED ({e}) — POSITION UNPROTECTED")
-        raise Exception(f"{ticker}: trail placement failed ({e}) — protective stop restored")
 
     pos = await state.get_position(ticker) or pos
     pos["stop_order_id"] = None
@@ -31383,7 +31391,9 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
                 fresh = await state.get_position(ticker)
                 if fresh:
                     try:
-                        await _reconcile_rearm_guard(ticker, dict(fresh))
+                        _log_rearm_outcome(
+                            ticker, await _reconcile_rearm_guard(ticker, dict(fresh)), "SCALE-OUT",
+                        )
                     except Exception as e:
                         logger.error(f"[SCALE-OUT] {ticker} re-arm after partial stop fill FAILED: {e}")
                         await alerts.send_nowait(
@@ -31408,7 +31418,7 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
         logger.error(f"[SCALE-OUT] {ticker} partial close FAILED: {e} — re-arming the full stop")
         await _note_exit_failure(ticker, pos, "scale_out")
         try:
-            await _reconcile_rearm_guard(ticker, pos)
+            _log_rearm_outcome(ticker, await _reconcile_rearm_guard(ticker, pos), "SCALE-OUT")
         except Exception as re:
             logger.error(f"[SCALE-OUT] {ticker} stop re-arm after failed scale-out ALSO failed: {re}")
             await alerts.send_nowait(
@@ -31451,7 +31461,7 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
     # exactly the naked-position failure the whole guard architecture exists to
     # prevent.
     try:
-        await _reconcile_rearm_guard(ticker, pos)
+        _log_rearm_outcome(ticker, await _reconcile_rearm_guard(ticker, pos), "SCALE-OUT")
     except Exception as e:
         logger.error(f"[SCALE-OUT] {ticker} runner stop re-arm FAILED: {e}")
         await alerts.send_nowait(
@@ -31608,7 +31618,9 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
                 fresh = await state.get_position(ticker)
                 if fresh:
                     try:
-                        await _reconcile_rearm_guard(ticker, dict(fresh))
+                        _log_rearm_outcome(
+                            ticker, await _reconcile_rearm_guard(ticker, dict(fresh)), "TAKE PROFIT",
+                        )
                     except Exception as e:
                         logger.error(f"[TAKE PROFIT] {ticker} re-arm after partial fill FAILED: {e}")
                         await alerts.send_nowait(
@@ -31635,7 +31647,7 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
         logger.error(f"[TAKE PROFIT] {ticker} close FAILED: {e} — re-arming protection")
         await _note_exit_failure(ticker, pos, "take_profit")
         try:
-            await _reconcile_rearm_guard(ticker, pos)
+            _log_rearm_outcome(ticker, await _reconcile_rearm_guard(ticker, pos), "TAKE PROFIT")
         except Exception as re:
             logger.error(f"[TAKE PROFIT] {ticker} stop re-arm after failed close ALSO failed: {re}")
             await alerts.send_nowait(
@@ -31926,7 +31938,9 @@ async def _tighten_stop_after_giveup(ticker: str, pos: dict, reason: str) -> Opt
         if remaining > 0:
             fresh = await state.get_position(ticker)
             if fresh:
-                await _reconcile_rearm_guard(ticker, dict(fresh))
+                _log_rearm_outcome(
+                    ticker, await _reconcile_rearm_guard(ticker, dict(fresh)), reason.upper(),
+                )
         else:
             await _finish_guard(ticker, "closed_by_stop")
         return None
@@ -31935,8 +31949,10 @@ async def _tighten_stop_after_giveup(ticker: str, pos: dict, reason: str) -> Opt
     try:
         info = await _place_option_protective_stop(ticker, contract, qty, target)
     except Exception as e:
-        logger.error(f"[{reason.upper()}] {ticker} tighter stop {target:.2f} rejected ({e}) — re-arming the old one")
-        await _reconcile_rearm_guard(ticker, dict(pos))
+        logger.error(f"[{reason.upper()}] {ticker} tighter stop {target:.2f} rejected ({e})")
+        _log_rearm_outcome(
+            ticker, await _reconcile_rearm_guard(ticker, dict(pos)), reason.upper(),
+        )
         return None
     pos["stop_order_id"] = info["order_id"]
     pos["trail"] = float(info["stop"])
@@ -32094,7 +32110,9 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
                 fresh = await state.get_position(ticker)
                 if fresh:
                     try:
-                        await _reconcile_rearm_guard(ticker, dict(fresh))
+                        _log_rearm_outcome(
+                            ticker, await _reconcile_rearm_guard(ticker, dict(fresh)), reason.upper(),
+                        )
                     except Exception as e:
                         logger.error(f"[{reason.upper()}] {ticker} re-arm after partial fill FAILED: {e}")
             return False
@@ -32135,10 +32153,10 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
         close_id = await _place_option_market_close(ticker, contract, qty,
                                                      market_ok=(reason == "eod_flatten"))
     except Exception as e:
-        logger.error(f"[{reason.upper()}] {ticker} close FAILED: {e} — re-arming protection")
+        logger.error(f"[{reason.upper()}] {ticker} close FAILED: {e}")
         pos["exit_retry"] = record_exit_failure(pos.get("exit_retry"), reason, time.time())
         try:
-            await _reconcile_rearm_guard(ticker, pos)
+            _log_rearm_outcome(ticker, await _reconcile_rearm_guard(ticker, pos), reason.upper())
         except Exception as re:
             logger.error(f"[{reason.upper()}] {ticker} stop re-arm after failed close ALSO failed: {re}")
             try:
@@ -32402,9 +32420,14 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 return
                             fresh = await state.get_position(ticker)
                             try:
+                                outcome = "unplaced"
                                 if fresh:
-                                    await _reconcile_rearm_guard(ticker, dict(fresh))
-                                await _finish_guard(ticker, "partial_fill_reprotected")
+                                    outcome = await _reconcile_rearm_guard(ticker, dict(fresh))
+                                _log_rearm_outcome(ticker, outcome, "STOP GUARD")
+                                if outcome == "lock_timeout":
+                                    await _finish_guard(ticker, "partial_fill_unprotected")
+                                else:
+                                    await _finish_guard(ticker, "partial_fill_reprotected")
                             except Exception as e:
                                 logger.error(
                                     f"[STOP GUARD] {ticker} re-arm after partial stop fill FAILED: {e}"
@@ -34164,6 +34187,7 @@ async def _book_partial_stop_fill(
     if consumed and str(pos.get("native_trail_order_id") or "") == consumed:
         pos["native_trail_order_id"] = None
         pos["native_trail_price_type"] = None
+        pos["native_trail_field_mode"] = None
     pos["partial_exits"] = int(pos.get("partial_exits") or 0) + 1
     if remaining > 0:
         await state.set_position(ticker, pos)
@@ -37731,8 +37755,15 @@ async def execute_live_order(payload: dict):
                             logger.warning(f"[CLOSE] {sym_u} close-failure stamp not persisted: {stamp_err}")
                     if pos:
                         try:
-                            await _reconcile_rearm_guard(sym_u, dict(pos))
-                            logger.warning(f"[CLOSE] {sym_u} close placement failed — protective stop re-armed")
+                            outcome = await _reconcile_rearm_guard(sym_u, dict(pos))
+                            if outcome == "placed":
+                                logger.warning(
+                                    f"[CLOSE] {sym_u} close placement failed — protective stop re-armed"
+                                )
+                            else:
+                                logger.error(
+                                    f"[CLOSE] {sym_u} close placement failed — re-arm {outcome}"
+                                )
                         except Exception as re_err:
                             logger.error(f"[CLOSE] {sym_u} close failed AND stop re-arm failed: {re_err}")
                     raise
@@ -38218,8 +38249,15 @@ async def execute_live_order(payload: dict):
                     # leave the position naked until the next reconcile pass.
                     if pos:
                         try:
-                            await _reconcile_rearm_guard(symbol, dict(pos))
-                            logger.warning(f"[CLOSE] {symbol} close placement failed — protective stop re-armed")
+                            outcome = await _reconcile_rearm_guard(symbol, dict(pos))
+                            if outcome == "placed":
+                                logger.warning(
+                                    f"[CLOSE] {symbol} close placement failed — protective stop re-armed"
+                                )
+                            else:
+                                logger.error(
+                                    f"[CLOSE] {symbol} close placement failed — re-arm {outcome}"
+                                )
                         except Exception as re_err:
                             logger.error(f"[CLOSE] {symbol} close failed AND stop re-arm failed: {re_err}")
                     raise
@@ -38767,6 +38805,22 @@ async def _book_shows_covering_stop(ticker: str, pos: dict, qty: int) -> bool:
     return False
 
 
+def _log_rearm_outcome(ticker: str, result: Any, label: str) -> str:
+    """Log what a re-arm actually did. ``lock_timeout`` is never called a re-arm."""
+    outcome = result if isinstance(result, str) and result else "unplaced"
+    if outcome == "placed":
+        logger.warning(f"[{label}] {ticker} protective stop re-armed")
+    elif outcome == "lock_timeout":
+        logger.error(f"[{label}] {ticker} re-arm lock_timeout — stop not confirmed")
+    elif outcome == "skipped_live":
+        logger.info(
+            f"[{label}] {ticker} re-arm skipped_live — a live stop already covers the position"
+        )
+    else:
+        logger.warning(f"[{label}] {ticker} re-arm {outcome}")
+    return outcome
+
+
 async def _acquire_rearm_lock(ticker: str):
     lock = state.position_lock(str(ticker).upper(), wait_timeout=5.0)
     try:
@@ -38814,7 +38868,12 @@ async def _reconcile_rearm_guard(
             return "unplaced"
         try:
             covered = await _book_shows_covering_stop(ticker, pos, qty)
-        except Exception:
+        except Exception as exc:
+            # Type only. The book error can carry a URL or an account id.
+            logger.warning(
+                "[RECONCILE] %s order book unreadable (%s) — placing the protective stop",
+                ticker, type(exc).__name__,
+            )
             covered = False
         if covered:
             logger.info(
@@ -38906,6 +38965,20 @@ async def _remember_native_skip(ticker: str, pos: dict, reason: str, detail: str
     pos["native_trail_skip"] = reason
     await state.set_position(ticker, pos)
     logger.info(f"[NATIVE TRAIL] {ticker} keeping the fixed stop — {detail}")
+
+
+_REPAIR_AT_MARKET_LOG_AT: Dict[str, float] = {}
+
+
+def _repair_at_market_due(ticker: str, interval_s: float = 300.0) -> bool:
+    """True at most once per ticker per five minutes."""
+    now = time.monotonic()
+    key = str(ticker or "").upper()
+    last = _REPAIR_AT_MARKET_LOG_AT.get(key)
+    if last is not None and (now - last) < interval_s:
+        return False
+    _REPAIR_AT_MARKET_LOG_AT[key] = now
+    return True
 
 
 async def _maybe_repair_inflated_native_trail(
@@ -39015,19 +39088,21 @@ async def _maybe_repair_inflated_native_trail(
             if is_short else float(floor_px) + 1e-9 >= float(market_side)
         )
         if immediate:
-            logger.warning(
-                f"[NATIVE TRAIL] {ticker} repair floor {floor_px} is at the "
-                f"{'ask side' if is_short else 'bid'} {market_side:.2f} — "
-                f"not sending a stop that would trigger immediately; "
-                f"leaving the resting stop"
-            )
-            alerts.retain(asyncio.create_task(alerts.send_nowait(
-                "warning",
-                "native_trail_repair_floor_at_market",
-                f"{ticker}: repair floor {floor_px} is at the market "
-                f"({market_side:.2f}) — resting stop left in place",
-                dedupe_key=f"native_trail_repair_market:{ticker}",
-            )))
+            if _repair_at_market_due(ticker):
+                logger.error(
+                    f"[NATIVE TRAIL] {ticker} repair floor {floor_px} is at the "
+                    f"{'ask side' if is_short else 'bid'} {market_side:.2f} — "
+                    f"not sending a stop that would trigger immediately; "
+                    f"leaving the resting stop"
+                )
+                alerts.retain(asyncio.create_task(alerts.send_nowait(
+                    "error",
+                    "native_trail_repair_floor_at_market",
+                    f"{ticker}: repair floor {floor_px} is at the market "
+                    f"({market_side:.2f}) — resting stop left in place",
+                    dedupe_key=f"native_trail_repair_market:{ticker}",
+                    dedupe_seconds=300,
+                )))
             return True
     if verdict["floor_check"] != "pass":
         logger.warning(
@@ -39065,8 +39140,10 @@ async def _maybe_repair_inflated_native_trail(
             return True
         fresh = await state.get_position(ticker) or pos
         try:
-            await _reconcile_rearm_guard(
-                ticker, dict(fresh), floor_price=old_stop,
+            _log_rearm_outcome(
+                ticker,
+                await _reconcile_rearm_guard(ticker, dict(fresh), floor_price=old_stop),
+                "NATIVE TRAIL",
             )
         except Exception as re_arm_error:
             await alerts.send_nowait(
@@ -39100,9 +39177,13 @@ async def _maybe_repair_inflated_native_trail(
     except NativeTrailRefused as e:
         await _remember_native_skip(ticker, fresh, "repair_refused", str(e))
         try:
-            await _reconcile_rearm_guard(
-                ticker, dict(await state.get_position(ticker) or fresh),
-                floor_price=old_stop,
+            _log_rearm_outcome(
+                ticker,
+                await _reconcile_rearm_guard(
+                    ticker, dict(await state.get_position(ticker) or fresh),
+                    floor_price=old_stop,
+                ),
+                "NATIVE TRAIL",
             )
         except Exception as re_arm_error:
             await alerts.send_nowait(
@@ -39121,7 +39202,11 @@ async def _maybe_repair_inflated_native_trail(
         fresh["native_trail_skip"] = str(e)[:240]
         await state.set_position(ticker, fresh)
         try:
-            await _reconcile_rearm_guard(ticker, dict(fresh), floor_price=old_stop)
+            _log_rearm_outcome(
+                ticker,
+                await _reconcile_rearm_guard(ticker, dict(fresh), floor_price=old_stop),
+                "NATIVE TRAIL",
+            )
         except Exception as re_arm_error:
             await alerts.send_nowait(
                 "critical", "native_trail_repair_unprotected",
@@ -39539,7 +39624,9 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
             fresh = await state.get_position(ticker)
             if fresh:
                 try:
-                    await _reconcile_rearm_guard(ticker, dict(fresh))
+                    _log_rearm_outcome(
+                        ticker, await _reconcile_rearm_guard(ticker, dict(fresh)), "TRAIL",
+                    )
                 except Exception as e:
                     logger.error(f"[TRAIL] {ticker} re-arm after partial stop fill FAILED: {e}")
                     await alerts.send_nowait(
@@ -44086,11 +44173,26 @@ async def _manual_native_trail_preview(
         if not allow_below_entry:
             levels.append(entry)
         price_floor = _native_trail_price_floor(*levels)
+        # Only this manual preview writes last_broker_stop_price. The write
+        # holds the position lock; a busy lock skips the cache instead of
+        # writing the position without it.
         if persist_broker_stop and live_stop is not None:
-            fresh = await state.get_position(ticker)
-            if isinstance(fresh, dict) and fresh.get("last_broker_stop_price") != live_stop:
-                fresh["last_broker_stop_price"] = live_stop
-                await state.set_position(ticker, fresh)
+            lock = state.position_lock(str(ticker).upper(), wait_timeout=5.0)
+            held = False
+            try:
+                await lock.acquire()
+                held = True
+                fresh = await state.get_position(ticker)
+                if isinstance(fresh, dict) and fresh.get("last_broker_stop_price") != live_stop:
+                    fresh["last_broker_stop_price"] = live_stop
+                    await state.set_position(ticker, fresh)
+            except LockNotAcquired:
+                logger.warning(
+                    f"[NATIVE TRAIL] {ticker} last broker stop not cached — position lock busy"
+                )
+            finally:
+                if held:
+                    await lock.release()
     verdict = _native_trail_floor_verdict(trigger, price_floor)
     return {
         "dry_run": True,
