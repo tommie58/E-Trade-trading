@@ -17061,7 +17061,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # empty saved value does not clear it. The delivery floor is at most error
 # for send and send_nowait. While the env URL is set, POST /alerts/config
 # cannot switch the webhook and cannot set a floor stricter than error.
-BOT_VERSION = "5.99.19"
+BOT_VERSION = "5.99.19-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
