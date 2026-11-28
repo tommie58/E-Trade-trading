@@ -556,3 +556,59 @@ def test_severity_floor_and_force_deliver_are_unchanged(monkeypatch):
     assert "below_floor" in events
     assert "forced_fill" in events
     assert _Client.events == ["forced_fill"]
+
+
+def test_exception_webhook_url_is_absent_from_logs_and_delivery(monkeypatch, caplog):
+    """send, send_nowait, and _post_webhook must not echo a hook URL."""
+    hook = "https://discord.com/api/webhooks/123/fake-token"
+    saved_alerts = main_bot.alerts._manager
+    caplog.set_level(logging.DEBUG, logger="etrade-bot.alerts")
+
+    class _Boom:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None):
+            raise RuntimeError(hook)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Boom)
+
+    async def scenario():
+        store = main_bot.StateStore(None)
+        main_bot.alerts.init(store, hook)
+        await main_bot.alerts.send("error", "hook_send", "send path")
+        await main_bot.alerts.send_nowait("error", "hook_nowait", "nowait path")
+        await asyncio.sleep(0)
+        await main_bot.alerts._manager._post_webhook(
+            {"severity": "error", "event": "hook_direct", "message": "direct"},
+        )
+        direct = await store.get(main_bot.alerts.ALERTS_LAST_DELIVERY_KEY)
+
+        async def explode_send(self, *args, **kwargs):
+            raise RuntimeError(hook)
+
+        monkeypatch.setattr(main_bot.alerts.AlertManager, "send", explode_send)
+        await main_bot.alerts.send("error", "hook_send_raise", "send path")
+
+        async def explode_stage(self, *args, **kwargs):
+            raise RuntimeError(hook)
+
+        monkeypatch.setattr(main_bot.alerts.AlertManager, "_stage", explode_stage)
+        await main_bot.alerts.send_nowait("error", "hook_nowait_raise", "nowait path")
+        return direct
+
+    try:
+        direct = asyncio.run(scenario())
+    finally:
+        _restore_alerts(saved_alerts)
+
+    blob = caplog.text + (direct or "")
+    assert "fake-token" not in blob
+    assert "discord.com/api/webhooks/123" not in blob
+    assert "webhook delivery failed" in (direct or "")
