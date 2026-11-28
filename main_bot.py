@@ -15943,7 +15943,11 @@ def plan_hold_guard(*, enabled: bool, minute_et: Any, close_minute: Any, today: 
     sym = str(ticker or "").upper()
     if sym and sym in set(opt_out or ()):
         return {**base, "detail": f"{sym} opted out (HOLD_GUARD_OPT_OUT_TICKERS)"}
-    # swing_hold is not an exemption. Nothing new is held overnight.
+    # Main's overnight exemption. The live caller passes this only when
+    # DAY_TRADE_MODE is off. While day-trade mode is on, swing_hold is not
+    # an exemption and the 3:40 flatten sells the position.
+    if swing_hold is True:
+        return {**base, "detail": f"{sym} flagged swing_hold"}
     reasons: List[str] = []
     exp = _day(expiry)
     dte: Optional[int] = None
@@ -16725,9 +16729,47 @@ CHAIN_SHADOW_COMPARISON_NOTE = (
     "does not change a live order, strike, quantity, stop, trail, rail, flatten, "
     "scanner, or the VWAP gate."
 )
-# DAY-TRADE MODE is always on. There is no env off switch and no overnight
-# book: the 3:40 PM ET flatten (12:40 on a half day) closes every open option.
-DAY_TRADE_MODE = True
+# DAY-TRADE MODE. Unset or empty stays on: 3:40 PM ET (12:40 on a half day)
+# flattens every open option, including one flagged swing_hold. Only an
+# explicit false, 0, off, or no turns it off, which restores the prior
+# swing_hold exemption. Any other value stays on and logs the variable name.
+_DAY_TRADE_OFF = frozenset({"false", "0", "off", "no"})
+_DAY_TRADE_ON = frozenset({"true", "1", "on", "yes"})
+
+
+def resolve_day_trade_mode(raw: Any) -> Tuple[bool, Optional[str]]:
+    """(enabled, warning_name). Unset, empty, and recognized on-values are on.
+
+    Only false, 0, off, and no turn it off. Anything else stays on (fail
+    closed toward the flatten) and the warning name is DAY_TRADE_MODE.
+    The raw value is not returned, so a log cannot echo it.
+    """
+    if raw is None:
+        return True, None
+    text = str(raw).strip().lower()
+    if text == "" or text in _DAY_TRADE_ON:
+        return True, None
+    if text in _DAY_TRADE_OFF:
+        return False, None
+    return True, "DAY_TRADE_MODE"
+
+
+def swing_hold_exempt(signal_swing: Any, day_trade_mode: bool) -> bool:
+    """Main's overnight exemption. Day-trade mode never grants it."""
+    return (not day_trade_mode) and signal_swing is True
+
+
+def note_day_trade_mode(raw: Any) -> bool:
+    """Effective mode for one raw env value. Logs the variable name only."""
+    enabled, warning = resolve_day_trade_mode(raw)
+    if warning:
+        logging.getLogger("etrade-bot").warning(
+            "unrecognized %s — day-trade flatten stays on", warning,
+        )
+    return enabled
+
+
+DAY_TRADE_MODE = note_day_trade_mode(os.getenv("DAY_TRADE_MODE"))
 # OPTIONS ONLY — the account trades option contracts, never shares. Every
 # ENTRY whose instrument is not "option" (or "crypto" when CRYPTO_ENABLED) is
 # refused at the last gate before the broker (closes still pass: a share
@@ -21133,17 +21175,49 @@ async def _announce_learning_transitions(ticker: str) -> None:
         logger.debug(f"learning transition check skipped: {e}")
 
 
+def _stamp_plan_qty(ctx: Optional[Dict[str, Any]], plan_qty: Any) -> Optional[int]:
+    """Record the pre-learning plan size. None when it is not an int."""
+    try:
+        plan_n = int(plan_qty)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if isinstance(ctx, dict):
+        ctx["plan_qty"] = plan_n
+    return plan_n
+
+
+def _log_size_decision(kind: str, symbol: str, plan_n: Optional[int],
+                       final_qty: Any, weight: Any) -> None:
+    """plan_qty, the quantity after the weight, and the weight. No account ids."""
+    logger.info(
+        "%s %s: plan_qty %s qty %s weight %s",
+        kind, symbol, plan_n, final_qty, weight,
+    )
+
+
 def _apply_learning_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]]) -> int:
     """Shrink an ENTRY's size by the learning weight; stamp what happened on
     `ctx` (it rides into the position_opened record). Never below one unit —
-    `floor_bound` records when the cut could not bite."""
+    `floor_bound` records when the cut could not bite.
+
+    `plan_qty` on `ctx` is the size before this weight. Logging it does not
+    change the quantity returned.
+    """
+    plan_n = _stamp_plan_qty(ctx, qty)
     if not ctx or not LEARNING_ENABLED:
+        if isinstance(ctx, dict):
+            _log_size_decision("LEARNING", symbol, plan_n, qty, ctx.get("weight"))
         return qty
     sized, floor_bound = learning.apply_weight(qty, float(ctx.get("weight") or 1.0))
-    ctx.update({"requested_qty": int(qty), "sized_qty": int(sized), "floor_bound": floor_bound})
+    ctx.update({
+        "requested_qty": int(qty), "sized_qty": int(sized), "floor_bound": floor_bound,
+        "plan_qty": int(qty),
+    })
+    _log_size_decision("LEARNING", symbol, int(qty), int(sized), ctx.get("weight"))
     if sized != qty or floor_bound:
         logger.warning(
-            f"🧠 LEARNING {symbol}: size {qty} → {sized} (weight {ctx.get('weight')}) "
+            f"🧠 LEARNING {symbol}: plan_qty {int(qty)} qty {sized} "
+            f"(weight {ctx.get('weight')}) "
             f"{'— one-unit floor, cut did not fully bite ' if floor_bound else ''}"
             f"— {'; '.join(ctx.get('notes') or [])}"
         )
@@ -21380,8 +21454,15 @@ def _apply_risk_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]],
     """Shrink an ENTRY by the regime × evidence weight (after the learning
     weight). `plan_qty` is the size BEFORE the learning weight. The 1-lot
     exemption applies only when that plan starts at 1. Under 1 contract sets
-    `skip_reason` and returns 0."""
+    `skip_reason` and returns 0.
+
+    The pre-learning plan size is recorded next to the final quantity and the
+    weight. That record does not change the quantity returned.
+    """
+    plan_n = _stamp_plan_qty(ctx, qty if plan_qty is None else plan_qty)
     if not ctx or not PORTFOLIO_RISK_ENABLED:
+        if isinstance(ctx, dict):
+            _log_size_decision("RISK", symbol, plan_n, qty, ctx.get("weight"))
         return qty
     regime = ctx.get("regime") if isinstance(ctx.get("regime"), dict) else None
     market_weight = None if regime is None else regime.get("weight")
@@ -21400,13 +21481,19 @@ def _apply_risk_weight(symbol: str, qty: int, ctx: Optional[Dict[str, Any]],
     })
     if decision["skipped"]:
         ctx["skip_reason"] = decision["reason"]
-        logger.warning(f"🧩 RISK {symbol}: {decision['reason']}")
+        _log_size_decision("RISK", symbol, ctx.get("plan_qty"), 0, ctx.get("weight"))
+        logger.warning(
+            f"🧩 RISK {symbol}: plan_qty {ctx.get('plan_qty')} qty 0 "
+            f"(weight {ctx.get('weight')}) — {decision['reason']}"
+        )
         return 0
     sized = int(decision["qty"])
     ctx.pop("skip_reason", None)
+    _log_size_decision("RISK", symbol, ctx.get("plan_qty"), sized, ctx.get("weight"))
     if sized != qty:
         logger.warning(
-            f"🧩 RISK {symbol}: size {qty} → {sized} (weight {ctx.get('weight')}) "
+            f"🧩 RISK {symbol}: plan_qty {ctx.get('plan_qty')} qty {sized} "
+            f"(weight {ctx.get('weight')}) "
             f"— {'; '.join(ctx.get('notes') or [])}"
         )
     return sized
@@ -31355,7 +31442,8 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
             close_minute=_session_close_minute(now_et), today=now_et.date().isoformat(),
             expiry=contract.get("expiration"), ticker=ticker, holidays=_MARKET_HOLIDAYS,
             events_for_day=econ_calendar.events_for_day,
-            earnings_date=sig.get("earnings_date"), swing_hold=sig.get("swing_hold") is True,
+            earnings_date=sig.get("earnings_date"),
+            swing_hold=swing_hold_exempt(sig.get("swing_hold"), DAY_TRADE_MODE),
             opt_out=HOLD_GUARD_OPT_OUT_TICKERS,
         )
         if hg["fire"]:
@@ -32888,7 +32976,7 @@ def _payload_edge(payload: dict) -> Dict[str, Any]:
     if isinstance(learned, dict):
         feats["learning"] = {
             k: learned.get(k) for k in
-            ("weight", "cells", "notes", "requested_qty", "sized_qty", "floor_bound")
+            ("weight", "cells", "notes", "plan_qty", "requested_qty", "sized_qty", "floor_bound")
         }
     # The portfolio-risk verdict: evidence class (so live outcomes can be split
     # proven vs permitted), regime/gap weight, correlated exposure, capacity.
@@ -32906,6 +32994,7 @@ def _payload_edge(payload: dict) -> Dict[str, Any]:
             "cluster": corr.get("cluster"),
             "correlated_pct": corr.get("correlated_pct"),
             "capacity": risk.get("capacity"),
+            "plan_qty": risk.get("plan_qty"),
             "requested_qty": risk.get("requested_qty"),
             "sized_qty": risk.get("sized_qty"),
             "floor_bound": risk.get("floor_bound"),
@@ -41966,6 +42055,7 @@ async def status():
             # option entries re-expressed ITM, best expiry in 0–7 DTE.
             "core_book_enabled": CORE_BOOK_ENABLED,
             "itm_expression_enabled": ITM_EXPRESSION_ENABLED,
+            # Effective DAY_TRADE_MODE. Unset stays true. Only false, 0, off, or no is false.
             "day_trade_mode": DAY_TRADE_MODE,
             # Read-only. Import-time constant the running gate uses.
             # mode is fail_closed only while that constant is on.

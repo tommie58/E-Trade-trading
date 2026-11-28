@@ -148,7 +148,49 @@ def _calm_tape():
     }
 
 
-def test_native_one_lot_ignores_unproven_weight_and_two_lot_cut_to_one_can_skip():
+def test_sizing_log_records_plan_qty_beside_final_qty_and_weight(caplog):
+    """Logging the pre-learning plan size does not change the cut."""
+    learning = {"weight": 0.5, "notes": ["cell"]}
+    with caplog.at_level("INFO", logger="etrade-bot"):
+        sized = main_bot._apply_learning_weight("AMZN", 2, learning)
+    assert sized == 1
+    assert learning["plan_qty"] == 2
+    assert learning["sized_qty"] == 1
+    assert "plan_qty 2" in caplog.text
+    assert "qty 1" in caplog.text
+    assert "weight 0.5" in caplog.text
+    risk = {
+        "weight": 0.5,
+        "ev_weight": 0.5,
+        "regime": {"weight": 1.0},
+        "notes": ["permitted, not proven → ×0.5 (unproven)"],
+    }
+    with caplog.at_level("INFO", logger="etrade-bot"):
+        final = main_bot._apply_risk_weight("AMZN", sized, risk, plan_qty=2)
+    assert final == 0
+    assert risk["plan_qty"] == 2
+    assert risk["sized_qty"] == 0
+    assert risk["weight"] == 0.5
+    text = caplog.text
+    assert "RISK AMZN: plan_qty 2 qty 0 weight 0.5" in text
+    edge = main_bot._payload_edge({
+        "_learning": learning, "_risk": risk, "action": "BUY",
+    })
+    assert edge["learning"]["plan_qty"] == 2
+    assert edge["learning"]["sized_qty"] == 1
+    assert edge["learning"]["weight"] == 0.5
+    assert edge["risk"]["plan_qty"] == 2
+    assert edge["risk"]["sized_qty"] == 0
+    assert edge["risk"]["weight"] == 0.5
+    native = {"weight": 0.5, "notes": []}
+    kept = main_bot._apply_learning_weight("AMZN", 1, native)
+    assert kept == 1 and native["plan_qty"] == 1
+    one = {
+        "weight": 0.5, "ev_weight": 0.5,
+        "regime": {"weight": 1.0}, "notes": [],
+    }
+    assert main_bot._apply_risk_weight("AMZN", kept, one, plan_qty=1) == 1
+    assert one["plan_qty"] == 1 and one["sized_qty"] == 1
     native = main_bot.contract_qty_for_risk_weight(
         1, 0.5, market_weight=1.0, ev_weight=0.5, plan_qty=1,
     )

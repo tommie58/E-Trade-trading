@@ -13,8 +13,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-import etrade_async
 import main_bot
+import etrade_async
 
 ACCT = "82345678"
 HTML_404 = (
@@ -79,20 +79,66 @@ def test_order_log_text_redacts_a_long_account_id():
     assert "sekret" not in text
 
 
-def test_swing_hold_is_not_an_overnight_exemption():
-    out = main_bot.exit_guards.plan_hold_guard(
-        enabled=True,
-        minute_et=15 * 60 + 50,
-        close_minute=16 * 60,
-        today="2026-11-18",
-        expiry="2026-11-18",
-        ticker="AMZN",
-        holidays=[],
-        events_for_day=lambda _day: [],
-        swing_hold=True,
+def test_swing_hold_flattens_while_day_trade_mode_is_on_and_exempts_when_off():
+    weekly = main_bot.trailing_engine.plan_scheduled_exit(
+        held_seconds=1800, et_minutes=15 * 60 + 45, weekday="Wed",
+        expiry="2026-11-20", today="2026-11-18", flatten_all=True,
     )
-    assert out["fire"] is True
-    assert "swing_hold" not in out["detail"]
+    assert weekly["fire"] is True and weekly["reason"] == "eod_flatten"
+    kept = main_bot.trailing_engine.plan_scheduled_exit(
+        held_seconds=1800, et_minutes=15 * 60 + 45, weekday="Wed",
+        expiry="2026-11-20", today="2026-11-18", flatten_all=False,
+    )
+    assert kept["fire"] is False
+    assert main_bot.swing_hold_exempt(True, True) is False
+    on = main_bot.exit_guards.plan_hold_guard(
+        enabled=True, minute_et=15 * 60 + 50, close_minute=16 * 60,
+        today="2026-11-18", expiry="2026-11-18", ticker="AMZN",
+        holidays=[], events_for_day=lambda _day: [],
+        swing_hold=main_bot.swing_hold_exempt(True, True),
+    )
+    assert on["fire"] is True
+    assert main_bot.swing_hold_exempt(True, False) is True
+    off = main_bot.exit_guards.plan_hold_guard(
+        enabled=True, minute_et=15 * 60 + 50, close_minute=16 * 60,
+        today="2026-11-18", expiry="2026-11-18", ticker="AMZN",
+        holidays=[], events_for_day=lambda _day: [],
+        swing_hold=main_bot.swing_hold_exempt(True, False),
+    )
+    assert off["fire"] is False
+    assert "swing_hold" in off["detail"]
+
+
+def test_day_trade_mode_parse_defaults_on_and_warns_the_name_only(caplog):
+    assert main_bot.resolve_day_trade_mode(None) == (True, None)
+    assert main_bot.resolve_day_trade_mode("") == (True, None)
+    assert main_bot.resolve_day_trade_mode("  ") == (True, None)
+    for raw in ("true", "TRUE", "1", "on", "YES"):
+        assert main_bot.resolve_day_trade_mode(raw) == (True, None)
+    for raw in ("false", "FALSE", "0", "off", "NO"):
+        assert main_bot.resolve_day_trade_mode(raw) == (False, None)
+    enabled, warning = main_bot.resolve_day_trade_mode("swing-please")
+    assert enabled is True and warning == "DAY_TRADE_MODE"
+    with caplog.at_level("WARNING", logger="etrade-bot"):
+        assert main_bot.note_day_trade_mode("swing-please") is True
+    assert "DAY_TRADE_MODE" in caplog.text
+    assert "swing-please" not in caplog.text
+    # Unset, recognized on, and garbage all keep the 3:40 flatten.
+    for raw in (None, "on", "garbage"):
+        mode, _warn = main_bot.resolve_day_trade_mode(raw)
+        assert mode is True
+        flat = main_bot.trailing_engine.plan_scheduled_exit(
+            held_seconds=600, et_minutes=15 * 60 + 45, weekday="Wed",
+            expiry="2026-11-20", today="2026-11-18", flatten_all=mode,
+        )
+        assert flat["fire"] is True
+    off_mode, off_warn = main_bot.resolve_day_trade_mode("off")
+    assert off_mode is False and off_warn is None
+    overnight = main_bot.trailing_engine.plan_scheduled_exit(
+        held_seconds=600, et_minutes=15 * 60 + 45, weekday="Wed",
+        expiry="2026-11-20", today="2026-11-18", flatten_all=off_mode,
+    )
+    assert overnight["fire"] is False
 
 
 def test_still_open_alert_starts_at_350_and_1250_on_a_half_day():
