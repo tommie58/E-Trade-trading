@@ -5682,28 +5682,44 @@ async def reconcile_once(
                 "warning", "protection_partial", msg,
                 dedupe_key=f"partial_cover:{ticker}",
             )
-        elif not has_leg_stop and not guard_active and protective_level(pos) > 0:
-            msg = f"{ticker}: UNPROTECTED — position at broker with no live stop and no active guard"
-            report["warnings"].append(msg)
-            logger.error(f"[RECONCILE] 🚨 {msg}")
-            # Stage this before the re-arm. Production passes send_nowait,
-            # so the webhook POST does not delay the re-arm. The re-arm
-            # itself is unchanged: fixed STOP until breakeven, then one
-            # TRAILING_STOP_CNST with a fixed-STOP fallback.
-            await _alert("critical", "position_unprotected", msg,
-                         dedupe_key=f"unprotected:{ticker}")
+        elif not has_leg_stop and (
+            (
+                not position_is_option(pos)
+                and isinstance(guard, dict)
+                and not str(guard.get("stop_order_id") or "").strip()
+                and str(guard.get("stop_client_id") or "").strip()
+                and (
+                    guard.get("stop_reply_lost")
+                    or guard.get("stop_reply_bound")
+                    or guard.get("flatten_unresolved")
+                )
+            )
+            or (not guard_active and protective_level(pos) > 0)
+        ):
             lost_stock = (
                 not position_is_option(pos)
                 and isinstance(guard, dict)
                 and not str(guard.get("stop_order_id") or "").strip()
                 and str(guard.get("stop_client_id") or "").strip()
-                and (guard.get("stop_reply_lost") or guard.get("stop_reply_bound"))
+                and (
+                    guard.get("stop_reply_lost")
+                    or guard.get("stop_reply_bound")
+                    or guard.get("flatten_unresolved")
+                )
             )
-            if auto_heal and rearm_guard is not None and lost_stock:
+            msg = f"{ticker}: UNPROTECTED — position at broker with no live stop and no active guard"
+            report["warnings"].append(msg)
+            logger.error(f"[RECONCILE] 🚨 {msg}")
+            # Page even while the guard record is still inside its trust
+            # window. Skipping the re-arm must not skip the page.
+            await _alert("critical", "position_unprotected", msg,
+                         dedupe_key=f"unprotected:{ticker}",
+                         dedupe_seconds=30)
+            if lost_stock:
                 report["warnings"].append(
                     f"{ticker}: stock lost-stop id is unresolved — not re-arming"
                 )
-            elif auto_heal and rearm_guard is not None:
+            elif auto_heal and rearm_guard is not None and not guard_active:
                 try:
                     rearm_result = await rearm_guard(ticker, pos)
                     if rearm_result in (None, "placed"):
@@ -28898,13 +28914,13 @@ _REDIS_ENDPOINT_RE = re.compile(
 _REDIS_EXC_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*Error)\b")
 
 
-# A host is an IPv4 address or a name that contains a letter and a dot.
-# The lookbehind keeps a decimal price (590.25:590.30), a ticker:qty,
-# a price:qty, and a clock (09:31:00) intact.
+# A host is an IPv4 address or a dotted name whose labels after the first
+# are at least two characters. That leaves BRK.B:100, a price pair, a
+# ticker quantity, and a clock untouched.
 _HOSTPORT_RE = re.compile(
     r"(?<![\d.])(?:"
     r"\d{1,3}(?:\.\d{1,3}){3}"
-    r"|[A-Za-z0-9-]*[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]*[A-Za-z][A-Za-z0-9-]*)+"
+    r"|[A-Za-z0-9-]*[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]{2,63})+"
     r"):\d{2,5}\b"
 )
 _URL_CRED_RE = re.compile(
@@ -31608,57 +31624,6 @@ class FlattenNotSent(Exception):
 NOT_SOLD = "NOT_SOLD"
 
 
-async def _stock_flatten_already_working(ticker: str, guard: dict) -> bool:
-    """True when a stock re-sell would add a second exit.
-
-    An unreadable book is treated as already working so a stock is not
-    sold again blind. Options do not use this; a 3004 stops their oversell.
-    """
-    try:
-        resp = await asyncio.wait_for(
-            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
-        )
-    except Exception as exc:
-        logger.warning("flatten re-sell book read failed (%s)", type(exc).__name__)
-        return True
-    client_id = str((guard or {}).get("flatten_client_id") or "").strip()
-    for order in reconciliation.parse_open_orders(resp):
-        cid = str(order.get("client_order_id") or "").strip()
-        status = str(order.get("status") or "").upper()
-        if client_id and cid == client_id and status in reconciliation._OPEN_ORDER_STATUSES:
-            return True
-        if _flatten_working_exit(order, ticker, guard):
-            return True
-    return False
-
-
-def _stock_listed_sell_state(orders: list, guard: dict) -> str:
-    """``unfilled``, ``filled``, ``working``, or ``unknown``.
-
-    ``unknown`` is a lagging or empty list: the first sell is not proven
-    unfilled, so a stock must not send another.
-    """
-    client_id = str((guard or {}).get("flatten_client_id") or "").strip()
-    order_id = str((guard or {}).get("flatten_order_id") or "").strip()
-    for order in orders or []:
-        oid = str(order.get("order_id") or "").strip()
-        cid = str(order.get("client_order_id") or "").strip()
-        if not ((order_id and oid == order_id) or (client_id and cid == client_id)):
-            continue
-        status = str(order.get("status") or "").upper()
-        try:
-            filled = int(order.get("filled") or 0)
-        except (TypeError, ValueError):
-            filled = 0
-        if _filled_order_status(status) or filled > 0:
-            return "filled"
-        if status in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
-            return "unfilled"
-        if status in reconciliation._OPEN_ORDER_STATUSES:
-            return "working"
-    return "unknown"
-
-
 async def _emergency_flatten(
     ticker: str, guard: dict, qty: int, *, book: str = "required",
 ) -> Optional[str]:
@@ -31689,47 +31654,29 @@ async def _emergency_flatten(
         if prior_label in {"", "NOT_FOUND", "UNKNOWN"}:
             is_stock = str(guard.get("kind") or "equity") != "option"
             if is_stock:
-                if int(guard.get("flatten_stock_resends") or 0) >= 1:
-                    logger.warning(
-                        "[FLATTEN] %s stock re-send already used — not selling",
-                        ticker,
-                    )
-                    return NOT_SOLD
-                if await _stock_flatten_already_working(ticker, guard):
-                    logger.warning(
-                        "[FLATTEN] %s prior sell %s was not acknowledged and a "
-                        "working exit is already on the book — not selling again",
-                        ticker, prior_id or prior_client,
-                    )
-                    return NOT_SOLD
-                held = await _flatten_broker_held_qty(ticker, {
-                    "action": guard.get("action") or "BUY",
-                    "contract": guard.get("contract"),
-                })
-                listed = "unknown"
-                try:
-                    book_resp = await asyncio.wait_for(
-                        _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
-                    )
-                    listed = _stock_listed_sell_state(
-                        reconciliation.parse_open_orders(book_resp), guard,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "stock flatten fill check failed (%s)", type(exc).__name__,
-                    )
-                if held is None or held <= 0 or listed != "unfilled":
-                    logger.warning(
-                        "[FLATTEN] %s not re-sending — holdings or fill check "
-                        "did not show the shares still held and the sell unfilled",
-                        ticker,
-                    )
-                    return NOT_SOLD
-                qty = min(int(held), int(qty))
-                await state.update_guard(ticker, flatten_stock_resends=1)
-                guard["flatten_stock_resends"] = 1
-            # Options fall through and place. A stock falls through only
-            # for this single proven re-send.
+                # No stock re-send. A lost reply is not proof the first
+                # sell failed, and a second sell can open a short.
+                logger.warning(
+                    "[FLATTEN] %s prior sell %s was not acknowledged — not re-sending",
+                    ticker, prior_id or prior_client,
+                )
+                return NOT_SOLD
+            held = await _flatten_broker_held_qty(ticker, {
+                "action": guard.get("action") or "BUY",
+                "contract": guard.get("contract"),
+            })
+            try:
+                held_n = int(held) if held is not None else None
+            except (TypeError, ValueError):
+                held_n = None
+            if held_n is None or held_n <= 0:
+                logger.warning(
+                    "[FLATTEN] %s option re-send skipped — holdings read "
+                    "did not show the contracts still held",
+                    ticker,
+                )
+                return NOT_SOLD
+            qty = min(held_n, int(qty))
         elif _emergency_flatten_reuse(p_status, p_filled):
             # Filled (including DONE_TRADE_EXECUTED with a blank quantity),
             # partially filled, or still working — this IS the flatten.
@@ -33265,6 +33212,17 @@ async def _finish_guard(ticker: str, result: str) -> None:
     await trade_ledger.record("guard_finished", {"ticker": ticker, "result": result})
 
 
+def _option_surplus_stop(order: dict, pos: dict, ticker: str) -> bool:
+    """A resting STOP or TRAILING_STOP that closes this option contract.
+
+    Close orders and take-profit LIMIT orders are not surplus stops.
+    """
+    price = str((order or {}).get("price_type") or "").upper()
+    if price != "STOP" and not price.startswith("TRAILING_STOP"):
+        return False
+    return bool(reconciliation.order_same_contract(order, pos, ticker))
+
+
 async def _option_surplus_once(ticker: str) -> None:
     """Cancel every resting option stop on this contract except the tracked one.
 
@@ -33285,13 +33243,17 @@ async def _option_surplus_once(ticker: str) -> None:
     except Exception as exc:
         logger.warning("option surplus read failed (%s)", type(exc).__name__)
         return
-    extras = []
+    resting = []
     for order in reconciliation.parse_open_orders(resp):
-        if not reconciliation.order_same_contract(order, pos, ticker):
+        if not _option_surplus_stop(order, pos, ticker):
             continue
         order_id = str(order.get("order_id") or "").strip()
-        if order_id and order_id != tracked:
-            extras.append(order_id)
+        if order_id:
+            resting.append(order_id)
+    # The original stays until the retry itself is a resting stop.
+    if tracked not in resting:
+        return
+    extras = [order_id for order_id in resting if order_id != tracked]
     for order_id in extras:
         try:
             await _cancel_order_verified(order_id)
@@ -33343,6 +33305,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                 return
             is_option = str(guard.get("kind") or "equity") == "option"
             allocation_hold_released = False
+            held_open = False
 
             status = str(guard.get("last_status") or "OPEN")
             filled = int(guard.get("last_filled") or 0)
@@ -34031,7 +33994,9 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 ticker, flatten_unresolved=True, stop_reply_bound=True,
                             ) or guard
                             guard = await _page_unconfirmed_stop(ticker, guard)
-                            return
+                            # Stay in the loop. Returning here paged once
+                            # and then left the stock naked and silent.
+                            held_open = True
                         except Exception as e:
                             logger.error(
                                 "[STOP GUARD] %s emergency flatten FAILED (%s)",
@@ -34073,7 +34038,12 @@ async def _stop_guard_worker(ticker: str) -> None:
                         )
                         return
 
-            if _filled_order_status(status) and filled > 0 and guarded >= filled:
+            if (
+                not held_open
+                and _filled_order_status(status)
+                and filled > 0
+                and guarded >= filled
+            ):
                 await _finish_guard(ticker, "filled_and_protected")
                 return
             if _entry_terminal_unfilled(status, filled):
@@ -41596,6 +41566,17 @@ async def _flatten_open_orders() -> List[dict]:
     return found
 
 
+def _portfolio_lists_a_position(portfolio: Any) -> bool:
+    """True when the portfolio payload actually lists at least one position."""
+    root = (portfolio or {}).get("PortfolioResponse") or {}
+    if not isinstance(root, dict):
+        return False
+    for acct in reconciliation._as_list(root.get("AccountPortfolio")):
+        if reconciliation._as_list(acct.get("Position") if isinstance(acct, dict) else None):
+            return True
+    return False
+
+
 async def _flatten_broker_held_qty(ticker: str, pos: dict) -> Optional[int]:
     """Contracts the broker still holds for this position.
 
@@ -41607,6 +41588,10 @@ async def _flatten_broker_held_qty(ticker: str, pos: dict) -> Optional[int]:
         portfolio = await _reconcile_fetch_portfolio()
     except Exception:
         logger.error(f"[FLATTEN REPLACE] {ticker} broker position read failed")
+        return None
+    if not _portfolio_lists_a_position(portfolio):
+        # An empty portfolio payload is lag, not a flat account.
+        logger.warning("[FLATTEN REPLACE] %s portfolio read was empty", ticker)
         return None
     try:
         record = reconciliation.parse_broker_positions(portfolio).get(str(ticker).upper())
@@ -46009,135 +45994,6 @@ async def flatten(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secr
     return await _flatten_book("panic")
 
 
-def _stock_lost_stop_unresolved(item: dict, guard: dict) -> bool:
-    """Equity whose lost stop id was never resolved. Options are not this case."""
-    if str(item.get("kind") or "") == "option":
-        return False
-    if not str((guard or {}).get("stop_client_id") or "").strip():
-        return False
-    if str(item.get("stop_order_id") or (guard or {}).get("stop_order_id") or "").strip():
-        return False
-    return bool((guard or {}).get("stop_reply_lost") or (guard or {}).get("stop_reply_bound"))
-
-
-async def _cancel_symbol_orders(ticker: str) -> None:
-    """Best-effort cancel of every open order on this symbol. Never buys."""
-    try:
-        resp = await asyncio.wait_for(
-            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
-        )
-    except Exception as exc:
-        logger.warning("symbol cancel read failed (%s)", type(exc).__name__)
-        return
-    for order in reconciliation.parse_open_orders(resp):
-        if str(order.get("symbol") or "").upper() != str(ticker or "").upper():
-            continue
-        order_id = str(order.get("order_id") or "").strip()
-        if not order_id:
-            continue
-        try:
-            await _cancel_order_verified(order_id)
-        except Exception as exc:
-            logger.warning("symbol cancel failed (%s)", type(exc).__name__)
-
-
-async def _page_lost_stop_short(ticker: str) -> None:
-    """Keep paging a short (or an unreadable holding) every 30s. Never buy."""
-    try:
-        await asyncio.sleep(UNCONFIRMED_STOP_PAGE_S)
-        guard = await state.get_guard(ticker)
-        if not guard or guard.get("done") or not guard.get("flatten_unresolved"):
-            return
-        await _page_unconfirmed_stop(ticker, guard)
-        _arm_lost_stop_short_page(ticker)
-    except Exception as exc:
-        logger.warning("lost-stop short page failed (%s)", type(exc).__name__)
-
-
-def _arm_lost_stop_short_page(ticker: str) -> None:
-    alerts.retain(asyncio.create_task(_page_lost_stop_short(ticker)))
-
-
-async def _panic_flatten_lost_stock(ticker: str, item: dict, guard: dict) -> dict:
-    """Sell a stock whose lost stop may still be live. Never buy a short back.
-
-    Cancel any known id, then sell the holding when that read works and the
-    tracked quantity when it does not. After the sell, cancel the symbol's
-    open orders and read the holding again. A short, a negative quantity, or
-    a failed read stays open and is paged every 30 seconds.
-    """
-    known = []
-    for order_id in (
-        item.get("stop_order_id"),
-        guard.get("stop_order_id"),
-        guard.get("flatten_order_id"),
-    ):
-        text = str(order_id or "").strip()
-        if text and text not in known:
-            known.append(text)
-    for order_id in known:
-        try:
-            await _cancel_order_verified(order_id, expected_qty=item.get("qty") or None)
-        except Exception as exc:
-            logger.warning("panic lost-stop cancel failed (%s)", type(exc).__name__)
-    held = await _flatten_broker_held_qty(ticker, {"action": item.get("action") or "BUY"})
-    tracked = int(item.get("qty") or 0)
-    if held is None:
-        sell_qty = tracked
-    elif held <= 0:
-        sell_qty = 0
-    else:
-        sell_qty = min(int(held), tracked)
-    await alerts.send_nowait(
-        "critical", "lost_stop_may_be_live",
-        f"{ticker}: flatten is selling while a lost stop may still be live.",
-        dedupe_key=f"lost_stop_live:{ticker}",
-    )
-    order_id = None
-    if sell_qty > 0:
-        order_id = await _emergency_flatten(
-            ticker,
-            {
-                "kind": "equity",
-                "action": item.get("action") or "BUY",
-                "stop_client_id": guard.get("stop_client_id"),
-                "stop_reply_lost": True,
-            },
-            sell_qty,
-            book="skip",
-        )
-    await _cancel_symbol_orders(ticker)
-    again = await _flatten_broker_held_qty(ticker, {"action": item.get("action") or "BUY"})
-    if again is None or again < 0:
-        await state.update_guard(
-            ticker,
-            flatten_unresolved=True,
-            stop_reply_bound=True,
-            done=False,
-        )
-        fresh = await state.get_guard(ticker) or guard
-        await _page_unconfirmed_stop(ticker, fresh)
-        _arm_lost_stop_short_page(ticker)
-        return {
-            "ticker": ticker,
-            "status": "short_watch",
-            "order_id": order_id,
-            "qty": sell_qty,
-            "kind": "equity",
-        }
-    if order_id:
-        await _finish_guard(ticker, "flattened")
-        await _defer_close_to_reconciler(ticker, order_id, "flatten close placed")
-    return {
-        "ticker": ticker,
-        "status": "closing" if order_id else "already_flat",
-        "order_id": order_id,
-        "qty": sell_qty,
-        "kind": "equity",
-        "stop": CANCEL_NONE,
-    }
-
-
 async def _flatten_book(trigger: str) -> Dict[str, Any]:
     """Kill entries, then close every tracked position. ONE implementation for
     every caller -- the panic button (`trigger='panic'`) and the risk desk's
@@ -46160,10 +46016,6 @@ async def _flatten_book(trigger: str) -> Dict[str, Any]:
             results.append({"ticker": ticker, "status": "blocked", "detail": item["blocked"]})
             continue
         try:
-            guard = dict(guards.get(ticker) or {})
-            if _stock_lost_stop_unresolved(item, guard):
-                results.append(await _panic_flatten_lost_stock(ticker, item, guard))
-                continue
             stop_outcome = CANCEL_NONE
             if item["stop_order_id"]:
                 # Compare against the CANCEL_* constants, never string literals.
@@ -46228,6 +46080,17 @@ async def _flatten_book(trigger: str) -> Dict[str, Any]:
             order_id = await _emergency_flatten(
                 ticker, guard_shape, item["qty"], book="skip",
             )
+            if order_id in (None, NOT_SOLD):
+                await state.update_guard(
+                    ticker, flatten_unresolved=True, stop_reply_bound=True, done=False,
+                )
+                fresh = await state.get_guard(ticker) or {}
+                await _page_unconfirmed_stop(ticker, fresh)
+                results.append({
+                    "ticker": ticker, "status": "failed",
+                    "detail": "NOT_SOLD",
+                })
+                continue
             await _finish_guard(ticker, "flattened")
             # The market close fills in seconds — hand the position to the
             # reconciler's fill capture so the REAL exit gets booked (never a
@@ -46244,10 +46107,7 @@ async def _flatten_book(trigger: str) -> Dict[str, Any]:
             results.append({"ticker": ticker, "status": "failed", "detail": str(e)[:300]})
 
     closing = [r["ticker"] for r in results if r["status"] == "closing"]
-    failed = [
-        r["ticker"] for r in results
-        if r["status"] in {"failed", "blocked", "short_watch"}
-    ]
+    failed = [r["ticker"] for r in results if r["status"] in {"failed", "blocked"}]
     await trade_ledger.record("flatten_all", {"trigger": trigger, "results": results})
     headline = ("DAILY LOSS LIMIT BREACHED - the risk desk flattened the book"
                 if trigger == "daily_loss" else "PANIC EXIT")

@@ -178,12 +178,15 @@ def test_endpoint_filter_keeps_prices_and_redacts_asyncpg_tuples(caplog):
             raise RuntimeError("unprintable")
 
     with caplog.at_level(logging.WARNING):
-        log.warning("trail 590.25:590.30 qty QQQ:100 price:qty 590.25:100 at 09:31:00")
+        log.warning(
+            "trail 590.25:590.30 qty QQQ:100 BRK.B:100 price:qty 590.25:100 at 09:31:00"
+        )
         log.warning("asyncpg connect failed %s", "('10.1.2.3', 5432)")
         log.warning("bad arg %s", _Boom())
     text = caplog.text
     assert "590.25:590.30" in text
     assert "QQQ:100" in text
+    assert "BRK.B:100" in text
     assert "590.25:100" in text
     assert "09:31:00" in text
     assert "10.1.2.3" not in text

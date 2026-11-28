@@ -439,14 +439,31 @@ def test_option_surplus_cancels_the_extra_stop_at_10s_and_on_a_later_listing(mon
         listed["rows"] = [_option_stop("ORIGINAL"), _option_stop("RETRY")]
         await main_bot._option_surplus_once("QQQ")
         after_first = list(cancelled)
-        # A later listing of that same original id is cancelled again.
-        listed["rows"] = [_option_stop("ORIGINAL"), _option_stop("RETRY")]
+        # The retry id is not on the book, so the original stays.
+        listed["rows"] = [_option_stop("ORIGINAL")]
         await main_bot._option_surplus_once("QQQ")
-        return after_first, list(cancelled)
+        missed = list(cancelled)
+        # A close and a take-profit limit are not surplus stops.
+        listed["rows"] = [
+            _option_stop("ORIGINAL"),
+            _option_stop("RETRY"),
+            {
+                **_option_stop("TRAIL"),
+                "price_type": "TRAILING_STOP_CNST",
+                "stop_price": None,
+                "offset_value": 0.2,
+            },
+            {**_option_stop("CLOSE"), "price_type": "LIMIT", "stop_price": None},
+            {**_option_stop("TARGET"), "price_type": "LIMIT", "stop_price": None},
+        ]
+        await main_bot._option_surplus_once("QQQ")
+        return after_first, missed, list(cancelled)
 
-    first, both = _run(scenario())
+    first, missed, later = _run(scenario())
     assert first == ["ORIGINAL"]
-    assert both == ["ORIGINAL", "ORIGINAL"]
+    assert missed == ["ORIGINAL"]
+    assert later == ["ORIGINAL", "ORIGINAL", "TRAIL"]
+    assert "CLOSE" not in later and "TARGET" not in later
     assert main_bot._OPTION_SURPLUS_DELAYS == (10.0, 30.0)
 
 
@@ -483,4 +500,120 @@ def test_option_retry_schedules_the_10s_and_30s_surplus_checks(monkeypatch):
 
     assert _run(scenario()) == [2, 2]
     assert delays == [10.0, 30.0]
+
+
+def test_stock_lost_reply_pages_every_30s_across_5400s(monkeypatch):
+    """One worker invocation keeps paging for 5,400s. It does not return after the first page."""
+    store = main_bot.StateStore(None)
+    pages = []
+    places = []
+    clock = {"t": 10_000.0}
+    end = clock["t"] + 5_400.0
+    monkeypatch.setattr(main_bot.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(main_bot, "state", store)
+
+    async def send_nowait(severity, event, message, **kwargs):
+        if event == "position_unprotected":
+            pages.append(clock["t"])
+
+    async def order_state(order_id, client_id):
+        return "EXECUTED", 100
+
+    async def nap(seconds):
+        clock["t"] += float(seconds)
+        if clock["t"] >= end:
+            await store.update_guard("QQQ", done=True)
+
+    async def flatten(*args, **kwargs):
+        return main_bot.NOT_SOLD
+
+    async def quiet(*args, **kwargs):
+        return None
+
+    async def book():
+        return {"OrdersResponse": {}}
+
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)
+    monkeypatch.setattr(main_bot, "_order_state", order_state)
+    monkeypatch.setattr(main_bot.asyncio, "sleep", nap)
+    monkeypatch.setattr(main_bot, "_emergency_flatten", flatten)
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", book)
+    monkeypatch.setattr(main_bot.trade_ledger, "record", quiet)
+    monkeypatch.setattr(main_bot, "_resolve_exit_fill", quiet)
+    monkeypatch.setattr(main_bot, "_defer_close_to_reconciler", quiet)
+    monkeypatch.setattr(main_bot, "_true_up_entry_fill", quiet)
+    monkeypatch.setattr(main_bot, "_cancel_order_safe", quiet)
+
+    async def place(*args, **kwargs):
+        places.append(1)
+        return {"order_id": "NO", "client_id": "no", "qty": 100, "stop": 90.0}
+
+    monkeypatch.setattr(main_bot, "_place_protective_stop", place)
+
+    async def scenario():
+        await store.set_position("QQQ", {
+            "action": "BUY", "entry": 100.0, "stop": 90.0,
+            "filled_qty": 100, "qty": 100,
+        })
+        await store.set_guard("QQQ", {
+            "done": False, "kind": "equity", "action": "BUY", "stop": 90.0,
+            "guarded_qty": 100, "trued_qty": 100,
+            "fill_detected_ts": 1, "stop_deadline_ts": 1,
+            "deadline_ts": end + 10_000,
+            "entry_order_id": "ENTRY-1",
+            "stop_client_id": "LOST-CLIENT",
+            "stop_reply_bound": True,
+        })
+        await main_bot._stop_guard_worker("QQQ")
+        return list(pages), await store.get_guard("QQQ")
+
+    times, guard = _run(scenario())
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    assert places == []
+    assert guard.get("result") != "stop_timeout_flattened"
+    assert len(times) >= 180
+    assert times[-1] - times[0] >= 5_400 - 30
+    assert gaps and max(gaps) <= 30
+
+
+def test_reconciler_pages_a_lost_stock_instead_of_skipping(monkeypatch):
+    store = main_bot.StateStore(None)
+    rearms = []
+    pages = []
+    monkeypatch.setattr(main_bot, "state", store)
+
+    async def rearm(ticker, position):
+        rearms.append(ticker)
+        return "placed"
+
+    async def alert(severity, event, message, **kwargs):
+        pages.append((severity, event))
+
+    async def portfolio():
+        return {"PortfolioResponse": {"AccountPortfolio": {"Position": [{
+            "symbolDescription": "QQQ",
+            "quantity": 100,
+            "Product": {"symbol": "QQQ", "securityType": "EQ"},
+        }]}}}
+
+    async def book():
+        return {"OrdersResponse": {}}
+
+    async def scenario():
+        await store.set_position("QQQ", _position("equity", 100))
+        guard = _guard("equity", 100)
+        guard["deadline_ts"] = 1_000_000_000.0
+        guard["stop_client_id"] = "LOST-CLIENT"
+        guard["stop_reply_bound"] = True
+        guard["stop_reply_lost"] = True
+        guard["stop_order_id"] = None
+        await store.set_guard("QQQ", guard)
+        await main_bot.reconciliation.reconcile_once(
+            store, portfolio, book, lambda order_id: True,
+            rearm_guard=rearm, alert=alert,
+        )
+
+    _run(scenario())
+    assert rearms == []
+    assert ("critical", "position_unprotected") in pages
 

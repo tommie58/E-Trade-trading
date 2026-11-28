@@ -92,8 +92,12 @@ def test_not_found_prior_flatten_sends_one_sell(monkeypatch):
     async def empty_book():
         return {"OrdersResponse": {}}
 
+    async def held(ticker, pos):
+        return None
+
     monkeypatch.setattr(main_bot, "_order_state", order_state)
     monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", empty_book)
+    monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", held)
 
     async def scenario(kind):
         sold.clear()
@@ -113,7 +117,9 @@ def test_not_found_prior_flatten_sends_one_sell(monkeypatch):
     equity_id, equity_sold = _run(scenario("equity"))
     assert equity_id == main_bot.NOT_SOLD
     assert equity_sold == []
-    assert _run(scenario("option"))[1] == [100]
+    option_id, option_sold = _run(scenario("option"))
+    assert option_id == main_bot.NOT_SOLD
+    assert option_sold == []
 
 
 def test_stock_not_found_resend_is_once_and_never_over_held(monkeypatch):
@@ -152,13 +158,12 @@ def test_stock_not_found_resend_is_once_and_never_over_held(monkeypatch):
             "flatten_order_id": "FLAT-1", "flatten_client_id": "FLAT-CLIENT",
             "flatten_attempts": 1,
         })
-        await main_bot._emergency_flatten("QQQ", await store.get_guard("QQQ"), 100)
-        again = await main_bot._emergency_flatten("QQQ", await store.get_guard("QQQ"), 100)
-        return list(sold), again
+        first = await main_bot._emergency_flatten("QQQ", await store.get_guard("QQQ"), 100)
+        return first, list(sold)
 
-    sold_qty, again = _run(scenario())
-    assert sold_qty == [100]
-    assert again == main_bot.NOT_SOLD
+    result, sold_qty = _run(scenario())
+    assert result == main_bot.NOT_SOLD
+    assert sold_qty == []
 
 
 def test_filled_stock_sell_that_reads_not_found_does_not_go_short(monkeypatch):
@@ -283,7 +288,8 @@ def test_unsold_prior_flatten_keeps_the_guard_paging(monkeypatch):
         await poll()
         first = [row for row in alerts if row[1] == "position_unprotected"]
         held = await store.get_guard("QQQ")
-        assert held.get("done") is not True
+        assert held.get("result") != "stop_timeout_flattened"
+        assert held.get("flatten_unresolved") is True
         assert ("critical", "stop_timeout_flattened") not in alerts
         clock["t"] += main_bot.UNCONFIRMED_STOP_PAGE_S
         await poll()
@@ -295,62 +301,17 @@ def test_unsold_prior_flatten_keeps_the_guard_paging(monkeypatch):
     assert second == first + 1
 
 
-def test_panic_lost_stock_stop_pages_a_short_and_never_buys(monkeypatch):
+def test_panic_stock_sells_the_tracked_quantity(monkeypatch):
+    """Panic uses the pre-split path: tracked qty, even if a holdings read would fail."""
     store = main_bot.StateStore(None)
-    orders = []
-    alerts = []
-    cancels = []
-    holdings = {"n": 0}
-    clock = {"t": 5_000.0}
+    sold = _install(monkeypatch, store)
+    reads = []
 
     async def held(ticker, pos):
-        holdings["n"] += 1
-        return 100 if holdings["n"] == 1 else -100
-
-    async def smart(kind, common, tokens):
-        orders.append((
-            str(common.get("orderAction") or "").upper(),
-            int(common.get("quantity") or 0),
-        ))
-        return {"orderId": "MKT-1"}
-
-    async def fetch():
-        return {"OrdersResponse": {}}
-
-    async def cancel(order_id, expected_qty=None):
-        cancels.append(order_id)
-        return main_bot.CANCEL_CONFIRMED
-
-    async def send_nowait(severity, event, message, **kwargs):
-        alerts.append((severity, event))
-
-    async def quiet(*args, **kwargs):
+        reads.append(ticker)
         return None
 
-    def tokens():
-        return {"oauth_token": "t", "oauth_token_secret": "s"}
-
-    async def account(_tokens):
-        return "acct"
-
-    monkeypatch.setattr(main_bot.time, "time", lambda: clock["t"])
-    monkeypatch.setattr(main_bot, "state", store)
     monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", held)
-    monkeypatch.setattr(main_bot, "_place_order_smart", smart)
-    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", fetch)
-    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel)
-    monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)
-    monkeypatch.setattr(main_bot, "load_tokens", tokens)
-    monkeypatch.setattr(main_bot, "_resolve_account_id_key", account)
-    monkeypatch.setattr(main_bot.trade_ledger, "record", quiet)
-    monkeypatch.setattr(main_bot, "_defer_close_to_reconciler", quiet)
-    monkeypatch.setattr(
-        main_bot.reconciliation, "parse_open_orders",
-        lambda _resp: [{"order_id": "STOP-LIVE", "symbol": "QQQ"}],
-    )
-    monkeypatch.setattr(
-        main_bot, "_arm_lost_stop_short_page", lambda ticker: alerts.append(("arm", ticker)),
-    )
 
     async def scenario():
         await store.set_position("QQQ", {
@@ -362,19 +323,52 @@ def test_panic_lost_stock_stop_pages_a_short_and_never_buys(monkeypatch):
             "stop_client_id": "LOST-CLIENT", "stop_reply_lost": True,
         })
         await main_bot._flatten_book("panic")
-        first = [row for row in alerts if row[1] == "position_unprotected"]
-        clock["t"] += main_bot.UNCONFIRMED_STOP_PAGE_S
-        await main_bot._page_unconfirmed_stop("QQQ", await store.get_guard("QQQ"))
-        second = [row for row in alerts if row[1] == "position_unprotected"]
-        return first, second, await store.get_guard("QQQ")
+        return list(sold), await store.get_guard("QQQ")
 
-    first, second, guard = _run(scenario())
-    assert orders == [("SELL", 100)]
-    assert not any(action.startswith("BUY") for action, _qty in orders)
-    assert cancels == ["STOP-LIVE"]
-    assert ("critical", "lost_stop_may_be_live") in alerts
-    assert ("arm", "QQQ") in alerts
-    assert len(first) == 1
-    assert len(second) == 2
-    assert guard.get("done") is not True
-    assert guard.get("flatten_unresolved") is True
+    sold_qty, guard = _run(scenario())
+    assert sold_qty == [100]
+    assert reads == []
+    assert guard.get("result") == "flattened"
+
+
+def test_option_not_found_resells_only_the_held_contracts(monkeypatch):
+    store = main_bot.StateStore(None)
+    sold = _install(monkeypatch, store)
+
+    async def order_state(order_id, client_id):
+        return "NOT_FOUND", 0
+
+    async def held(ticker, pos):
+        return 2
+
+    monkeypatch.setattr(main_bot, "_order_state", order_state)
+    monkeypatch.setattr(main_bot, "_flatten_broker_held_qty", held)
+
+    async def scenario():
+        await store.set_guard("QQQ", {
+            "done": False, "kind": "option", "action": "BUY",
+            "flatten_order_id": "FLAT-1", "flatten_client_id": "FLAT-CLIENT",
+            "flatten_attempts": 1,
+            "contract": {"right": "CALL", "strike": 450.0, "expiration": "2026-12-18"},
+        })
+        return await main_bot._emergency_flatten(
+            "QQQ", await store.get_guard("QQQ"), 4,
+        )
+
+    assert _run(scenario())
+    assert sold == [2]
+
+
+def test_empty_portfolio_read_is_not_flat(monkeypatch):
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+
+    async def empty():
+        return {"PortfolioResponse": {"AccountPortfolio": []}}
+
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_portfolio", empty)
+
+    async def scenario():
+        return await main_bot._flatten_broker_held_qty("QQQ", {"action": "BUY"})
+
+    assert _run(scenario()) is None
