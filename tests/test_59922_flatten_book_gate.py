@@ -372,3 +372,148 @@ def test_empty_portfolio_read_is_not_flat(monkeypatch):
         return await main_bot._flatten_broker_held_qty("QQQ", {"action": "BUY"})
 
     assert _run(scenario()) is None
+
+
+def _drive_deadline(monkeypatch, store, *, kind, reply_lost, client_id, deadline, qty=100):
+    sold = []
+    alerts = []
+    clock = {"t": 10_000.0}
+
+    async def place(*args, **kwargs):
+        raise main_bot.ETradeAPIError(400, "rejected")
+
+    async def fetch():
+        raise RuntimeError("book down")
+
+    async def smart(kind_name, common, tokens):
+        sold.append((
+            str(common.get("orderAction") or ""),
+            int(common.get("quantity") or 0),
+            clock["t"],
+        ))
+        return {"orderId": "MKT-1"}
+
+    async def send_nowait(severity, event, message, **kwargs):
+        alerts.append((severity, event, clock["t"]))
+
+    async def order_state(order_id, client_id_arg):
+        return "EXECUTED", qty
+
+    steps = {"n": 0}
+
+    async def nap(seconds):
+        clock["t"] += float(seconds)
+        steps["n"] += 1
+        if sold or (reply_lost and steps["n"] >= 1) or clock["t"] > 20_000:
+            await store.update_guard("QQQ", done=True)
+
+    async def quiet(*args, **kwargs):
+        return None
+
+    def tokens():
+        return {"oauth_token": "t", "oauth_token_secret": "s"}
+
+    async def account(_tokens):
+        return "acct"
+
+    monkeypatch.setattr(main_bot.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(main_bot, "state", store)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)
+    monkeypatch.setattr(main_bot, "_order_state", order_state)
+    monkeypatch.setattr(main_bot.asyncio, "sleep", nap)
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", fetch)
+    monkeypatch.setattr(main_bot, "_place_order_smart", smart)
+    monkeypatch.setattr(main_bot, "load_tokens", tokens)
+    monkeypatch.setattr(main_bot, "_resolve_account_id_key", account)
+    monkeypatch.setattr(main_bot.trade_ledger, "record", quiet)
+    monkeypatch.setattr(main_bot, "_resolve_exit_fill", quiet)
+    monkeypatch.setattr(main_bot, "_defer_close_to_reconciler", quiet)
+    monkeypatch.setattr(main_bot, "_true_up_entry_fill", quiet)
+    monkeypatch.setattr(main_bot, "_cancel_order_safe", quiet)
+    if kind == "option":
+        monkeypatch.setattr(main_bot, "_place_option_protective_stop", place)
+    else:
+        monkeypatch.setattr(main_bot, "_place_protective_stop", place)
+    return sold, alerts, clock, deadline
+
+
+def test_definite_reject_sells_when_the_book_is_down(monkeypatch):
+    store = main_bot.StateStore(None)
+    deadline = 10_060.0
+    sold, alerts, clock, _deadline = _drive_deadline(
+        monkeypatch, store, kind="equity", reply_lost=False,
+        client_id="", deadline=deadline,
+    )
+
+    async def scenario():
+        await store.set_position("QQQ", {
+            "action": "BUY", "entry": 100.0, "stop": 90.0,
+            "filled_qty": 100, "qty": 100,
+        })
+        await store.set_guard("QQQ", {
+            "done": False, "kind": "equity", "action": "BUY", "stop": 90.0,
+            "guarded_qty": 0, "trued_qty": 100,
+            "fill_detected_ts": 1, "stop_deadline_ts": deadline,
+            "deadline_ts": 100_000.0, "entry_order_id": "ENTRY-1",
+        })
+        await main_bot._stop_guard_worker("QQQ")
+        return list(sold)
+
+    fills = _run(scenario())
+    assert fills and fills[0][0] == "SELL" and fills[0][1] == 100
+    assert deadline <= fills[0][2] <= deadline + 10
+
+
+def test_lost_reply_with_the_book_down_pages_and_does_not_sell(monkeypatch):
+    store = main_bot.StateStore(None)
+    sold, alerts, _clock, _deadline = _drive_deadline(
+        monkeypatch, store, kind="equity", reply_lost=True,
+        client_id="LOST", deadline=1.0,
+    )
+
+    async def scenario():
+        await store.set_position("QQQ", {
+            "action": "BUY", "entry": 100.0, "stop": 90.0,
+            "filled_qty": 100, "qty": 100,
+        })
+        await store.set_guard("QQQ", {
+            "done": False, "kind": "equity", "action": "BUY", "stop": 90.0,
+            "guarded_qty": 0, "trued_qty": 100,
+            "fill_detected_ts": 1, "stop_deadline_ts": 1.0,
+            "deadline_ts": 100_000.0, "entry_order_id": "ENTRY-1",
+            "stop_reply_lost": True, "stop_client_id": "LOST",
+            "stop_reply_bound": True,
+        })
+        await main_bot._stop_guard_worker("QQQ")
+        return list(sold), list(alerts)
+
+    fills, sent = _run(scenario())
+    assert fills == []
+    assert any(event == "position_unprotected" for _sev, event, _t in sent)
+
+
+def test_option_deadline_still_sells_when_the_book_is_down(monkeypatch):
+    store = main_bot.StateStore(None)
+    sold, _alerts, _clock, _deadline = _drive_deadline(
+        monkeypatch, store, kind="option", reply_lost=False,
+        client_id="", deadline=1.0, qty=2,
+    )
+
+    async def scenario():
+        await store.set_position("QQQ", {
+            "action": "BUY", "entry_premium": 3.0, "stop_premium": 2.4,
+            "filled_qty": 2, "qty": 2,
+            "contract": {"right": "CALL", "strike": 450.0, "expiration": "2026-12-18"},
+        })
+        await store.set_guard("QQQ", {
+            "done": False, "kind": "option", "action": "BUY", "stop": 2.4,
+            "guarded_qty": 0, "trued_qty": 2,
+            "fill_detected_ts": 1, "stop_deadline_ts": 1.0,
+            "deadline_ts": 100_000.0, "entry_order_id": "ENTRY-1",
+            "contract": {"right": "CALL", "strike": 450.0, "expiration": "2026-12-18"},
+        })
+        await main_bot._stop_guard_worker("QQQ")
+        return list(sold)
+
+    fills = _run(scenario())
+    assert fills and fills[0][0] == "SELL_CLOSE" and fills[0][1] == 2

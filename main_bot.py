@@ -33958,9 +33958,20 @@ async def _stop_guard_worker(ticker: str) -> None:
                         if status not in _TERMINAL_ORDER_STATUSES:
                             await _cancel_order_safe(guard.get("entry_order_id"))
                         try:
+                            # A lost reply or a client id that was never
+                            # cleared may still be a live stop. Every other
+                            # deadline, including a string of definite 4xx
+                            # rejects, sells the way main did.
+                            outstanding = bool(
+                                guard.get("stop_reply_lost")
+                                or str(guard.get("stop_client_id") or "").strip()
+                            )
+                            flatten_book = (
+                                "required" if outstanding and not is_option
+                                else "best_effort"
+                            )
                             flatten_id = await _emergency_flatten(
-                                ticker, guard, filled,
-                                book="best_effort" if allocation_hold_released or is_option else "required",
+                                ticker, guard, filled, book=flatten_book,
                             )
                             if flatten_id in (None, NOT_SOLD):
                                 raise FlattenNotSent("not sold")
