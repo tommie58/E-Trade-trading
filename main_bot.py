@@ -28887,6 +28887,47 @@ _REDIS_ENDPOINT_RE = re.compile(
 _REDIS_EXC_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*Error)\b")
 
 
+_HOSTPORT_RE = re.compile(
+    r"\b(?:\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)+):\d{2,5}\b"
+)
+_URL_CRED_RE = re.compile(
+    r"([a-z][a-z0-9+.-]*://)([^/\s:@]+):([^@\s/]+)@",
+    re.I,
+)
+
+
+def _redact_log_endpoints(text: str) -> str:
+    """Drop host:port and URL user:password from a log line."""
+    cleaned = _URL_CRED_RE.sub(r"\1***:***@", str(text or ""))
+    return _HOSTPORT_RE.sub("<redacted>", cleaned)
+
+
+class _EndpointLogFilter(logging.Filter):
+    """Redact host:port and URL credentials on every record.
+
+    A redis-py TimeoutError logged as ``Timeout reading from host:6379``
+    must not keep the endpoint, even when the call site interpolated the
+    exception text.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            rendered = record.getMessage()
+        except Exception:
+            rendered = str(record.msg)
+        cleaned = _redact_log_endpoints(rendered)
+        if cleaned != rendered:
+            record.msg = cleaned
+            record.args = ()
+        if record.exc_text:
+            record.exc_text = _redact_log_endpoints(record.exc_text)
+        return True
+
+
+_ENDPOINT_LOG_FILTER = _EndpointLogFilter()
+
+
 class _RedisConnectionLogFilter(logging.Filter):
     """Redis library connection logs keep the exception type and drop the host."""
 
@@ -28928,6 +28969,8 @@ def _install_etrade_log_redactor() -> None:
             obj.addFilter(_ETRADE_LOG_REDACTOR)
         if not any(isinstance(existing, _RedisConnectionLogFilter) for existing in obj.filters):
             obj.addFilter(_REDIS_LOG_FILTER)
+        if not any(isinstance(existing, _EndpointLogFilter) for existing in obj.filters):
+            obj.addFilter(_ENDPOINT_LOG_FILTER)
 
     def _arm_handler(hdlr) -> None:
         if hdlr is None:
@@ -28937,6 +28980,8 @@ def _install_etrade_log_redactor() -> None:
             hdlr.addFilter(_ETRADE_LOG_REDACTOR)
         if not any(isinstance(existing, _RedisConnectionLogFilter) for existing in filters):
             hdlr.addFilter(_REDIS_LOG_FILTER)
+        if not any(isinstance(existing, _EndpointLogFilter) for existing in filters):
+            hdlr.addFilter(_ENDPOINT_LOG_FILTER)
 
     def _arm_logger(obj: logging.Logger) -> None:
         _arm(obj)
@@ -29232,6 +29277,10 @@ def _emergency_flatten_reuse(status: Any, filled: Any) -> bool:
         filled_n = int(filled or 0)
     except (TypeError, ValueError):
         filled_n = 0
+    # NOT_FOUND / blank means the sell was never acknowledged. Treating
+    # that as in flight recorded a flatten that was never sent.
+    if label in {"", "NOT_FOUND", "UNKNOWN"}:
+        return False
     if filled_n > 0 or label not in _TERMINAL_ORDER_STATUSES:
         return True
     return label in _FILLED_ORDER_STATUSES
@@ -30884,7 +30933,7 @@ async def _lost_stop_clearance(guard: dict) -> str:
         return "clear"
     if outcome in (CANCEL_FILLED, CANCEL_PARTIAL):
         return "filled"
-    return "unconfirmed"
+    return "live"
 
 
 async def _adopt_covering_stop(
@@ -31520,6 +31569,30 @@ def _flatten_working_exit(order: dict, ticker: str, guard: dict) -> bool:
     return str(order.get("security_type") or "EQ").upper() not in {"OPTN", "OPTION"}
 
 
+async def _stock_flatten_already_working(ticker: str, guard: dict) -> bool:
+    """True when a stock re-sell would add a second exit.
+
+    An unreadable book is treated as already working so a stock is not
+    sold again blind. Options do not use this; a 3004 stops their oversell.
+    """
+    try:
+        resp = await asyncio.wait_for(
+            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.warning("flatten re-sell book read failed (%s)", type(exc).__name__)
+        return True
+    client_id = str((guard or {}).get("flatten_client_id") or "").strip()
+    for order in reconciliation.parse_open_orders(resp):
+        cid = str(order.get("client_order_id") or "").strip()
+        status = str(order.get("status") or "").upper()
+        if client_id and cid == client_id and status in reconciliation._OPEN_ORDER_STATUSES:
+            return True
+        if _flatten_working_exit(order, ticker, guard):
+            return True
+    return False
+
+
 async def _emergency_flatten(
     ticker: str, guard: dict, qty: int, *, book: str = "required",
 ) -> Optional[str]:
@@ -31546,7 +31619,18 @@ async def _emergency_flatten(
         # broker cannot be reached we must stay blocked: an unverified retry is
         # exactly the oversell this guard is meant to prevent.
         p_status, p_filled = await _order_state(prior_id, prior_client)
-        if _emergency_flatten_reuse(p_status, p_filled):
+        prior_label = str(p_status or "").upper().strip()
+        if prior_label in {"", "NOT_FOUND", "UNKNOWN"}:
+            is_stock = str(guard.get("kind") or "equity") != "option"
+            if is_stock and await _stock_flatten_already_working(ticker, guard):
+                logger.warning(
+                    "[FLATTEN] %s prior sell %s was not acknowledged and a "
+                    "working exit is already on the book — not selling again",
+                    ticker, prior_id or prior_client,
+                )
+                return prior_id
+            # Not sent. Fall through and place one sell of the tracked qty.
+        elif _emergency_flatten_reuse(p_status, p_filled):
             # Filled (including DONE_TRADE_EXECUTED with a blank quantity),
             # partially filled, or still working — this IS the flatten.
             if p_filled > 0 or str(p_status or "").upper() not in _TERMINAL_ORDER_STATUSES:
@@ -33346,17 +33430,20 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 stop_reply_clean_read_ts=latch["ts"],
                             ) or guard
                             if latch["ready"]:
-                                # One retry only after the original stop is
-                                # provably gone. A late list_orders hit is
-                                # not that proof.
+                                # Cancel-verified, or two clean misses of a
+                                # client id the book has never listed. One
+                                # retry either way. A live order is not a miss.
                                 clearance = await _lost_stop_clearance(guard)
-                                guard = await state.update_guard(
-                                    ticker, stop_reply_retried=True,
-                                ) or guard
-                                if clearance == "clear":
+                                if clearance in ("clear", "unconfirmed"):
+                                    guard = await state.update_guard(
+                                        ticker, stop_reply_retried=True,
+                                    ) or guard
                                     can_place = True
                                 else:
                                     can_place = False
+                                    guard = await state.update_guard(
+                                        ticker, stop_reply_retried=True,
+                                    ) or guard
                                     guard = await _page_unconfirmed_stop(ticker, guard)
                                     if is_option and clearance != "filled":
                                         guard = await state.update_guard(
@@ -33421,7 +33508,13 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 ) or guard
                             can_place = False
                     if can_place:
-                        client_id = str(uuid.uuid4().int)[:18]
+                        # The one retry reuses the lost clientOrderId. A
+                        # first place mints a new one. Broker dedupe is not
+                        # what keeps this to a single resting stop.
+                        if guard.get("stop_reply_retried") and str(guard.get("stop_client_id") or "").strip():
+                            client_id = str(guard.get("stop_client_id")).strip()
+                        else:
+                            client_id = str(uuid.uuid4().int)[:18]
                         guard = await state.update_guard(
                             ticker, stop_client_id=client_id,
                         ) or guard
@@ -33833,6 +33926,16 @@ async def _stop_guard_worker(ticker: str) -> None:
             # Only tighten while the deadline is still AHEAD of us: once it has
             # passed, `stop_deadline - now` goes negative and this pinned to a
             # 1s loop, hammering the emergency-flatten retry every second.
+            if (
+                not is_option
+                and filled > 0
+                and not guard.get("stop_order_id")
+                and (guard.get("stop_reply_bound") or guard.get("stop_reply_retried"))
+            ):
+                # Stocks stay paged every 30s until a stop is resting or
+                # the position is flat. The deadline branch does not run
+                # while stop_reply_lost is still set.
+                guard = await _page_unconfirmed_stop(ticker, guard)
             sleep_s = float(STOP_GUARD_POLL_SECONDS)
             if stop_deadline and not guard.get("stop_order_id"):
                 remaining = stop_deadline - time.time()

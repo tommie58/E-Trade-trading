@@ -186,54 +186,56 @@ def test_no_retry_after_one_read_or_a_short_gap_or_a_failed_read(monkeypatch):
     assert _run(scenario()) == [100]
 
 
-def test_equity_book_lag_of_120s_does_not_double_the_stop(monkeypatch):
-    """The original stop is invisible until 120s. No second stop and no sell."""
+def test_equity_book_lag_retries_once_and_surplus_keeps_one_stop(monkeypatch):
+    """Two clean misses retry once. A late original beside that retry leaves one stop."""
     store = main_bot.StateStore(None)
-    clock_box = {}
+    client_ids = []
 
     async def book():
-        if clock_box["t"] < 10_000.0 + 120:
-            return {"OrdersResponse": {}}
-        guard = await store.get_guard("QQQ")
-        return {"OrdersResponse": {"Order": _equity_stop(
-            "LATE", 100, 90.0,
-        ) | {"clientOrderId": guard.get("stop_client_id")}}}
+        return {"OrdersResponse": {}}
 
-    # _equity_stop doesn't take clientOrderId at the top level. Patch below.
-    places, sold, alerts, _cancels, clock = _install(
+    places, sold, _alerts, _cancels, clock = _install(
         monkeypatch, store, kind="equity", qty=100, book=book,
     )
-    clock_box["t"] = clock["t"]
 
-    async def book2():
-        if clock["t"] < 10_120.0:
-            return {"OrdersResponse": {}}
-        guard = await store.get_guard("QQQ")
-        order = _equity_stop("LATE", 100, 90.0)
-        order["clientOrderId"] = guard.get("stop_client_id")
-        return {"OrdersResponse": {"Order": order}}
+    async def place_capture(*args, **kwargs):
+        client_ids.append(main_bot._PENDING_STOP_CLIENT_ID.get())
+        places.append(100)
+        if len(places) == 1:
+            raise _Gone()
+        return {"order_id": "RETRY", "client_id": client_ids[-1], "qty": 100, "stop": 90.0}
 
-    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", book2)
+    monkeypatch.setattr(main_bot, "_place_protective_stop", place_capture)
 
     async def scenario():
         await store.set_position("QQQ", _position("equity", 100))
         await store.set_guard("QQQ", _guard("equity", 100))
         await _poll(store, clock, 0)
         await _poll(store, clock, 10)
-        await _poll(store, clock, 0)          # retry would fire; cancel not confirmed
-        clock["t"] = 10_120.0
-        await _poll(store, clock, 0)          # the original stop is finally visible
+        await _poll(store, clock, 0)
         return await store.get_guard("QQQ")
 
     held = _run(scenario())
-    assert places == [100]
+    assert places == [100, 100]
     assert sold == []
-    assert held.get("stop_order_id") == "LATE"
-    assert sum(places) + sum(sold) <= 100
-    assert any(event == "position_unprotected" for _sev, event in alerts)
+    assert client_ids[0] and client_ids[0] == client_ids[1]
+    late = {
+        "order_id": "LATE", "symbol": "QQQ", "security_type": "EQ",
+        "status": "OPEN", "price_type": "STOP", "order_action": "SELL",
+        "ordered": 100, "filled": 0, "stop_price": 90.0,
+    }
+    retry = dict(late, order_id="RETRY")
+    plan = main_bot.reconciliation.plan_protection_repair(
+        "QQQ", 100, [late, retry], tracked_stop_id=held.get("stop_order_id"),
+    )
+    assert plan["keep_order_id"] in {"LATE", "RETRY"}
+    assert plan["cancel_order_ids"] == [
+        oid for oid in ("LATE", "RETRY") if oid != plan["keep_order_id"]
+    ]
+    assert len(plan["cancel_order_ids"]) == 1
 
 
-def test_option_book_lag_flattens_without_a_second_stop(monkeypatch):
+def test_option_book_lag_retries_once_instead_of_flattening(monkeypatch):
     store = main_bot.StateStore(None)
 
     async def book():
@@ -252,10 +254,9 @@ def test_option_book_lag_flattens_without_a_second_stop(monkeypatch):
         return await store.get_guard("QQQ")
 
     held = _run(scenario())
-    assert places == [2]
-    assert sold == [2]
-    assert held.get("stop_order_id") != "RETRY"
-    assert any(event == "position_unprotected" for _sev, event in alerts)
+    assert places == [2, 2]
+    assert sold == []
+    assert held.get("stop_order_id") == "RETRY"
 
 
 def test_stock_cancel_not_confirmed_pages_without_a_retry_or_a_sell(monkeypatch):
@@ -294,3 +295,38 @@ def test_stock_cancel_not_confirmed_pages_without_a_retry_or_a_sell(monkeypatch)
     assert market == []
     assert "LOST-1" in cancel_ids
     assert any(event == "position_unprotected" for _sev, event in alerts)
+
+
+def test_stock_clean_read_path_keeps_paging_every_30s(monkeypatch):
+    store = main_bot.StateStore(None)
+
+    async def book():
+        return {"OrdersResponse": {}}
+
+    places, sold, alerts, _cancels, clock = _install(
+        monkeypatch, store, kind="equity", qty=100, book=book,
+    )
+
+    async def place_fail(*args, **kwargs):
+        places.append(100)
+        raise _Gone()
+
+    monkeypatch.setattr(main_bot, "_place_protective_stop", place_fail)
+
+    async def scenario():
+        await store.set_position("QQQ", _position("equity", 100))
+        await store.set_guard("QQQ", _guard("equity", 100))
+        await _poll(store, clock, 0)
+        await _poll(store, clock, 10)
+        await _poll(store, clock, 0)  # retry also lost
+        first = [row for row in alerts if row[1] == "position_unprotected"]
+        clock["t"] += main_bot.UNCONFIRMED_STOP_PAGE_S
+        await _poll(store, clock, 0)
+        second = [row for row in alerts if row[1] == "position_unprotected"]
+        return first, second
+
+    first, second = _run(scenario())
+    assert places == [100, 100]
+    assert sold == []
+    assert len(first) >= 1
+    assert len(second) == len(first) + 1

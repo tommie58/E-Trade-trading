@@ -149,3 +149,21 @@ def test_redis_failure_log_has_no_host_or_port(caplog):
     source = open(main_bot.__file__, encoding="utf-8").read()
     assert 'Redis push failed, processing directly: {e}' not in source
     assert 'Redis push failed, processing directly (%s)' in source
+
+
+def test_endpoint_filter_redacts_a_redis_timeout_message(caplog):
+    main_bot._install_etrade_log_redactor()
+    log = logging.getLogger("etrade-bot.store-test")
+    try:
+        raise TimeoutError("Timeout reading from cache.example.com:6379")
+    except TimeoutError as exc:
+        with caplog.at_level(logging.WARNING):
+            log.warning("state get failed: %s", exc)
+            log.warning(
+                "connect %s",
+                "redis://default:s3cret@cache.example.com:6379/0",
+            )
+    assert "cache.example.com" not in caplog.text
+    assert "6379" not in caplog.text
+    assert "s3cret" not in caplog.text
+    assert "TimeoutError" in caplog.text or "state get failed" in caplog.text
