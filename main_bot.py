@@ -17195,13 +17195,14 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # the live broker stop. A failed check leaves the resting stop in place.
 # 5.99.21: alert webhooks do not block the trail loop, the reconcile re-arm,
 # a close, or the SPY-gap sit-out. The 3:50 PM ET position_open_after_flatten
-# alert includes untracked broker positions and is skipped when
-# DAY_TRADE_MODE is off. It is sent with send_nowait. The webhook-source
-# fallback says unknown. Failure text is the exception type plus an HTTP
-# status or errno, never a URL, body, or header. effective_min_severity is
-# capped at error even when no env webhook URL is set. DAY_TRADE_MODE treats
-# off, no, and 0 as OFF. Old main treated off as ON. swing_hold was already
-# flattened under old main's default ON.
+# alert includes untracked broker positions from a snapshot no older than
+# 10 minutes. When DAY_TRADE_MODE is off it still pages a tracked position
+# that expires today, and it skips other tracked swings and untracked names.
+# It is sent with send_nowait. The webhook-source fallback says unknown.
+# Failure text is the exception type plus an HTTP status or errno, never a
+# URL, body, or header. effective_min_severity is capped at error even when
+# no env webhook URL is set. The DAY_TRADE_MODE parser behavior is unchanged
+# and documented: off, no, and 0 are OFF.
 BOT_VERSION = "5.99.21-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
@@ -17354,9 +17355,7 @@ CHAIN_SHADOW_COMPARISON_NOTE = (
 # flattens every open option, including one flagged swing_hold. Only an
 # explicit false, 0, off, or no turns it off, which restores the prior
 # swing_hold exemption. Any other value stays on and logs the variable name.
-# off, no, and 0 are OFF. Old main treated off as ON
-# (`not in {"false", "0", "no"}`). swing_hold was already flattened under
-# old main's default ON.
+# The parser behavior is unchanged and documented: off, no, and 0 are OFF.
 _DAY_TRADE_OFF = frozenset({"false", "0", "off", "no"})
 _DAY_TRADE_ON = frozenset({"true", "1", "on", "yes"})
 
@@ -17364,10 +17363,9 @@ _DAY_TRADE_ON = frozenset({"true", "1", "on", "yes"})
 def resolve_day_trade_mode(raw: Any) -> Tuple[bool, Optional[str]]:
     """(enabled, warning_name). Unset, empty, and recognized on-values are on.
 
-    Only false, 0, off, and no turn it off. off, no, and 0 are OFF. Old main
-    treated off as ON. Anything else stays on (fail closed toward the
-    flatten) and the warning name is DAY_TRADE_MODE. Unset stays on, so a
-    swing_hold position was already flattened under old main's default ON.
+    Only false, 0, off, and no turn it off. off, no, and 0 are OFF. The
+    parser behavior is unchanged and documented. Anything else stays on
+    (fail closed toward the flatten) and the warning name is DAY_TRADE_MODE.
     The raw value is not returned, so a log cannot echo it.
     """
     if raw is None:
@@ -18559,19 +18557,27 @@ def position_still_open_alert_due(now_et: datetime) -> bool:
     return minute >= (close - 10)
 
 
+# Untracked names are the broker book only while this snapshot is fresh.
+# Older than this, or an age that cannot be read, is not a 3:50 page.
+OPEN_AFTER_FLATTEN_SNAPSHOT_MAX_AGE_S = 10 * 60
+
+
 def open_after_flatten_names(tracked: Any, snapshot: Any) -> List[str]:
     """Tickers for the 3:50 alert: the tracked book, then untracked broker legs.
 
-    `snapshot` is the published account snapshot. Its `untracked` list and
-    any position row with tracked false are on the broker book and not
-    covered by a tracked position. A missing snapshot leaves the tracked
-    names. Names are symbols only.
+    `snapshot` is a fresh account snapshot, or None when it must not contribute
+    names. Its `untracked` list and any position row with tracked false are on
+    the broker book. A symbol already listed from the tracked book is not
+    repeated, so the same symbol or contract does not appear twice. A missing
+    snapshot leaves the tracked names. Names are symbols only.
     """
     names: List[str] = []
+    seen = set()
     if isinstance(tracked, dict):
         for ticker in sorted(tracked):
             symbol = str(ticker or "").strip().upper()
-            if symbol:
+            if symbol and symbol not in seen:
+                seen.add(symbol)
                 names.append(symbol)
     if not isinstance(snapshot, dict):
         return names
@@ -18590,14 +18596,29 @@ def open_after_flatten_names(tracked: Any, snapshot: Any) -> List[str]:
             symbol = str(row.get("symbol") or "").strip().upper()
             if symbol:
                 extras.append(symbol)
-    seen = set(names)
     for symbol in sorted(set(extras)):
-        label = f"{symbol} (untracked)"
-        if label in seen:
+        if symbol in seen:
             continue
-        seen.add(label)
-        names.append(label)
+        seen.add(symbol)
+        names.append(f"{symbol} (untracked)")
     return names
+
+
+def still_open_snapshot_for_untracked(
+    snapshot: Any,
+) -> Tuple[Optional[dict], Optional[float]]:
+    """(snapshot, age) when untracked names may be read. Otherwise (None, age).
+
+    A missing snapshot is (None, None): nothing to warn about. A snapshot
+    whose age is unknown or older than OPEN_AFTER_FLATTEN_SNAPSHOT_MAX_AGE_S
+    is not used. Age is seconds, from `_snapshot_age`.
+    """
+    if not isinstance(snapshot, dict):
+        return None, None
+    age = _snapshot_age(snapshot)
+    if age is None or age > OPEN_AFTER_FLATTEN_SNAPSHOT_MAX_AGE_S:
+        return None, age
+    return snapshot, age
 
 
 def _is_market_open_at(now_et: datetime) -> bool:
@@ -41298,18 +41319,35 @@ async def _trail_pass() -> None:
         except Exception as e:
             logger.warning(f"[TRAIL] {ticker} pass failed: {e}")
 
-async def _alert_positions_still_open() -> None:
-    """Critical alert when a tracked or untracked position is still open after 3:50 PM ET.
+def _tracked_still_open_for_alert(
+    positions: Dict[str, Any], now_et: datetime, day_trade_mode: bool,
+) -> Dict[str, Any]:
+    """Tracked rows the 3:50 alert may name.
 
-    Half days use 12:50 PM ET. Untracked names come from the broker account
-    snapshot: positions on the broker book this bot does not track. Skipped
-    when DAY_TRADE_MODE is off, because an overnight hold is allowed then.
-    The webhook is send_nowait, so a slow or failing receiver does not delay
-    the caller. Does not place or cancel an order.
+    Day-trade mode names every tracked position. Mode off names only a
+    tracked position that expires today. Other swings are an allowed hold.
+    """
+    if day_trade_mode:
+        return positions
+    kept: Dict[str, Any] = {}
+    for ticker, pos in positions.items():
+        if isinstance(pos, dict) and _flatten_expires_today(pos, now_et):
+            kept[ticker] = pos
+    return kept
+
+
+async def _alert_positions_still_open() -> None:
+    """Critical alert when a position is still open after 3:50 PM ET.
+
+    Half days use 12:50 PM ET. Untracked names come from a broker account
+    snapshot no older than OPEN_AFTER_FLATTEN_SNAPSHOT_MAX_AGE_S. A stale
+    or unreadable snapshot contributes no untracked names and does not send
+    an alert that would be untracked names only. When DAY_TRADE_MODE is off,
+    only a tracked position expiring today is named. The webhook is
+    send_nowait, so a slow or failing receiver does not delay the caller.
+    Does not place or cancel an order.
     """
     try:
-        if not DAY_TRADE_MODE:
-            return
         now_et = _utcnow().astimezone(_ET_ZONE)
         if not position_still_open_alert_due(now_et):
             return
@@ -41321,20 +41359,37 @@ async def _alert_positions_still_open() -> None:
         except Exception as exc:
             logger.error("[FLATTEN] open-book read failed (%s)", type(exc).__name__)
             positions = {}
-        snapshot = None
-        try:
-            snapshot = await _load_account_snapshot()
-        except Exception as exc:
-            logger.error("[FLATTEN] broker snapshot read failed (%s)", type(exc).__name__)
+        tracked = _tracked_still_open_for_alert(positions, now_et, DAY_TRADE_MODE)
+        usable_snapshot = None
+        age: Optional[float] = None
+        if DAY_TRADE_MODE:
             snapshot = None
-        labels = open_after_flatten_names(positions, snapshot)
+            try:
+                snapshot = await _load_account_snapshot()
+            except Exception as exc:
+                logger.error("[FLATTEN] broker snapshot read failed (%s)", type(exc).__name__)
+                snapshot = None
+            usable_snapshot, age = still_open_snapshot_for_untracked(snapshot)
+            if isinstance(snapshot, dict) and usable_snapshot is None:
+                shown = "unknown" if age is None else f"{age:.1f}s"
+                logger.warning(
+                    "[FLATTEN] broker snapshot age %s — untracked names skipped",
+                    shown,
+                )
+        labels = open_after_flatten_names(tracked, usable_snapshot)
         if not labels:
             return
         when = "12:50 PM ET" if _session_close_minute(now_et) == 13 * 60 else "3:50 PM ET"
+        message = (
+            f"Position(s) still open after {when}: {', '.join(labels)}. "
+            "No overnight hold."
+        )
+        if age is not None and any(label.endswith("(untracked)") for label in labels):
+            message += f" Broker snapshot age {age:.1f}s."
         await alerts.send_nowait(
             "critical",
             "position_open_after_flatten",
-            f"Position(s) still open after {when}: {', '.join(labels)}. No overnight hold.",
+            message,
             dedupe_key=f"open_after_flatten:{now_et.date().isoformat()}",
         )
     except Exception as exc:

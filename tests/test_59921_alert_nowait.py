@@ -127,10 +127,9 @@ def _assert_secret_absent(text: str) -> None:
 
 
 def test_version_pins_the_day_trade_off_parser_and_the_rails():
-    """off, no, and 0 are OFF. Old main treated off as ON.
+    """off, no, and 0 are OFF. The parser behavior is unchanged and documented.
 
-    Unset stays ON, and a swing_hold position was already flattened under
-    that default. The 5% and 10% rails are unchanged.
+    The 5% and 10% rails are unchanged.
     """
     assert main_bot.BOT_VERSION == "5.99.21-pro-day-trader"
     assert main_bot.RISK_PER_TRADE_PCT == 5.0
@@ -147,11 +146,33 @@ def test_version_pins_the_day_trade_off_parser_and_the_rails():
     assert flat["fire"] is True and flat["reason"] == "eod_flatten"
 
 
+def _option(expiration: str) -> dict:
+    return {
+        "qty": 1,
+        "filled_qty": 1,
+        "action": "BUY",
+        "contract": {"right": "CALL", "strike": 500, "expiration": expiration},
+    }
+
+
+def _book(untracked, *, age_s=5.0, positions=None, epoch=True) -> str:
+    body = {"untracked": list(untracked)}
+    if positions is not None:
+        body["positions"] = positions
+    if epoch:
+        body["epoch"] = time.time() - age_s
+    return json.dumps(body)
+
+
+def _dedupe_key(day: str = "2026-11-18") -> str:
+    return f"alert:dedupe:open_after_flatten:{day}"
+
+
 def test_open_after_flatten_names_include_untracked_broker_legs():
     names = main_bot.open_after_flatten_names(
         {"qqq": {"qty": 1}},
         {
-            "untracked": ["AMD", "amd"],
+            "untracked": ["AMD", "amd", "QQQ"],
             "positions": [
                 {"symbol": "amd", "tracked": False},
                 {"symbol": "QQQ", "tracked": False},
@@ -159,7 +180,9 @@ def test_open_after_flatten_names_include_untracked_broker_legs():
             ],
         },
     )
-    assert names == ["QQQ", "AMD (untracked)", "QQQ (untracked)"]
+    assert names == ["QQQ", "AMD (untracked)"]
+    assert "QQQ (untracked)" not in names
+    assert len(names) == len(set(names))
     assert main_bot.open_after_flatten_names({}, None) == []
     assert main_bot.open_after_flatten_names({"spy": {}}, None) == ["SPY"]
 
@@ -172,10 +195,7 @@ def test_still_open_alert_names_an_untracked_broker_position(isolated, monkeypat
         main_bot.alerts.init(store, None)
         await store.set(
             main_bot.reconciliation.ACCOUNT_SNAPSHOT_KEY,
-            json.dumps({
-                "untracked": ["AMD"],
-                "positions": [{"symbol": "AMD", "tracked": False, "qty": 4}],
-            }),
+            _book(["AMD"], positions=[{"symbol": "AMD", "tracked": False, "qty": 4}]),
         )
         await main_bot._alert_positions_still_open()
         return await main_bot.alerts.recent(5)
@@ -183,6 +203,7 @@ def test_still_open_alert_names_an_untracked_broker_position(isolated, monkeypat
     recent = _run(scenario())
     assert [item["event"] for item in recent] == ["position_open_after_flatten"]
     assert "AMD (untracked)" in recent[0]["message"]
+    assert "Broker snapshot age" in recent[0]["message"]
     assert "3:50 PM ET" in recent[0]["message"]
     _assert_secret_absent(recent[0]["message"])
 
@@ -196,7 +217,7 @@ def test_still_open_alert_names_tracked_and_untracked_together(isolated, monkeyp
         await store.set_position("QQQ", {"qty": 1, "filled_qty": 1})
         await store.set(
             main_bot.reconciliation.ACCOUNT_SNAPSHOT_KEY,
-            json.dumps({"untracked": ["IWM"]}),
+            _book(["IWM"]),
         )
         await main_bot._alert_positions_still_open()
         return await main_bot.alerts.recent(5)
@@ -205,33 +226,138 @@ def test_still_open_alert_names_tracked_and_untracked_together(isolated, monkeyp
     message = recent[0]["message"]
     assert "QQQ" in message
     assert "IWM (untracked)" in message
+    assert "QQQ (untracked)" not in message
+    assert "Broker snapshot age" in message
     assert "12:50 PM ET" in message
 
 
-def test_still_open_alert_is_skipped_when_day_trade_mode_is_off(isolated, monkeypatch):
+def test_mode_off_alerts_a_tracked_0dte_and_skips_swings_and_untracked(isolated, monkeypatch):
+    """Mode off still pages a tracked position that expires today."""
     _freeze(monkeypatch, FULL_DAY)
     monkeypatch.setattr(main_bot, "DAY_TRADE_MODE", False)
     store = isolated
-    calls = {"n": 0}
-
-    async def forbid():
-        calls["n"] += 1
-        raise AssertionError("book read while day-trade mode is off")
-
-    monkeypatch.setattr(store, "all_positions", forbid)
 
     async def scenario():
-        main_bot.alerts.init(store, WEBHOOK)
-        await store.set_position("QQQ", {"qty": 1})
+        main_bot.alerts.init(store, None)
+        await store.set_position("QQQ", _option("2026-11-18"))
+        await store.set_position("IWM", _option("2026-11-20"))
         await store.set(
             main_bot.reconciliation.ACCOUNT_SNAPSHOT_KEY,
-            json.dumps({"untracked": ["AMD"]}),
+            _book(["AMD"]),
         )
         await main_bot._alert_positions_still_open()
         return await main_bot.alerts.recent(5)
 
-    assert _run(scenario()) == []
-    assert calls["n"] == 0
+    recent = _run(scenario())
+    message = recent[0]["message"]
+    assert recent[0]["event"] == "position_open_after_flatten"
+    assert "QQQ" in message
+    assert "IWM" not in message
+    assert "AMD" not in message
+    assert "(untracked)" not in message
+
+
+def test_mode_off_skips_a_tracked_swing_that_does_not_expire_today(isolated, monkeypatch):
+    _freeze(monkeypatch, FULL_DAY)
+    monkeypatch.setattr(main_bot, "DAY_TRADE_MODE", False)
+    store = isolated
+
+    async def scenario():
+        main_bot.alerts.init(store, None)
+        await store.set_position("QQQ", _option("2026-11-20"))
+        await store.set(
+            main_bot.reconciliation.ACCOUNT_SNAPSHOT_KEY,
+            _book(["AMD"]),
+        )
+        await main_bot._alert_positions_still_open()
+        recent = await main_bot.alerts.recent(5)
+        key = await store.get(_dedupe_key())
+        return recent, key
+
+    recent, key = _run(scenario())
+    assert recent == []
+    assert key is None
+
+
+def test_mode_on_names_swings_and_a_fresh_untracked_book(isolated, monkeypatch):
+    _freeze(monkeypatch, FULL_DAY)
+    monkeypatch.setattr(main_bot, "DAY_TRADE_MODE", True)
+    store = isolated
+
+    async def scenario():
+        main_bot.alerts.init(store, None)
+        await store.set_position("QQQ", _option("2026-11-18"))
+        await store.set_position("IWM", _option("2026-11-20"))
+        await store.set(
+            main_bot.reconciliation.ACCOUNT_SNAPSHOT_KEY,
+            _book(["AMD", "QQQ"]),
+        )
+        await main_bot._alert_positions_still_open()
+        return await main_bot.alerts.recent(5)
+
+    message = _run(scenario())[0]["message"]
+    assert "QQQ" in message and "IWM" in message
+    assert "AMD (untracked)" in message
+    assert "QQQ (untracked)" not in message
+    assert "Broker snapshot age" in message
+
+
+def test_stale_snapshot_does_not_name_untracked_or_take_the_dedupe_key(isolated, monkeypatch, caplog):
+    """A days-old snapshot must not page, and must not spend the day's key."""
+    caplog.set_level(logging.WARNING, logger="etrade-bot")
+    _freeze(monkeypatch, FULL_DAY)
+    store = isolated
+
+    async def scenario():
+        main_bot.alerts.init(store, None)
+        await store.set(
+            main_bot.reconciliation.ACCOUNT_SNAPSHOT_KEY,
+            _book(["AMZN"], age_s=3 * 24 * 60 * 60),
+        )
+        await main_bot._alert_positions_still_open()
+        quiet = await main_bot.alerts.recent(5)
+        free = await store.get(_dedupe_key())
+        await store.set_position("QQQ", _option("2026-11-18"))
+        await main_bot._alert_positions_still_open()
+        recent = await main_bot.alerts.recent(5)
+        taken = await store.get(_dedupe_key())
+        return quiet, free, recent, taken
+
+    quiet, free, recent, taken = _run(scenario())
+    assert quiet == []
+    assert free is None
+    assert taken == "1"
+    message = recent[0]["message"]
+    assert "QQQ" in message
+    assert "AMZN" not in message
+    assert "(untracked)" not in message
+    assert "broker snapshot age" in caplog.text
+    assert "untracked names skipped" in caplog.text
+    assert "AMZN" not in caplog.text
+    assert "unknown" not in caplog.text
+
+
+def test_unknown_snapshot_age_skips_untracked_names(isolated, monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="etrade-bot")
+    _freeze(monkeypatch, FULL_DAY)
+    store = isolated
+
+    async def scenario():
+        main_bot.alerts.init(store, None)
+        await store.set(
+            main_bot.reconciliation.ACCOUNT_SNAPSHOT_KEY,
+            _book(["AMZN"], epoch=False),
+        )
+        await main_bot._alert_positions_still_open()
+        recent = await main_bot.alerts.recent(5)
+        key = await store.get(_dedupe_key())
+        return recent, key
+
+    recent, key = _run(scenario())
+    assert recent == []
+    assert key is None
+    assert "broker snapshot age unknown" in caplog.text
+    assert "AMZN" not in caplog.text
 
 
 def test_still_open_alert_waits_until_350(isolated, monkeypatch):
@@ -265,7 +391,7 @@ def test_still_open_alert_survives_a_failed_book_read(isolated, monkeypatch, cap
         main_bot.alerts.init(store, None)
         await store.set(
             main_bot.reconciliation.ACCOUNT_SNAPSHOT_KEY,
-            json.dumps({"untracked": ["AMD"]}),
+            _book(["AMD"]),
         )
         await main_bot._alert_positions_still_open()
         return await main_bot.alerts.recent(5)
