@@ -136,12 +136,12 @@ def test_retry_places_once_after_two_clean_reads_ten_seconds_apart(monkeypatch):
         return {"OrdersResponse": {}}
 
     places, sold, alerts, _cancels, clock = _install(
-        monkeypatch, store, kind="equity", qty=100, book=book, clearance="clear",
+        monkeypatch, store, kind="option", qty=2, book=book, clearance="clear",
     )
 
     async def scenario():
-        await store.set_position("QQQ", _position("equity", 100))
-        await store.set_guard("QQQ", _guard("equity", 100))
+        await store.set_position("QQQ", _position("option", 2))
+        await store.set_guard("QQQ", _guard("option", 2))
         await _poll(store, clock, 0)       # lost reply
         await _poll(store, clock, 10)      # clean read 1
         await _poll(store, clock, 0)       # clean read 2, 10s later, retry
@@ -149,7 +149,7 @@ def test_retry_places_once_after_two_clean_reads_ten_seconds_apart(monkeypatch):
         return await store.get_guard("QQQ")
 
     held = _run(scenario())
-    assert places == [100, 100]
+    assert places == [2, 2]
     assert sold == []
     assert held.get("stop_order_id") == "RETRY"
 
@@ -186,53 +186,49 @@ def test_no_retry_after_one_read_or_a_short_gap_or_a_failed_read(monkeypatch):
     assert _run(scenario()) == [100]
 
 
-def test_equity_book_lag_retries_once_and_surplus_keeps_one_stop(monkeypatch):
-    """Two clean misses retry once. A late original beside that retry leaves one stop."""
+def test_stock_never_listed_lost_stop_does_not_retry_or_rearm(monkeypatch):
+    """20s of empty book: one lost place only, and the reconciler does not re-arm."""
     store = main_bot.StateStore(None)
-    client_ids = []
+    rearms = []
 
     async def book():
         return {"OrdersResponse": {}}
 
-    places, sold, _alerts, _cancels, clock = _install(
+    places, sold, alerts, _cancels, clock = _install(
         monkeypatch, store, kind="equity", qty=100, book=book,
     )
 
-    async def place_capture(*args, **kwargs):
-        client_ids.append(main_bot._PENDING_STOP_CLIENT_ID.get())
-        places.append(100)
-        if len(places) == 1:
-            raise _Gone()
-        return {"order_id": "RETRY", "client_id": client_ids[-1], "qty": 100, "stop": 90.0}
-
-    monkeypatch.setattr(main_bot, "_place_protective_stop", place_capture)
-
     async def scenario():
-        await store.set_position("QQQ", _position("equity", 100))
-        await store.set_guard("QQQ", _guard("equity", 100))
+        pos = _position("equity", 100)
+        guard = _guard("equity", 100)
+        guard["deadline_ts"] = 1
+        await store.set_position("QQQ", pos)
+        await store.set_guard("QQQ", guard)
         await _poll(store, clock, 0)
         await _poll(store, clock, 10)
-        await _poll(store, clock, 0)
-        return await store.get_guard("QQQ")
+        await _poll(store, clock, 10)
+        held = await store.get_guard("QQQ")
+        async def rearm(ticker, position):
+            rearms.append(int(position.get("filled_qty") or position.get("qty") or 0))
+            return "placed"
+        async def portfolio():
+            return {"PortfolioResponse": {"AccountPortfolio": {"Position": [{
+                "symbolDescription": "QQQ",
+                "quantity": 100,
+                "Product": {"symbol": "QQQ", "securityType": "EQ"},
+            }]}}}
+        await main_bot.reconciliation.reconcile_once(
+            store, portfolio, book, lambda order_id: True,
+            rearm_guard=rearm, alert=lambda *a, **k: None,
+        )
+        return held
 
     held = _run(scenario())
-    assert places == [100, 100]
+    assert places == [100]
     assert sold == []
-    assert client_ids[0] and client_ids[0] == client_ids[1]
-    late = {
-        "order_id": "LATE", "symbol": "QQQ", "security_type": "EQ",
-        "status": "OPEN", "price_type": "STOP", "order_action": "SELL",
-        "ordered": 100, "filled": 0, "stop_price": 90.0,
-    }
-    retry = dict(late, order_id="RETRY")
-    plan = main_bot.reconciliation.plan_protection_repair(
-        "QQQ", 100, [late, retry], tracked_stop_id=held.get("stop_order_id"),
-    )
-    assert plan["keep_order_id"] in {"LATE", "RETRY"}
-    assert plan["cancel_order_ids"] == [
-        oid for oid in ("LATE", "RETRY") if oid != plan["keep_order_id"]
-    ]
-    assert len(plan["cancel_order_ids"]) == 1
+    assert rearms == []
+    assert held.get("stop_reply_lost") is True
+    assert any(event == "position_unprotected" for _sev, event in alerts)
 
 
 def test_option_book_lag_retries_once_instead_of_flattening(monkeypatch):
@@ -326,7 +322,7 @@ def test_stock_clean_read_path_keeps_paging_every_30s(monkeypatch):
         return first, second
 
     first, second = _run(scenario())
-    assert places == [100, 100]
+    assert places == [100]
     assert sold == []
     assert len(first) >= 1
     assert len(second) == len(first) + 1

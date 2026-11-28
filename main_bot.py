@@ -5692,7 +5692,18 @@ async def reconcile_once(
             # TRAILING_STOP_CNST with a fixed-STOP fallback.
             await _alert("critical", "position_unprotected", msg,
                          dedupe_key=f"unprotected:{ticker}")
-            if auto_heal and rearm_guard is not None:
+            lost_stock = (
+                not position_is_option(pos)
+                and isinstance(guard, dict)
+                and not str(guard.get("stop_order_id") or "").strip()
+                and str(guard.get("stop_client_id") or "").strip()
+                and (guard.get("stop_reply_lost") or guard.get("stop_reply_bound"))
+            )
+            if auto_heal and rearm_guard is not None and lost_stock:
+                report["warnings"].append(
+                    f"{ticker}: stock lost-stop id is unresolved — not re-arming"
+                )
+            elif auto_heal and rearm_guard is not None:
                 try:
                     rearm_result = await rearm_guard(ticker, pos)
                     if rearm_result in (None, "placed"):
@@ -33429,10 +33440,21 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 stop_reply_clean_reads=latch["count"],
                                 stop_reply_clean_read_ts=latch["ts"],
                             ) or guard
-                            if latch["ready"]:
-                                # Cancel-verified, or two clean misses of a
-                                # client id the book has never listed. One
-                                # retry either way. A live order is not a miss.
+                            if latch["ready"] and not is_option:
+                                # A stock never auto-retries a lost stop.
+                                # Page until a human resolves the client id.
+                                can_place = False
+                                guard = await state.update_guard(
+                                    ticker,
+                                    stop_reply_retried=True,
+                                    stop_reply_lost=True,
+                                    stop_reply_bound=True,
+                                    stop_allocation_held=False,
+                                ) or guard
+                                guard = await _page_unconfirmed_stop(ticker, guard)
+                            elif latch["ready"]:
+                                # Options: cancel-verified, or two clean misses
+                                # of a client id the book has never listed.
                                 clearance = await _lost_stop_clearance(guard)
                                 if clearance in ("clear", "unconfirmed"):
                                     guard = await state.update_guard(
@@ -33511,7 +33533,11 @@ async def _stop_guard_worker(ticker: str) -> None:
                         # The one retry reuses the lost clientOrderId. A
                         # first place mints a new one. Broker dedupe is not
                         # what keeps this to a single resting stop.
-                        if guard.get("stop_reply_retried") and str(guard.get("stop_client_id") or "").strip():
+                        if (
+                            is_option
+                            and guard.get("stop_reply_retried")
+                            and str(guard.get("stop_client_id") or "").strip()
+                        ):
                             client_id = str(guard.get("stop_client_id")).strip()
                         else:
                             client_id = str(uuid.uuid4().int)[:18]
