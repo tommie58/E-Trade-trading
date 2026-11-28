@@ -202,6 +202,7 @@ def test_done_trade_executed_with_zero_qty_places_a_stop_and_stays_tracked(monke
     monkeypatch.setattr(main_bot, "_cancel_order_safe", cancel)
     monkeypatch.setattr(main_bot, "_emergency_flatten", no_flatten)
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
     monkeypatch.setattr(main_bot.trade_ledger, "record", record)
 
     async def scenario():
@@ -328,6 +329,7 @@ def test_lagging_zero_then_a_real_holding_places_a_stop_for_that_qty(monkeypatch
     monkeypatch.setattr(main_bot, "_cancel_order_safe", cancel)
     monkeypatch.setattr(main_bot, "_emergency_flatten", no_flatten)
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
     monkeypatch.setattr(main_bot.trade_ledger, "record", record)
 
     async def scenario():
@@ -389,6 +391,7 @@ def test_repeated_zero_reads_past_the_window_finish_flat(monkeypatch):
     monkeypatch.setattr(main_bot, "_place_option_protective_stop", place_stop)
     monkeypatch.setattr(main_bot, "_cancel_order_safe", cancel)
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
     monkeypatch.setattr(main_bot.trade_ledger, "record", record)
 
     async def scenario():
@@ -458,6 +461,7 @@ def test_deadline_does_not_flatten_a_single_zero_read(monkeypatch):
     monkeypatch.setattr(main_bot, "_cancel_order_safe", cancel)
     monkeypatch.setattr(main_bot, "_emergency_flatten", no_flatten)
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
     monkeypatch.setattr(main_bot.trade_ledger, "record", record)
 
     async def scenario():

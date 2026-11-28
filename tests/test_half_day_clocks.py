@@ -457,6 +457,7 @@ def test_close_orders_are_not_refused_by_the_close_20_entry_block(monkeypatch):
 
     monkeypatch.setattr(main_bot.trade_ledger, "record", _record)
     monkeypatch.setattr(main_bot.alerts, "send", _send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", _send)
     original_process = main_bot.process_signal
 
     closes = (

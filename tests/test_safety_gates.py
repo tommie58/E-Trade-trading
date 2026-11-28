@@ -731,6 +731,233 @@ def test_trail_native_refuses_when_the_resting_stop_is_tighter(monkeypatch):
     assert held["stop_order_id"] == "STOP-LONG"
 
 
+def test_trail_native_floor_uses_the_live_broker_stop(monkeypatch):
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+    monkeypatch.setattr(main_bot, "WEBHOOK_SECRET", "s3cret")
+
+    async def quote(ticker, contract=None):
+        return 10.00, 10.10
+
+    async def read_stop(order_id):
+        assert str(order_id) == "STOP-LONG"
+        return 9.20
+
+    monkeypatch.setattr(main_bot, "_current_bid_ask", quote)
+    monkeypatch.setattr(main_bot, "_read_open_order_stop", read_stop)
+
+    async def scenario():
+        pos = _long_premium_option(6.40)
+        pos["trail"] = 7.10
+        await store.set_position("QQQ", pos)
+        return await main_bot.arm_native_trail(
+            {"ticker": "QQQ", "dry_run": True}, "s3cret",
+        )
+
+    preview = asyncio.run(scenario())
+    # Saved floor is max(6.40, trail 7.10, entry 8.00) = 8.00.
+    # The live stopPrice 9.20 is tighter, so it is the floor.
+    assert preview["floor"] == pytest.approx(9.20)
+    assert preview["trigger"] == pytest.approx(8.70)
+    assert preview["floor_check"] == "fail"
+    assert preview["floor"] > 8.00
+
+
+def test_trail_native_live_read_failure_keeps_the_saved_floor(monkeypatch):
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+    monkeypatch.setattr(main_bot, "WEBHOOK_SECRET", "s3cret")
+    cancelled = []
+
+    async def quote(ticker, contract=None):
+        return 10.00, 10.10
+
+    async def read_stop(order_id):
+        raise RuntimeError("book unreadable")
+
+    async def cancel(*args, **kwargs):
+        cancelled.append(args)
+        raise AssertionError("cancel ran after a live-stop read failure")
+
+    monkeypatch.setattr(main_bot, "_current_bid_ask", quote)
+    monkeypatch.setattr(main_bot, "_read_open_order_stop", read_stop)
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel)
+
+    async def scenario():
+        pos = _long_premium_option(6.40)
+        pos["trail"] = 7.10
+        await store.set_position("QQQ", pos)
+        preview = await main_bot.arm_native_trail(
+            {"ticker": "QQQ", "dry_run": True}, "s3cret",
+        )
+        # Trigger 8.70 clears the saved floor 8.00, so a live call may arm,
+        # but the floor it passes must not be under 8.00.
+        calls = []
+
+        async def arm(ticker, offset=None, min_trigger=None, source="operator", allow_below_entry=False):
+            calls.append(min_trigger)
+            return {"ticker": ticker, "order_id": "N-2"}
+
+        monkeypatch.setattr(main_bot, "_arm_native_trail", arm)
+        await main_bot.arm_native_trail({"ticker": "QQQ"}, "s3cret")
+        return preview, calls
+
+    preview, calls = asyncio.run(scenario())
+    assert preview["floor"] == pytest.approx(8.00)
+    assert preview["floor_check"] == "pass"
+    assert preview["floor"] >= 8.00
+    assert calls == [pytest.approx(8.00)]
+    assert cancelled == []
+
+
+def test_repair_floor_fail_alert_is_not_awaited(monkeypatch):
+    steps = []
+    store, _armed = _install_repair_fakes(
+        monkeypatch, _inflated_trail_book(2.50), steps,
+    )
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def send_nowait(*args, **kwargs):
+        started.set()
+        await release.wait()
+
+    async def send(*args, **kwargs):
+        raise AssertionError("floor-fail path awaited alerts.send")
+
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)
+    monkeypatch.setattr(main_bot.alerts, "send", send)
+
+    async def scenario():
+        pos = _entry_floor_option({"native_trail_order_id": "1598", "stop_order_id": None})
+        await store.set_position("QQQ", pos)
+        task = asyncio.create_task(main_bot._maybe_repair_inflated_native_trail(
+            "QQQ", pos, 3.24, 0.10, "1598",
+        ))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        done, _pending = await asyncio.wait({task}, timeout=0.2)
+        assert task in done
+        assert task.result() is True
+        release.set()
+        pending = [item for item in asyncio.all_tasks() if item is not asyncio.current_task()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert steps == []
+
+
+def test_rearm_price_is_never_looser_for_longs_or_shorts():
+    long_opt = {
+        "action": "BUY",
+        "stop_premium": 2.4,
+        "trail": 2.8,
+        "contract": {"right": "CALL", "strike": 450.0, "expiration": "2026-12-18"},
+    }
+    assert main_bot._rearm_protection_price(long_opt, floor_price=2.5) == pytest.approx(2.8)
+    assert main_bot._rearm_protection_price(long_opt, floor_price=3.1) == pytest.approx(3.1)
+    short = {"action": "SELL", "stop": 10.0, "trail": 9.4}
+    assert main_bot._rearm_protection_price(short, floor_price=9.8) == pytest.approx(9.4)
+    assert main_bot._rearm_protection_price(short, floor_price=9.0) == pytest.approx(9.0)
+
+
+def test_rearm_uses_the_tight_price_and_one_place(monkeypatch):
+    store = main_bot.StateStore(None)
+    monkeypatch.setattr(main_bot, "state", store)
+    placed = []
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def place_opt(ticker, contract, qty, premium):
+        placed.append(("opt", qty, premium))
+        if not started.is_set():
+            started.set()
+            await release.wait()
+        return {"order_id": f"S-{len(placed)}"}
+
+    async def place_eq(ticker, action, qty, stop):
+        placed.append(("eq", qty, stop, action))
+        return {"order_id": "E-1"}
+
+    monkeypatch.setattr(main_bot, "_place_option_protective_stop", place_opt)
+    monkeypatch.setattr(main_bot, "_place_protective_stop", place_eq)
+
+    async def scenario():
+        pos = _entry_floor_option({"trail": 2.8, "stop_order_id": None, "filled_qty": 2, "qty": 2})
+        await store.set_position("QQQ", pos)
+        first = asyncio.create_task(main_bot._reconcile_rearm_guard(
+            "QQQ", dict(pos), floor_price=3.1,
+        ))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        second = asyncio.create_task(main_bot._reconcile_rearm_guard(
+            "QQQ", dict(pos), floor_price=3.1,
+        ))
+        await asyncio.sleep(0.05)
+        release.set()
+        await first
+        await second
+        short = {"action": "SELL", "stop": 10.0, "trail": 9.4, "filled_qty": 4, "qty": 4, "stop_order_id": None}
+        await store.set_position("IWM", short)
+        await main_bot._reconcile_rearm_guard("IWM", dict(short), floor_price=9.0)
+
+    asyncio.run(scenario())
+    assert placed[0] == ("opt", 2, pytest.approx(3.1))
+    assert len([row for row in placed if row[0] == "opt"]) == 1
+    assert ("eq", 4, pytest.approx(9.0), "SELL") in placed
+
+
+def test_repair_partial_rearms_only_the_remainder(monkeypatch):
+    steps = []
+    store, _armed = _install_repair_fakes(
+        monkeypatch, _inflated_trail_book(2.50), steps,
+    )
+    seen = {}
+
+    async def cancel(order_id, expected_qty=0):
+        steps.append("cancel")
+        return main_bot.CANCEL_PARTIAL
+
+    async def partial(ticker, order_id, price, reason):
+        steps.append("book")
+        seen["book_price"] = price
+        pos = await store.get_position(ticker)
+        pos["filled_qty"] = 1
+        pos["qty"] = 1
+        pos["stop_order_id"] = None
+        pos["native_trail_order_id"] = None
+        await store.set_position(ticker, pos)
+        return 1
+
+    async def rearm(ticker, pos, floor_price=None):
+        steps.append("rearm")
+        seen["qty"] = int(pos.get("filled_qty") or 0)
+        seen["floor"] = floor_price
+        return None
+
+    monkeypatch.setattr(main_bot, "_cancel_order_verified", cancel)
+    monkeypatch.setattr(main_bot, "_handle_partial_stop_fill", partial)
+    monkeypatch.setattr(main_bot, "_reconcile_rearm_guard", rearm)
+
+    async def scenario():
+        pos = _entry_floor_option({
+            "native_trail_order_id": "1598",
+            "stop_order_id": None,
+            "filled_qty": 3,
+            "qty": 3,
+        })
+        await store.set_position("QQQ", pos)
+        owned = await main_bot._maybe_repair_inflated_native_trail(
+            "QQQ", pos, 3.50, 0.10, "1598",
+        )
+        return owned
+
+    assert asyncio.run(scenario()) is True
+    assert steps == ["cancel", "book", "rearm"]
+    assert seen["qty"] == 1
+    assert seen["book_price"] == pytest.approx(2.50)
+    assert seen["floor"] == pytest.approx(2.50)
+
+
 def test_engine_trail_stays_at_hard_stop_until_breakeven():
     te = main_bot.trailing_engine
     early = te.compute_trail_level("BUY", 3.0, 2.4, 3.1, 2.9)
