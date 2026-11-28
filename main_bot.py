@@ -29560,12 +29560,13 @@ def _orders_client(tokens: Dict[str, str]) -> "pyetrade.ETradeOrder":
     )
 
 
-def _raw_client(tokens: Dict[str, str]) -> ETradeAsyncClient:
+def _raw_client(tokens: Dict[str, str], timeout: float = 20.0) -> ETradeAsyncClient:
     """Async httpx client with raw JSON Order API payloads (primary path)."""
     return ETradeAsyncClient(
         CONSUMER_KEY, CONSUMER_SECRET,
         tokens["oauth_token"], tokens["oauth_token_secret"],
         sandbox=is_sandbox,
+        timeout=timeout,
     )
 
 
@@ -31681,6 +31682,12 @@ async def _stock_lost_reply_flatten_once(ticker: str, guard: dict, tracked: int)
 
 
 _LOST_STOP_PAGERS = set()
+_LOST_STOP_PAGE_SLEEP = asyncio.sleep
+
+
+async def _lost_stop_page_sleep(seconds: float) -> None:
+    """The pager's wait. Tests replace this; it does not share the guard's sleep mock."""
+    await _LOST_STOP_PAGE_SLEEP(seconds)
 
 
 def _arm_lost_stop_pager(ticker: str) -> None:
@@ -31697,7 +31704,7 @@ def _arm_lost_stop_pager(ticker: str) -> None:
     async def _run() -> None:
         try:
             while True:
-                await asyncio.sleep(UNCONFIRMED_STOP_PAGE_S)
+                await _lost_stop_page_sleep(UNCONFIRMED_STOP_PAGE_S)
                 guard = await state.get_guard(ticker) or {}
                 if guard.get("lost_stop_cancel_done"):
                     return
@@ -41059,6 +41066,11 @@ def _reconcile_has_tokens() -> bool:
     return load_tokens() is not None
 
 
+_PORTFOLIO_TIMEOUT: contextvars.ContextVar = contextvars.ContextVar(
+    "portfolio_timeout", default=20.0,
+)
+
+
 async def _reconcile_fetch_portfolio() -> Dict[str, Any]:
     tokens = load_tokens()
     if not tokens:
@@ -41066,7 +41078,7 @@ async def _reconcile_fetch_portfolio() -> Dict[str, Any]:
     _require_probeable_session()
     try:
         acct_key = await _resolve_account_id_key(tokens)
-        result = await _raw_client(tokens).get_portfolio(acct_key)
+        result = await _raw_client(tokens, timeout=_PORTFOLIO_TIMEOUT.get()).get_portfolio(acct_key)
     except Exception as e:
         # The reconciler runs every 15 min even with the app closed — it is
         # the earliest detector of a midnight-ET token expiry.
@@ -41110,7 +41122,10 @@ async def _reconcile_fetch_orders() -> Dict[str, Any]:
     _require_probeable_session()
     try:
         acct_key = await _resolve_account_id_key(tokens)
-        client = _raw_client(tokens)
+        client = _raw_client(
+            tokens,
+            timeout=PRE_CANCEL_STOP_READ_TIMEOUT_S if bounded else 20.0,
+        )
 
         async def _page(marker):
             return await client.list_orders(
@@ -42733,9 +42748,15 @@ async def _flatten_broker_held_qty(ticker: str, pos: dict) -> Optional[int]:
     holding, not a default for a failed read.
     """
     try:
-        portfolio = await asyncio.wait_for(
-            _reconcile_fetch_portfolio(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
-        )
+        import socket
+        socket.setdefaulttimeout(PRE_CANCEL_STOP_READ_TIMEOUT_S)
+        _timeout_token = _PORTFOLIO_TIMEOUT.set(PRE_CANCEL_STOP_READ_TIMEOUT_S)
+        try:
+            portfolio = await asyncio.wait_for(
+                _reconcile_fetch_portfolio(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+            )
+        finally:
+            _PORTFOLIO_TIMEOUT.reset(_timeout_token)
     except Exception as exc:
         # A timeout is unknown, not a flat account.
         logger.error(

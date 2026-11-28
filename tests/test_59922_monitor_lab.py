@@ -20,7 +20,7 @@ def _wire_book(monkeypatch, client):
         return "acct"
 
     monkeypatch.setattr(main_bot, "_resolve_account_id_key", account)
-    monkeypatch.setattr(main_bot, "_raw_client", lambda _tokens: client)
+    monkeypatch.setattr(main_bot, "_raw_client", lambda _tokens, timeout=20.0: client)
 
 
 def _etrade_3004():
@@ -673,6 +673,7 @@ def test_a_90s_portfolio_hang_keeps_page_gaps_at_30s(monkeypatch):
     monkeypatch.setattr(main_bot.time, "time", lambda: clock["t"])
     monkeypatch.setattr(main_bot, "state", store)
     monkeypatch.setattr(main_bot.asyncio, "sleep", nap)
+    monkeypatch.setattr(main_bot, "_lost_stop_page_sleep", nap)
     monkeypatch.setattr(main_bot.asyncio, "wait_for", wait_for)
     monkeypatch.setattr(main_bot, "_reconcile_fetch_portfolio", slow)
     monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)

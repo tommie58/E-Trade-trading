@@ -75,10 +75,14 @@ def _install(monkeypatch, store, *, kind, qty, book, clearance=None):
     async def account(_tokens):
         return "acct"
 
+    async def portfolio():
+        return {"PortfolioResponse": {"AccountPortfolio": []}}
+
     monkeypatch.setattr(main_bot, "state", store)
     monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)
     monkeypatch.setattr(main_bot, "_order_state", order_state)
     monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", book)
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_portfolio", portfolio)
     monkeypatch.setattr(main_bot.asyncio, "sleep", nap)
     monkeypatch.setattr(main_bot, "_resolve_exit_fill", quiet)
     monkeypatch.setattr(main_bot, "_defer_close_to_reconciler", quiet)
