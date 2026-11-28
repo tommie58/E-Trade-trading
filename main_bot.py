@@ -31580,6 +31580,15 @@ def _flatten_working_exit(order: dict, ticker: str, guard: dict) -> bool:
     return str(order.get("security_type") or "EQ").upper() not in {"OPTN", "OPTION"}
 
 
+class FlattenNotSent(Exception):
+    """No market sell went out. The position is not flattened."""
+
+
+# Returned by _emergency_flatten when no sell was sent. Callers must not
+# record the position as flattened.
+NOT_SOLD = "NOT_SOLD"
+
+
 async def _stock_flatten_already_working(ticker: str, guard: dict) -> bool:
     """True when a stock re-sell would add a second exit.
 
@@ -31666,14 +31675,14 @@ async def _emergency_flatten(
                         "[FLATTEN] %s stock re-send already used — not selling",
                         ticker,
                     )
-                    return prior_id
+                    return NOT_SOLD
                 if await _stock_flatten_already_working(ticker, guard):
                     logger.warning(
                         "[FLATTEN] %s prior sell %s was not acknowledged and a "
                         "working exit is already on the book — not selling again",
                         ticker, prior_id or prior_client,
                     )
-                    return prior_id
+                    return NOT_SOLD
                 held = await _flatten_broker_held_qty(ticker, {
                     "action": guard.get("action") or "BUY",
                     "contract": guard.get("contract"),
@@ -31696,7 +31705,7 @@ async def _emergency_flatten(
                         "did not show the shares still held and the sell unfilled",
                         ticker,
                     )
-                    return prior_id
+                    return NOT_SOLD
                 qty = min(int(held), int(qty))
                 await state.update_guard(ticker, flatten_stock_resends=1)
                 guard["flatten_stock_resends"] = 1
@@ -31742,7 +31751,7 @@ async def _emergency_flatten(
                     f"could not be read ({type(exc).__name__}).",
                     dedupe_key=f"flatten_book:{ticker}",
                 )
-                raise Exception(type(exc).__name__) from None
+                return NOT_SOLD
             book_resp = None
         if book_resp is not None:
             sell_qty = int(qty)
@@ -33899,6 +33908,8 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 ticker, guard, filled,
                                 book="best_effort" if allocation_hold_released or is_option else "required",
                             )
+                            if flatten_id in (None, NOT_SOLD):
+                                raise FlattenNotSent("not sold")
                             exit_fill = await _resolve_exit_fill(flatten_id)
                             payload_g = {"ticker": ticker, "action": guard.get("action") or "BUY"}
                             if exit_fill and is_option:
@@ -33919,6 +33930,16 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 f"— position flattened at market (qty={filled}, order={flatten_id})",
                                 dedupe_key=f"stop_timeout:{ticker}",
                             )
+                            return
+                        except FlattenNotSent:
+                            logger.warning(
+                                "[STOP GUARD] %s flatten did not sell — position stays open",
+                                ticker,
+                            )
+                            guard = await state.update_guard(
+                                ticker, flatten_unresolved=True, stop_reply_bound=True,
+                            ) or guard
+                            guard = await _page_unconfirmed_stop(ticker, guard)
                             return
                         except Exception as e:
                             logger.error(
@@ -34017,7 +34038,11 @@ async def _stop_guard_worker(ticker: str) -> None:
                 not is_option
                 and filled > 0
                 and not guard.get("stop_order_id")
-                and (guard.get("stop_reply_bound") or guard.get("stop_reply_retried"))
+                and (
+                    guard.get("stop_reply_bound")
+                    or guard.get("stop_reply_retried")
+                    or guard.get("flatten_unresolved")
+                )
             ):
                 # Stocks stay paged every 30s until a stop is resting or
                 # the position is flat. The deadline branch does not run
