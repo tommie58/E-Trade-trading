@@ -24999,17 +24999,25 @@ async def _load_account_snapshot() -> Optional[dict]:
 
 
 def _snapshot_age(snapshot: Optional[dict]) -> Optional[float]:
-    """Seconds since the snapshot was built. A consumer that cannot tell a
-    2-second-old view from a 6-hour-old one will trust a stale account."""
+    """Seconds since the snapshot was built.
+
+    NaN, infinities, a future timestamp, and a millisecond epoch are unknown.
+    Unknown is never treated as fresh. A consumer that cannot tell a
+    2-second-old view from a 6-hour-old one will trust a stale account.
+    """
     if not snapshot:
         return None
     try:
         epoch = float(snapshot.get("epoch") or 0)
     except (TypeError, ValueError):
         return None
-    if epoch <= 0:
+    if not math.isfinite(epoch) or epoch <= 0:
         return None
-    return round(max(time.time() - epoch, 0.0), 1)
+    now = time.time()
+    # A millisecond epoch of "now" is ~1e12 and would otherwise clamp to 0.
+    if epoch > 1e11 or epoch > now:
+        return None
+    return round(now - epoch, 1)
 
 
 @app.post("/app/heartbeat")
