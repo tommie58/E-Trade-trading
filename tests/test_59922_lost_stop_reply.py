@@ -658,3 +658,76 @@ def test_equity_flatten_does_not_sell_more_than_the_long(monkeypatch):
 
     assert _run(confirmed()) == [100]
     assert sum(sold) <= 100
+
+
+def test_allocation_backoff_starts_at_20s_and_caps_at_300s():
+    assert main_bot.allocation_backoff_delay(0) == 0
+    assert main_bot.allocation_backoff_delay(1) == 20
+    assert main_bot.allocation_backoff_delay(2) == 40
+    assert main_bot.allocation_backoff_delay(5) == 300
+
+
+def test_option_3004_does_not_place_again_until_the_backoff(monkeypatch):
+    store = main_bot.StateStore(None)
+    places = []
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(main_bot.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(main_bot, "state", store)
+
+    async def place(*args, **kwargs):
+        places.append(clock["t"])
+        raise _Allocated()
+
+    async def send_nowait(*args, **kwargs):
+        return None
+
+    async def order_state(order_id, client_id):
+        return "EXECUTED", 2
+
+    async def nap(_seconds):
+        await store.update_guard("QQQ", done=True)
+
+    async def book():
+        return {"OrdersResponse": {}}
+
+    async def quiet(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main_bot, "_place_option_protective_stop", place)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send_nowait)
+    monkeypatch.setattr(main_bot, "_order_state", order_state)
+    monkeypatch.setattr(main_bot.asyncio, "sleep", nap)
+    monkeypatch.setattr(main_bot, "_reconcile_fetch_orders", book)
+    monkeypatch.setattr(main_bot.trade_ledger, "record", quiet)
+    monkeypatch.setattr(main_bot, "_true_up_entry_fill", quiet)
+    monkeypatch.setattr(main_bot, "_cancel_order_safe", quiet)
+
+    async def poll():
+        guard = await store.get_guard("QQQ")
+        guard["done"] = False
+        await store.set_guard("QQQ", guard)
+        await main_bot._stop_guard_worker("QQQ")
+
+    async def scenario():
+        await store.set_position("QQQ", {
+            "action": "BUY", "entry_premium": 3.0, "stop_premium": 2.4,
+            "filled_qty": 2, "qty": 2,
+            "contract": {"right": "CALL", "strike": 450.0, "expiration": "2026-12-18"},
+        })
+        await store.set_guard("QQQ", {
+            "done": False, "kind": "option", "action": "BUY", "stop": 2.4,
+            "guarded_qty": 0, "trued_qty": 2, "entry_order_id": "ENTRY-1",
+            "fill_detected_ts": 1, "stop_deadline_ts": 1_000_000.0,
+            "deadline_ts": 1_000_000.0,
+            "contract": {"right": "CALL", "strike": 450.0, "expiration": "2026-12-18"},
+        })
+        await poll()
+        held = await store.get_guard("QQQ")
+        clock["t"] += 19
+        await poll()
+        return held, list(places)
+
+    held, seen = _run(scenario())
+    assert seen == [10_000.0]
+    assert int(held.get("stop_3004_count") or 0) == 1
+    assert float(held.get("stop_3004_until") or 0) >= 10_020.0

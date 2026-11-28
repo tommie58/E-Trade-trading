@@ -30834,6 +30834,21 @@ _ALLOCATION_REJECT_RE = re.compile(
 )
 
 
+ALLOCATION_BACKOFF_BASE_S = 20.0
+ALLOCATION_BACKOFF_CAP_S = 300.0
+
+
+def allocation_backoff_delay(count: int) -> float:
+    """Seconds to wait after ``count`` 3004 rejects. The first place is not delayed."""
+    try:
+        n = int(count)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return 0.0
+    return min(ALLOCATION_BACKOFF_CAP_S, ALLOCATION_BACKOFF_BASE_S * (2 ** (n - 1)))
+
+
 def _allocation_reject(err: BaseException) -> bool:
     """E*TRADE 3004: the contracts are already pledged to a resting order."""
     if str(getattr(err, "code", "") or "") == "3004":
@@ -33313,6 +33328,15 @@ async def _stop_guard_worker(ticker: str) -> None:
                 status, filled = await _order_state(guard.get("entry_order_id"), guard.get("entry_client_id"))
             except Exception as e:
                 logger.warning(f"[STOP GUARD] {ticker} poll failed: {e}")
+            if (
+                is_option
+                and str(guard.get("stop_3004_state") or "")
+                and str(guard.get("stop_3004_state")) != str(filled)
+            ):
+                guard = await state.update_guard(
+                    ticker, stop_3004_count=0, stop_3004_until=0,
+                    stop_3004_state=str(filled),
+                ) or guard
 
             # A filled status with no filledQuantity is still a fill. Size the
             # stop from the broker holding, then the guard or tracked qty, and
@@ -33639,6 +33663,12 @@ async def _stop_guard_worker(ticker: str) -> None:
                                     ticker, stop_allocation_held_polls=step["polls"],
                                 ) or guard
                             can_place = False
+                    if (
+                        can_place
+                        and is_option
+                        and time.time() < float(guard.get("stop_3004_until") or 0)
+                    ):
+                        can_place = False
                     if can_place:
                         # The one retry reuses the lost clientOrderId. A
                         # first place mints a new one. Broker dedupe is not
@@ -33733,6 +33763,14 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 # retry after a lost reply was not a clean
                                 # reject. One 3004 is the whole retry. Do not
                                 # place again and do not flatten.
+                                extra = {}
+                                if is_option and _allocation_reject(e):
+                                    n = int(guard.get("stop_3004_count") or 0) + 1
+                                    extra = {
+                                        "stop_3004_count": n,
+                                        "stop_3004_until": time.time() + allocation_backoff_delay(n),
+                                        "stop_3004_state": str(filled),
+                                    }
                                 logger.warning(
                                     "[STOP GUARD] %s stop place not confirmed (%s) — "
                                     "not placing again while the book lags",
@@ -33742,6 +33780,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                                     ticker,
                                     stop_allocation_held=True,
                                     stop_reply_lost=False,
+                                    **extra,
                                 ) or guard
                                 adopt_pos = {
                                     "action": guard.get("action") or "BUY",
