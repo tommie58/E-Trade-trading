@@ -18432,6 +18432,10 @@ STOP_ALLOCATION_HELD_POLLS = 3
 # After the hold ends with the book still unreadable, page again at this
 # interval until a stop is adopted or the option is flattened.
 UNCONFIRMED_STOP_PAGE_S = 30.0
+# One stop retry after this many successful book reads, spaced at least
+# this far apart, that show neither the original order nor a covering stop.
+LOST_REPLY_RETRY_READS = 2
+LOST_REPLY_RETRY_GAP_S = 10.0
 # CANCEL SETTLEMENT: E*TRADE answers a cancel with CANCEL_REQUESTED, which is a
 # PENDING state — the contracts/shares stay allocated to the dying order for a
 # beat afterwards. Sending the replacement stop or the closing order inside that
@@ -30777,6 +30781,37 @@ def allocation_hold_after_poll(guard: dict, now: float,
     return {"polls": polls, "expired": past and polls >= int(max_polls)}
 
 
+def lost_reply_clean_read(guard: dict, now: float, *, ok: bool) -> dict:
+    """Count successful empty book reads toward the one lost-reply retry.
+
+    A failed read resets the count. A successful read counts only when it
+    is at least LOST_REPLY_RETRY_GAP_S after the previous counted read.
+    ``ready`` is the second counted read, and only when a retry has not
+    already been used.
+    """
+    if not ok or (guard or {}).get("stop_reply_retried"):
+        return {"count": 0, "ts": 0.0, "ready": False}
+    try:
+        count = int((guard or {}).get("stop_reply_clean_reads") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    try:
+        ts = float((guard or {}).get("stop_reply_clean_read_ts") or 0)
+    except (TypeError, ValueError):
+        ts = 0.0
+    now = float(now)
+    if count <= 0 or ts <= 0:
+        return {"count": 1, "ts": now, "ready": False}
+    if (now - ts) < LOST_REPLY_RETRY_GAP_S:
+        return {"count": count, "ts": ts, "ready": False}
+    count += 1
+    return {
+        "count": count,
+        "ts": now,
+        "ready": count >= LOST_REPLY_RETRY_READS,
+    }
+
+
 async def _page_unconfirmed_stop(ticker: str, guard: dict) -> dict:
     """Critical page for a lost stop that is still not confirmed resting.
 
@@ -30797,6 +30832,59 @@ async def _page_unconfirmed_stop(ticker: str, guard: dict) -> dict:
         dedupe_seconds=int(UNCONFIRMED_STOP_PAGE_S),
     )
     return await state.update_guard(ticker, stop_reply_paged_at=now) or guard
+
+
+async def _lost_stop_clearance(guard: dict) -> str:
+    """Whether the lost stop is provably gone.
+
+    ``clear`` means the cancel was confirmed, or the broker shows that
+    order terminal and unfilled. An empty list is not that proof — the
+    order can land later — so it returns ``unconfirmed``. ``filled``
+    means the stop already sold.
+    """
+    client_id = str((guard or {}).get("stop_client_id") or "").strip()
+    order_id = str((guard or {}).get("stop_order_id") or "").strip()
+    if not client_id and not order_id:
+        return "unconfirmed"
+    found = None
+    try:
+        resp = await asyncio.wait_for(
+            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.warning("lost-stop lookup failed (%s)", type(exc).__name__)
+        resp = None
+    if resp is not None:
+        for order in reconciliation.parse_open_orders(resp):
+            oid = str(order.get("order_id") or "").strip()
+            cid = str(order.get("client_order_id") or "").strip()
+            if (order_id and oid == order_id) or (client_id and cid == client_id):
+                found = order
+                break
+        if found is None and not order_id:
+            # Not in this snapshot. That is lag, not "no such order".
+            return "unconfirmed"
+    elif not order_id:
+        return "unconfirmed"
+    if found is not None:
+        status = str(found.get("status") or "").upper()
+        if _filled_order_status(status):
+            return "filled"
+        if status in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
+            return "clear"
+        order_id = str(found.get("order_id") or "").strip() or order_id
+    if not order_id:
+        return "unconfirmed"
+    try:
+        outcome = await _cancel_order_verified(order_id)
+    except Exception as exc:
+        logger.warning("lost-stop cancel failed (%s)", type(exc).__name__)
+        return "unconfirmed"
+    if outcome == CANCEL_CONFIRMED:
+        return "clear"
+    if outcome in (CANCEL_FILLED, CANCEL_PARTIAL):
+        return "filled"
+    return "unconfirmed"
 
 
 async def _adopt_covering_stop(
@@ -31488,7 +31576,10 @@ async def _emergency_flatten(
             )
         except Exception as exc:
             logger.warning("flatten book read failed (%s)", type(exc).__name__)
-            if book == "required":
+            is_option_flatten = str(guard.get("kind") or "equity") == "option"
+            # Options still sell: a live stop makes the broker reject the
+            # close with 3004. Equity refuses, so a blind sell cannot short.
+            if book == "required" and not is_option_flatten:
                 await alerts.send_nowait(
                     "critical", "flatten_book_unreadable",
                     f"{ticker}: emergency flatten did not sell — the order book "
@@ -33119,6 +33210,30 @@ async def _stop_guard_worker(ticker: str) -> None:
                             guard.get("stop_order_id"), expected_qty=guarded,
                         )
                         can_place = replace_outcome == CANCEL_CONFIRMED
+                        if (
+                            guard.get("stop_reply_lost")
+                            and replace_outcome not in (CANCEL_CONFIRMED, CANCEL_NONE)
+                        ):
+                            # The original stop is not provably gone. Do not
+                            # place another, and do not sell a stock.
+                            can_place = False
+                            guard = await _page_unconfirmed_stop(ticker, guard)
+                            if is_option and replace_outcome not in (
+                                CANCEL_FILLED, CANCEL_PARTIAL,
+                            ):
+                                guard = await state.update_guard(
+                                    ticker,
+                                    stop_allocation_held=False,
+                                    stop_reply_lost=False,
+                                    stop_reply_bound=True,
+                                ) or guard
+                                allocation_hold_released = True
+                            else:
+                                guard = await state.update_guard(
+                                    ticker,
+                                    stop_reply_lost=True,
+                                    stop_reply_bound=True,
+                                ) or guard
                         if replace_outcome == CANCEL_PARTIAL:
                             # The stop sold part of the position. The guard's model
                             # (entry filled N, stop covers N) no longer describes
@@ -33219,14 +33334,56 @@ async def _stop_guard_worker(ticker: str) -> None:
                             guarded = filled
                             can_place = False
                         elif (
-                            verdict.get("status") == "absent"
+                            verdict.get("status") in ("absent", "inconclusive")
                             and guard.get("stop_reply_lost")
-                            and not guard.get("stop_allocation_held")
+                            and not guard.get("stop_reply_retried")
+                            and not guard.get("stop_reply_bound")
                         ):
-                            # The book was read and the original order is not
-                            # working. One retry may place.
-                            can_place = True
+                            latch = lost_reply_clean_read(guard, time.time(), ok=True)
+                            guard = await state.update_guard(
+                                ticker,
+                                stop_reply_clean_reads=latch["count"],
+                                stop_reply_clean_read_ts=latch["ts"],
+                            ) or guard
+                            if latch["ready"]:
+                                # One retry only after the original stop is
+                                # provably gone. A late list_orders hit is
+                                # not that proof.
+                                clearance = await _lost_stop_clearance(guard)
+                                guard = await state.update_guard(
+                                    ticker, stop_reply_retried=True,
+                                ) or guard
+                                if clearance == "clear":
+                                    can_place = True
+                                else:
+                                    can_place = False
+                                    guard = await _page_unconfirmed_stop(ticker, guard)
+                                    if is_option and clearance != "filled":
+                                        guard = await state.update_guard(
+                                            ticker,
+                                            stop_allocation_held=False,
+                                            stop_reply_lost=False,
+                                            stop_reply_bound=True,
+                                        ) or guard
+                                        allocation_hold_released = True
+                                    else:
+                                        guard = await state.update_guard(
+                                            ticker,
+                                            stop_allocation_held=False,
+                                            stop_reply_lost=True,
+                                            stop_reply_bound=True,
+                                        ) or guard
+                            else:
+                                can_place = False
                         else:
+                            if verdict.get("status") == "unreadable":
+                                guard = await state.update_guard(
+                                    ticker,
+                                    stop_reply_clean_reads=0,
+                                    stop_reply_clean_read_ts=0,
+                                ) or guard
+                            can_place = False
+                        if not adopted and not can_place and not guard.get("stop_reply_retried"):
                             if not guard.get("stop_allocation_held") and not guard.get("stop_reply_bound"):
                                 guard = await state.update_guard(
                                     ticker, stop_allocation_held=True,
@@ -33308,7 +33465,30 @@ async def _stop_guard_worker(ticker: str) -> None:
                             await settle_heat_after_stop_armed(ticker)
                             guarded = filled
                         except Exception as e:
-                            if _allocation_reject(e) or (
+                            if guard.get("stop_reply_retried"):
+                                # The one retry did not rest a stop. Do not
+                                # place another. Options flatten; stocks page.
+                                logger.warning(
+                                    "[STOP GUARD] %s stop retry failed (%s)",
+                                    ticker, type(e).__name__,
+                                )
+                                guard = await _page_unconfirmed_stop(ticker, guard)
+                                if is_option:
+                                    guard = await state.update_guard(
+                                        ticker,
+                                        stop_allocation_held=False,
+                                        stop_reply_lost=False,
+                                        stop_reply_bound=True,
+                                    ) or guard
+                                    allocation_hold_released = True
+                                else:
+                                    guard = await state.update_guard(
+                                        ticker,
+                                        stop_allocation_held=False,
+                                        stop_reply_lost=True,
+                                        stop_reply_bound=True,
+                                    ) or guard
+                            elif _allocation_reject(e) or (
                                 _place_reply_ambiguous(e) and guard.get("stop_reply_lost")
                             ):
                                 # The broker already has the stop, or the one
@@ -33507,7 +33687,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                 and not guard.get("stop_order_id")
                 and not guard.get("stop_allocation_held")
                 and not guard.get("stop_reply_lost")
-                and time.time() >= stop_deadline
+                and (time.time() >= stop_deadline or allocation_hold_released)
             ):
                 if filled <= 0 and _filled_order_status(status):
                     # Sized above when a quantity existed. Still no cancel
@@ -33518,51 +33698,61 @@ async def _stop_guard_worker(ticker: str) -> None:
                         f"deleting the position"
                     )
                 elif filled > 0:
-                    if status not in _TERMINAL_ORDER_STATUSES:
-                        await _cancel_order_safe(guard.get("entry_order_id"))
-                    try:
-                        flatten_id = await _emergency_flatten(
-                            ticker, guard, filled,
-                            book="best_effort" if allocation_hold_released else "required",
-                        )
-                        exit_fill = await _resolve_exit_fill(flatten_id)
-                        payload_g = {"ticker": ticker, "action": guard.get("action") or "BUY"}
-                        if exit_fill and is_option:
-                            await _record_close(ticker, None, payload_g, exit_premium=exit_fill, close_reason="emergency_flatten_fill")
-                        elif exit_fill:
-                            await _record_close(ticker, exit_fill, payload_g, close_reason="emergency_flatten_fill")
-                        else:
-                            await _defer_close_to_reconciler(ticker, flatten_id,
-                                                             "emergency flatten placed — fill not yet priced")
-                        await _finish_guard(ticker, "stop_timeout_flattened")
-                        await trade_ledger.record("stop_timeout_flattened", {
-                            "ticker": ticker, "qty": filled, "flatten_order_id": flatten_id,
-                            "timeout_seconds": STOP_PLACEMENT_TIMEOUT_SECONDS,
-                        })
-                        await alerts.send_nowait(
-                            "critical", "stop_timeout_flattened",
-                            f"{ticker}: no protective stop resting {STOP_PLACEMENT_TIMEOUT_SECONDS}s after entry "
-                            f"— position flattened at market (qty={filled}, order={flatten_id})",
-                            dedupe_key=f"stop_timeout:{ticker}",
-                        )
-                        return
-                    except Exception as e:
-                        logger.error(
-                            "[STOP GUARD] %s emergency flatten FAILED (%s)",
-                            ticker, type(e).__name__,
-                        )
-                        await alerts.send_nowait(
-                            "critical", "stop_timeout_flatten_failed",
-                            f"{ticker}: UNPROTECTED past the {STOP_PLACEMENT_TIMEOUT_SECONDS}s stop deadline and "
-                            f"the emergency flatten failed ({type(e).__name__}). The guard keeps retrying.",
-                            dedupe_key=f"stop_timeout_fail:{ticker}",
-                        )
-                        if allocation_hold_released:
-                            # The lost order was never proven gone. Do not
-                            # place another stop on the next poll.
-                            await state.update_guard(ticker, stop_reply_lost=True)
-                        # Fall through — next poll retries the stop placement
-                        # first, then this flatten again if it still won't stick.
+                    if (
+                        not is_option
+                        and guard.get("stop_reply_lost")
+                    ):
+                        # A lost equity stop may still be live. Do not sell
+                        # until its cancel is confirmed.
+                        guard = await _page_unconfirmed_stop(ticker, guard)
+                    elif (
+                        not is_option
+                        and allocation_hold_released
+                        and await _lost_stop_clearance(guard) != "clear"
+                    ):
+                        guard = await _page_unconfirmed_stop(ticker, guard)
+                    else:
+                        if status not in _TERMINAL_ORDER_STATUSES:
+                            await _cancel_order_safe(guard.get("entry_order_id"))
+                        try:
+                            flatten_id = await _emergency_flatten(
+                                ticker, guard, filled,
+                                book="best_effort" if allocation_hold_released or is_option else "required",
+                            )
+                            exit_fill = await _resolve_exit_fill(flatten_id)
+                            payload_g = {"ticker": ticker, "action": guard.get("action") or "BUY"}
+                            if exit_fill and is_option:
+                                await _record_close(ticker, None, payload_g, exit_premium=exit_fill, close_reason="emergency_flatten_fill")
+                            elif exit_fill:
+                                await _record_close(ticker, exit_fill, payload_g, close_reason="emergency_flatten_fill")
+                            else:
+                                await _defer_close_to_reconciler(ticker, flatten_id,
+                                                                 "emergency flatten placed — fill not yet priced")
+                            await _finish_guard(ticker, "stop_timeout_flattened")
+                            await trade_ledger.record("stop_timeout_flattened", {
+                                "ticker": ticker, "qty": filled, "flatten_order_id": flatten_id,
+                                "timeout_seconds": STOP_PLACEMENT_TIMEOUT_SECONDS,
+                            })
+                            await alerts.send_nowait(
+                                "critical", "stop_timeout_flattened",
+                                f"{ticker}: no protective stop resting {STOP_PLACEMENT_TIMEOUT_SECONDS}s after entry "
+                                f"— position flattened at market (qty={filled}, order={flatten_id})",
+                                dedupe_key=f"stop_timeout:{ticker}",
+                            )
+                            return
+                        except Exception as e:
+                            logger.error(
+                                "[STOP GUARD] %s emergency flatten FAILED (%s)",
+                                ticker, type(e).__name__,
+                            )
+                            await alerts.send_nowait(
+                                "critical", "stop_timeout_flatten_failed",
+                                f"{ticker}: UNPROTECTED past the {STOP_PLACEMENT_TIMEOUT_SECONDS}s stop deadline and "
+                                f"the emergency flatten failed ({type(e).__name__}). The guard keeps retrying.",
+                                dedupe_key=f"stop_timeout_fail:{ticker}",
+                            )
+                            if allocation_hold_released:
+                                await state.update_guard(ticker, stop_reply_lost=True)
                 else:
                     await _cancel_order_safe(guard.get("entry_order_id"))
                     # Re-poll after the cancel: a fill may have raced it. If it
