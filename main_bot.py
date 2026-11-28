@@ -31407,9 +31407,18 @@ def _flatten_working_exit(order: dict, ticker: str, guard: dict) -> bool:
     return str(order.get("security_type") or "EQ").upper() not in {"OPTN", "OPTION"}
 
 
-async def _emergency_flatten(ticker: str, guard: dict, qty: int) -> Optional[str]:
+async def _emergency_flatten(
+    ticker: str, guard: dict, qty: int, *, book: str = "required",
+) -> Optional[str]:
     """LAST-RESORT market close of a filled-but-unprotected entry (stop
     placement timeout). Certainty of fill beats price — always MARKET.
+
+    ``book`` controls the pre-sell order read:
+    ``skip`` sells the requested quantity even when list_orders fails
+    (panic and the daily-loss flatten). ``required`` is the stop-guard
+    deadline path: an unreadable book does not sell. ``best_effort``
+    still cancels a working exit when the book can be read, and sells
+    the tracked quantity when it cannot (an option lost-reply flatten).
 
     IDEMPOTENT. The guard retries this on failure roughly once a second, and a
     read timeout can raise AFTER the market sell already reached the broker.
@@ -31443,49 +31452,54 @@ async def _emergency_flatten(ticker: str, guard: dict, qty: int) -> Optional[str
             f"[FLATTEN] {ticker} prior flatten {prior_id} ended {p_status} unfilled "
             f"— placing replacement (attempt {attempts + 1}/{_MAX_FLATTEN_ATTEMPTS})"
         )
-    # A lost-ack stop may still be working. Read the book before the market
-    # sell. Cancel a working exit first; if it stays up, sell only the
-    # shares it does not already cover. An unreadable book does not sell.
-    try:
-        book = await asyncio.wait_for(
-            _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
-        )
-    except Exception as exc:
-        logger.warning("flatten book read failed (%s)", type(exc).__name__)
-        await alerts.send_nowait(
-            "critical", "flatten_book_unreadable",
-            f"{ticker}: emergency flatten did not sell — the order book "
-            f"could not be read ({type(exc).__name__}).",
-            dedupe_key=f"flatten_book:{ticker}",
-        )
-        raise Exception(type(exc).__name__) from None
-    sell_qty = int(qty)
-    for order in reconciliation.parse_open_orders(book):
-        if not _flatten_working_exit(order, ticker, guard):
-            continue
-        remaining = reconciliation._stop_remaining(order)
+    # Panic and daily-loss do not consult the order book. The stop-guard
+    # deadline path does: a working stop is cancelled first, and an
+    # unreadable book does not sell. best_effort sells the tracked
+    # quantity when that read fails.
+    if book != "skip":
         try:
-            outcome = await _cancel_order_verified(
-                order.get("order_id"), expected_qty=remaining,
+            book_resp = await asyncio.wait_for(
+                _reconcile_fetch_orders(), PRE_CANCEL_STOP_READ_TIMEOUT_S,
             )
         except Exception as exc:
-            logger.warning("flatten cancel failed (%s)", type(exc).__name__)
-            outcome = CANCEL_LIVE
-        if outcome != CANCEL_CONFIRMED:
-            sell_qty -= remaining
-    if sell_qty < 1:
-        logger.warning(
-            "[FLATTEN] %s working exit still covers the shares — not selling",
-            ticker,
-        )
-        await alerts.send_nowait(
-            "critical", "flatten_oversell_avoided",
-            f"{ticker}: emergency flatten did not sell — a working stop or "
-            f"sell still covers the position.",
-            dedupe_key=f"flatten_covered:{ticker}",
-        )
-        raise Exception("covered")
-    qty = sell_qty
+            logger.warning("flatten book read failed (%s)", type(exc).__name__)
+            if book == "required":
+                await alerts.send_nowait(
+                    "critical", "flatten_book_unreadable",
+                    f"{ticker}: emergency flatten did not sell — the order book "
+                    f"could not be read ({type(exc).__name__}).",
+                    dedupe_key=f"flatten_book:{ticker}",
+                )
+                raise Exception(type(exc).__name__) from None
+            book_resp = None
+        if book_resp is not None:
+            sell_qty = int(qty)
+            for order in reconciliation.parse_open_orders(book_resp):
+                if not _flatten_working_exit(order, ticker, guard):
+                    continue
+                remaining = reconciliation._stop_remaining(order)
+                try:
+                    outcome = await _cancel_order_verified(
+                        order.get("order_id"), expected_qty=remaining,
+                    )
+                except Exception as exc:
+                    logger.warning("flatten cancel failed (%s)", type(exc).__name__)
+                    outcome = CANCEL_LIVE
+                if outcome != CANCEL_CONFIRMED:
+                    sell_qty -= remaining
+            if sell_qty < 1:
+                logger.warning(
+                    "[FLATTEN] %s working exit still covers the shares — not selling",
+                    ticker,
+                )
+                await alerts.send_nowait(
+                    "critical", "flatten_oversell_avoided",
+                    f"{ticker}: emergency flatten did not sell — a working stop or "
+                    f"sell still covers the position.",
+                    dedupe_key=f"flatten_covered:{ticker}",
+                )
+                raise Exception("covered")
+            qty = sell_qty
     tokens = load_tokens()
     if not tokens:
         raise Exception("E*TRADE tokens not set")
@@ -33476,7 +33490,9 @@ async def _stop_guard_worker(ticker: str) -> None:
                     if status not in _TERMINAL_ORDER_STATUSES:
                         await _cancel_order_safe(guard.get("entry_order_id"))
                     try:
-                        flatten_id = await _emergency_flatten(ticker, guard, filled)
+                        flatten_id = await _emergency_flatten(
+                            ticker, guard, filled, book="required",
+                        )
                         exit_fill = await _resolve_exit_fill(flatten_id)
                         payload_g = {"ticker": ticker, "action": guard.get("action") or "BUY"}
                         if exit_fill and is_option:
@@ -45542,7 +45558,9 @@ async def _flatten_book(trigger: str) -> Dict[str, Any]:
                     )
             guard_shape = {"kind": item["kind"], "contract": item["contract"],
                            "action": item["action"]}
-            order_id = await _emergency_flatten(ticker, guard_shape, item["qty"])
+            order_id = await _emergency_flatten(
+                ticker, guard_shape, item["qty"], book="skip",
+            )
             await _finish_guard(ticker, "flattened")
             # The market close fills in seconds — hand the position to the
             # reconciler's fill capture so the REAL exit gets booked (never a
