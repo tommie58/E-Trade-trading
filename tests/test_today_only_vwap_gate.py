@@ -907,6 +907,7 @@ def test_crosscheck_block_alerts_once_per_fifteen_minutes(redis_scanner, monkeyp
         sent.append(kwargs.get("dedupe_key") or args)
 
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
 
     async def scenario():
         await _seed(store, "SPY", spy)
@@ -1081,6 +1082,7 @@ def test_crosscheck_alert_returns_before_the_webhook(redis_scanner, monkeypatch)
         await asyncio.sleep(8)
 
     monkeypatch.setattr(main_bot.alerts, "send", send)
+    monkeypatch.setattr(main_bot.alerts, "send_nowait", send)
 
     async def scenario():
         await _seed(store, "SPY", spy)

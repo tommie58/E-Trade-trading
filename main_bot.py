@@ -2689,13 +2689,24 @@ floor, NOT the dedupe key, so a re-poll of the same fill cannot double-post.
 
 Fire-and-forget by design: an alerting failure must NEVER break trading, so
 every path here swallows and logs its own errors.
+
+Order, stop, flatten, and kill paths call `send_nowait`. That still logs and
+pushes `alerts:recent` before any POST. The POST itself is a background task
+with a strong reference and a done-callback. More than 50 deliveries in flight
+drops a non-critical POST (counted). A critical delivery waits in a small
+overflow queue and starts when a slot frees. Shutdown gives in-flight posts
+at most 3 seconds to finish. `send` still awaits the POST for callers that
+need the result, including the delivery test.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
+from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("etrade-bot.alerts")
 
@@ -2731,10 +2742,202 @@ ALERTS_RECENT_MAX = 200
 _VALID_SEVERITIES = {"info", "warning", "error", "critical"}
 _SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2, "critical": 3}
 DEFAULT_MIN_SEVERITY = "warning"
+_MAX_INFLIGHT_DELIVERIES = 50
+# Critical POSTs wait here instead of being dropped at the in-flight cap.
+# The queue itself stops at 150 so a stuck receiver cannot hold them forever.
+_CRITICAL_QUEUE_MAX = 150
+_DRAIN_TIMEOUT_S = 3.0
+_URL_IN_TEXT = re.compile(r"https?://\S+")
+_CRITICAL_EVENTS = {
+    "position_unprotected",
+    "stop_placement_failed",
+    "partial_fill_unprotected",
+    "native_trail_unprotected",
+    "eod_flatten_blocked",
+    "flatten_close_unsaved",
+    "kill_switch_engaged",
+    "circuit_breaker_tripped",
+}
+# Webhook POSTs. Capped so a hung receiver cannot pile tasks up.
+_delivery_tasks: set = set()
+# Tasks created by synchronous callers (they await send_nowait themselves).
+_background_tasks: set = set()
+# (coroutine, label) waiting for an in-flight slot. Critical only.
+_critical_queue: Deque[Tuple[Any, str]] = deque()
+_dropped = 0
+# Cleared during shutdown drain so a finishing task does not start another.
+_deliveries_open = True
 
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _redact_text(text: str) -> str:
+    """Strip URLs. httpx puts the request URL in exception text."""
+    return _URL_IN_TEXT.sub("[url]", text or "")
+
+
+def _redact_exc(exc: BaseException) -> str:
+    return _redact_text(f"{type(exc).__name__}: {exc}")[:200]
+
+
+def _delivery_is_critical(severity: str, event: str) -> bool:
+    """True when this POST must not be dropped at the in-flight cap.
+
+    Severity `critical` qualifies, and so do the unprotected / flatten / kill
+    events even when one of them is labelled warning or error.
+    """
+    if str(severity or "").lower() == "critical":
+        return True
+    name = str(event or "")
+    if name in _CRITICAL_EVENTS:
+        return True
+    if name.endswith("_unprotected"):
+        return True
+    if name.startswith("stop_timeout_"):
+        return True
+    return False
+
+
+def delivery_status() -> Dict[str, int]:
+    """In-flight posts, non-critical drops, and critical deliveries waiting."""
+    return {
+        "in_flight": len(_delivery_tasks),
+        "dropped": int(_dropped),
+        "queued": len(_critical_queue),
+    }
+
+
+def _on_alert_task_done(task: "asyncio.Task") -> None:
+    _delivery_tasks.discard(task)
+    _background_tasks.discard(task)
+    if not task.cancelled():
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            exc = None
+        if exc is not None:
+            logger.warning(f"alert delivery task failed: {_redact_exc(exc)}")
+    if _deliveries_open:
+        try:
+            _drain_critical_queue()
+        except Exception as e:
+            logger.warning(f"alert queue drain failed: {_redact_exc(e)}")
+
+
+def _start_delivery(coro, label: str) -> bool:
+    """Start one POST if a slot is free. The caller still owns `coro` on False."""
+    if not _deliveries_open or len(_delivery_tasks) >= _MAX_INFLIGHT_DELIVERIES:
+        return False
+    task = asyncio.create_task(coro)
+    _delivery_tasks.add(task)
+    task.add_done_callback(_on_alert_task_done)
+    return True
+
+
+def _drain_critical_queue() -> None:
+    """Start queued critical POSTs until the in-flight cap is full again."""
+    while _critical_queue and len(_delivery_tasks) < _MAX_INFLIGHT_DELIVERIES:
+        if not _deliveries_open:
+            return
+        coro, label = _critical_queue.popleft()
+        if not _start_delivery(coro, label):
+            _critical_queue.appendleft((coro, label))
+            return
+
+
+def _close_coro(coro) -> None:
+    close = getattr(coro, "close", None)
+    if close is not None:
+        close()
+
+
+def schedule_alert(coro, *, label: str = "", critical: bool = False) -> bool:
+    """Run a delivery coroutine in the background.
+
+    Holds a strong reference until the task finishes. The done-callback logs
+    a failure at warning and does not re-raise. A critical delivery that
+    finds 50 posts already in flight is queued, not dropped, and starts when
+    a slot frees. A non-critical one is dropped and counted. Returns False
+    only when the POST was dropped.
+    """
+    global _dropped
+    keep = bool(critical) or _delivery_is_critical("", label)
+    if keep:
+        if not _critical_queue and _start_delivery(coro, label):
+            return True
+        if len(_critical_queue) >= _CRITICAL_QUEUE_MAX:
+            _dropped += 1
+            logger.warning(
+                f"critical alert queue full ({_CRITICAL_QUEUE_MAX}) "
+                f"— {label or 'alert'} dropped"
+            )
+            _close_coro(coro)
+            return False
+        _critical_queue.append((coro, label))
+        _drain_critical_queue()
+        return True
+    _drain_critical_queue()
+    if _start_delivery(coro, label):
+        return True
+    _dropped += 1
+    where = f" ({label})" if label else ""
+    logger.warning(
+        f"alert delivery dropped — {len(_delivery_tasks)} already in flight{where}"
+    )
+    _close_coro(coro)
+    return False
+
+
+async def drain(timeout: float = _DRAIN_TIMEOUT_S) -> Dict[str, int]:
+    """Finish in-flight deliveries, waiting at most `timeout` seconds.
+
+    Called on shutdown / lifespan exit. Queued critical POSTs start as slots
+    free. Whatever is still running at the deadline is cancelled so a redeploy
+    cannot hang, and anything still queued is closed and logged by event name.
+    """
+    global _deliveries_open
+    try:
+        timeout_s = max(0.0, float(timeout))
+    except (TypeError, ValueError):
+        timeout_s = _DRAIN_TIMEOUT_S
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while True:
+        _drain_critical_queue()
+        pending = [task for task in list(_delivery_tasks) if not task.done()]
+        if not pending and not _critical_queue:
+            break
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        if not pending:
+            break
+        await asyncio.wait(pending, timeout=remaining)
+    _deliveries_open = False
+    leftover = [task for task in list(_delivery_tasks) if not task.done()]
+    for task in leftover:
+        task.cancel()
+    if leftover:
+        await asyncio.wait(leftover)
+        still = [task for task in leftover if not task.done()]
+        if still:
+            logger.warning(
+                f"alert drain stopped with {len(still)} delivery(s) still in flight"
+            )
+    while _critical_queue:
+        coro, label = _critical_queue.popleft()
+        _close_coro(coro)
+        logger.warning(f"alert drain closed queued delivery ({label or 'alert'})")
+    return delivery_status()
+
+
+def retain(task: "asyncio.Task") -> "asyncio.Task":
+    """Hold a task a synchronous caller created. Exceptions log at warning."""
+    _background_tasks.add(task)
+    task.add_done_callback(_on_alert_task_done)
+    return task
 
 
 def mask_webhook_url(url: Optional[str]) -> Optional[str]:
@@ -2855,12 +3058,19 @@ class AlertManager:
         ok, detail = await self._post_webhook(record)
         return {"delivered": ok, "detail": detail}
 
-    async def send(self, severity: str, event: str, message: str,
-                   dedupe_key: Optional[str] = None,
-                   data: Optional[Dict[str, Any]] = None,
-                   force_deliver: bool = False,
-                   webhook_text: Optional[str] = None,
-                   dedupe_seconds: Optional[int] = None) -> None:
+    async def _stage(self, severity: str, event: str, message: str,
+                     dedupe_key: Optional[str] = None,
+                     data: Optional[Dict[str, Any]] = None,
+                     force_deliver: bool = False,
+                     webhook_text: Optional[str] = None,
+                     dedupe_seconds: Optional[int] = None):
+        """Dedupe, log, and store. Return the webhook payload, or None.
+
+        None means do not POST: a duplicate, no webhook, or below the severity
+        floor. The log line and `alerts:recent` write have already happened
+        unless the alert was deduped. `dedupe_seconds` overrides the manager
+        window for this key (minimum 10s), the same rule as `send`.
+        """
         severity = severity.lower() if severity.lower() in _VALID_SEVERITIES else "warning"
         record: Dict[str, Any] = {
             "ts": _utcnow_iso(),
@@ -2888,10 +3098,11 @@ class AlertManager:
                 )
                 if not fresh:
                     logger.debug(f"[ALERT][dup suppressed] {event}")
-                    return
+                    return None
             except Exception as e:
                 logger.warning(
-                    f"alert dedupe check failed (sending anyway): {_scrub_alert_text(str(e))}"
+                    "alert dedupe check failed (sending anyway): "
+                    f"{_scrub_alert_text(_redact_exc(e))}"
                 )
 
         # 1) Always log.
@@ -2906,16 +3117,32 @@ class AlertManager:
                 ALERTS_RECENT_KEY, json.dumps(record, default=str), ALERTS_RECENT_MAX,
             )
         except Exception as e:
-            logger.warning(f"alert store failed: {_scrub_alert_text(str(e))}")
+            logger.warning(f"alert store failed: {_scrub_alert_text(_redact_exc(e))}")
 
         # 3) Webhook — severity-filtered, deduped, best-effort.
         if not self._webhook_url:
-            return
+            return None
         if not force_deliver and (
             _SEVERITY_RANK.get(severity, 1) < _SEVERITY_RANK.get(self._min_severity, 1)
         ):
-            return  # below the configured delivery floor — log + /alerts only
-        await self._post_webhook(record, text_override=webhook_text)
+            return None  # below the configured delivery floor — log + /alerts only
+        return record, webhook_text
+
+    async def send(self, severity: str, event: str, message: str,
+                   dedupe_key: Optional[str] = None,
+                   data: Optional[Dict[str, Any]] = None,
+                   force_deliver: bool = False,
+                   webhook_text: Optional[str] = None,
+                   dedupe_seconds: Optional[int] = None) -> None:
+        staged = await self._stage(
+            severity, event, message, dedupe_key=dedupe_key, data=data,
+            force_deliver=force_deliver, webhook_text=webhook_text,
+            dedupe_seconds=dedupe_seconds,
+        )
+        if staged is None:
+            return
+        record, text = staged
+        await self._post_webhook(record, text_override=text)
 
     async def _post_webhook(self, record: Dict[str, Any],
                             text_override: Optional[str] = None) -> tuple:
@@ -2946,7 +3173,7 @@ class AlertManager:
             # the log and into the delivery record GET /alerts/config returns.
             raw_error = str(e)
             secret = self._webhook_url or ""
-            scrubbed = _scrub_alert_text(raw_error)
+            scrubbed = _scrub_alert_text(_redact_exc(e))
             if secret and (secret in raw_error or secret in scrubbed):
                 detail = "webhook delivery failed"
             else:
@@ -2984,7 +3211,8 @@ _manager: Optional[AlertManager] = None
 
 def init(state: Any, webhook_url: Optional[str], dedupe_seconds: int = 300) -> None:
     """Configure the module-level manager (called once at startup)."""
-    global _manager
+    global _manager, _deliveries_open
+    _deliveries_open = True
     _manager = AlertManager(state, webhook_url, dedupe_seconds)
     logger.info(
         f"alerting ready — webhook={'configured' if _manager.webhook_configured else 'NOT configured (log + /alerts only)'}"
@@ -3046,11 +3274,52 @@ async def send(severity: str, event: str, message: str,
                             dedupe_seconds=dedupe_seconds)
     except Exception as e:
         raw_error = str(e)
-        text = _scrub_alert_text(raw_error)
+        text = _scrub_alert_text(_redact_exc(e))
         secret = (_manager._webhook_url or "") if _manager is not None else ""
         if secret and (secret in raw_error or secret in text):
             text = "webhook delivery failed"
         logger.error(f"alert send failed ({event}): {text}")
+
+
+async def send_nowait(severity: str, event: str, message: str,
+                      dedupe_key: Optional[str] = None,
+                      data: Optional[Dict[str, Any]] = None,
+                      force_deliver: bool = False,
+                      webhook_text: Optional[str] = None,
+                      dedupe_seconds: Optional[int] = None) -> None:
+    """Write the in-app record, then POST without blocking the caller.
+
+    The log line and `alerts:recent` push finish before this returns and
+    before the POST starts. The POST is an `asyncio` task held in a set; its
+    done-callback logs failures at warning. When 50 deliveries are already in
+    flight a non-critical POST is dropped and counted. A critical one is
+    queued until a slot frees. The in-app record stays either way.
+    Never raises.
+    """
+    try:
+        if _manager is None:
+            logger.warning(f"[ALERT][{severity.upper()}] {event} — {message} (alerting not initialised)")
+            return
+        staged = await _manager._stage(
+            severity, event, message, dedupe_key=dedupe_key, data=data,
+            force_deliver=force_deliver, webhook_text=webhook_text,
+            dedupe_seconds=dedupe_seconds,
+        )
+        if staged is None:
+            return
+        record, text = staged
+        schedule_alert(
+            _manager._post_webhook(record, text_override=text),
+            label=str(record.get("event") or event),
+            critical=_delivery_is_critical(record.get("severity"), record.get("event")),
+        )
+    except Exception as e:
+        raw_error = str(e)
+        text = _scrub_alert_text(_redact_exc(e))
+        secret = (_manager._webhook_url or "") if _manager is not None else ""
+        if secret and (secret in raw_error or secret in text):
+            text = "webhook delivery failed"
+        logger.warning(f"alert send_nowait failed ({event}): {text}")
 
 
 async def recent(count: int = 50) -> List[Dict[str, Any]]:
@@ -16581,7 +16850,7 @@ CRYPTO_COMMISSION_PCT = float(os.getenv("CRYPTO_COMMISSION_PCT", "0.50"))
 # budget. The 1-lot unproven exemption applies only to a plan that starts at
 # 1. A bare portfolio 404 can infer flat only while the book, the orders, and
 # the last confirmed read all say empty, and only for two passes in a row.
-BOT_VERSION = "5.99.17-pro-day-trader"
+BOT_VERSION = "5.99.18-pro-day-trader"
 
 # ---- Safety / parity config (mirrors etrade_bot_handler.py) ----
 # Gate parity with the Rork app. The app dispatches against
@@ -25284,7 +25553,7 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
         "pin_stale": bool(pinned) and source != "pinned",
     }
     if pinned and source != "pinned":
-        await alerts.send(
+        await alerts.send_nowait(
             "warning", "account_pin_stale",
             f"Pinned account {mask_account_key(pinned)} is not among the {len(account_list)} linked "
             f"accounts — orders route to ****{acct_id[-4:] or '????'} instead. "
@@ -25295,7 +25564,7 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
         # Deliberate in-app choice — nothing ambiguous to warn about.
         pass
     elif target and not matched:
-        await alerts.send(
+        await alerts.send_nowait(
             "warning", "account_binding_mismatch",
             f"ETRADE_ACCOUNT_ID ({mask_account_key(target)}) matched none of {len(account_list)} linked accounts — "
             f"orders will route to ****{acct_id[-4:] or '????'} ({chosen.get('accountDesc', 'n/a')}). "
@@ -25303,7 +25572,7 @@ async def _resolve_account_id_key(tokens: Dict[str, str]) -> str:
             dedupe_key=f"acctbind:{mask_account_key(target)}:{mask_account_key(acct_id)}",
         )
     elif not target and len(account_list) > 1:
-        await alerts.send(
+        await alerts.send_nowait(
             "warning", "account_binding_unset",
             f"ETRADE_ACCOUNT_ID is not set and {len(account_list)} accounts are linked — "
             f"orders route to the first ACTIVE one (****{acct_id[-4:] or '????'}, "
@@ -25453,7 +25722,7 @@ async def _record_api_failure(source: str, error: str) -> None:
             "source": source, "failures": fails, "last_error": str(error)[:300],
             "cooldown_seconds": CIRCUIT_BREAKER_COOLDOWN_SECONDS,
         })
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", "circuit_breaker_tripped",
             f"Order placement HALTED after {fails} consecutive API failures ({source}): {error}",
             dedupe_key="breaker_trip",
@@ -29806,7 +30075,7 @@ async def _place_option_protective_stop(ticker: str, contract: dict, qty: int, s
             # when no bid was readable — moving protection AWAY from the market
             # on no evidence at all. Keep the level, surface it, and let the
             # reconciler re-arm against a real bid.
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "option_stop_2084_no_bid",
                 f"{ticker}: protective stop {stop_px:.2f} rejected (2084 — must rest below the bid) and "
                 f"no live bid is readable — NOT loosening it blind; the reconciler re-arms on a real bid",
@@ -30150,7 +30419,7 @@ async def _arm_native_trail(
             if fresh:
                 await _reconcile_rearm_guard(ticker, dict(fresh))
         except Exception as re_arm_error:
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "native_trail_unprotected",
                 f"{ticker}: arming a native trail failed AND the protective stop could not be "
                 f"restored — verify at your broker now ({e}; re-arm: {re_arm_error})",
@@ -30441,7 +30710,7 @@ async def _place_crossing_exit(common: dict, tokens: dict, bid: float, market_ok
         })
         return await _place_order_smart("option", fallback, tokens)
     if outcome in (CANCEL_PARTIAL, CANCEL_LIVE):
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", "crossing_exit_unresolved",
             f"{common.get('symbol')}: crossing exit {order_id} did not fill in "
             f"{EXIT_CROSS_WAIT_SECONDS:.0f}s and the cancel returned {outcome} — check the position",
@@ -30487,7 +30756,7 @@ async def _place_limit_only_exit(common: dict, tokens: dict, bid: float) -> Any:
         if outcome == CANCEL_FILLED:
             return placed
         if outcome != CANCEL_CONFIRMED:
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "crossing_exit_unresolved",
                 f"{symbol}: limit exit {order_id} did not fill and the cancel returned {outcome} — check the position",
                 dedupe_key=f"cross_exit:{symbol}",
@@ -30569,7 +30838,7 @@ async def _exit_after_limit_rejection(common: dict, tokens: dict, bid: float,
         "ticker": symbol, "rejected_limit": rejected_limit, "retry_limit": tight,
         "bid": fresh_bid, "error": str(first_err)[:200],
     })
-    await alerts.send(
+    await alerts.send_nowait(
         "warning", "exit_1011_market",
         f"{symbol}: E*TRADE refused the exit limit as too far from the market (1011) — "
         f"closed at MARKET instead so the position is not left open.",
@@ -30701,12 +30970,12 @@ def _mark_trusted_for_harvest(ticker: str, contract: Optional[dict], label: str)
         f"holding rather than selling on a price that may not be real "
         f"(the stop and trail still protect this position)"
     )
-    asyncio.create_task(alerts.send(
+    alerts.retain(asyncio.create_task(alerts.send_nowait(
         "warning", "harvest_blocked_untrusted_mark",
         f"{ticker}: a take-profit/scale-out was due but the quote is not trustworthy — "
         f"{quality['detail']}. The position stays open and protected.",
         dedupe_key=f"untrustedmark:{ticker}:{quality['reason']}",
-    ))
+    )))
     return False
 
 
@@ -30784,7 +31053,7 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
                         await _reconcile_rearm_guard(ticker, dict(fresh))
                     except Exception as e:
                         logger.error(f"[SCALE-OUT] {ticker} re-arm after partial stop fill FAILED: {e}")
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "critical", "partial_fill_unprotected",
                             f"{ticker}: the protective stop filled part of the position and the "
                             f"remaining {remaining} could NOT be re-protected — close them manually: {e}",
@@ -30809,7 +31078,7 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
             await _reconcile_rearm_guard(ticker, pos)
         except Exception as re:
             logger.error(f"[SCALE-OUT] {ticker} stop re-arm after failed scale-out ALSO failed: {re}")
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "scale_out_unprotected",
                 f"{ticker}: scale-out failed AND the protective stop could not be re-armed — "
                 f"position is UNPROTECTED, manual review needed",
@@ -30852,7 +31121,7 @@ async def _maybe_scale_out(ticker: str, pos: dict, mark: float) -> bool:
         await _reconcile_rearm_guard(ticker, pos)
     except Exception as e:
         logger.error(f"[SCALE-OUT] {ticker} runner stop re-arm FAILED: {e}")
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", "scale_out_runner_unprotected",
             f"{ticker}: {runner_qty} runner contract(s) left WITHOUT a protective stop after "
             f"scale-out — manual review needed",
@@ -31009,7 +31278,7 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
                         await _reconcile_rearm_guard(ticker, dict(fresh))
                     except Exception as e:
                         logger.error(f"[TAKE PROFIT] {ticker} re-arm after partial fill FAILED: {e}")
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "critical", "partial_fill_unprotected",
                             f"{ticker}: the protective order filled part of the position while "
                             f"banking the target and the remaining {remaining} could NOT be "
@@ -31036,7 +31305,7 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
             await _reconcile_rearm_guard(ticker, pos)
         except Exception as re:
             logger.error(f"[TAKE PROFIT] {ticker} stop re-arm after failed close ALSO failed: {re}")
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "take_profit_unprotected",
                 f"{ticker}: the take-profit close failed AND the protective stop could not be "
                 f"re-armed — position is UNPROTECTED, manual review needed",
@@ -31078,7 +31347,7 @@ async def _maybe_take_profit(ticker: str, pos: dict, mark: float,
             f"leaving the booking to the reconciler rather than inventing an exit price"
         )
     await _finish_guard(ticker, "closed_by_take_profit")
-    await alerts.send(
+    await alerts.send_nowait(
         "info", "take_profit_closed",
         f"{ticker}: take-profit target {target:.2f} tagged — {qty} contract(s) closed"
         + (f" at {fill:.2f}" if fill else " (fill pending)"),
@@ -31217,7 +31486,7 @@ async def _stop_churn_gate(ticker: str, pos: dict, who: str) -> bool:
             f"[STOP CHURN] {ticker} {who} wanted the stop off but it was cancelled "
             f"{verdict['recent']}× in {STOP_CHURN_WINDOW_SECONDS / 60:.0f} min — leaving it resting"
         )
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", "stop_churn_blocked",
             f"{ticker}: the protective stop was cancelled {verdict['recent']} times in "
             f"{STOP_CHURN_WINDOW_SECONDS / 60:.0f} minutes — the bot stopped touching it so the position "
@@ -31250,7 +31519,7 @@ async def _exit_retry_gate(ticker: str, pos: dict, reason: str) -> bool:
             f"{EXIT_RETRY_SLOW_SECONDS / 60:.0f} min"
             + (f", stop pulled up to {tightened:.2f}" if tightened else ", stop unchanged")
         )
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", f"{reason}_gave_up",
             f"{ticker}: the {reason.replace('_', ' ')} close failed {retry['fails']} times. The bot now "
             f"retries once every {EXIT_RETRY_SLOW_SECONDS / 60:.0f} minutes"
@@ -31506,7 +31775,7 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
                 f"({outcome}) — not risking a double sale"
             )
             if reason == "eod_flatten":
-                await alerts.send(
+                await alerts.send_nowait(
                     "critical", "eod_flatten_blocked",
                     f"{ticker}: the 3:40 PM ET flatten could NOT run — the resting protective "
                     f"order could not be confirmed cancelled ({outcome}). Close this manually "
@@ -31543,7 +31812,7 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
                 await state.set_position(ticker, pos)
             except Exception:
                 pass
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", f"{reason}_failed",
             f"{ticker}: the {reason.replace('_', ' ')} close FAILED ({e}) — "
             + ("this position may expire worthless; close it manually."
@@ -31590,7 +31859,7 @@ async def _maybe_scheduled_exit(ticker: str, pos: dict, mark: float) -> bool:
             f"leaving the booking to the reconciler rather than inventing an exit price"
         )
     await _finish_guard(ticker, f"closed_by_{reason}")
-    await alerts.send(
+    await alerts.send_nowait(
         "info", f"{reason}_closed",
         f"{ticker}: {verdict['detail']} — {qty} contract(s) closed"
         + (f" at {fill:.2f}" if fill else " (fill pending)"),
@@ -31694,7 +31963,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                     confirmed, guard = await _note_broker_zero(ticker, guard)
                     if confirmed:
                         if not guard.get("unreadable_fill_alerted"):
-                            await alerts.send(
+                            await alerts.send_nowait(
                                 "critical", "entry_fill_qty_unreadable",
                                 f"{ticker}: entry is {status} and the broker holding "
                                 f"stayed 0 — no protective stop. The position stays tracked.",
@@ -31721,7 +31990,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                             f"[STOP GUARD] {ticker} could not stamp the sized fill: {e}"
                         )
                     if not guard.get("unreadable_fill_alerted"):
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "critical", "entry_fill_qty_unreadable",
                             f"{ticker}: entry is {status} but the filled quantity was "
                             f"0 or missing — protective stop sized at {sized}. "
@@ -31732,7 +32001,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                             ticker, unreadable_fill_alerted=True,
                         ) or guard
                 elif not guard.get("unreadable_fill_alerted"):
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "critical", "entry_fill_qty_unreadable",
                         f"{ticker}: entry is {status} but the filled quantity was "
                         f"0 or missing — no size was available for a protective stop. "
@@ -31760,126 +32029,135 @@ async def _stop_guard_worker(ticker: str) -> None:
             # so every downstream P&L number measures from reality. `trued_qty`
             # re-arms the true-up when partials grow the position (the average
             # price moves with each partial).
+            pending_entry_alert = None
             if filled > int(guard.get("trued_qty") or 0):
                 if await _true_up_entry_fill(ticker, guard):
                     guard = await state.update_guard(ticker, trued_qty=filled) or guard
-                    # BUY ALERT — fired here, not at placement: this is the first
-                    # moment a real average execution price exists. The dedupe key
-                    # carries the cumulative qty, so a re-poll cannot double-post
-                    # while a growing partial still announces itself.
-                    await _alert_entry_fill(ticker, guard, filled)
+                    # BUY ALERT — the average price exists, but the protective
+                    # stop is placed first. Delivery is scheduled after that
+                    # stop and does not block it. The dedupe key carries the
+                    # cumulative qty, so a re-poll cannot double-post while a
+                    # growing partial still announces itself.
+                    pending_entry_alert = (guard, filled)
 
-            guarded = int(guard.get("guarded_qty") or 0)
-            if filled > guarded:
-                # (Re)place the protective stop for the total filled quantity.
-                can_place = True
-                if guard.get("stop_order_id"):
-                    # Replace flow: only place a new stop if the old one is truly
-                    # cancelled — never risk two live stops double-selling, and
-                    # never re-arm behind a stop that already filled.
-                    replace_outcome = await _cancel_order_verified(
-                        guard.get("stop_order_id"), expected_qty=guarded,
-                    )
-                    can_place = replace_outcome == CANCEL_CONFIRMED
-                    if replace_outcome == CANCEL_PARTIAL:
-                        # The stop sold part of the position. The guard's model
-                        # (entry filled N, stop covers N) no longer describes
-                        # reality, and placing a stop for `filled` would
-                        # over-commit and be rejected 3004. Book the slice and
-                        # hand the remainder to the reconciler's re-arm path,
-                        # which sizes from the position itself.
-                        remaining = await _handle_partial_stop_fill(
-                            ticker, guard.get("stop_order_id"), guard.get("stop"),
-                            "guard_stop_partial",
+            try:
+                guarded = int(guard.get("guarded_qty") or 0)
+                if filled > guarded:
+                    # (Re)place the protective stop for the total filled quantity.
+                    can_place = True
+                    if guard.get("stop_order_id"):
+                        # Replace flow: only place a new stop if the old one is truly
+                        # cancelled — never risk two live stops double-selling, and
+                        # never re-arm behind a stop that already filled.
+                        replace_outcome = await _cancel_order_verified(
+                            guard.get("stop_order_id"), expected_qty=guarded,
                         )
-                        if remaining <= 0:
-                            await _finish_guard(ticker, "closed_by_stop")
+                        can_place = replace_outcome == CANCEL_CONFIRMED
+                        if replace_outcome == CANCEL_PARTIAL:
+                            # The stop sold part of the position. The guard's model
+                            # (entry filled N, stop covers N) no longer describes
+                            # reality, and placing a stop for `filled` would
+                            # over-commit and be rejected 3004. Book the slice and
+                            # hand the remainder to the reconciler's re-arm path,
+                            # which sizes from the position itself.
+                            remaining = await _handle_partial_stop_fill(
+                                ticker, guard.get("stop_order_id"), guard.get("stop"),
+                                "guard_stop_partial",
+                            )
+                            if remaining <= 0:
+                                await _finish_guard(ticker, "closed_by_stop")
+                                return
+                            fresh = await state.get_position(ticker)
+                            try:
+                                if fresh:
+                                    await _reconcile_rearm_guard(ticker, dict(fresh))
+                                await _finish_guard(ticker, "partial_fill_reprotected")
+                            except Exception as e:
+                                logger.error(
+                                    f"[STOP GUARD] {ticker} re-arm after partial stop fill FAILED: {e}"
+                                )
+                                # Finish the guard anyway: while it stays un-done
+                                # `guard_owns_stop` keeps the reconciler's
+                                # UNPROTECTED sweep from touching this position,
+                                # and that sweep is the safety net that re-arms it.
+                                await _finish_guard(ticker, "partial_fill_unprotected")
+                                await alerts.send_nowait(
+                                    "critical", "partial_fill_unprotected",
+                                    f"{ticker}: the protective stop filled part of the position and the "
+                                    f"remaining {remaining} could NOT be re-protected — the reconciler "
+                                    f"will retry, but verify at your broker now: {e}",
+                                    dedupe_key=f"partial_unprotected:{ticker}",
+                                )
                             return
-                        fresh = await state.get_position(ticker)
+                        if replace_outcome == CANCEL_FILLED:
+                            logger.warning(
+                                f"[STOP GUARD] {ticker} protective stop already executed — position closed, "
+                                f"not re-arming"
+                            )
+                            await _finish_guard(ticker, "closed_by_stop")
+                            stop_fill = await _resolve_exit_fill(guard.get("stop_order_id"))
+                            payload_g = {"ticker": ticker, "action": guard.get("action") or "BUY"}
+                            if stop_fill and is_option:
+                                await _record_close(ticker, None, payload_g, exit_premium=stop_fill, close_reason="stop_fill")
+                            elif stop_fill:
+                                await _record_close(ticker, stop_fill, payload_g, close_reason="stop_fill")
+                            else:
+                                await _defer_close_to_reconciler(ticker, guard.get("stop_order_id"),
+                                                                 "guard stop executed — fill price unavailable")
+                            return
+                    if can_place:
                         try:
-                            if fresh:
-                                await _reconcile_rearm_guard(ticker, dict(fresh))
-                            await _finish_guard(ticker, "partial_fill_reprotected")
+                            if is_option:
+                                stop_info = await _place_option_protective_stop(
+                                    ticker, dict(guard.get("contract") or {}), filled,
+                                    float(guard.get("stop") or 0),
+                                )
+                            else:
+                                stop_info = await _place_protective_stop(
+                                    ticker, str(guard.get("action") or "BUY"), filled,
+                                    float(guard.get("stop") or 0),
+                                )
+                            guard = await state.update_guard(
+                                ticker,
+                                guarded_qty=filled,
+                                stop_order_id=stop_info["order_id"],
+                                stop_client_id=stop_info["client_id"],
+                            ) or guard
+                            async with _position_section(ticker, "stop placement"):
+                                pos = await state.get_position(ticker)
+                                if pos:
+                                    pos["stop_order_id"] = stop_info["order_id"]
+                                    pos["filled_qty"] = filled
+                                    await state.set_position(ticker, pos)
+                            await settle_heat_after_stop_armed(ticker)
+                            guarded = filled
                         except Exception as e:
-                            logger.error(
-                                f"[STOP GUARD] {ticker} re-arm after partial stop fill FAILED: {e}"
+                            # The OLD stop was already cancelled above and the new one
+                            # did not stick, so nothing is resting. The guard record
+                            # still pointed at the dead order id, and the stop-placement
+                            # timeout breaker below only fires when `stop_order_id` is
+                            # falsy — so a stale-truthy id disarmed the one control that
+                            # emergency-flattens an unprotected fill. Clear it: the guard
+                            # must describe what is ACTUALLY resting at the broker.
+                            guard = await state.update_guard(ticker, stop_order_id=None,
+                                                             stop_client_id=None) or guard
+                            async with _position_section(ticker, "stop id clear"):
+                                pos = await state.get_position(ticker)
+                                if pos and pos.get("stop_order_id"):
+                                    pos["stop_order_id"] = None
+                                    await state.set_position(ticker, pos)
+                            logger.error(f"[STOP GUARD] {ticker} stop placement FAILED (will retry): {e}")
+                            await alerts.send_nowait(
+                                "critical", "stop_placement_failed",
+                                f"{ticker}: protective stop placement failed (guard will retry): {e}",
+                                dedupe_key=f"guard_fail:{ticker}",
                             )
-                            # Finish the guard anyway: while it stays un-done
-                            # `guard_owns_stop` keeps the reconciler's
-                            # UNPROTECTED sweep from touching this position,
-                            # and that sweep is the safety net that re-arms it.
-                            await _finish_guard(ticker, "partial_fill_unprotected")
-                            await alerts.send(
-                                "critical", "partial_fill_unprotected",
-                                f"{ticker}: the protective stop filled part of the position and the "
-                                f"remaining {remaining} could NOT be re-protected — the reconciler "
-                                f"will retry, but verify at your broker now: {e}",
-                                dedupe_key=f"partial_unprotected:{ticker}",
-                            )
-                        return
-                    if replace_outcome == CANCEL_FILLED:
-                        logger.warning(
-                            f"[STOP GUARD] {ticker} protective stop already executed — position closed, "
-                            f"not re-arming"
-                        )
-                        await _finish_guard(ticker, "closed_by_stop")
-                        stop_fill = await _resolve_exit_fill(guard.get("stop_order_id"))
-                        payload_g = {"ticker": ticker, "action": guard.get("action") or "BUY"}
-                        if stop_fill and is_option:
-                            await _record_close(ticker, None, payload_g, exit_premium=stop_fill, close_reason="stop_fill")
-                        elif stop_fill:
-                            await _record_close(ticker, stop_fill, payload_g, close_reason="stop_fill")
-                        else:
-                            await _defer_close_to_reconciler(ticker, guard.get("stop_order_id"),
-                                                             "guard stop executed — fill price unavailable")
-                        return
-                if can_place:
-                    try:
-                        if is_option:
-                            stop_info = await _place_option_protective_stop(
-                                ticker, dict(guard.get("contract") or {}), filled,
-                                float(guard.get("stop") or 0),
-                            )
-                        else:
-                            stop_info = await _place_protective_stop(
-                                ticker, str(guard.get("action") or "BUY"), filled,
-                                float(guard.get("stop") or 0),
-                            )
-                        guard = await state.update_guard(
-                            ticker,
-                            guarded_qty=filled,
-                            stop_order_id=stop_info["order_id"],
-                            stop_client_id=stop_info["client_id"],
-                        ) or guard
-                        async with _position_section(ticker, "stop placement"):
-                            pos = await state.get_position(ticker)
-                            if pos:
-                                pos["stop_order_id"] = stop_info["order_id"]
-                                pos["filled_qty"] = filled
-                                await state.set_position(ticker, pos)
-                        await settle_heat_after_stop_armed(ticker)
-                        guarded = filled
-                    except Exception as e:
-                        # The OLD stop was already cancelled above and the new one
-                        # did not stick, so nothing is resting. The guard record
-                        # still pointed at the dead order id, and the stop-placement
-                        # timeout breaker below only fires when `stop_order_id` is
-                        # falsy — so a stale-truthy id disarmed the one control that
-                        # emergency-flattens an unprotected fill. Clear it: the guard
-                        # must describe what is ACTUALLY resting at the broker.
-                        guard = await state.update_guard(ticker, stop_order_id=None,
-                                                         stop_client_id=None) or guard
-                        async with _position_section(ticker, "stop id clear"):
-                            pos = await state.get_position(ticker)
-                            if pos and pos.get("stop_order_id"):
-                                pos["stop_order_id"] = None
-                                await state.set_position(ticker, pos)
-                        logger.error(f"[STOP GUARD] {ticker} stop placement FAILED (will retry): {e}")
-                        await alerts.send(
-                            "critical", "stop_placement_failed",
-                            f"{ticker}: protective stop placement failed (guard will retry): {e}",
-                            dedupe_key=f"guard_fail:{ticker}",
-                        )
+
+            finally:
+                if pending_entry_alert is not None:
+                    alert_guard, alert_filled = pending_entry_alert
+                    pending_entry_alert = None
+                    await _alert_entry_fill(ticker, alert_guard, alert_filled)
 
             guard = await state.update_guard(ticker, last_filled=filled, last_status=status) or guard
 
@@ -31949,7 +32227,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                                 # no exposure. Loud anyway: a signal was accepted
                                 # and now has NOTHING working at the broker.
                                 logger.error(f"[ENTRY CHASE] {ticker} reprice FAILED after cancel: {e}")
-                                await alerts.send(
+                                await alerts.send_nowait(
                                     "critical", "entry_chase_failed",
                                     f"{ticker}: the entry was cancelled to reprice at "
                                     f"{float(chase['next_limit']):.2f} and the replacement FAILED ({e}) — "
@@ -32010,7 +32288,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                             "ticker": ticker, "qty": filled, "flatten_order_id": flatten_id,
                             "timeout_seconds": STOP_PLACEMENT_TIMEOUT_SECONDS,
                         })
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "critical", "stop_timeout_flattened",
                             f"{ticker}: no protective stop resting {STOP_PLACEMENT_TIMEOUT_SECONDS}s after entry "
                             f"— position flattened at market (qty={filled}, order={flatten_id})",
@@ -32019,7 +32297,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                         return
                     except Exception as e:
                         logger.error(f"[STOP GUARD] {ticker} emergency flatten FAILED (will retry): {e}")
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "critical", "stop_timeout_flatten_failed",
                             f"{ticker}: UNPROTECTED past the {STOP_PLACEMENT_TIMEOUT_SECONDS}s stop deadline and "
                             f"the emergency flatten failed (guard keeps retrying): {e}",
@@ -32047,7 +32325,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                             "ticker": ticker, "entry_order_id": guard.get("entry_order_id"),
                             "timeout_seconds": STOP_PLACEMENT_TIMEOUT_SECONDS,
                         })
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "warning", "stop_timeout_entry_cancelled",
                             f"{ticker}: entry unfilled and no protective stop within "
                             f"{STOP_PLACEMENT_TIMEOUT_SECONDS}s — entry auto-cancelled",
@@ -32088,7 +32366,7 @@ async def _stop_guard_worker(ticker: str) -> None:
                 if filled > 0:
                     # Filled but stop never stuck — keep trying rather than walk away.
                     logger.error(f"[STOP GUARD] {ticker} UNPROTECTED at deadline — extending guard")
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "critical", "position_unprotected",
                         f"{ticker}: filled entry still has NO resting stop at the guard deadline — guard extended, retrying",
                         dedupe_key=f"unprotected:{ticker}",
@@ -32379,21 +32657,20 @@ def format_fill_alert(fill: dict) -> dict:
             pass
     return {
         "event": "trade_buy_filled" if side == "BUY" else "trade_sell_filled",
-        "severity": "info",
+        "severity": "critical",
         "headline": headline,
         "text": "\n".join(lines),
     }
 
 
 async def _alert_fill(fill: dict, dedupe_key: Optional[str] = None) -> None:
-    """Deliver a fill notice. `force_deliver` is required: a fill is honestly
-    `info` severity, and the default webhook floor is `warning` — without the
-    bypass the one alert the operator actually wants would be logged and then
-    dropped. Never raises: alerting must not be able to break trading."""
+    """Deliver a fill notice. Fills are critical so a full in-flight cap queues
+    them instead of dropping the POST. `force_deliver` still skips the severity
+    floor. Never raises: alerting must not be able to break trading."""
     try:
         fill = {**fill, "live": LIVE_TRADING and not is_sandbox, "sandbox": is_sandbox}
         rendered = format_fill_alert(fill)
-        await alerts.send(
+        await alerts.send_nowait(
             rendered["severity"], rendered["event"], rendered["headline"],
             dedupe_key=dedupe_key,
             data={k: v for k, v in fill.items() if k != "contract"} | {"contract": fill.get("contract")},
@@ -36158,7 +36435,7 @@ async def execute_live_order(payload: dict):
             "origin": str(payload.get(DISPATCH_ORIGIN_FIELD) or "") or None,
             "reason": origin_reason,
         })
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", "entry_refused_origin",
             f"{ticker} {action}: {origin_reason}",
             dedupe_key=f"origin:{ticker}",
@@ -36481,7 +36758,7 @@ async def execute_live_order(payload: dict):
                         "ticker": sym_u, "expiry": expiry, "strike": strike,
                         "delta": new_delta, "dte": check["dte"], "reason": check["reason"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_expression_refused",
                         f"{symbol}: no live ticket — {check['reason']}.",
                         dedupe_key=f"expression_refused:{symbol}",
@@ -36554,7 +36831,7 @@ async def execute_live_order(payload: dict):
                 })
                 if not zd["allowed"]:
                     logger.warning(f"⛔ {symbol} {zd['reason']}")
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "zero_dte_cap",
                         f"{symbol}: no live ticket — {zd['reason']}.",
                         dedupe_key=f"zero_dte_cap:{symbol}:{today_iso_0dte}",
@@ -36581,7 +36858,7 @@ async def execute_live_order(payload: dict):
                         "ticker": sym_u, "bid": real_bid, "ask": real_ask,
                         "cost": cost_model.summary(cost_verdict["cost"]),
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_cost_refused",
                         f"{symbol}: no live ticket — {reason}.",
                         dedupe_key=f"cost_refused:{symbol}",
@@ -36741,7 +37018,7 @@ async def execute_live_order(payload: dict):
                         "ticker": sym_u, "real_bid": real_bid or None, "real_ask": real_ask or None,
                         "spread_pct": spread_gate["spread_pct"], "ceiling_pct": spread_gate["ceiling"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_spread_refused",
                         f"{symbol}: no live ticket — {spread_gate['reason']}.",
                         dedupe_key=f"spread_refused:{symbol}",
@@ -36834,7 +37111,7 @@ async def execute_live_order(payload: dict):
                         "intended_usd": reprice["intended_usd"],
                         "one_contract_usd": reprice["actual_unit_usd"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_reprice_rejected",
                         f"{symbol}: entry REJECTED — real premium is {reprice['drift_pct']:.0f}% above the "
                         f"app's estimate (≈${reprice['actual_unit_usd']:.0f}/contract vs "
@@ -36861,7 +37138,7 @@ async def execute_live_order(payload: dict):
                         "drift_pct": reprice["drift_pct"],
                         "intended_usd": reprice["intended_usd"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_repriced",
                         f"{symbol}: real premium {reprice['drift_pct']:.0f}% above the app's estimate — "
                         f"resized {quantity} → {reprice['qty']} contract(s) to hold the intended "
@@ -36889,7 +37166,7 @@ async def execute_live_order(payload: dict):
                         "etrade_ask": real_ask or None,
                         "etrade_quote_type": contract_liquidity.get("quote_type"),
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_quote_refused",
                         f"{symbol}: no live ticket — {pq['reason']}.",
                         dedupe_key=f"quote_refused:{symbol}",
@@ -36912,7 +37189,7 @@ async def execute_live_order(payload: dict):
                         "spread_pct": live_spread["spread_pct"], "ceiling_pct": live_spread["ceiling"],
                         "quote_source": pq["source"], "app_decides": bool(app_decides),
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_spread_refused",
                         f"{symbol}: no live ticket — {reason}.",
                         dedupe_key=f"spread_refused:{symbol}",
@@ -36943,7 +37220,7 @@ async def execute_live_order(payload: dict):
                         "payoff_r": shape["payoff_r"],
                         "qty_requested": quantity,
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_shape_refused",
                         f"{symbol}: no live ticket — {shape['reason']}. Paper it instead.",
                         dedupe_key=f"shape_refused:{symbol}",
@@ -36980,7 +37257,7 @@ async def execute_live_order(payload: dict):
                         "risk_usd": risk_check["risk_usd"],
                         "ceiling_usd": risk_check["ceiling_usd"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_risk_rejected",
                         f"{symbol}: entry REFUSED — {risk_check['reason']}.",
                         dedupe_key=f"priced_risk_reject:{symbol}",
@@ -37001,7 +37278,7 @@ async def execute_live_order(payload: dict):
                         "requested_risk_usd": risk_check["requested_risk_usd"],
                         "ceiling_usd": risk_check["ceiling_usd"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_risk_resized",
                         f"{symbol}: real contract risks more than the day can spend — "
                         f"resized {quantity} → {risk_check['qty']} contract(s) "
@@ -37022,7 +37299,7 @@ async def execute_live_order(payload: dict):
                         "ticker": sym_u, "qty_requested": quantity,
                         "caps": capacity["caps"], "inputs": capacity["inputs"],
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "warning", "entry_capacity_refused",
                         f"{symbol}: no live ticket — {capacity['reason']}.",
                         dedupe_key=f"capacity_refused:{symbol}",
@@ -37055,7 +37332,7 @@ async def execute_live_order(payload: dict):
                         "notional_usd": cap["notional_usd"], "notional_cap_usd": cap["notional_cap_usd"],
                         "app_decides": bool(app_decides),
                     })
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "critical", "entry_hard_cap_refused",
                         f"{symbol}: entry REFUSED — {cap['reason']}.",
                         dedupe_key=f"hard_cap:{symbol}",
@@ -37082,7 +37359,7 @@ async def execute_live_order(payload: dict):
                             "ticker": sym_u, "premium": cap_premium or None, "stop_premium": cap_stop,
                             "qty": quantity, "reason": heat_reason,
                         })
-                        await alerts.send(
+                        await alerts.send_nowait(
                             "warning", "entry_app_open_risk_refused",
                             f"{symbol}: app entry REFUSED — {heat_reason}.",
                             dedupe_key=f"app_open_risk:{symbol}",
@@ -37795,7 +38072,7 @@ async def execute_live_order(payload: dict):
             "error_type": type(e).__name__,
             "counted_toward_breaker": not local,
         })
-        await alerts.send(
+        await alerts.send_nowait(
             "error", "order_failed",
             f"{ticker} {action} ({instrument}) failed: {safe_exc}",
             dedupe_key=f"order_failed:{ticker}",
@@ -38292,7 +38569,7 @@ async def _maybe_repair_inflated_native_trail(
         try:
             await _reconcile_rearm_guard(ticker, dict(await state.get_position(ticker) or fresh))
         except Exception as re_arm_error:
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "native_trail_repair_unprotected",
                 f"{ticker}: inflated trail cancelled, repair refused, and fixed stop "
                 f"re-arm failed — verify at your broker ({e}; re-arm: {re_arm_error})",
@@ -38310,7 +38587,7 @@ async def _maybe_repair_inflated_native_trail(
         try:
             await _reconcile_rearm_guard(ticker, dict(fresh))
         except Exception as re_arm_error:
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "native_trail_repair_unprotected",
                 f"{ticker}: inflated trail cancelled and repair failed — verify at your "
                 f"broker now ({e}; re-arm: {re_arm_error})",
@@ -38417,7 +38694,7 @@ async def _maybe_hand_off_native_trail(
             ).isoformat()
             fresh["native_trail_skip"] = str(e)[:240]
             await state.set_position(ticker, fresh)
-        await alerts.send(
+        await alerts.send_nowait(
             "warning", "native_trail_auto_failed",
             f"{ticker}: could not place the E*TRADE trailing stop ({e}). "
             f"The fixed stop stays the protection; the bot tries the trail again in "
@@ -38729,7 +39006,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
                     await _reconcile_rearm_guard(ticker, dict(fresh))
                 except Exception as e:
                     logger.error(f"[TRAIL] {ticker} re-arm after partial stop fill FAILED: {e}")
-                    await alerts.send(
+                    await alerts.send_nowait(
                         "critical", "partial_fill_unprotected",
                         f"{ticker}: the trailing stop filled part of the position and the "
                         f"remaining {remaining} could NOT be re-protected — close them manually: {e}",
@@ -38759,7 +39036,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         await trade_ledger.record("trail_stop_executed", {
             "ticker": ticker, "stop": plan["current_stop"], "order_id": stop_order_id,
         })
-        await alerts.send(
+        await alerts.send_nowait(
             "info", "trail_stop_executed",
             f"{ticker}: trailing stop filled at the broker around {float(plan['current_stop']):.2f} — position closed.",
             dedupe_key=f"trail_hit:{ticker}",
@@ -38822,7 +39099,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
             f"[TRAIL] {ticker} ratchet to {new_stop:.2f} failed — protection restored at "
             f"{float(stop_info['stop']):.2f} (order={stop_info['order_id']}), will retry next pass"
         )
-        await alerts.send(
+        await alerts.send_nowait(
             "warning", "trail_ratchet_recovered",
             f"{ticker}: could not tighten the stop to {new_stop:.2f} — the previous stop at "
             f"{float(stop_info['stop']):.2f} is resting again, so the position stayed protected. "
@@ -38840,7 +39117,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         await trade_ledger.record("trail_ratchet_failed", {
             "ticker": ticker, "new_stop": new_stop, "error": str(last_err),
         })
-        await alerts.send(
+        await alerts.send_nowait(
             "critical", "trail_ratchet_failed",
             f"{ticker}: trailing ratchet cancelled the old stop but the new stop at {new_stop:.2f} "
             f"failed to rest — position unprotected until the reconciler re-arms: {last_err}",
@@ -38868,7 +39145,7 @@ async def _trail_ratchet_one(ticker: str, pos: dict) -> None:
         "order_id": stop_info["order_id"],
     })
     if tier != prev_tier:
-        await alerts.send(
+        await alerts.send_nowait(
             "info", "trail_tier_advanced",
             f"{ticker}: {trailing_engine.TRAIL_TIER_LABEL.get(tier, tier)} — stop now {float(stop_info['stop']):.2f} "
             f"(+{plan['trail']['r_multiple']:.2f}R shown)",
@@ -39373,7 +39650,7 @@ async def _flatten_save(ticker: str, pos: dict) -> None:
     order_id = _flatten_sent_order_id(pos) or "unknown"
     message = f"{ticker}: close sent, order id not saved ({order_id})"
     logger.error(f"[FLATTEN REPLACE] {message}")
-    await alerts.send(
+    await alerts.send_nowait(
         "error", "flatten_close_unsaved", message,
         dedupe_key=f"flatten_unsaved:{ticker}:{order_id}",
     )
@@ -39410,7 +39687,7 @@ async def _alert_flatten(
         await _flatten_save(ticker, pos)
         return
     event = "unfilled_flatten_manual" if once else "unfilled_flatten_replace"
-    await alerts.send(
+    await alerts.send_nowait(
         "critical", event, message,
         dedupe_key=f"unfilled_flatten:{ticker}:{condition}",
     )
@@ -40242,7 +40519,7 @@ async def _app_eyes_pass() -> None:
                 f"[EXIT AUTHORITY] 👁️ {ticker} — {lapse}; broker stop re-tightened "
                 f"to the app's tactical level {tactical:.2f} (order={stop_info['order_id']})"
             )
-            await alerts.send(
+            await alerts.send_nowait(
                 "warning", "exit_authority_reverted",
                 f"{ticker}: {lapse}, so it can no longer manage this exit — the "
                 f"protective stop was re-tightened to {tactical:.2f} at the broker.",
@@ -40250,7 +40527,7 @@ async def _app_eyes_pass() -> None:
             )
         except Exception as e:
             logger.error(f"[EXIT AUTHORITY] {ticker} re-tighten FAILED: {e}")
-            await alerts.send(
+            await alerts.send_nowait(
                 "critical", "exit_authority_retighten_failed",
                 f"{ticker}: {lapse} and the protective stop could NOT be "
                 f"re-tightened to {tactical:.2f} — verify at your broker now: {e}",
@@ -40924,8 +41201,13 @@ async def _announce_preflight() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    """Lifespan exit. In-flight alert posts get at most 3s, then state closes."""
     global _worker_stop
     _worker_stop = True
+    try:
+        await alerts.drain(alerts._DRAIN_TIMEOUT_S)
+    except Exception as e:
+        logger.warning(f"alert drain failed: {type(e).__name__}")
     await _close_study_page_engine()
     await state.close()
 
@@ -42019,6 +42301,7 @@ async def status():
         },
         "pro_trader": _pro_trader_status_payload(daily.get("trades_today")),
         "alert_webhook_configured": alerts.webhook_configured(),
+        "alert_delivery": alerts.delivery_status(),
         "account_binding": _account_binding,
         "crypto_account_binding": _crypto_account_binding,
         "crypto_enabled": CRYPTO_ENABLED,
@@ -43277,7 +43560,7 @@ async def kill(x_rork_secret: Optional[str] = Header(None, alias="X-Rork-Secret"
     logger.warning("KILL SWITCH activated (distributed — all workers respect it)")
     open_tickers = await state.position_tickers()
     await trade_ledger.record("kill_switch_engaged", {"open_positions": open_tickers})
-    await alerts.send(
+    await alerts.send_nowait(
         "critical", "kill_switch_engaged",
         f"KILL SWITCH engaged — all entries halted. Open positions: {', '.join(open_tickers) or 'none'}",
         dedupe_key="kill_switch",
@@ -43406,7 +43689,7 @@ async def _flatten_book(trigger: str) -> Dict[str, Any]:
     await trade_ledger.record("flatten_all", {"trigger": trigger, "results": results})
     headline = ("DAILY LOSS LIMIT BREACHED - the risk desk flattened the book"
                 if trigger == "daily_loss" else "PANIC EXIT")
-    await alerts.send(
+    await alerts.send_nowait(
         "critical", "flatten_all",
         f"{headline} - entries halted. "
         f"Closing: {', '.join(closing) or 'none'}. "

@@ -47,8 +47,8 @@ def _logs(caplog) -> str:
     return "\n".join(record.getMessage() for record in caplog.records)
 
 
-def test_bot_version_is_5_99_17():
-    assert main_bot.BOT_VERSION == "5.99.17-pro-day-trader"
+def test_bot_version_is_5_99_18():
+    assert main_bot.BOT_VERSION == "5.99.18-pro-day-trader"
     assert main_bot.reconciliation.ORDERS_READ_MAX_AGE_SECONDS == 30
     assert main_bot.reconciliation.INFERRED_FLAT_PASS_CAP == 2
     assert main_bot.reconciliation.PORTFOLIO_404_RETRY_SECONDS == 2
